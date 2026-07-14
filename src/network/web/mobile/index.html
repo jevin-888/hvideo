@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>HVIDEO 移动控制终端</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <link rel="stylesheet" href="style.css?v=1039">
+</head>
+
+<body>
+    <!-- 顶部标题 -->
+    <header class="app-header">
+        <h1 class="app-title" id="playback-status-text">正在播放：</h1>
+    </header>
+
+    <!-- 视频页面 -->
+    <main class="app-main page-content" id="page-video">
+        <section class="video-hero-area">
+            <!-- 带有蓝色边框的展会效果图 -->
+            <div class="hero-blue-frame">
+                <img src="assets/city-hero.png" class="hero-main-img" alt=""
+                    onerror="this.style.display='none'; this.nextElementSibling.style.background='linear-gradient(135deg, #1a3a6a 0%, #2b579a 100%)';">
+                <div class="hero-text-overlay">
+                    <div class="hero-glass-modal">
+                        <h2 class="hero-m-text">领航未来, 成就梦想</h2>
+                        <p class="hero-s-text">Pilot the future, achieve the dream</p>
+                    </div>
+                </div>
+                <!-- 媒体类型筛选（覆盖在图片底部） -->
+                <div class="media-type-tabs">
+                    <button class="media-type-btn active" data-type="video">视频</button>
+                    <button class="media-type-btn" data-type="image">图片</button>
+                    <button class="media-type-btn" data-type="audio">音频</button>
+                    <button class="media-type-btn" data-type="usb">U盘</button>
+                </div>
+            </div>
+
+            <!-- 分类导航容器（包含导航和按钮） -->
+            <div style="position: relative;">
+                <div class="cat-nav-row" id="category-nav">
+                    <!-- 动态生成 -->
+                </div>
+                <!-- 图片上屏按钮 -->
+                <div class="image-to-screen-container hidden" id="image-to-screen-container">
+                    <button class="image-to-screen-btn" id="image-to-screen-btn" type="button" title="图片上屏">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="2" y="3" width="20" height="14" rx="2" />
+                            <path d="M8 21h8M12 17v4" />
+                        </svg>
+                    </button>
+                    <!-- 隐藏的文件选择器 -->
+                    <input type="file" id="image-upload-input" accept="image/*" style="display: none;">
+                </div>
+            </div>
+
+            <!-- U盘工具栏：文件夹导航 + 播放模式 + 扫描按钮 -->
+            <div class="usb-toolbar hidden" id="usb-toolbar">
+                <div class="usb-folder-nav" id="usb-folder-nav">
+                    <!-- 文件夹导航将动态插入这里 -->
+                </div>
+                <div class="usb-mode-picker" id="usb-mode-picker">
+                    <button class="usb-mode-trigger" id="usb-mode-trigger" type="button" aria-haspopup="true" aria-expanded="false">
+                        <span id="usb-mode-label">顺序播放</span>
+                        <span class="usb-mode-chevron" aria-hidden="true"></span>
+                    </button>
+                    <div class="usb-mode-menu" id="usb-mode-menu" role="menu" hidden>
+                        <button class="usb-mode-option active" type="button" role="menuitemradio" aria-checked="true" data-mode="sequence">顺序播放</button>
+                        <button class="usb-mode-option" type="button" role="menuitemradio" aria-checked="false" data-mode="random">随机播放</button>
+                        <button class="usb-mode-option" type="button" role="menuitemradio" aria-checked="false" data-mode="loop">循环播放</button>
+                        <button class="usb-mode-option" type="button" role="menuitemradio" aria-checked="false" data-mode="single">单曲循环</button>
+                    </div>
+                </div>
+                <button class="usb-scan-btn" id="usb-scan-btn">扫描</button>
+            </div>
+        </section>
+
+        <!-- 视频列表网格 -->
+        <section class="video-grid-section">
+            <div class="material-matrix" id="video-grid">
+                <div class="grid-status-tip">加载中...</div>
+            </div>
+        </section>
+    </main>
+
+    <!-- 中控页面 -->
+    <main class="app-main page-content hidden" id="page-control">
+        <!-- 标签页导航 -->
+        <div class="control-tabs">
+            <button class="control-tab active" data-tab="ac">空调</button>
+            <button class="control-tab" data-tab="lighting">灯光</button>
+        </div>
+
+        <!-- 空调控制页面 -->
+        <div class="control-panel active" id="ac-panel">
+            <!-- 温度显示区域 -->
+            <div class="temp-display-area">
+                <div class="temp-value" id="temp-display">26</div>
+                <div class="temp-label">温度</div>
+                <div class="temp-controls">
+                    <button class="temp-btn" id="temp-down">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M18 15l-6-6-6 6" />
+                        </svg>
+                    </button>
+                    <button class="temp-btn" id="temp-up">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M6 9l6 6 6-6" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- 空调控制按钮 -->
+            <div class="ac-control-buttons" id="hvac-control-buttons">
+                <button class="ac-btn" id="hvac-on">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10" />
+                        <path d="M12 8v8M8 12h8" />
+                    </svg>
+                    <span>打开</span>
+                </button>
+                <button class="ac-btn active" id="hvac-cool">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path
+                            d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                    </svg>
+                    <span>制冷</span>
+                </button>
+                <button class="ac-btn" id="hvac-heat">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="5" />
+                        <path d="M12 2v6M12 16v6M2 12h6M16 12h6" />
+                    </svg>
+                    <span>制热</span>
+                </button>
+                <button class="ac-btn" id="hvac-fan-low">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2v20M8 6h8M8 18h8" />
+                        <circle cx="12" cy="12" r="3" />
+                    </svg>
+                    <span>低风</span>
+                </button>
+                <button class="ac-btn" id="hvac-fan-medium">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2v20M6 6h12M6 18h12" />
+                        <circle cx="12" cy="12" r="4" />
+                    </svg>
+                    <span>中风</span>
+                </button>
+                <button class="ac-btn" id="hvac-fan-high">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2v20M4 6h16M4 18h16" />
+                        <circle cx="12" cy="12" r="5" />
+                    </svg>
+                    <span>高风</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- 灯光控制页面 -->
+        <div class="control-panel" id="lighting-panel">
+            <div class="lighting-layout">
+                <!-- 上方：调光控制 -->
+                <div class="dimmer-control">
+                    <div class="dimmer-title">调光</div>
+                    <div class="dimmer-circle" id="dimmer-circle">
+                        <div class="dimmer-value" id="dimmer-value">50%</div>
+                    </div>
+                    <div class="dimmer-label" id="dimmer-label">射灯</div>
+                    <input type="range" class="dimmer-slider" id="dimmer-slider" min="0" max="100" value="50">
+                </div>
+
+                <!-- 下方：灯光开关（2x2 网格） -->
+                <div class="light-switches" id="lighting-switches">
+                    <div class="light-switch-item">
+                        <label class="light-toggle">
+                            <input type="checkbox" id="light-spot" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="light-label active">射灯</span>
+                    </div>
+                    <div class="light-switch-item">
+                        <label class="light-toggle">
+                            <input type="checkbox" id="light-strip">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="light-label">灯带</span>
+                    </div>
+                    <div class="light-switch-item">
+                        <label class="light-toggle">
+                            <input type="checkbox" id="light-floor">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="light-label">地台灯</span>
+                    </div>
+                    <div class="light-switch-item">
+                        <label class="light-toggle">
+                            <input type="checkbox" id="light-flood">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="light-label">聚光灯</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+    <!-- 场景页面 -->
+    <main class="app-main page-content hidden" id="page-scene">
+        <!-- 标签页导航 -->
+        <div class="control-tabs">
+            <button class="control-tab active" data-tab="scene">场景</button>
+            <button class="control-tab" data-tab="playlist">播放列表</button>
+        </div>
+
+        <!-- 场景选择面板 -->
+        <div class="control-panel active" id="scene-panel">
+            <div class="scene-buttons-container" id="scene-buttons">
+                <div class="scene-loading">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 播放列表面板 -->
+        <div class="control-panel" id="playlist-panel">
+            <div class="scene-buttons-container" id="playlist-buttons">
+                <div class="scene-loading">加载中...</div>
+            </div>
+        </div>
+    </main>
+
+    <!-- 底部控制 (1:1 图片对齐) -->
+    <div class="footer-control-panel">
+        <div class="icons-action-strip">
+            <!-- 1. 播放/暂停 -->
+            <div class="ctrl-node">
+                <button id="play-pause-btn">
+                    <svg viewBox="0 0 24 24">
+                        <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2" />
+                        <path d="M10 8l6 4-6 4V8z" fill="currentColor" />
+                    </svg>
+                </button>
+                <span class="ctrl-label" id="play-pause-label">播放</span>
+            </div>
+
+            <!-- 2. 音量- -->
+            <div class="ctrl-node">
+                <button id="volume-down-btn">
+                    <svg viewBox="0 0 24 24">
+                        <path d="M11 7l-4 3H5v4h2l4 3V7z" />
+                        <rect x="14" y="11" width="6" height="2" />
+                    </svg>
+                </button>
+                <span class="ctrl-label">音量-</span>
+            </div>
+
+            <!-- 3. 静音/取消 -->
+            <div class="ctrl-node">
+                <button id="mute-btn">
+                    <svg viewBox="0 0 24 24">
+                        <path d="M11 7l-4 3H5v4h2l4 3V7z" />
+                    </svg>
+                </button>
+                <span class="ctrl-label" id="mute-label">静音</span>
+            </div>
+
+            <!-- 4. 音量+ -->
+            <div class="ctrl-node">
+                <button id="volume-up-btn">
+                    <svg viewBox="0 0 24 24">
+                        <path d="M11 7l-4 3H5v4h2l4 3V7z" />
+                        <rect x="16" y="8" width="2" height="8" rx="1" />
+                        <rect x="13" y="11" width="8" height="2" rx="1" />
+                    </svg>
+                </button>
+                <span class="ctrl-label">音量+</span>
+            </div>
+
+            <!-- 5. 重播 -->
+            <div class="ctrl-node">
+                <button id="replay-btn">
+                    <svg viewBox="0 0 24 24">
+                        <path
+                            d="M12 5V2L8 6l4 4V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.7-6-6h-2c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" />
+                    </svg>
+                </button>
+                <span class="ctrl-label">重播</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 底部 Tab (对齐图标) -->
+    <nav class="system-bottom-tabs">
+        <button class="nav-cell active" data-page="video">
+            <svg class="nav-svg" viewBox="0 0 24 24">
+                <path d="M15 10l5-3v10l-5-3V10z" />
+                <rect x="2" y="6" width="13" height="12" rx="2" />
+            </svg>
+            <span class="nav-text">视频</span>
+        </button>
+        <button class="nav-cell" data-page="control">
+            <svg class="nav-svg" viewBox="0 0 24 24">
+                <rect x="3" y="3" width="7" height="7" rx="1" />
+                <rect x="14" y="3" width="7" height="7" rx="1" />
+                <rect x="14" y="14" width="7" height="7" rx="1" />
+                <rect x="3" y="14" width="7" height="7" rx="1" />
+            </svg>
+            <span class="nav-text">中控</span>
+        </button>
+        <button class="nav-cell" data-page="scene">
+            <svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="5" width="20" height="14" rx="2" />
+                <path d="M2 16.1A5 5 0 0 1 5.9 20M2 12A9 9 0 0 1 10 20M2 20h.1" />
+            </svg>
+            <span class="nav-text">场景</span>
+        </button>
+    </nav>
+
+    <!-- 提示框容器 -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script type="module" src="script.js?v=117"></script>
+</body>
+
+</html>

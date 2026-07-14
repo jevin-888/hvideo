@@ -1,0 +1,12 @@
+# Copy to signing.properties and fill local signing secrets.
+# signing.properties is intentionally ignored by Git.
+
+hw81.storeFile=vendor/security8.1/platform.keystore
+hw81.storePassword=change-me
+hw81.keyAlias=android
+hw81.keyPassword=change-me
+
+hw82.storeFile=vendor/security8.2/platform.keystore
+hw82.storePassword=change-me
+hw82.keyAlias=platform
+hw82.keyPassword=change-me

@@ -1,0 +1,1069 @@
+#!/system/bin/sh
+# HSVJ Engine Ultra Optimizer - 完整版
+# 彻底解决 SELinux、SurfaceFlinger、性能问题
+# RK3566/RK3568
+
+# ==============================================
+# SELinux 自动提权（核心）
+# ==============================================
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Need root, restarting with su..."
+    exec su -c "$0" "$@"
+    exit 1
+fi
+
+echo "[HSVJ] Optimizer started."
+OPT_DAEMON_PID_FILE="/data/local/tmp/hsvj_optimize_daemon.pid"
+
+# ==============================================
+# SELinux 永久规则配置（最关键 - 解决 MPP 访问拒绝）
+# ==============================================
+configure_selinux_rules() {
+    echo "[HSVJ] Configuring SELinux rules for MPP access..."
+
+    # 方案1: 使用 supolicy 添加永久规则（最佳方案）
+    if command -v supolicy >/dev/null 2>&1; then
+        echo "[HSVJ] Using supolicy to inject SELinux rules..."
+        supolicy --live \
+            "allow system_app shell_data_file dir { search read open getattr write add_name remove_name }" \
+            "allow system_app shell_data_file file { read write open getattr create unlink append }" \
+            "allow system_app video_device chr_file ioctl" \
+            "allow system_app video_device chr_file { read write open getattr }" \
+            "allow system_app mpp_device chr_file ioctl" \
+            "allow system_app mpp_device chr_file { read write open getattr }" \
+            "allow system_app gpu_device chr_file ioctl" \
+            "allow system_app gpu_device chr_file { read write open getattr }" \
+            2>/dev/null
+
+        if [ $? -eq 0 ]; then
+            echo "[HSVJ] SELinux rules injected successfully"
+            return 0
+        else
+            echo "[HSVJ] supolicy injection failed, trying alternative methods"
+        fi
+    fi
+
+    # 方案2: 设置 Permissive 模式（兼容方案）
+    if [ "$(getenforce)" = "Enforcing" ]; then
+        echo "[HSVJ] Setting SELinux to Permissive mode"
+        setenforce 0
+        if [ $? -eq 0 ]; then
+            echo "[HSVJ] SELinux set to Permissive"
+        fi
+    fi
+
+    # 方案3: 修改设备节点权限（兜底方案）
+    echo "[HSVJ] Updating device node permissions..."
+    for dev in /dev/mpp_service /dev/mpp-service /dev/rkvdec /dev/rkvenc /dev/vepu /dev/vpu_service /dev/dri/renderD128; do
+        if [ -e "$dev" ]; then
+            chmod 666 "$dev" 2>/dev/null
+            chown system:system "$dev" 2>/dev/null
+            chcon u:object_r:video_device:s0 "$dev" 2>/dev/null
+            echo "[HSVJ] Updated permissions for $dev"
+        fi
+    done
+
+    # 方案4: 禁用 SELinux 审计日志（减少日志噪音）
+    echo 0 > /sys/fs/selinux/enforce 2>/dev/null
+    auditctl -e 0 2>/dev/null
+
+}
+
+# ==============================================
+# SurfaceFlinger 优化（减少 Composition 错误）
+# ==============================================
+optimize_surfaceflinger() {
+    echo "[HSVJ] Optimizing SurfaceFlinger..."
+
+    # 禁用 SurfaceFlinger 的调试日志（减少 CompositionEngine 错误日志）
+    setprop log.tag.CompositionEngine WARN
+    setprop log.tag.SurfaceFlinger WARN
+    setprop log.tag.BufferQueue WARN
+    setprop log.tag.BufferQueueProducer WARN
+
+    # 强制使用硬件合成
+    setprop debug.sf.hw 1
+    setprop debug.sf.latch_unsignaled 1
+
+    # 禁用 VSYNC 偏移
+    setprop debug.sf.disable_backpressure 1
+
+    # 优化 GPU 渲染（使用 SkiaGL 以获得更好的视频性能）
+    setprop debug.hwui.renderer skiagl
+    setprop debug.renderengine.backend skiaglthreaded
+
+    # 新增：禁用不必要的 UI 效果
+    setprop debug.hwui.render_dirty_regions false
+    setprop debug.hwui.show_dirty_regions false
+    setprop debug.hwui.skip_empty_damage true
+    setprop debug.hwui.use_buffer_age false
+
+    # 新增：优化合成策略（减少 UI 开销）
+    setprop debug.sf.max_igbp_list_size 2
+    setprop debug.sf.early_phase_offset_ns 500000
+    setprop debug.sf.early_gl_phase_offset_ns 500000
+
+    # 新增：禁用动画和过渡效果（已在 optimize_dedicated_device 中设置）
+    # 但在这里再次确认
+    settings put global window_animation_scale 0
+    settings put global transition_animation_scale 0
+    settings put global animator_duration_scale 0
+
+    echo "[HSVJ] SurfaceFlinger optimized for video playback"
+}
+
+# ==============================================
+# 专机性能模式
+# ==============================================
+set_node_value() {
+    local node="$1"
+    local value="$2"
+    [ -e "$node" ] || return 1
+    echo "$value" > "$node" 2>/dev/null
+}
+
+lock_cpu_performance() {
+    echo "[HSVJ] Locking CPU performance..."
+    for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+        [ -d "$policy" ] || continue
+        set_node_value "$policy/scaling_governor" performance
+        MAX_FREQ="$(cat "$policy/cpuinfo_max_freq" 2>/dev/null)"
+        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$policy/scaling_available_frequencies" 2>/dev/null | awk '{print $NF}')"
+        if [ -n "$MAX_FREQ" ]; then
+            set_node_value "$policy/scaling_max_freq" "$MAX_FREQ"
+            set_node_value "$policy/scaling_min_freq" "$MAX_FREQ"
+        fi
+        echo "[HSVJ] CPU $(basename "$policy") governor=$(cat "$policy/scaling_governor" 2>/dev/null) cur=$(cat "$policy/scaling_cur_freq" 2>/dev/null) min=$(cat "$policy/scaling_min_freq" 2>/dev/null) max=$(cat "$policy/scaling_max_freq" 2>/dev/null)"
+    done
+}
+
+lock_devfreq_performance() {
+    echo "[HSVJ] Locking GPU/VPU/DMC devfreq performance..."
+    for dev in /sys/class/devfreq/*; do
+        [ -d "$dev" ] || continue
+        NAME="$(basename "$dev" | tr '[:upper:]' '[:lower:]')"
+        case "$NAME" in
+            *gpu*|*mali*|*vpu*|*vdec*|*rkvdec*|*venc*|*rkvenc*|*dmc*|*ddr*|*bus*)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        set_node_value "$dev/governor" performance
+        MAX_FREQ="$(cat "$dev/max_freq" 2>/dev/null)"
+        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$dev/available_frequencies" 2>/dev/null | awk '{print $NF}')"
+        if [ -n "$MAX_FREQ" ]; then
+            set_node_value "$dev/max_freq" "$MAX_FREQ"
+            set_node_value "$dev/min_freq" "$MAX_FREQ"
+        fi
+        echo "[HSVJ] DEVFREQ $NAME governor=$(cat "$dev/governor" 2>/dev/null) cur=$(cat "$dev/cur_freq" 2>/dev/null) min=$(cat "$dev/min_freq" 2>/dev/null) max=$(cat "$dev/max_freq" 2>/dev/null)"
+    done
+}
+
+optimize_dedicated_device() {
+    echo "[HSVJ] Applying dedicated-device performance profile..."
+
+    lock_cpu_performance
+    lock_devfreq_performance
+
+    # 屏幕和电源设置
+    settings put system screen_off_timeout 2147483647
+    settings put global stay_on_while_plugged_in 3
+
+    # 完全禁用所有动画（引擎不需要 UI 动画）
+    settings put global window_animation_scale 0
+    settings put global transition_animation_scale 0
+    settings put global animator_duration_scale 0
+
+    # 禁用应用待机和电池优化（确保视频播放不被打断）
+    settings put global app_standby_enabled 0
+    settings put global adaptive_battery_management_enabled 0
+    settings put global low_power 0
+    settings put global automatic_power_save_mode 0
+
+    # 禁用省电模式的所有功能
+    settings put global low_power_trigger_level 0
+
+    # SurfaceFlinger 和 HWC 优化（专注视频性能）
+    setprop debug.hwui.disable_vsync false
+    setprop debug.sf.disable_backpressure 1
+    setprop debug.sf.latch_unsignaled 1
+    setprop debug.sf.enable_hwc_vds 1
+    setprop debug.sf.enable_gl_backpressure 0
+    setprop vendor.hwc.disable_skip_validate 1
+
+    # 新增：视频播放专用优化
+    setprop media.stagefright.cache-params 18432/20480/15
+    setprop media.stagefright.enable-player true
+    setprop media.stagefright.enable-meta true
+    setprop media.stagefright.enable-scan false
+    setprop media.stagefright.enable-http true
+    setprop media.stagefright.use-awesome true
+
+    # 新增：音频优化
+    setprop audio.deep_buffer.media true
+    setprop audio.offload.video true
+    setprop audio.offload.disable false
+
+    # 新增：禁用 UI 相关的后台服务
+    settings put secure notification_badging 0
+    settings put secure adaptive_sleep 0
+    settings put secure camera_gesture_disabled 1
+    settings put secure screensaver_enabled 0
+    settings put secure accessibility_enabled 0
+
+    # 日志降噪
+    setprop log.tag.CompositionEngine WARN
+    setprop log.tag.SurfaceFlinger WARN
+    setprop log.tag.BufferQueue WARN
+    setprop log.tag.BufferQueueProducer WARN
+    setprop log.tag.AudioTrack WARN
+    setprop log.tag.RKCodec WARN
+    setprop log.tag.RKMpp WARN
+    setprop log.tag.MppDecoder WARN
+    setprop log.tag.mpp_dec_parser ERROR
+    setprop log.tag.mpp_dec ERROR
+    setprop log.tag.mpp_service ERROR
+    setprop log.tag.mpp_dev ERROR
+    setprop log.tag.mpp_device ERROR
+    setprop log.tag.auditd ERROR
+    setprop log.tag.audit ERROR
+    setprop log.tag.rknn_server ERROR
+    dmesg -n 1 2>/dev/null
+    echo 1 1 1 1 > /proc/sys/kernel/printk 2>/dev/null
+
+    # HSVJ 应用后台保护
+    dumpsys deviceidle whitelist +com.hsvj.engine 2>/dev/null
+    cmd appops set com.hsvj.engine RUN_IN_BACKGROUND allow 2>/dev/null
+    cmd appops set com.hsvj.engine RUN_ANY_IN_BACKGROUND allow 2>/dev/null
+    cmd appops set com.hsvj.engine WAKE_LOCK allow 2>/dev/null
+    cmd appops set com.hsvj.engine SYSTEM_ALERT_WINDOW allow 2>/dev/null
+
+    # 新增：内存管理优化
+    # 降低 swap 倾向，优先使用物理内存
+    echo 10 > /proc/sys/vm/swappiness 2>/dev/null
+
+    # 优化脏页回写策略，减少卡顿
+    echo 5 > /proc/sys/vm/dirty_background_ratio 2>/dev/null
+    echo 10 > /proc/sys/vm/dirty_ratio 2>/dev/null
+
+    # 优化 VFS 缓存压力
+    echo 50 > /proc/sys/vm/vfs_cache_pressure 2>/dev/null
+
+    # 优化 OOM killer 策略
+    echo 0 > /proc/sys/vm/oom_kill_allocating_task 2>/dev/null
+
+    # 新增：网络优化（减少不必要的网络开销）
+    # 禁用 IPv6（如果不需要）
+    echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null
+    echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null
+
+    # TCP 优化
+    echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse 2>/dev/null
+    echo 30 > /proc/sys/net/ipv4/tcp_fin_timeout 2>/dev/null
+    echo 4096 > /proc/sys/net/core/somaxconn 2>/dev/null
+
+    # 新增：I/O 调度优化
+    for disk in /sys/block/mmcblk*/queue; do
+        if [ -d "$disk" ]; then
+            # 使用 deadline 或 noop 调度器以减少延迟
+            if [ -f "$disk/scheduler" ]; then
+                echo deadline > "$disk/scheduler" 2>/dev/null || echo noop > "$disk/scheduler" 2>/dev/null
+            fi
+            # 优化读取预读
+            echo 512 > "$disk/read_ahead_kb" 2>/dev/null
+            # 禁用 I/O 统计以减少开销
+            echo 0 > "$disk/iostats" 2>/dev/null
+        fi
+    done
+
+    # 新增：禁用不必要的内核功能
+    # 禁用内核审计
+    echo 0 > /proc/sys/kernel/audit 2>/dev/null
+
+    # 优化定时器频率
+    echo 0 > /proc/sys/kernel/nmi_watchdog 2>/dev/null
+
+    echo "[HSVJ] Dedicated-device performance profile applied"
+}
+
+# ==============================================
+# 稳定优先的专机服务精简
+# ==============================================
+disable_optional_services() {
+    echo "[HSVJ] Disabling optional services for dedicated device..."
+
+    # 基础设置禁用
+    settings put secure location_mode 0
+    settings put global master_sync_enabled 0
+    settings put system accelerometer_rotation 0
+    dumpsys deviceidle disable 2>/dev/null
+
+    # 禁用蓝牙（HVIDEO不需要蓝牙）
+    settings put global bluetooth_on 0 2>/dev/null
+    settings put global ble_scan_always_enabled 0 2>/dev/null
+
+    # 禁用不必要的后台服务
+    settings put global stay_on_while_plugged_in 3  # 充电时保持唤醒
+    settings put global app_idle_enabled 0
+    settings put global device_idle_constants_watch ""
+
+    # 减少日志输出
+    setprop log.tag.android.hardware.graphics.allocator-V1-service WARN
+    setprop log.tag.mali_gralloc WARN
+    setprop log.tag.gralloc WARN
+    setprop log.tag.WifiVendorHal ERROR
+    setprop log.tag.WificondScannerImpl WARN
+    setprop log.tag.MediaProvider WARN
+    setprop log.tag.bluetooth ERROR
+    setprop log.tag.bt_btif ERROR
+    setprop log.tag.BluetoothAdapterService ERROR
+
+    safe_disable_pkg() {
+        local pkg="$1"
+        if pm path "$pkg" >/dev/null 2>&1; then
+            pm disable-user --user 0 "$pkg" >/dev/null 2>&1 && \
+                echo "[HSVJ] Disabled optional package: $pkg"
+        fi
+    }
+
+    safe_force_stop_pkg() {
+        local pkg="$1"
+        if pm path "$pkg" >/dev/null 2>&1; then
+            am force-stop "$pkg" >/dev/null 2>&1 && \
+                echo "[HSVJ] Force-stopped optional package: $pkg"
+        fi
+    }
+
+    # 基础应用禁用（原有）
+    safe_disable_pkg android.rockchip.update.service
+    safe_disable_pkg com.example.partnersupportsampletvinput
+    safe_disable_pkg com.android.printspooler
+    safe_disable_pkg com.android.bips
+    safe_disable_pkg com.android.music
+    safe_disable_pkg com.android.musicfx
+    safe_disable_pkg com.android.dreams.basic
+    safe_disable_pkg com.android.dreams.phototable
+    safe_disable_pkg com.android.wallpaper.livepicker
+    safe_disable_pkg com.android.wallpaperpicker
+    safe_disable_pkg com.android.wallpapercropper
+    safe_disable_pkg com.android.egg
+    safe_disable_pkg com.android.traceur
+    safe_disable_pkg com.android.soundrecorder
+    safe_disable_pkg com.android.gallery3d
+    safe_disable_pkg com.android.calculator2
+    safe_disable_pkg com.android.deskclock
+    safe_disable_pkg com.android.contacts
+    safe_disable_pkg com.android.calendar
+    safe_disable_pkg com.android.htmlviewer
+
+    # 屏幕刘海仿真（不需要）
+    safe_disable_pkg com.android.internal.display.cutout.emulation.corner
+    safe_disable_pkg com.android.internal.display.cutout.emulation.double
+    safe_disable_pkg com.android.internal.display.cutout.emulation.hole
+    safe_disable_pkg com.android.internal.display.cutout.emulation.tall
+    safe_disable_pkg com.android.internal.display.cutout.emulation.waterfall
+
+    # 通信相关（专机不需要）
+    safe_disable_pkg com.android.nfc
+    safe_disable_pkg com.android.mms.service
+    safe_disable_pkg com.android.smspush
+    safe_disable_pkg com.android.simappdialog
+    safe_disable_pkg com.android.carrierdefaultapp
+    safe_disable_pkg com.android.carrierconfig
+    safe_disable_pkg com.android.cellbroadcastreceiver
+    safe_disable_pkg com.android.stk
+
+    # 网络代理和书签（不需要）
+    safe_disable_pkg com.android.pacprocessor
+    safe_disable_pkg com.android.proxyhandler
+    safe_disable_pkg com.android.bookmarkprovider
+    safe_disable_pkg com.android.providers.partnerbookmarks
+    safe_disable_pkg com.android.onetimeinitializer
+
+    # 新增：蓝牙相关（专机不需要蓝牙功能）
+    safe_disable_pkg com.android.bluetooth
+    safe_disable_pkg com.android.bluetoothmidiservice
+
+    # 新增：Telephony 相关（专机不打电话）
+    safe_disable_pkg com.android.server.telecom
+    safe_disable_pkg com.android.phone
+
+    # 新增：备份和同步（专机不需要）
+    safe_disable_pkg com.android.backupconfirm
+    safe_disable_pkg com.android.sharedstoragebackup
+    safe_disable_pkg com.android.wallpaperbackup
+    safe_disable_pkg com.android.localtransport
+
+    # 新增：无障碍和智能功能（专机不需要）
+    safe_disable_pkg com.android.companiondevicemanager
+    safe_disable_pkg android.ext.services
+    safe_disable_pkg com.android.settings.intelligence
+
+    # 新增：定位服务（专机不需要定位）
+    safe_disable_pkg com.android.location.fused
+
+    # 新增：VPN和热点（专机不需要）
+    safe_disable_pkg com.android.vpndialogs
+    safe_disable_pkg com.android.hotspot2.osulogin
+
+    # 新增：存储管理（不需要主动管理）
+    safe_disable_pkg com.android.storagemanager
+
+    # 新增：主题包（占用内存，专机不需要主题切换）
+    safe_disable_pkg com.android.theme.color.amethyst
+    safe_disable_pkg com.android.theme.color.sand
+    safe_disable_pkg com.android.theme.color.cinnamon
+    safe_disable_pkg com.android.theme.color.tangerine
+    safe_disable_pkg com.android.theme.color.aquamarine
+    safe_disable_pkg com.android.theme.color.black
+    safe_disable_pkg com.android.theme.color.green
+    safe_disable_pkg com.android.theme.color.ocean
+    safe_disable_pkg com.android.theme.color.space
+    safe_disable_pkg com.android.theme.color.palette
+    safe_disable_pkg com.android.theme.color.carbon
+    safe_disable_pkg com.android.theme.color.orchid
+    safe_disable_pkg com.android.theme.color.purple
+
+    # 新增：图标包（占用内存）
+    safe_disable_pkg com.android.theme.icon.pebble
+    safe_disable_pkg com.android.theme.icon.vessel
+    safe_disable_pkg com.android.theme.icon.taperedrect
+    safe_disable_pkg com.android.theme.icon.teardrop
+    safe_disable_pkg com.android.theme.icon.squircle
+    safe_disable_pkg com.android.theme.icon.roundedrect
+    safe_disable_pkg com.android.theme.icon_pack.victor.settings
+    safe_disable_pkg com.android.theme.icon_pack.victor.systemui
+    safe_disable_pkg com.android.theme.icon_pack.victor.launcher
+    safe_disable_pkg com.android.theme.icon_pack.victor.android
+    safe_disable_pkg com.android.theme.icon_pack.victor.themepicker
+    safe_disable_pkg com.android.theme.icon_pack.rounded.systemui
+    safe_disable_pkg com.android.theme.icon_pack.rounded.android
+    safe_disable_pkg com.android.theme.icon_pack.rounded.launcher
+    safe_disable_pkg com.android.theme.icon_pack.rounded.themepicker
+    safe_disable_pkg com.android.theme.icon_pack.rounded.settings
+    safe_disable_pkg com.android.theme.icon_pack.circular.themepicker
+    safe_disable_pkg com.android.theme.icon_pack.circular.settings
+    safe_disable_pkg com.android.theme.icon_pack.circular.systemui
+    safe_disable_pkg com.android.theme.icon_pack.circular.android
+    safe_disable_pkg com.android.theme.icon_pack.circular.launcher
+    safe_disable_pkg com.android.theme.icon_pack.kai.settings
+    safe_disable_pkg com.android.theme.icon_pack.kai.themepicker
+    safe_disable_pkg com.android.theme.icon_pack.kai.systemui
+    safe_disable_pkg com.android.theme.icon_pack.kai.android
+    safe_disable_pkg com.android.theme.icon_pack.kai.launcher
+    safe_disable_pkg com.android.theme.icon_pack.sam.settings
+    safe_disable_pkg com.android.theme.icon_pack.sam.systemui
+    safe_disable_pkg com.android.theme.icon_pack.sam.android
+    safe_disable_pkg com.android.theme.icon_pack.sam.launcher
+    safe_disable_pkg com.android.theme.icon_pack.sam.themepicker
+    safe_disable_pkg com.android.theme.icon_pack.filled.settings
+    safe_disable_pkg com.android.theme.icon_pack.filled.systemui
+    safe_disable_pkg com.android.theme.icon_pack.filled.android
+    safe_disable_pkg com.android.theme.icon_pack.filled.launcher
+    safe_disable_pkg com.android.theme.icon_pack.filled.themepicker
+    safe_disable_pkg com.android.theme.font.notoserifsource
+
+    # 新增：测试和调试相关
+    safe_disable_pkg com.android.cts.priv.ctsshim
+    safe_disable_pkg com.android.cts.ctsshim
+    safe_disable_pkg com.android.dynsystem
+
+    # 新增：Captive Portal（专机不需要网络登录检测）
+    safe_disable_pkg com.android.captiveportallogin
+
+    # 新增：MTP（专机不需要USB文件传输）
+    safe_disable_pkg com.android.mtp
+
+    # 新增：Provision（初始设置向导，已完成设置）
+    safe_disable_pkg com.android.provision
+
+    # 新增：SE（安全元件服务，专机不需要）
+    safe_disable_pkg com.android.se
+
+    # 强制停止已禁用的应用
+    safe_force_stop_pkg android.rockchip.update.service
+    safe_force_stop_pkg com.example.partnersupportsampletvinput
+    safe_force_stop_pkg com.android.soundrecorder
+    safe_force_stop_pkg com.android.gallery3d
+    safe_force_stop_pkg com.android.music
+    safe_force_stop_pkg com.android.musicfx
+    safe_force_stop_pkg com.android.nfc
+    safe_force_stop_pkg com.android.mms.service
+    safe_force_stop_pkg com.android.smspush
+    safe_force_stop_pkg com.android.cellbroadcastreceiver
+    safe_force_stop_pkg com.android.bluetooth
+    safe_force_stop_pkg com.android.bluetoothmidiservice
+    safe_force_stop_pkg com.android.server.telecom
+    safe_force_stop_pkg com.android.phone
+    safe_force_stop_pkg com.android.location.fused
+    safe_force_stop_pkg android.ext.services
+
+    # 新增：深度优化 UI 服务（引擎不需要复杂 UI）
+    # 但保留 SystemUI 核心功能以确保系统启动
+    safe_disable_pkg com.android.wallpaper
+    safe_disable_pkg com.android.theme.wallpaper
+
+    # 手势导航（如果不使用可以禁用）
+    safe_disable_pkg com.android.systemui.gesture.line.overlay
+    safe_disable_pkg com.android.internal.systemui.navbar.gestural_wide_back
+    safe_disable_pkg com.android.internal.systemui.navbar.gestural_narrow_back
+    safe_disable_pkg com.android.internal.systemui.navbar.gestural_extra_wide_back
+
+    # 保留基础导航（确保系统可用）
+    # safe_disable_pkg com.android.internal.systemui.navbar.gestural
+    # safe_disable_pkg com.android.internal.systemui.navbar.threebutton
+    echo "[HSVJ] Basic navigation kept for system stability"
+
+    # 输入法相关（保留 Google 输入法，如果不存在则保留其他输入法）
+    # safe_disable_pkg com.android.inputmethod.latin
+    # safe_disable_pkg com.google.android.inputmethod.latin
+    echo "[HSVJ] Input method kept for basic text input"
+
+    # 无障碍服务（如果不需要）
+    safe_disable_pkg com.android.accessibility
+
+    # 语音助手（引擎不需要）
+    safe_disable_pkg com.android.hotwordenrollment.okgoogle
+    safe_disable_pkg com.android.hotwordenrollment.xgoogle
+
+    # Google 服务（如果系统中有）
+    safe_disable_pkg com.android.vending
+    safe_disable_pkg com.google.android.gms
+    safe_disable_pkg com.google.android.gsf
+    safe_disable_pkg com.google.android.googlequicksearchbox
+
+    # 文档和下载 UI（专机不需要）
+    safe_disable_pkg com.android.documentsui
+    safe_disable_pkg com.android.providers.downloads.ui
+
+    # 快捷设置相关（减少 SystemUI 负担）
+    safe_disable_pkg com.android.systemui.gesture
+    safe_disable_pkg com.android.systemui.plugin
+
+    # 屏保和壁纸选择器（已在上面禁用，这里确保）
+    safe_disable_pkg com.android.dreams.basic
+    safe_disable_pkg com.android.dreams.phototable
+
+    # 屏幕截图编辑器（如果有）
+    safe_disable_pkg com.android.screenshoteditactivity
+
+    echo "[HSVJ] UI components deeply optimized (core kept for boot)"
+
+# ==============================================
+# 系统服务精简（停止不必要的 init 服务）
+# ==============================================
+disable_unnecessary_init_services() {
+    echo "[HSVJ] Disabling unnecessary init services..."
+
+    # 停止蓝牙相关服务
+    stop vendor.bluetooth-1-0 2>/dev/null
+    setprop ctl.stop vendor.bluetooth-1-0 2>/dev/null
+
+    # 停止传感器服务（专机不需要）
+    stop vendor.sensors-hal-1-0 2>/dev/null
+    setprop ctl.stop vendor.sensors-hal-1-0 2>/dev/null
+
+    # 停止无线电服务（专机不需要移动网络）
+    stop vendor.radio-1-2 2>/dev/null
+    stop vendor.radio-config-hal-1-0 2>/dev/null
+    stop vendor.ril-daemon 2>/dev/null
+    setprop ctl.stop vendor.radio-1-2 2>/dev/null
+    setprop ctl.stop vendor.radio-config-hal-1-0 2>/dev/null
+    setprop ctl.stop vendor.ril-daemon 2>/dev/null
+
+    # 停止摄像头服务（专机不需要摄像头）
+    stop cameraserver 2>/dev/null
+    stop vendor.camera-provider-2-4 2>/dev/null
+    stop vendor.camera-provider-2-4-ext 2>/dev/null
+    setprop ctl.stop cameraserver 2>/dev/null
+    setprop ctl.stop vendor.camera-provider-2-4 2>/dev/null
+    setprop ctl.stop vendor.camera-provider-2-4-ext 2>/dev/null
+
+    # 保留 DRM 服务（视频播放需要）
+    # 不禁用 vendor.drm-clearkey-hal-1-3
+    # 不禁用 vendor.drm-widevine-hal-1-3
+    echo "[HSVJ] DRM services kept for video playback"
+
+    # 停止 CAS 服务（条件访问系统，专机不需要）
+    stop vendor.cas-hal-1-2 2>/dev/null
+    setprop ctl.stop vendor.cas-hal-1-2 2>/dev/null
+
+    # 保留 Gatekeeper 和 Keymaster（可能影响系统启动和应用验证）
+    # 改为仅停止不必要的验证，但保留服务运行
+    echo "[HSVJ] Gatekeeper/Keymaster kept for system stability"
+
+    # 停止 traced（跟踪服务，专机不需要调试跟踪）
+    stop traced 2>/dev/null
+    stop traced_probes 2>/dev/null
+    setprop ctl.stop traced 2>/dev/null
+    setprop ctl.stop traced_probes 2>/dev/null
+
+    # 停止 incident（事故报告服务）
+    stop incidentd 2>/dev/null
+    setprop ctl.stop incidentd 2>/dev/null
+
+    # 停止 statsd（统计服务）
+    stop statsd 2>/dev/null
+    setprop ctl.stop statsd 2>/dev/null
+
+    # 停止 mdnsd（mDNS 服务发现）
+    stop mdnsd 2>/dev/null
+    setprop ctl.stop mdnsd 2>/dev/null
+
+    # 禁用系统服务的日志
+    setprop log.tag.CameraService ERROR
+    setprop log.tag.Camera ERROR
+    setprop log.tag.BluetoothAdapterService ERROR
+    setprop log.tag.BluetoothManagerService ERROR
+    setprop log.tag.BluetoothGatt ERROR
+    setprop log.tag.bt_btif ERROR
+    setprop log.tag.bt_stack ERROR
+    setprop log.tag.Sensors ERROR
+    setprop log.tag.SensorService ERROR
+    setprop log.tag.RadioService ERROR
+    setprop log.tag.RILJ ERROR
+    setprop log.tag.RIL ERROR
+    setprop log.tag.Telephony ERROR
+
+    echo "[HSVJ] Unnecessary init services disabled (core services preserved)"
+}
+
+# ==============================================
+# RKNN 服务关闭
+# ==============================================
+disable_rknn_service() {
+    RK_PLATFORM="$(cat /proc/device-tree/compatible /proc/device-tree/model /proc/cpuinfo 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+    case "$RK_PLATFORM" in
+        *rk3566*|*rk3568*)
+            ;;
+        *)
+            echo "[HSVJ] RKNN service kept for non-RK3566/RK3568 platform"
+            return 0
+            ;;
+    esac
+
+    echo "[HSVJ] Disabling RKNN service..."
+
+    stop rknn_server 2>/dev/null
+    stop rknnserver 2>/dev/null
+    pkill -f rknn_server 2>/dev/null
+    pkill -f rknnserver 2>/dev/null
+
+    setprop ctl.stop rknn_server 2>/dev/null
+    setprop ctl.stop rknnserver 2>/dev/null
+
+    if pidof rknn_server >/dev/null 2>&1 || pidof rknnserver >/dev/null 2>&1; then
+        echo "[HSVJ] RKNN service still running"
+    else
+        echo "[HSVJ] RKNN service stopped"
+    fi
+}
+
+# ==============================================
+# 清理系统缓存和临时文件
+# ==============================================
+cleanup_system_cache() {
+    echo "[HSVJ] Cleaning system cache and temporary files..."
+
+    # 清理 logcat 缓冲区
+    logcat -c 2>/dev/null
+
+    # 清理 tombstone 文件（崩溃日志）
+    rm -rf /data/tombstones/* 2>/dev/null
+
+    # 清理 ANR 日志
+    rm -rf /data/anr/* 2>/dev/null
+
+    # 清理系统日志
+    rm -rf /data/system/dropbox/* 2>/dev/null
+
+    # 清理临时文件
+    rm -rf /data/local/tmp/*.tmp 2>/dev/null
+    rm -rf /data/local/tmp/*.log 2>/dev/null
+
+    # 清理不必要应用的缓存（但保留 HSVJ）
+    for pkg in $(pm list packages -e | cut -d: -f2 | grep -v "hsvj\|systemui\|launcher"); do
+        # 只清理非核心应用的缓存
+        case "$pkg" in
+            com.android.bluetooth|com.android.phone|com.android.server.telecom|com.android.location.fused)
+                pm clear "$pkg" 2>/dev/null
+                echo "[HSVJ] Cleared cache for $pkg"
+                ;;
+        esac
+    done
+
+    # 清理 shader 缓存（排除 HSVJ）
+    for shader_dir in /data/user_de/0/*/code_cache/com.android.*/shader_cache; do
+        if ! echo "$shader_dir" | grep -q "hsvj"; then
+            rm -rf "$shader_dir"/* 2>/dev/null
+        fi
+    done
+
+    echo "[HSVJ] System cache cleaned"
+}
+
+# ==============================================
+# PackageManager 安装残留清理
+# ==============================================
+cleanup_package_install_residue() {
+    echo "[HSVJ] Cleaning package install staging residue..."
+
+    # PackageManager 也会使用 /data/app/vmdl*.tmp 作为活动安装会话目录。
+    # 如果在这里移除新的会话目录，可能导致 install-commit 失败并出现
+    # INSTALL_FAILED_INVALID_APK，因此只删除明确陈旧的残留目录。
+    STALE_SECONDS="${HSVJ_INSTALL_STAGING_STALE_SECONDS:-86400}"
+    NOW_SECONDS="$(date +%s 2>/dev/null)"
+    REMOVED_COUNT=0
+    FREED_KB=0
+    for dir in /data/app/vmdl*.tmp; do
+        [ -d "$dir" ] || continue
+
+        case "$dir" in
+            /data/app/vmdl*.tmp)
+                ;;
+            *)
+                echo "[HSVJ] Skip unexpected staging path: $dir"
+                continue
+                ;;
+        esac
+
+        DIR_MTIME="$(stat -c %Y "$dir" 2>/dev/null)"
+        if [ -z "$NOW_SECONDS" ] || [ -z "$DIR_MTIME" ]; then
+            echo "[HSVJ] Skip staging dir without reliable age: $dir"
+            continue
+        fi
+
+        AGE_SECONDS=$((NOW_SECONDS - DIR_MTIME))
+        if [ "$AGE_SECONDS" -lt "$STALE_SECONDS" ]; then
+            echo "[HSVJ] Skip active/recent package staging dir: $dir age=${AGE_SECONDS}s threshold=${STALE_SECONDS}s"
+            continue
+        fi
+
+        SIZE_KB="$(du -sk "$dir" 2>/dev/null | awk '{print $1}')"
+        [ -n "$SIZE_KB" ] || SIZE_KB=0
+        echo "[HSVJ] Removing stale package staging dir: $dir age=${AGE_SECONDS}s (${SIZE_KB}KB)"
+
+        rm -rf "$dir" 2>/dev/null
+        if [ -e "$dir" ]; then
+            echo "[HSVJ] Failed to remove staging dir: $dir"
+        else
+            REMOVED_COUNT=$((REMOVED_COUNT + 1))
+            FREED_KB=$((FREED_KB + SIZE_KB))
+        fi
+    done
+
+    echo "[HSVJ] Package staging cleanup done: removed=${REMOVED_COUNT}, freed=${FREED_KB}KB"
+}
+
+schedule_package_install_residue_cleanup() {
+    DELAY_SECONDS="${HSVJ_INSTALL_STAGING_CLEANUP_DELAY_SECONDS:-180}"
+    echo "[HSVJ] Package staging cleanup scheduled after ${DELAY_SECONDS}s."
+    (
+        sleep "$DELAY_SECONDS"
+        cleanup_package_install_residue
+    ) &
+}
+
+# ==============================================
+# 基础优化
+# ==============================================
+base_optimize() {
+    # OOM 保护
+    protect_app_oom
+
+    # RKVDEC 硬件解码器锁定最高频率（400MHz），避免 vdec2_ondemand 调频延迟导致 4K 解码卡顿
+    RKVDEC_DEVFREQ="/sys/class/devfreq/fdf80200.rkvdec"
+    if [ -d "$RKVDEC_DEVFREQ" ]; then
+        echo performance > "$RKVDEC_DEVFREQ/governor" 2>/dev/null
+        MAX_FREQ=$(cat "$RKVDEC_DEVFREQ/max_freq" 2>/dev/null)
+        if [ -n "$MAX_FREQ" ]; then
+            echo "$MAX_FREQ" > "$RKVDEC_DEVFREQ/min_freq" 2>/dev/null
+        fi
+        echo "[HSVJ] RKVDEC governor: $(cat $RKVDEC_DEVFREQ/governor 2>/dev/null), freq: $(cat $RKVDEC_DEVFREQ/cur_freq 2>/dev/null)"
+    else
+        echo "[HSVJ] RKVDEC devfreq node not found, skipping"
+    fi
+
+    # 强制全屏
+    settings put global policy_control immersive.full=*
+
+    # 日志降噪
+    setprop log.tag.V4L2DeviceDetector WARN
+    setprop log.tag.CompositionEngine WARN
+    setprop log.tag.mpp_dec_parser ERROR
+    setprop log.tag.mpp_dec ERROR
+    setprop log.tag.mpp_service ERROR
+    setprop log.tag.mpp_dev ERROR
+    setprop log.tag.mpp_device ERROR
+    setprop log.tag.auditd ERROR
+    setprop log.tag.audit ERROR
+
+    # 端口转发 80 -> 8080（只绑定当前 eth0 IP，避免旧 IP 的 ARP 缓存继续命中本机服务）
+    while true; do
+        line="$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | awk '/tcp dpt:80 redir ports 8080/ {print $1; exit}')"
+        [ -n "$line" ] || break
+        iptables -t nat -D PREROUTING "$line" 2>/dev/null || break
+    done
+    eth_ip="$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)"
+    if [ -n "$eth_ip" ]; then
+        iptables -t nat -A PREROUTING -d "$eth_ip"/32 -p tcp --dport 80 -j REDIRECT --to-port 8080
+    fi
+
+    # 清理缓存
+    :
+}
+
+# ==============================================
+# 系统终极精简（全部可卸载应用，一次性清理）
+# ==============================================
+uninstall_bloatware() {
+    echo "[HSVJ] Uninstalling all useless system apps..."
+
+    # 谷歌与浏览器
+    pm uninstall --user 0 com.google.android.webview
+    pm uninstall --user 0 com.google.android.tts
+    pm uninstall --user 0 com.android.chrome
+
+    # 打印相关
+    pm uninstall --user 0 com.android.printspooler
+    pm uninstall --user 0 com.android.bips
+
+    # 录音
+    pm uninstall --user 0 com.android.soundrecorder
+
+    # 壁纸、动态壁纸、屏保（彻底删除）
+    # ==============================================
+    pm uninstall --user 0 com.android.wallpaperpicker          # 静态壁纸选择器
+    pm uninstall --user 0 com.android.wallpaper.livepicker    # 动态壁纸选择器
+    pm uninstall --user 0 com.android.dreams.basic            # 系统屏保（Daydream）
+    pm uninstall --user 0 com.android.dreams.phototable       # 照片屏保
+    pm uninstall --user 0 com.android.wallpaper               # 壁纸服务/ThemePicker（部分系统）
+    pm uninstall --user 0 com.android.theme.wallpaper         # 主题壁纸组件
+
+    # 日常应用
+    pm uninstall --user 0 com.android.music
+    pm uninstall --user 0 com.android.musicfx
+    pm uninstall --user 0 com.android.gallery3d
+    pm uninstall --user 0 com.android.calculator2
+    pm uninstall --user 0 com.android.deskclock
+    pm uninstall --user 0 com.android.contacts
+    pm uninstall --user 0 com.android.calendar
+    pm uninstall --user 0 com.android.egg
+
+    # 测试与工具
+    pm uninstall --user 0 com.cghs.stresstest
+    pm uninstall --user 0 com.DeviceTest
+    pm uninstall --user 0 com.ebanswers.aotoshutdown
+    pm uninstall --user 0 com.lztek.autoboot
+
+    # 加入系统白名单，永不休眠、永不限制
+    dumpsys deviceidle whitelist +com.hsvj.engine
+
+    # 关闭电池优化 & 后台限制
+    settings put global app_standby_enabled 0
+    settings put secure allowed_background_apps com.hsvj.engine
+
+    # 允许安装后自动运行、禁止系统拦截
+    pm set-app-standby-enabled com.hsvj.engine false
+    pm dontkill com.hsvj.engine
+
+    # 通信类
+    # pm uninstall --user 0 com.android.nfc
+    # pm uninstall --user 0 com.android.providers.telephony
+    # pm uninstall --user 0 com.android.mms.service
+    # pm uninstall --user 0 com.android.smspush
+
+    # 测试与代理
+    # pm uninstall --user 0 com.android.cts.priv.ctsshim
+    # pm uninstall --user 0 com.android.cts.ctsshim
+    # pm uninstall --user 0 com.android.pacprocessor
+    # pm uninstall --user 0 com.android.proxyhandler
+
+    # 文件管理、系统播放器
+    pm uninstall --user 0 com.android.documentsui
+    pm uninstall --user 0 android.rk.RockVideoPlayer
+
+    # 刘海/屏幕切口
+    pm uninstall --user 0 com.android.internal.display.cutout.emulation.corner
+    pm uninstall --user 0 com.android.internal.display.cutout.emulation.double
+    pm uninstall --user 0 com.android.internal.display.cutout.emulation.hole
+    pm uninstall --user 0 com.android.internal.display.cutout.emulation.tall
+    pm uninstall --user 0 com.android.internal.display.cutout.emulation.waterfall
+
+    # 杂项
+    # pm uninstall --user 0 com.android.htmlviewer
+    # pm uninstall --user 0 com.android.soundpicker
+    # pm uninstall --user 0 com.android.dynsystem
+    # pm uninstall --user 0 com.android.bookmarkprovider
+    # pm uninstall --user 0 com.android.providers.partnerbookmarks
+    # pm uninstall --user 0 com.android.onetimeinitializer
+    # pm uninstall --user 0 com.android.traceur
+    # pm uninstall --user 0 com.rockchip.wfd
+    # pm uninstall --user 0 com.android.simappdialog
+    # pm uninstall --user 0 com.android.carrierdefaultapp
+    # pm uninstall --user 0 com.android.carrierconfig
+}
+
+# ==============================================
+# 内存自动维护
+# ==============================================
+drop_caches() {
+    echo "[HSVJ] Low memory, dropping page cache..."
+    sync
+    echo 1 > /proc/sys/vm/drop_caches 2>/dev/null
+}
+
+startup_memory_trim() {
+    echo "[HSVJ] Startup memory trim..."
+    # HSVJ 可能已经在播放视频时，不要释放页缓存。
+    # 优化脚本由 MainActivity 异步启动；强制释放缓存
+    # 如果发生在播放期间，可能卡住文件 IO 并干扰 MPP/Vulkan 时序。
+    :
+}
+
+protect_app_oom() {
+    APP_PID=$(pidof com.hsvj.engine)
+    if [ -n "$APP_PID" ]; then
+        for PID in $APP_PID; do
+            echo -1000 > /proc/$PID/oom_score_adj 2>/dev/null
+            CUR_OOM="$(cat /proc/$PID/oom_score_adj 2>/dev/null)"
+            log -t HSVJ_OPT "OOM protect PID:$PID score:$CUR_OOM"
+        done
+    fi
+}
+
+check_memory() {
+    FREE_MEM=$(cat /proc/meminfo | awk '/MemFree/{print $2}')
+    # 只在可用内存低于 40MB 时才清理，避免频繁 drop_caches 造成视频读盘卡顿
+    [ "$FREE_MEM" -lt 40960 ] && drop_caches
+}
+
+# ==============================================
+# 轻量守护
+# ==============================================
+daemon() {
+    local count=0
+    while true; do
+        protect_app_oom
+        check_memory
+        if pidof rknn_server >/dev/null 2>&1 || pidof rknnserver >/dev/null 2>&1; then
+            disable_rknn_service
+        fi
+        count=$((count+1))
+        # 每 20 次（约 10 分钟）才强制清理一次，减少对运行中应用的干扰
+        [ $count -ge 20 ] && { count=0; }
+        sleep 30
+    done
+}
+
+# ==============================================
+# 主执行流程
+# ==============================================
+echo "[HSVJ] Starting optimization sequence..."
+
+# 1. 最关键：配置 SELinux 规则（解决 MPP 访问拒绝）
+configure_selinux_rules
+
+# 2. 延迟清理 PackageManager 安装残留，避免刚安装/更新时碰到 active install session
+schedule_package_install_residue_cleanup
+
+# 3. 优化 SurfaceFlinger（减少 Composition 错误）
+optimize_surfaceflinger
+
+# 4. RK3566/RK3568 关闭 RKNN 服务，RK3588 保持可用
+disable_rknn_service
+
+# 4.5 禁用不必要的 init 服务
+disable_unnecessary_init_services
+
+# 5. 启动前轻量内存清理
+startup_memory_trim
+
+# 6. 专机性能模式
+optimize_dedicated_device
+
+# 7. 稳定优先的可选服务精简
+disable_optional_services
+
+# 7.5 清理系统缓存
+cleanup_system_cache
+
+# 8. 基础优化
+base_optimize
+
+# 9. 系统精简必须离线执行；运行中卸载/停系统包会抢 IO/CPU，影响正在播放的视频。
+echo "[HSVJ] Runtime optimizer skips uninstall_bloatware"
+
+# 10. 启动守护进程
+OLD_OPT_DAEMON_PID="$(cat "$OPT_DAEMON_PID_FILE" 2>/dev/null)"
+if [ -n "$OLD_OPT_DAEMON_PID" ] && [ -d "/proc/$OLD_OPT_DAEMON_PID" ]; then
+    OLD_CMDLINE="$(tr '\0' ' ' < /proc/$OLD_OPT_DAEMON_PID/cmdline 2>/dev/null)"
+    if echo "$OLD_CMDLINE" | grep -q "hsvj_optimize.sh"; then
+        echo "[HSVJ] Stopping old optimizer daemon pid=$OLD_OPT_DAEMON_PID."
+        kill "$OLD_OPT_DAEMON_PID" 2>/dev/null
+        sleep 1
+    fi
+fi
+daemon &
+echo "$!" > "$OPT_DAEMON_PID_FILE"
+
+echo "[HSVJ] =========================================="
+echo "[HSVJ] System fully optimized!"
+echo "[HSVJ] =========================================="
+echo "[HSVJ] SELinux: $(getenforce)"
+echo "[HSVJ] App PID: $(pidof com.hsvj.engine)"
+echo "[HSVJ] OOM Score: $(cat /proc/$(pidof com.hsvj.engine)/oom_score_adj 2>/dev/null || echo 'N/A')"
+echo "[HSVJ] =========================================="
+echo "[HSVJ] Memory Status:"
+echo "[HSVJ]   Total: $(cat /proc/meminfo | grep MemTotal | awk '{print $2}') KB"
+echo "[HSVJ]   Free: $(cat /proc/meminfo | grep MemFree | awk '{print $2}') KB"
+echo "[HSVJ]   Available: $(cat /proc/meminfo | grep MemAvailable | awk '{print $2}') KB"
+echo "[HSVJ] =========================================="
+echo "[HSVJ] CPU Governor:"
+for policy in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -d "$policy" ] && echo "[HSVJ]   $(basename $policy): $(cat $policy/scaling_governor 2>/dev/null) @ $(cat $policy/scaling_cur_freq 2>/dev/null) Hz"
+done
+echo "[HSVJ] =========================================="
+echo "[HSVJ] GPU/VPU Status:"
+for dev in /sys/class/devfreq/*; do
+    [ -d "$dev" ] || continue
+    NAME="$(basename "$dev")"
+    case "$NAME" in
+        *gpu*|*mali*|*vpu*|*vdec*|*rkvdec*)
+            echo "[HSVJ]   $NAME: $(cat $dev/governor 2>/dev/null) @ $(cat $dev/cur_freq 2>/dev/null) Hz"
+            ;;
+    esac
+done
+echo "[HSVJ] =========================================="
+echo "[HSVJ] Disabled Services:"
+echo "[HSVJ]   - Bluetooth (bluetooth-1-0)"
+echo "[HSVJ]   - Camera (cameraserver)"
+echo "[HSVJ]   - Radio/Telephony (radio-1-2, ril-daemon)"
+echo "[HSVJ]   - Sensors (sensors-hal-1-0)"
+echo "[HSVJ]   - RKNN (rknn_server)"
+echo "[HSVJ]   - Location (location.fused)"
+echo "[HSVJ]   - Traced (traced, traced_probes)"
+echo "[HSVJ]   - Statsd (statsd)"
+echo "[HSVJ] =========================================="
+echo "[HSVJ] Preserved for Stability:"
+echo "[HSVJ]   ✓ DRM services (video playback)"
+echo "[HSVJ]   ✓ Gatekeeper/Keymaster (system security)"
+echo "[HSVJ]   ✓ SystemUI core (system boot)"
+echo "[HSVJ]   ✓ Input method (basic input)"
+echo "[HSVJ]   ✓ Navigation (gesture/buttons)"
+echo "[HSVJ] =========================================="
+echo "[HSVJ] Optimizations Applied:"
+echo "[HSVJ]   ✓ CPU locked to performance mode"
+echo "[HSVJ]   ✓ GPU/VPU/DMC locked to max frequency"
+echo "[HSVJ]   ✓ SELinux configured for MPP access"
+echo "[HSVJ]   ✓ SurfaceFlinger optimized"
+echo "[HSVJ]   ✓ Memory management tuned"
+echo "[HSVJ]   ✓ I/O scheduler optimized"
+echo "[HSVJ]   ✓ Network stack tuned"
+echo "[HSVJ]   ✓ System cache cleaned"
+echo "[HSVJ]   ✓ 50+ unused packages disabled"
+echo "[HSVJ]   ✓ All theme packages disabled"
+echo "[HSVJ]   ✓ Background daemon running"
+echo "[HSVJ] =========================================="

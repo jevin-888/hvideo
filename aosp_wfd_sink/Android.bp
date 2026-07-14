@@ -1,0 +1,58 @@
+// AOSP 编译脚本 - framework 层（AIDL + 管理器 + Parcelable）
+// 部署路径: frameworks/base/Android.bp 的 framework-sources 组里追加
+//
+// 实际操作：把 aidl/ 和 framework/ 下的文件拷贝到 AOSP 树对应位置，
+// 然后在 frameworks/base/Android.bp 里把新文件加入 framework-aidl 和 framework-default 资源列表。
+// 这里给出独立 Android.bp，便于直接放到 frameworks/base/wfd_sink/ 目录下作为子模块编译。
+
+// ==========================================================
+// 1. AIDL 接口编译（生成 IWfdSinkService.java / WfdSinkStatus.java）
+// ==========================================================
+filegroup {
+    name: "wfd_sink_aidl",
+    srcs: [
+        "aidl/android/wfd_sink/IWfdSinkService.aidl",
+        "aidl/android/wfd_sink/WfdSinkStatus.aidl",
+    ],
+    path: "aidl",
+}
+
+// ==========================================================
+// 2. framework 层 Java 源码（管理器 + Parcelable 实现）
+// ==========================================================
+filegroup {
+    name: "wfd_sink_framework_java",
+    srcs: [
+        "framework/android/wfd_sink/WfdSinkManager.java",
+        "framework/android/wfd_sink/WfdSinkStatus.java",
+    ],
+    path: "framework",
+}
+
+// ==========================================================
+// 3. services 层 Java 源码（系统服务实现 + JNI 桥接）
+// ==========================================================
+filegroup {
+    name: "wfd_sink_services_java",
+    srcs: [
+        "services/com/android/server/wfd_sink/hsvj/WfdSinkService.java",
+        "services/com/rockchip/wfd/WifiDisplayService.java",
+    ],
+    path: "services",
+}
+
+// ==========================================================
+// 4. 预编译 native 库 libwfdsink_jni_hsvj.so -> /system/lib64/
+// 注意：这里的 so 必须由 vendor/WifiDisplay_backup/jni 重新编译，且包含
+// native_startWFDSinkWithSurface。旧 wfd_miracast_sink 产物只能输出到 native WFD
+// 顶层 Surface，不能进入 app 的 ImageReader/LayerMirror 管线。
+// ==========================================================
+cc_prebuilt_library_shared {
+    name: "libwfdsink_jni_hsvj",
+    srcs: ["prebuilts/arm64-v8a/libwfdsink_jni_hsvj.so"],
+    compile_multilib: "64",
+    check_elf_files: false,
+    strip: {
+        none: true,
+    },
+}

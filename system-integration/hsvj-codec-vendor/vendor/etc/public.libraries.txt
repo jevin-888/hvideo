@@ -1,0 +1,8 @@
+libmpp.so
+libavcodec.so
+libavformat.so
+libavutil.so
+libavfilter.so
+libswscale.so
+libswresample.so
+libffmpeg_58.so

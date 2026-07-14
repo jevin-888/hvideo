@@ -1,0 +1,3 @@
+#!/bin/bash
+# pkg-config wrapper for cross-compilation
+PKG_CONFIG_PATH="/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/pkgconfig" exec pkg-config "$@"

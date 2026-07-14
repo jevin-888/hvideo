@@ -1,0 +1,94 @@
+# Git 属性配置 - 确保跨平台编码一致性
+
+# 自动检测文本文件并规范化行尾
+* text=auto
+
+# 明确指定文本文件使用 UTF-8 编码
+*.cpp text eol=lf encoding=UTF-8
+*.c text eol=lf encoding=UTF-8
+*.h text eol=lf encoding=UTF-8
+*.hpp text eol=lf encoding=UTF-8
+*.cc text eol=lf encoding=UTF-8
+*.cxx text eol=lf encoding=UTF-8
+*.java text eol=lf encoding=UTF-8
+*.kt text eol=lf encoding=UTF-8
+*.py text eol=lf encoding=UTF-8
+*.sh text eol=lf encoding=UTF-8
+*.md text eol=lf encoding=UTF-8
+*.json text eol=lf encoding=UTF-8
+*.xml text eol=lf encoding=UTF-8
+*.gradle text eol=lf encoding=UTF-8
+*.js text eol=lf encoding=UTF-8
+*.ts text eol=lf encoding=UTF-8
+*.css text eol=lf encoding=UTF-8
+*.html text eol=lf encoding=UTF-8
+
+# 字幕文件必须使用 UTF-8
+*.ass text eol=lf encoding=UTF-8
+*.srt text eol=lf encoding=UTF-8
+*.lrc text eol=lf encoding=UTF-8
+
+# CMake 文件
+CMakeLists.txt text eol=lf encoding=UTF-8
+*.cmake text eol=lf encoding=UTF-8
+
+# 配置文件
+*.ini text eol=lf encoding=UTF-8
+*.conf text eol=lf encoding=UTF-8
+*.config text eol=lf encoding=UTF-8
+*.properties text eol=lf encoding=UTF-8
+
+# 文档文件
+*.txt text eol=lf encoding=UTF-8
+*.rst text eol=lf encoding=UTF-8
+
+# Windows 批处理文件保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mov binary
+*.mp4 binary
+*.mp3 binary
+*.flac binary
+*.ogg binary
+*.zip binary
+*.7z binary
+*.rar binary
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.pdf binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.eot binary
+*.so binary
+*.a binary
+*.lib binary
+*.dll binary
+*.dylib binary
+*.exe binary
+*.apk binary
+*.aab binary
+*.jar binary
+*.class binary
+*.dex binary
+*.o binary
+*.obj binary
+*.spv binary
+
+# Android 特定文件
+*.keystore binary
+*.jks binary
+
+# 忽略 diff 的文件
+*.lock linguist-generated=true
+package-lock.json linguist-generated=true
+yarn.lock linguist-generated=true

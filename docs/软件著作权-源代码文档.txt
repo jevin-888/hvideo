@@ -1,0 +1,3205 @@
+================================================================================
+HSVJEngine 软件著作权申请 - 源代码文档
+================================================================================
+
+软件名称：HSVJEngine（火山VJ引擎）
+版本号：1.0
+源代码总行数：99282 行
+源代码文件数：185 个
+主要编程语言：C++
+
+================================================================================
+前30页源代码（约1500行）
+================================================================================
+
+   1: ﻿/**
+   2:  * @file AudioPlayer.cpp
+   3:  * @brief 闊抽鎾斁鍣ㄥ疄鐜?
+   4:  *
+   5:  * 鏈枃浠跺疄鐜颁簡闊抽鎾斁鍣ㄧ被锛岃礋璐ｏ細
+   6:  * - 闊抽杈撳嚭璁惧绠＄悊
+   7:  * - PCM闊抽鏁版嵁鎾斁
+   8:  * - 闊抽噺鎺у埗鍜屾贰鍏ユ贰鍑?
+   9:  * - 闊抽娴佹帶鍒讹紙鎾斁銆佹殏鍋溿€佸仠姝級
+  10:  */
+  11:
+  12: #include "audio/AudioPlayer.h"
+  13: #include "utils/Logger.h"
+  14:
+  15: #ifdef __ANDROID__
+  16: #include <aaudio/AAudio.h>
+  17: #include <algorithm>
+  18: #include <chrono>
+  19: #include <cstring>
+  20: #include <thread>
+  21:
+  22: #endif
+  23:
+  24: namespace hsvj {
+  25:
+  26: AudioPlayer::AudioPlayer()
+  27: #ifdef __ANDROID__
+  28:     : stream_(nullptr), sampleRate_(44100), channelCount_(2),
+  29:       format_(AAUDIO_FORMAT_PCM_I16), bytesPerFrame_(0),
+  30:       deviceId_(AAUDIO_UNSPECIFIED), playing_(false), volume_(1.0f),
+  31:       targetVolume_(1.0f), currentVolume_(1.0f), volumeStep_(0.0f),
+  32:       fadeComplete_(true), volumeBeforeFade_(1.0f),
+  33:       channelMode_(AudioChannelMode::STEREO)
+  34: #endif
+  35: {
+  36: }
+  37:
+  38: AudioPlayer::~AudioPlayer() { shutdown(); }
+  39:
+  40: bool AudioPlayer::initialize(int32_t sampleRate, int32_t channelCount,
+  41:                              int32_t format, int32_t deviceId) {
+  42: #ifdef __ANDROID__
+  43:   LOG_DEBUG("[AudioPlayer] initialize started: sampleRate=%d, channels=%d, format=%d",
+  44:            sampleRate, channelCount, format);
+  45:
+  46:   shutdown();
+  47:
+  48:   needsReinit_.store(false, std::memory_order_release);
+  49:   sampleRate_ = sampleRate;
+  50:   channelCount_ = channelCount;
+  51:   format_ = format;
+  52:   deviceId_ = deviceId;
+  53:
+  54:   // Calculate bytes per frame
+  55:   if (format == AAUDIO_FORMAT_PCM_I16) {
+  56:     bytesPerFrame_ = channelCount_ * sizeof(int16_t);
+  57:   } else if (format == AAUDIO_FORMAT_PCM_FLOAT) {
+  58:     bytesPerFrame_ = channelCount_ * sizeof(float);
+  59:   } else {
+  60:     LOG_ERROR("[AudioPlayer] Unsupported audio format: %d", format);
+  61:     return false;
+  62:   }
+  63:
+  64:   LOG_DEBUG("[AudioPlayer] bytesPerFrame=%d", bytesPerFrame_);
+  65:
+  66:   // Create AAudio stream builder
+  67:   AAudioStreamBuilder *builder = nullptr;
+  68:   aaudio_result_t result = AAudio_createStreamBuilder(&builder);
+  69:   if (result != AAUDIO_OK) {
+  70:     LOG_ERROR("[AudioPlayer] Failed to create AAudio stream builder: %d", result);
+  71:     return false;
+  72:   }
+  73:
+  74:   LOG_DEBUG("[AudioPlayer] AAudio stream builder created successfully");
+  75:
+  76:   // Configure stream parameters
+  77:   AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
+  78:   AAudioStreamBuilder_setPerformanceMode(builder,
+  79:                                          AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+  80:   AAudioStreamBuilder_setFormat(builder, format_);
+  81:   AAudioStreamBuilder_setChannelCount(builder, channelCount_);
+  82:   AAudioStreamBuilder_setSampleRate(builder, sampleRate_);
+  83:
+  84:   // Set audio device ID (if specified)
+  85:   if (deviceId_ != AAUDIO_UNSPECIFIED) {
+  86:     AAudioStreamBuilder_setDeviceId(builder, deviceId_);
+  87:     LOG_DEBUG("Setting audio device ID: %d", deviceId_);
+  88:   }
+  89:
+  90:   // Note: setUsage and setContentType require API 28+, current min SDK is 26
+  91:   // If these features are needed, use conditional compilation:
+  92:   // #if __ANDROID_API__ >= 28
+  93:   //     AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
+  94:   //     AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
+  95:   // #endif
+  96:
+  97:   AAudioStreamBuilder_setDataCallback(builder, dataCallback, this);
+  98:   AAudioStreamBuilder_setErrorCallback(builder, errorCallback, this);
+  99:
+ 100:   // 优先 EXCLUSIVE：直通 HAL，AAudioStream_getTimestamp() 通常可用，
+ 101:   // 视频时钟可以用真实硬件出声时间锁定，免除经验补偿。
+ 102:   // 若 EXCLUSIVE 被占用或不支持（多数情况下 RK3588 HDMI 支持），自动回退 SHARED。
+ 103:   AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_EXCLUSIVE);
+ 104:   LOG_DEBUG("[AudioPlayer] Trying AAudio EXCLUSIVE mode first...");
+ 105:   result = AAudioStreamBuilder_openStream(builder, &stream_);
+ 106:   if (result != AAUDIO_OK) {
+ 107:     LOG_WARN("[AudioPlayer] EXCLUSIVE mode unavailable (%d), falling back to SHARED", result);
+ 108:     AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+ 109:     result = AAudioStreamBuilder_openStream(builder, &stream_);
+ 110:   }
+ 111:   if (result != AAUDIO_OK) {
+ 112:     LOG_ERROR("[AudioPlayer] Failed to open AAudio stream: %d", result);
+ 113:     AAudioStreamBuilder_delete(builder);
+ 114:     return false;
+ 115:   }
+ 116:   // 记录最终 sharing mode 便于诊断
+ 117:   aaudio_sharing_mode_t actualSharing = AAudioStream_getSharingMode(stream_);
+ 118:   LOG_INFO("[AudioPlayer] AAudio sharing mode actual=%d (0=EXCLUSIVE, 1=SHARED)",
+ 119:            static_cast<int>(actualSharing));
+ 120:
+ 121:   // 冷启动首曲防爆音：把 currentVolume_ 归零并武装首次写入时自动淡入。
+ 122:   // 构造器默认 currentVolume_=1.0；若不归零，APP 启动后第一首歌的首批 PCM
+ 123:   // 会从 0 直接跳到全幅 → click。和 flush() 走同一套防爆音路径。
+ 124:   currentVolume_.store(0.0f);
+ 125:   targetVolume_.store(0.0f);
+ 126:   volumeStep_.store(0.0f);
+ 127:   fadeComplete_.store(true);
+ 128:   pendingFadeInAfterFlush_.store(true, std::memory_order_release);
+ 129:   LOG_INFO("[AudioPlayer] Initial volume zeroed, fade-in armed for first write");
+ 130:
+ 131:   // 拉高 buffer size 消除启动期 underrun：
+ 132:   // EXCLUSIVE + LOW_LATENCY 默认 bufferSize = 2 * framesPerBurst (~4-8ms)，
+ 133:   // 在首几包音频写入未稳定前极易 underrun（起播连续 3-5 次 click/断续）。
+ 134:   // 把 bufferSize 拉到 4 * framesPerBurst (~16-32ms)，在 bufferCapacity 范围内。
+ 135:   {
+ 136:     int32_t framesPerBurst = AAudioStream_getFramesPerBurst(stream_);
+ 137:     int32_t bufferCapacity = AAudioStream_getBufferCapacityInFrames(stream_);
+ 138:     int32_t currentBufferSize = AAudioStream_getBufferSizeInFrames(stream_);
+ 139:     if (framesPerBurst > 0 && bufferCapacity > 0) {
+ 140:       int32_t desired = framesPerBurst * 12;
+ 141:       if (desired > bufferCapacity) desired = bufferCapacity;
+ 142:       if (desired > currentBufferSize) {
+ 143:         aaudio_result_t r = AAudioStream_setBufferSizeInFrames(stream_, desired);
+ 144:         if (r >= 0) {
+ 145:           LOG_INFO("[AudioPlayer] AAudio buffer resized: %d -> %d (burst=%d capacity=%d)",
+ 146:                    currentBufferSize, r, framesPerBurst, bufferCapacity);
+ 147:         } else {
+ 148:           LOG_WARN("[AudioPlayer] AAudio setBufferSizeInFrames failed: %d (keep default %d)",
+ 149:                    r, currentBufferSize);
+ 150:         }
+ 151:       } else {
+ 152:         LOG_INFO("[AudioPlayer] AAudio buffer kept: size=%d burst=%d capacity=%d",
+ 153:                  currentBufferSize, framesPerBurst, bufferCapacity);
+ 154:       }
+ 155:     }
+ 156:   }
+ 157:
+ 158:   // Verify actual parameters
+ 159:   int32_t actualSampleRate = AAudioStream_getSampleRate(stream_);
+ 160:   int32_t actualChannelCount = AAudioStream_getChannelCount(stream_);
+ 161:   int32_t actualFormat = AAudioStream_getFormat(stream_);
+ 162:   int32_t actualDeviceId = AAudioStream_getDeviceId(stream_);
+ 163:
+ 164:   LOG_INFO("[AudioPlayer] AAudio stream opened: requested=%dHz/%dch/fmt%d actual=%dHz/%dch/fmt%d deviceId=%d",
+ 165:            sampleRate_, channelCount_, format_,
+ 166:            actualSampleRate, actualChannelCount, actualFormat, actualDeviceId);
+ 167:
+ 168:   // Defensive check: if actual format does not match requested format,
+ 169:   // close the stream to avoid interpreting audio data with wrong sample format.
+ 170:   if (actualFormat != format_) {
+ 171:     LOG_ERROR("[AudioPlayer] Actual audio format (%d) != requested format (%d), "
+ 172:               "closing stream", actualFormat, format_);
+ 173:     AAudioStream_close(stream_);
+ 174:     stream_ = nullptr;
+ 175:     AAudioStreamBuilder_delete(builder);
+ 176:     return false;
+ 177:   }
+ 178:
+ 179:   if (actualChannelCount != channelCount_) {
+ 180:     LOG_ERROR("[AudioPlayer] Actual channel count (%d) != requested channel count (%d), closing stream",
+ 181:               actualChannelCount, channelCount_);
+ 182:     AAudioStream_close(stream_);
+ 183:     stream_ = nullptr;
+ 184:     AAudioStreamBuilder_delete(builder);
+ 185:     return false;
+ 186:   }
+ 187:
+ 188:   if (actualSampleRate > 0 && actualSampleRate != sampleRate_) {
+ 189:     LOG_WARN("[AudioPlayer] Actual sample rate differs from requested: requested=%d actual=%d",
+ 190:              sampleRate_, actualSampleRate);
+ 191:   }
+ 192:
+ 193:   // Cleanup builder
+ 194:   AAudioStreamBuilder_delete(builder);
+ 195:
+ 196:   return true;
+ 197: #else
+ 198:   return false;
+ 199: #endif
+ 200: }
+ 201:
+ 202: void AudioPlayer::shutdown() {
+ 203: #ifdef __ANDROID__
+ 204:   std::lock_guard<std::mutex> writeLock(writeMutex_);
+ 205:   LOG_DEBUG("[AudioPlayer] Shutdown starting...");
+ 206:
+ 207:   // 璁剧疆鍏抽棴鏍囧織锛岃鍥炶皟绔嬪嵆杩斿洖闈欓煶
+ 208:   shuttingDown_.store(true, std::memory_order_release);
+ 209:
+ 210:   // 鍋滄鎾斁锛岀瓑寰呭洖璋冪嚎绋嬮€€鍑?
+ 211:   stop();
+ 212:
+ 213:   // 鍐嶆纭娴佸凡鍋滄锛堥槻寰℃€ф鏌ワ級
+ 214:   if (stream_) {
+ 215:     aaudio_stream_state_t state = AAudioStream_getState(stream_);
+ 216:     LOG_DEBUG("[AudioPlayer] Stream state before close: %d", state);
+ 217:
+ 218:     // 濡傛灉娴佽繕鍦ㄦ椿鍔ㄧ姸鎬侊紝寮哄埗鏆傚仠骞剁瓑寰?
+ 219:     if (state == AAUDIO_STREAM_STATE_STARTED ||
+ 220:         state == AAUDIO_STREAM_STATE_STARTING ||
+ 221:         state == AAUDIO_STREAM_STATE_PAUSING) {
+ 222:       LOG_WARN("[AudioPlayer] Stream still active, forcing pause");
+ 223:       AAudioStream_requestPause(stream_);
+ 224:
+ 225:       aaudio_stream_state_t nextState;
+ 226:       // 淇锛氳秴鏃舵椂闂翠粠 100 绉掗檷浣庡埌 1 绉掞紝閬垮厤闃诲瑙ｇ爜绾跨▼
+ 227:       AAudioStream_waitForStateChange(stream_, state, &nextState, 1000 * 1000000LL);
+ 228:       LOG_DEBUG("[AudioPlayer] After force pause: state=%d", nextState);
+ 229:
+ 230:       // 鐭殏绛夊緟
+ 231:       std::this_thread::sleep_for(std::chrono::milliseconds(10));
+ 232:     }
+ 233:   }
+ 234:
+ 235:   // 淇濆瓨鎸囬拡骞舵竻绌烘垚鍛樺彉閲忥紙闃叉鍥炶皟璁块棶锛?
+ 236:   AAudioStream *toClose = stream_;
+ 237:   stream_ = nullptr;
+ 238:
+ 239:   LOG_DEBUG("[AudioPlayer] Closing stream...");
+ 240:
+ 241:   // 鍏抽棴娴侊紙姝ゆ椂鍥炶皟搴旇宸茬粡瀹屽叏鍋滄锛?
+ 242:   if (toClose) {
+ 243:     AAudioStream_close(toClose);
+ 244:     LOG_DEBUG("[AudioPlayer] Stream closed");
+ 245:   }
+ 246:
+ 247:   // 娓呯┖闃熷垪
+ 248:   std::lock_guard<std::mutex> lock(queueMutex_);
+ 249:   while (!audioQueue_.empty()) {
+ 250:     AudioQueueItem item = audioQueue_.front();
+ 251:     audioQueue_.pop();
+ 252:     delete[] item.data;
+ 253:   }
+ 254:
+ 255:   shuttingDown_.store(false, std::memory_order_release);
+ 256:   LOG_DEBUG("[AudioPlayer] Shutdown complete");
+ 257: #endif
+ 258: }
+ 259:
+ 260: bool AudioPlayer::start() {
+ 261: #ifdef __ANDROID__
+ 262:   LOG_DEBUG("[AudioPlayer] start() called, stream_=%p", (void*)stream_);
+ 263:
+ 264:   if (!stream_) {
+ 265:     LOG_ERROR("[AudioPlayer] Not initialized, cannot start");
+ 266:     return false;
+ 267:   }
+ 268:
+ 269:   aaudio_stream_state_t state = AAudioStream_getState(stream_);
+ 270:   if (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING) {
+ 271:     playing_ = true;
+ 272:     LOG_DEBUG("[AudioPlayer] Stream already started/starting (state=%d), skip requestStart", state);
+ 273:     return true;
+ 274:   }
+ 275:
+ 276:   aaudio_result_t result = AAudioStream_requestStart(stream_);
+ 277:   if (result != AAUDIO_OK) {
+ 278:     LOG_ERROR("[AudioPlayer] Failed to start AAudio stream: %d", result);
+ 279:     return false;
+ 280:   }
+ 281:
+ 282:   playing_ = true;
+ 283:
+ 284:   state = AAudioStream_getState(stream_);
+ 285:   int32_t bufferSize = AAudioStream_getBufferSizeInFrames(stream_);
+ 286:   int32_t framesPerBurst = AAudioStream_getFramesPerBurst(stream_);
+ 287:   LOG_DEBUG("[AudioPlayer] Started: state=%d, bufferSize=%d, framesPerBurst=%d",
+ 288:            state, bufferSize, framesPerBurst);
+ 289:   return true;
+ 290: #else
+ 291:   return false;
+ 292: #endif
+ 293: }
+ 294:
+ 295: void AudioPlayer::stop() {
+ 296: #ifdef __ANDROID__
+ 297:   if (!stream_ || !playing_) {
+ 298:     return;
+ 299:   }
+ 300:
+ 301:   LOG_DEBUG("[AudioPlayer] Stopping stream...");
+ 302:
+ 303:   // 浣跨敤 requestPause 鑰屼笉鏄?requestStop锛屽洜涓?pause 鏇村彲闈?
+ 304:   aaudio_result_t result = AAudioStream_requestPause(stream_);
+ 305:   if (result != AAUDIO_OK) {
+ 306:     LOG_WARN("[AudioPlayer] AAudioStream_requestPause failed: %d, trying requestStop", result);
+ 307:     result = AAudioStream_requestStop(stream_);
+ 308:   }
+ 309:
+ 310:   // 绛夊緟鐘舵€佹敼鍙橈紝纭繚鍥炶皟绾跨▼宸茬粡鍋滄
+ 311:   aaudio_stream_state_t currentState = AAudioStream_getState(stream_);
+ 312:   LOG_DEBUG("[AudioPlayer] Current state after request: %d", currentState);
+ 313:
+ 314:   // 绛夊緟鐩村埌鐘舵€佸彉涓?PAUSED 鎴?STOPPED
+ 315:   if (currentState != AAUDIO_STREAM_STATE_PAUSED &&
+ 316:       currentState != AAUDIO_STREAM_STATE_STOPPED) {
+ 317:     aaudio_stream_state_t nextState = AAUDIO_STREAM_STATE_UNINITIALIZED;
+ 318:     int64_t timeoutNanos = 100 * 1000000LL; // 100ms timeout
+ 319:     result = AAudioStream_waitForStateChange(stream_,
+ 320:                                              currentState,
+ 321:                                              &nextState,
+ 322:                                              timeoutNanos);
+ 323:     LOG_DEBUG("[AudioPlayer] waitForStateChange result=%d, nextState=%d", result, nextState);
+ 324:   }
+ 325:
+ 326:   // 鐭殏绛夊緟纭繚鍥炶皟绾跨▼瀹屽叏閫€鍑猴紙AAudio 鍐呴儴娓呯悊锛?
+ 327:   std::this_thread::sleep_for(std::chrono::milliseconds(10));
+ 328:
+ 329:   playing_ = false;
+ 330:   LOG_DEBUG("[AudioPlayer] Stopped");
+ 331: #endif
+ 332: }
+ 333:
+ 334: void AudioPlayer::pause() {
+ 335: #ifdef __ANDROID__
+ 336:   if (!stream_ || !playing_) {
+ 337:     return;
+ 338:   }
+ 339:
+ 340:   aaudio_result_t result = AAudioStream_requestPause(stream_);
+ 341:   if (result == AAUDIO_OK) {
+ 342:     // Wait for stream to fully pause (max 50ms)
+ 343:     aaudio_stream_state_t currentState = AAudioStream_getState(stream_);
+ 344:     aaudio_stream_state_t nextState;
+ 345:     if (currentState == AAUDIO_STREAM_STATE_PAUSING) {
+ 346:       AAudioStream_waitForStateChange(stream_, AAUDIO_STREAM_STATE_PAUSING,
+ 347:                                       &nextState, 50 * 1000000LL); // 50ms
+ 348:     }
+ 349:   }
+ 350:   playing_ = false; // Update status flag
+ 351:   LOG_DEBUG("AudioPlayer paused");
+ 352: #endif
+ 353: }
+ 354:
+ 355: void AudioPlayer::resume() {
+ 356: #ifdef __ANDROID__
+ 357:   if (!stream_) {
+ 358:     return;
+ 359:   }
+ 360:
+ 361:   if (playing_) {
+ 362:     return;
+ 363:   }
+ 364:
+ 365:   aaudio_stream_state_t state = AAudioStream_getState(stream_);
+ 366:   if (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING) {
+ 367:     playing_ = true;
+ 368:     LOG_DEBUG("[AudioPlayer] resume: stream already started/starting (state=%d)", state);
+ 369:     return;
+ 370:   }
+ 371:
+ 372:   aaudio_result_t result = AAudioStream_requestStart(stream_);
+ 373:   if (result != AAUDIO_OK) {
+ 374:     LOG_ERROR("[AudioPlayer] resume: requestStart failed: %d", result);
+ 375:     return;
+ 376:   }
+ 377:   playing_ = true;
+ 378:   LOG_DEBUG("[AudioPlayer] resumed");
+ 379: #endif
+ 380: }
+ 381:
+ 382: void AudioPlayer::flush() {
+ 383: #ifdef __ANDROID__
+ 384:   // Clear audio queue to prevent residual data causing audio tail
+ 385:   {
+ 386:     std::lock_guard<std::mutex> lock(queueMutex_);
+ 387:     while (!audioQueue_.empty()) {
+ 388:       AudioQueueItem item = audioQueue_.front();
+ 389:       audioQueue_.pop();
+ 390:       delete[] item.data;
+ 391:     }
+ 392:   }
+ 393:   // 切歌/音轨切换防爆音：把当前音量强制归零，并标记"下次 write() 自动淡入"。
+ 394:   // 这样上层无论淡出是否完成、淡入是否按时调用，新歌首批样本一定从 0 开始爬升。
+ 395:   currentVolume_.store(0.0f);
+ 396:   targetVolume_.store(0.0f);
+ 397:   volumeStep_.store(0.0f);
+ 398:   fadeComplete_.store(true);  // 保持当前 0 音量，直到 write() 触发淡入
+ 399:   pendingFadeInAfterFlush_.store(true, std::memory_order_release);
+ 400:   LOG_DEBUG("AudioPlayer queue flushed; volume zeroed, fade-in armed for next write");
+ 401: #endif
+ 402: }
+ 403:
+ 404: void AudioPlayer::markNeedsReinit(const char* reason) {
+ 405: #ifdef __ANDROID__
+ 406:   bool already = needsReinit_.exchange(true, std::memory_order_acq_rel);
+ 407:   if (!already) {
+ 408:     aaudio_stream_state_t state = stream_ ? AAudioStream_getState(stream_) : AAUDIO_STREAM_STATE_UNINITIALIZED;
+ 409:     LOG_WARN("[AudioPlayer] markNeedsReinit: reason=%s stream=%p state=%d playing=%d pending=%d",
+ 410:              reason ? reason : "unknown", (void*)stream_, state,
+ 411:              (int)playing_.load(std::memory_order_acquire), getPendingFrames());
+ 412:   }
+ 413: #else
+ 414:   (void)reason;
+ 415: #endif
+ 416: }
+ 417:
+ 418: int32_t AudioPlayer::write(const void *data, int32_t numFrames) {
+ 419: #ifdef __ANDROID__
+ 420:   // CRITICAL: 浣跨敤浜掓枼閿佷繚鎶ゆ暣涓?write() 鏂规硶
+ 421:   // 閬垮厤鍙岃В鐮佸櫒鍒囨崲鏃朵袱涓В鐮佸櫒鍚屾椂鍐欏叆瀵艰嚧绔炴€佸拰宕╂簝
+ 422:   std::lock_guard<std::mutex> writeLock(writeMutex_);
+ 423:
+ 424:   if (!stream_) {
+ 425:     static int warnNoStream = 0;
+ 426:     if (warnNoStream++ % 100 == 0) {
+ 427:       LOG_WARN("AudioPlayer::write: stream not initialized");
+ 428:     }
+ 429:     return 0;
+ 430:   }
+ 431:
+ 432:   // 濡傛灉闇€瑕侀噸鏂板垵濮嬪寲锛屾嫆缁濆啓鍏?
+ 433:   if (needsReinit_.load(std::memory_order_acquire)) {
+ 434:     static int warnNeedsReinit = 0;
+ 435:     if (warnNeedsReinit++ % 100 == 0) {
+ 436:       LOG_WARN("AudioPlayer::write: needs reinit, dropping audio data");
+ 437:     }
+ 438:     return 0;
+ 439:   }
+ 440:
+ 441:   if (!playing_) {
+ 442:     aaudio_stream_state_t state = stream_ ? AAudioStream_getState(stream_) : AAUDIO_STREAM_STATE_UNINITIALIZED;
+ 443:     if (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING) {
+ 444:       playing_.store(true, std::memory_order_release);
+ 445:       LOG_WARN("AudioPlayer::write: repaired stale playing flag while stream state=%d", state);
+ 446:     }
+ 447:   }
+ 448:
+ 449:   // 鑳屽帇鎺у埗锛氶槦鍒楁弧鏃堕樆濉炵瓑寰呮秷璐规柟鑵惧嚭绌洪棿锛岄伩鍏嶄涪甯?
+ 450:   // 浣跨敤鏉′欢鍙橀噺鑰岄潪 sleep+閲嶈瘯锛屾秷璐规柟娑堣垂鍚庝細 notify
+ 451:   const size_t MAX_QUEUE_SIZE = 96; // 缂╁皬闃熷垪涓婇檺锛岀害 10 甯х紦鍐茶冻澶熶綆寤惰繜
+ 452:   const auto WAIT_TIMEOUT = std::chrono::milliseconds(500);
+ 453:
+ 454:   {
+ 455:     std::unique_lock<std::mutex> lock(queueMutex_);
+ 456:     bool hasSpace = queueCondition_.wait_for(lock, WAIT_TIMEOUT, [this] {
+ 457:       return audioQueue_.size() < MAX_QUEUE_SIZE ||
+ 458:              shuttingDown_.load(std::memory_order_acquire);
+ 459:       });
+ 460:     if (shuttingDown_.load(std::memory_order_acquire)) {
+ 461:       aaudio_stream_state_t state = stream_ ? AAudioStream_getState(stream_) : AAUDIO_STREAM_STATE_UNINITIALIZED;
+ 462:       if (!shuttingDown_.load(std::memory_order_acquire) &&
+ 463:           (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING)) {
+ 464:         playing_.store(true, std::memory_order_release);
+ 465:       } else {
+ 466:         static int dropCount = 0;
+ 467:         if (dropCount++ % 200 == 0) {
+ 468:           LOG_WARN("AudioPlayer::write: queue full or stopped, dropping audio data (queue=%zu playing=%d shutdown=%d state=%d)",
+ 469:                    audioQueue_.size(), (int)playing_.load(std::memory_order_acquire),
+ 470:                    (int)shuttingDown_.load(std::memory_order_acquire), state);
+ 471:         }
+ 472:         return 0;
+ 473:       }
+ 474:     }
+ 475:     if (!hasSpace && audioQueue_.size() >= MAX_QUEUE_SIZE) {
+ 476:       static int queuePressureCount = 0;
+ 477:       if (queuePressureCount++ % 50 == 0) {
+ 478:         aaudio_stream_state_t state = stream_ ? AAudioStream_getState(stream_) : AAUDIO_STREAM_STATE_UNINITIALIZED;
+ 479:         LOG_WARN("AudioPlayer::write: queue pressure, dropping oldest queued audio block (queue=%zu max=%zu state=%d)",
+ 480:                  audioQueue_.size(), MAX_QUEUE_SIZE, state);
+ 481:       }
+ 482:       AudioQueueItem &oldest = audioQueue_.front();
+ 483:       if (oldest.data) {
+ 484:         delete[] oldest.data;
+ 485:         oldest.data = nullptr;
+ 486:       }
+ 487:       audioQueue_.pop();
+ 488:     }
+ 489:   }
+ 490:
+ 491:   // Allocate buffer and copy data
+ 492:   int32_t dataSize = numFrames * bytesPerFrame_;
+ 493:   int32_t bufferSize = dataSize / sizeof(int16_t);
+ 494:
+ 495:   // Use new(std::nothrow) to avoid throwing exception
+ 496:   int16_t *buffer = new (std::nothrow) int16_t[bufferSize];
+ 497:   if (!buffer) {
+ 498:     LOG_ERROR("AudioPlayer::write: Failed to allocate buffer (%d bytes)",
+ 499:               dataSize);
+ 500:     return 0; // Memory allocation failed, return
+ 501:   }
+ 502:
+ 503:   memcpy(buffer, data, dataSize);
+ 504:
+ 505:   // Audio effect reactive: call callback to pass PCM data for spectrum analysis
+ 506:   {
+ 507:     std::lock_guard<std::mutex> callbackLock(audioCallbackMutex_);
+ 508:     if (audioDataCallback_) {
+ 509:       audioDataCallback_(static_cast<const int16_t*>(data), numFrames, sampleRate_);
+ 510:     }
+ 511:   }
+ 512:
+ 513:   // Add to queue (including frame count info)
+ 514:   {
+ 515:     std::lock_guard<std::mutex> lock(queueMutex_);
+ 516:     audioQueue_.push(AudioQueueItem(buffer, numFrames));
+ 517:
+ 518:   }
+ 519:   queueCondition_.notify_one();
+ 520:
+ 521:   // 防爆音：flush() 后的首次成功入队触发自动淡入，从 0 平滑爬升到目标音量。
+ 522:   if (pendingFadeInAfterFlush_.exchange(false, std::memory_order_acq_rel)) {
+ 523:     int32_t durMs = pendingFadeInDurationMs_.load(std::memory_order_relaxed);
+ 524:     if (durMs < 30) durMs = 30;
+ 525:     // 从当前（刚被 flush 归零的）currentVolume_=0 爬升到 volume_
+ 526:     fadeToVolume(volume_.load(), durMs);
+ 527:     LOG_DEBUG("AudioPlayer::write: triggered auto fade-in after flush, duration=%dms target=%.2f",
+ 528:               durMs, volume_.load());
+ 529:   }
+ 530:
+ 531:   return numFrames;
+ 532: #else
+ 533:   return 0;
+ 534: #endif
+ 535: }
+ 536:
+ 537: void AudioPlayer::setVolume(float volume) {
+ 538:   float clampedVolume = std::max(0.0f, std::min(1.0f, volume));
+ 539:   volume_ = clampedVolume;
+ 540:   // When setting immediately, sync update current volume and target volume
+ 541:   targetVolume_ = clampedVolume;
+ 542:   currentVolume_ = clampedVolume;
+ 543:   volumeStep_ = 0.0f;
+ 544:   fadeComplete_ = true;
+ 545: }
+ 546:
+ 547: void AudioPlayer::setAudioDataCallback(AudioDataCallback callback) {
+ 548: #ifdef __ANDROID__
+ 549:   std::lock_guard<std::mutex> lock(audioCallbackMutex_);
+ 550:   audioDataCallback_ = callback;
+ 551:   LOG_DEBUG("[AudioPlayer] Audio data callback %s", callback ? "set" : "cleared");
+ 552: #else
+ 553:   (void)callback;
+ 554: #endif
+ 555: }
+ 556:
+ 557: void AudioPlayer::fadeToVolume(float targetVolume, int32_t durationMs) {
+ 558: #ifdef __ANDROID__
+ 559:   float clampedTarget = std::max(0.0f, std::min(1.0f, targetVolume));
+ 560:   targetVolume_ = clampedTarget;
+ 561:
+ 562:   // Calculate volume change step per frame
+ 563:   // Assuming sample rate is 48000Hz, each callback ~256 frames, so ~187 callbacks/sec
+ 564:   // More precise calculation: based on actual sample rate and buffer size
+ 565:   float framesPerCallback = 256.0f; // AAudio typical value
+ 566:   float callbacksPerSecond = sampleRate_ / framesPerCallback;
+ 567:   float totalCallbacks = (durationMs / 1000.0f) * callbacksPerSecond;
+ 568:
+ 569:   if (totalCallbacks < 1.0f) {
+ 570:     totalCallbacks = 1.0f;
+ 571:   }
+ 572:
+ 573:   float currentVol = currentVolume_.load();
+ 574:   float volumeDiff = clampedTarget - currentVol;
+ 575:   volumeStep_ = volumeDiff / totalCallbacks;
+ 576:   fadeComplete_ = false;
+ 577:
+ 578:   LOG_DEBUG(
+ 579:       "AudioPlayer::fadeToVolume: from %.2f to %.2f, step=%.4f, duration=%dms",
+ 580:       currentVol, clampedTarget, volumeStep_.load(), durationMs);
+ 581: #endif
+ 582: }
+ 583:
+ 584: void AudioPlayer::fadeOut(int32_t durationMs) {
+ 585: #ifdef __ANDROID__
+ 586:   volumeBeforeFade_ = volume_.load();
+ 587:   fadeToVolume(0.0f, durationMs);
+ 588: #endif
+ 589: }
+ 590:
+ 591: void AudioPlayer::fadeIn(int32_t durationMs) {
+ 592: #ifdef __ANDROID__
+ 593:   // Fade in from 0 to target volume
+ 594:   currentVolume_ = 0.0f;
+ 595:   fadeToVolume(volume_.load(), durationMs);
+ 596: #endif
+ 597: }
+ 598:
+ 599: void AudioPlayer::waitForFadeComplete() {
+ 600: #ifdef __ANDROID__
+ 601:   // Wait for fade in/out complete (max 500ms)
+ 602:   int waitCount = 0;
+ 603:   while (!fadeComplete_ && waitCount < 50) {
+ 604:     std::this_thread::sleep_for(std::chrono::milliseconds(10));
+ 605:     waitCount++;
+ 606:   }
+ 607:   if (!fadeComplete_) {
+ 608:     LOG_WARN("AudioPlayer::waitForFadeComplete: timeout");
+ 609:     fadeComplete_ = true;
+ 610:     currentVolume_ = targetVolume_.load();
+ 611:   }
+ 612: #endif
+ 613: }
+ 614:
+ 615: void AudioPlayer::setAudioChannelMode(AudioChannelMode mode) {
+ 616:   AudioChannelMode oldMode = channelMode_.exchange(mode);
+ 617:   if (oldMode != mode) {
+ 618:     const char* modeStr = (mode == AudioChannelMode::LEFT) ? "LEFT" :
+ 619:                           (mode == AudioChannelMode::RIGHT) ? "RIGHT" : "STEREO";
+ 620:     LOG_DEBUG("[AudioPlayer] Channel mode changed: %s", modeStr);
+ 621:   }
+ 622: }
+ 623:
+ 624: int32_t AudioPlayer::getBufferSizeInFrames() const {
+ 625: #ifdef __ANDROID__
+ 626:   if (!stream_) {
+ 627:     return 0;
+ 628:   }
+ 629:   return AAudioStream_getBufferSizeInFrames(stream_);
+ 630: #else
+ 631:   return 0;
+ 632: #endif
+ 633: }
+ 634:
+ 635: int64_t AudioPlayer::getAAudioFramesRead() const {
+ 636: #ifdef __ANDROID__
+ 637:   if (!stream_) return 0;
+ 638:   int64_t framesRead = AAudioStream_getFramesRead(stream_);
+ 639:   return framesRead > 0 ? framesRead : 0;
+ 640: #else
+ 641:   return 0;
+ 642: #endif
+ 643: }
+ 644:
+ 645: int64_t AudioPlayer::getAAudioFramesWritten() const {
+ 646: #ifdef __ANDROID__
+ 647:   if (!stream_) return 0;
+ 648:   int64_t framesWritten = AAudioStream_getFramesWritten(stream_);
+ 649:   return framesWritten > 0 ? framesWritten : 0;
+ 650: #else
+ 651:   return 0;
+ 652: #endif
+ 653: }
+ 654:
+ 655: bool AudioPlayer::getAAudioPresentationTimestamp(int64_t &framePosition,
+ 656:                                                   int64_t &timeNanos) const {
+ 657: #ifdef __ANDROID__
+ 658:   if (!stream_) return false;
+ 659:   int64_t fp = 0;
+ 660:   int64_t tn = 0;
+ 661:   // CLOCK_MONOTONIC：与 std::chrono::steady_clock 同源，可直接互转。
+ 662:   // 该 API 在流刚启动 / Underrun 后短时间会返回 AAUDIO_ERROR_*；调用者需有 fallback。
+ 663:   aaudio_result_t res = AAudioStream_getTimestamp(stream_, CLOCK_MONOTONIC, &fp, &tn);
+ 664:   if (res != AAUDIO_OK) return false;
+ 665:   if (fp < 0 || tn <= 0) return false;
+ 666:   framePosition = fp;
+ 667:   timeNanos = tn;
+ 668:   return true;
+ 669: #else
+ 670:   (void)framePosition;
+ 671:   (void)timeNanos;
+ 672:   return false;
+ 673: #endif
+ 674: }
+ 675:
+ 676: int32_t AudioPlayer::getAAudioInFlightFrames() const {
+ 677: #ifdef __ANDROID__
+ 678:   if (!stream_) return 0;
+ 679:   int64_t framesWritten = AAudioStream_getFramesWritten(stream_);
+ 680:   int64_t framesRead = AAudioStream_getFramesRead(stream_);
+ 681:   if (framesWritten <= 0 || framesRead < 0) return 0;
+ 682:   int64_t inFlight = framesWritten - framesRead;
+ 683:   if (inFlight < 0) inFlight = 0;
+ 684:   if (inFlight > INT32_MAX) inFlight = INT32_MAX;
+ 685:   return static_cast<int32_t>(inFlight);
+ 686: #else
+ 687:   return 0;
+ 688: #endif
+ 689: }
+ 690:
+ 691: double AudioPlayer::estimatedOutputDelaySeconds() const {
+ 692: #ifdef __ANDROID__
+ 693:   if (!stream_ || sampleRate_ <= 0) return 0.0;
+ 694:
+ 695:   const int64_t framesWritten = AAudioStream_getFramesWritten(stream_);
+ 696:   if (framesWritten <= 0) return 0.0;
+ 697:
+ 698:   // 优先：AAudioStream_getTimestamp 直接给出"该帧将于 hwTimeNs 出声"。
+ 699:   //   delay = (framesWritten - hwFramePos) / sampleRate
+ 700:   // 该值天然包含 AAudio buffer + HAL + DSP + HDMI 全链路延迟。
+ 701:   // RK3588 SHARED 模式下该 API 经常 ERROR_INVALID_STATE，故必须有 fallback。
+ 702:   double instantSec = -1.0;
+ 703:   int64_t hwFramePos = 0;
+ 704:   int64_t hwTimeNs = 0;
+ 705:   aaudio_result_t res = AAudioStream_getTimestamp(stream_, CLOCK_MONOTONIC,
+ 706:                                                   &hwFramePos, &hwTimeNs);
+ 707:   if (res == AAUDIO_OK && hwFramePos > 0 && hwTimeNs > 0 &&
+ 708:       framesWritten >= hwFramePos) {
+ 709:     int64_t framesAhead = framesWritten - hwFramePos;
+ 710:     instantSec = static_cast<double>(framesAhead) /
+ 711:                  static_cast<double>(sampleRate_);
+ 712:   } else {
+ 713:     // Fallback：framesWritten - framesRead 只覆盖 AAudio app-side buffer，
+ 714:     // HAL + DSP + HDMI sink + TV 音频处理通常另加 150-300ms，
+ 715:     // 经 RK3588 HDMI 实测：inFlight ~74ms + 经验余量 0.18s ≈ 实际可闻延迟 250ms。
+ 716:     const int64_t framesRead = AAudioStream_getFramesRead(stream_);
+ 717:     int64_t inFlight = framesWritten - (framesRead > 0 ? framesRead : 0);
+ 718:     if (inFlight < 0) inFlight = 0;
+ 719:     instantSec = static_cast<double>(inFlight) /
+ 720:                  static_cast<double>(sampleRate_) + 0.18;
+ 721:   }
+ 722:
+ 723:   if (instantSec < 0.0) instantSec = 0.0;
+ 724:   if (instantSec > 1.0) instantSec = 1.0;  // 安全 clamp
+ 725:
+ 726:   // EMA 平滑：首次直接采用，后续 alpha=0.1
+ 727:   int64_t prevNs = smoothedOutputDelayNs_.load(std::memory_order_relaxed);
+ 728:   double smoothedSec;
+ 729:   if (prevNs <= 0) {
+ 730:     smoothedSec = instantSec;
+ 731:   } else {
+ 732:     const double prevSec = static_cast<double>(prevNs) / 1e9;
+ 733:     smoothedSec = prevSec * 0.9 + instantSec * 0.1;
+ 734:   }
+ 735:   smoothedOutputDelayNs_.store(static_cast<int64_t>(smoothedSec * 1e9),
+ 736:                                std::memory_order_relaxed);
+ 737:   return smoothedSec;
+ 738: #else
+ 739:   return 0.0;
+ 740: #endif
+ 741: }
+ 742:
+ 743: int32_t AudioPlayer::getPendingFrames() const {
+ 744: #ifdef __ANDROID__
+ 745:   std::lock_guard<std::mutex> lock(const_cast<AudioPlayer*>(this)->queueMutex_);
+ 746:   int32_t totalFrames = 0;
+ 747:
+ 748:   // Copy a queue or traverse queue to calculate total frames
+ 749:   // Note: this is frequently called in decodeThread, performance is important
+ 750:   // Here we traverse the queue
+ 751:   auto tempQueue = audioQueue_;
+ 752:   while(!tempQueue.empty()) {
+ 753:     const auto& item = tempQueue.front();
+ 754:     // Calculate remaining unplayed frames for this item
+ 755:     totalFrames += item.numFrames - (item.usedSamples / channelCount_);
+ 756:     tempQueue.pop();
+ 757:   }
+ 758:   return totalFrames;
+ 759: #else
+ 760:   return 0;
+ 761: #endif
+ 762: }
+ 763:
+ 764: void AudioPlayer::errorCallback(AAudioStream *stream,
+ 765:                                 void *userData,
+ 766:                                 aaudio_result_t error) {
+ 767: #ifdef __ANDROID__
+ 768:   (void)stream;
+ 769:   AudioPlayer *player = static_cast<AudioPlayer *>(userData);
+ 770:
+ 771:   LOG_ERROR("[AudioPlayer] AAudio error callback: error=%d (%s)",
+ 772:             error, AAudio_convertResultToText(error));
+ 773:
+ 774:   // 鏍囪闇€瑕侀噸鏂板垵濮嬪寲
+ 775:   player->needsReinit_.store(true, std::memory_order_release);
+ 776:
+ 777:   // AudioFlinger 宕╂簝鏃讹紝鍋滄鎾斁閬垮厤杩涗竴姝ラ敊璇?
+ 778:   if (error == AAUDIO_ERROR_DISCONNECTED) {
+ 779:     LOG_ERROR("[AudioPlayer] AudioFlinger disconnected, stopping playback");
+ 780:     player->playing_.store(false, std::memory_order_release);
+ 781:   }
+ 782: #else
+ 783:   (void)userData;
+ 784:   (void)error;
+ 785: #endif
+ 786: }
+ 787:
+ 788: aaudio_data_callback_result_t AudioPlayer::dataCallback(AAudioStream *stream,
+ 789:                                                         void *userData,
+ 790:                                                         void *audioData,
+ 791:                                                         int32_t numFrames) {
+ 792:
+ 793: #ifdef __ANDROID__
+ 794:   (void)stream; // Unused, but callback signature requires it
+ 795:   AudioPlayer *player = static_cast<AudioPlayer *>(userData);
+ 796:   return player->onAudioReady(audioData, numFrames);
+ 797: #else
+ 798:   return AAUDIO_CALLBACK_RESULT_STOP;
+ 799: #endif
+ 800: }
+ 801:
+ 802: aaudio_data_callback_result_t AudioPlayer::onAudioReady(void *audioData,
+ 803:                                                         int32_t numFrames) {
+ 804: #ifdef __ANDROID__
+ 805:   // 棣栧厛妫€鏌ユ槸鍚︽鍦ㄥ叧闂紙鏈€楂樹紭鍏堢骇锛?
+ 806:   if (shuttingDown_.load(std::memory_order_acquire)) {
+ 807:     if (audioData && numFrames > 0 && bytesPerFrame_ > 0) {
+ 808:       memset(audioData, 0, static_cast<size_t>(numFrames) * bytesPerFrame_);
+ 809:     }
+ 810:     return AAUDIO_CALLBACK_RESULT_CONTINUE;
+ 811:   }
+ 812:
+ 813:   // Basic parameter validation to guard against buggy drivers returning
+ 814:   // invalid callback arguments which could cause out-of-bounds writes.
+ 815:   if (!audioData || numFrames <= 0) {
+ 816:     return AAUDIO_CALLBACK_RESULT_CONTINUE;
+ 817:   }
+ 818:
+ 819:   if (channelCount_ <= 0 || bytesPerFrame_ <= 0) {
+ 820:     return AAUDIO_CALLBACK_RESULT_CONTINUE;
+ 821:   }
+ 822:
+ 823:   // Clamp excessively large numFrames to avoid integer overflow when
+ 824:   // multiplying by channelCount_ or bytesPerFrame_.
+ 825:   const int32_t MAX_FRAMES_PER_CALLBACK = 8192; // ~170ms at 48kHz
+ 826:   if (numFrames > MAX_FRAMES_PER_CALLBACK) {
+ 827:     static int warnCount = 0;
+ 828:     if (warnCount++ % 100 == 0) {
+ 829:       LOG_WARN(
+ 830:           "AudioPlayer::onAudioReady: numFrames too large (%d), clamped to %d",
+ 831:           numFrames, MAX_FRAMES_PER_CALLBACK);
+ 832:     }
+ 833:     numFrames = MAX_FRAMES_PER_CALLBACK;
+ 834:   }
+ 835:
+ 836:   int64_t totalSamples64 =
+ 837:       static_cast<int64_t>(numFrames) * static_cast<int64_t>(channelCount_);
+ 838:   if (totalSamples64 <= 0 ||
+ 839:       totalSamples64 > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+ 840:     memset(audioData, 0, static_cast<size_t>(numFrames) * bytesPerFrame_);
+ 841:     return AAUDIO_CALLBACK_RESULT_CONTINUE;
+ 842:   }
+ 843:
+ 844:   int32_t totalSamples = static_cast<int32_t>(totalSamples64);
+ 845:   int16_t *output = static_cast<int16_t *>(audioData);
+ 846:
+ 847:   memset(output, 0, static_cast<size_t>(numFrames) * bytesPerFrame_);
+ 848:
+ 849:   // Process fade in/out, update current volume
+ 850:   float currentVol = currentVolume_.load();
+ 851:   float targetVol = targetVolume_.load();
+ 852:   float step = volumeStep_.load();
+ 853:   bool fading = !fadeComplete_.load();
+ 854:
+ 855:   if (fading) {
+ 856:     // Calculate new current volume
+ 857:     if (step > 0) {
+ 858:       // Fade in
+ 859:       currentVol += step;
+ 860:       if (currentVol >= targetVol) {
+ 861:         currentVol = targetVol;
+ 862:         fadeComplete_ = true;
+ 863:       }
+ 864:     } else if (step < 0) {
+ 865:       // Fade out
+ 866:       currentVol += step;
+ 867:       if (currentVol <= targetVol) {
+ 868:         currentVol = targetVol;
+ 869:         fadeComplete_ = true;
+ 870:       }
+ 871:     } else {
+ 872:       fadeComplete_ = true;
+ 873:     }
+ 874:     currentVolume_ = currentVol;
+ 875:   }
+ 876:
+ 877:   // Read data from queue
+ 878:   std::unique_lock<std::mutex> lock(queueMutex_);
+ 879:
+ 880:   int32_t samplesWritten = 0;
+ 881:   size_t queueSizeBefore = audioQueue_.size();
+ 882:   int32_t samplesRemaining = totalSamples;
+ 883:   int32_t outputOffset = 0;
+ 884:
+ 885:   while (samplesRemaining > 0 && !audioQueue_.empty()) {
+ 886:     AudioQueueItem &item = audioQueue_.front();
+ 887:     int32_t itemRemainingSamples = item.getRemainingSamples(channelCount_);
+ 888:
+ 889:     if (itemRemainingSamples <= 0) {
+ 890:       // Queue item fully used, delete it
+ 891:       if (item.data) {
+ 892:           delete[] item.data;
+ 893:           item.data = nullptr;
+ 894:       }
+ 895:       audioQueue_.pop();
+ 896:       continue;
+ 897:     }
+ 898:
+ 899:     // Calculate samples to write this time
+ 900:     int32_t samplesToWrite = std::min(samplesRemaining, itemRemainingSamples);
+ 901:
+ 902:     // Apply volume and copy data (using smoothly transitioning current volume)
+ 903:     int32_t itemDataOffset = item.usedSamples;
+ 904:
+ 905:     if (fading) {
+ 906:       // Fade mode: adjust volume progressively for each sample
+ 907:       float volStart = currentVol - step; // Volume at start of this frame
+ 908:       float volEnd = currentVol;          // Volume at end of this frame
+ 909:       float volDelta = (volEnd - volStart) / samplesToWrite;
+ 910:       float sampleVol = volStart;
+ 911:
+ 912:       for (int32_t i = 0; i < samplesToWrite; i++) {
+ 913:         output[outputOffset + i] =
+ 914:             static_cast<int16_t>(item.data[itemDataOffset + i] * sampleVol);
+ 915:         sampleVol += volDelta;
+ 916:       }
+ 917:     } else {
+ 918:       // Normal mode: use fixed volume
+ 919:       for (int32_t i = 0; i < samplesToWrite; i++) {
+ 920:         output[outputOffset + i] =
+ 921:             static_cast<int16_t>(item.data[itemDataOffset + i] * currentVol);
+ 922:       }
+ 923:     }
+ 924:
+ 925:     // Update used sample count
+ 926:     item.usedSamples += samplesToWrite;
+ 927:     samplesWritten += samplesToWrite;
+ 928:     outputOffset += samplesToWrite;
+ 929:     samplesRemaining -= samplesToWrite;
+ 930:
+ 931:     // If queue item data fully used, delete it
+ 932:     if (item.usedSamples >= item.numFrames * channelCount_) {
+ 933:       if (item.data) {
+ 934:         delete[] item.data;
+ 935:         item.data = nullptr;
+ 936:       }
+ 937:       audioQueue_.pop();
+ 938:     }
+ 939:   }
+ 940:
+ 941:
+ 942:   lock.unlock();
+ 943:   queueCondition_.notify_one();
+ 944:
+ 945:   // Apply channel mode processing (after volume processing)
+ 946:   // Only stereo (2 channels) needs processing
+ 947:   if (channelCount_ == 2 && samplesWritten > 0) {
+ 948:     AudioChannelMode mode = channelMode_.load();
+ 949:     if (mode == AudioChannelMode::LEFT) {
+ 950:       // Play left channel only: copy left channel to right channel
+ 951:       // Sample format: L0 R0 L1 R1 L2 R2 ...
+ 952:       int32_t numFramesWritten = samplesWritten / 2;
+ 953:       for (int32_t i = 0; i < numFramesWritten; i++) {
+ 954:         int16_t leftSample = output[i * 2];      // Left channel
+ 955:         output[i * 2 + 1] = leftSample;          // Copy to right channel
+ 956:       }
+ 957:     } else if (mode == AudioChannelMode::RIGHT) {
+ 958:       // Play right channel only: copy right channel to left channel
+ 959:       int32_t numFramesWritten = samplesWritten / 2;
+ 960:       for (int32_t i = 0; i < numFramesWritten; i++) {
+ 961:         int16_t rightSample = output[i * 2 + 1]; // Right channel
+ 962:         output[i * 2] = rightSample;             // Copy to left channel
+ 963:       }
+ 964:     }
+ 965:     // STEREO mode doesn't need processing, keep as is
+ 966:   }
+ 967:
+ 968:   // Debug: record callback state
+ 969:   // If queue is large but written samples is small, consumption may be too slow (only warn on first detection)
+ 970:   static bool slowConsumptionWarned = false;
+ 971:   if (!slowConsumptionWarned && queueSizeBefore > 50 && samplesWritten < totalSamples / 2) {
+ 972:     LOG_WARN("AudioPlayer::onAudioReady: Large queue (%zu items) but slow "
+ 973:              "consumption (%d/%d samples)",
+ 974:              queueSizeBefore, samplesWritten, totalSamples);
+ 975:     slowConsumptionWarned = true;
+ 976:   }
+ 977:
+ 978:   return AAUDIO_CALLBACK_RESULT_CONTINUE;
+ 979: #else
+ 980:   return AAUDIO_CALLBACK_RESULT_STOP;
+ 981: #endif
+ 982: }
+ 983:
+ 984:
+ 985: } // namespace hsvj
+ 986: /**
+ 987:  * @file AudioPlayerManager.cpp
+ 988:  * @brief 全局音频播放器管理器实现
+ 989:  */
+ 990:
+ 991: #include "audio/AudioPlayerManager.h"
+ 992: #include "utils/Logger.h"
+ 993:
+ 994: namespace hsvj {
+ 995:
+ 996: AudioPlayerManager& AudioPlayerManager::getInstance() {
+ 997:     static AudioPlayerManager instance;
+ 998:     return instance;
+ 999: }
+1000:
+1001: AudioPlayer* AudioPlayerManager::getAudioPlayer() {
+1002:     std::lock_guard<std::mutex> lock(mutex_);
+1003:     return audioPlayer_.get();
+1004: }
+1005:
+1006: bool AudioPlayerManager::ensureInitialized(int32_t sampleRate,
+1007:                                           int32_t channelCount,
+1008:                                           int32_t format,
+1009:                                           int32_t deviceId) {
+1010:     std::lock_guard<std::mutex> lock(mutex_);
+1011:
+1012:     if (initialized_ && audioPlayer_) {
+1013:         const bool sameParams =
+1014:             audioPlayer_->getSampleRate() == sampleRate &&
+1015:             audioPlayer_->getChannelCount() == channelCount &&
+1016:             audioPlayer_->getFormat() == format &&
+1017:             audioPlayer_->getDeviceId() == deviceId;
+1018:         if (sameParams) {
+1019:             return true;
+1020:         }
+1021:
+1022:         LOG_INFO("[AudioPlayerManager] Reinitializing AudioPlayer: %dHz/%dch/fmt%d/dev%d -> %dHz/%dch/fmt%d/dev%d",
+1023:                  audioPlayer_->getSampleRate(), audioPlayer_->getChannelCount(),
+1024:                  audioPlayer_->getFormat(), audioPlayer_->getDeviceId(),
+1025:                  sampleRate, channelCount, format, deviceId);
+1026:         audioPlayer_->shutdown();
+1027:         initialized_ = false;
+1028:     }
+1029:
+1030:     if (!audioPlayer_) {
+1031:         audioPlayer_ = std::make_unique<AudioPlayer>();
+1032:     }
+1033:
+1034:     bool success = audioPlayer_->initialize(sampleRate, channelCount, format, deviceId);
+1035:     if (success) {
+1036:         initialized_ = true;
+1037:         LOG_INFO("[AudioPlayerManager] Global AudioPlayer initialized: %dHz, %dch",
+1038:                  sampleRate, channelCount);
+1039:     } else {
+1040:         LOG_ERROR("[AudioPlayerManager] Failed to initialize global AudioPlayer");
+1041:     }
+1042:
+1043:     return success;
+1044: }
+1045:
+1046: void AudioPlayerManager::shutdown() {
+1047:     std::lock_guard<std::mutex> lock(mutex_);
+1048:
+1049:     if (audioPlayer_) {
+1050:         audioPlayer_->shutdown();
+1051:         audioPlayer_.reset();
+1052:         initialized_ = false;
+1053:         focusOwner_.store(static_cast<int>(AudioFocusSource::NONE), std::memory_order_release);
+1054:         LOG_INFO("[AudioPlayerManager] Global AudioPlayer shutdown");
+1055:     }
+1056: }
+1057:
+1058: void AudioPlayerManager::requestFocus(AudioFocusSource source) {
+1059:     std::lock_guard<std::mutex> lock(mutex_);
+1060:     if (source == AudioFocusSource::VIDEO) {
+1061:         videoRefCount_++;
+1062:         focusOwner_.store(static_cast<int>(source), std::memory_order_release);
+1063:     }
+1064: }
+1065:
+1066: void AudioPlayerManager::restoreFocus(AudioFocusSource source) {
+1067:     std::lock_guard<std::mutex> lock(mutex_);
+1068:     if (source == AudioFocusSource::VIDEO) {
+1069:         focusOwner_.store(static_cast<int>(source), std::memory_order_release);
+1070:     }
+1071: }
+1072:
+1073: void AudioPlayerManager::releaseFocus(AudioFocusSource source) {
+1074:     std::lock_guard<std::mutex> lock(mutex_);
+1075:     if (source == AudioFocusSource::VIDEO) {
+1076:         if (videoRefCount_ > 0) {
+1077:             videoRefCount_--;
+1078:         }
+1079:         if (videoRefCount_ <= 0) {
+1080:             videoRefCount_ = 0;
+1081:             if (audioPlayer_ && focusOwner_.load(std::memory_order_acquire) == static_cast<int>(AudioFocusSource::VIDEO)) {
+1082:                 audioPlayer_->stop();
+1083:                 focusOwner_.store(static_cast<int>(AudioFocusSource::NONE), std::memory_order_release);
+1084:             }
+1085:         }
+1086:     }
+1087: }
+1088:
+1089: bool AudioPlayerManager::hasFocus(AudioFocusSource source) const {
+1090:     // 热路径：无锁原子读取
+1091:     return focusOwner_.load(std::memory_order_acquire) == static_cast<int>(source);
+1092: }
+1093:
+1094: void AudioPlayerManager::setCurrentAudioLayerId(int layerId) {
+1095:     // 写操作加锁保证可见性（写频率极低）
+1096:     std::lock_guard<std::mutex> lock(mutex_);
+1097:     currentAudioLayerId_.store(layerId, std::memory_order_release);
+1098: }
+1099:
+1100: int AudioPlayerManager::getCurrentAudioLayerId() const {
+1101:     return currentAudioLayerId_.load(std::memory_order_acquire);
+1102: }
+1103:
+1104: bool AudioPlayerManager::hasAudioFocusForLayer(int layerId) const {
+1105:     // 热路径：无锁原子读取
+1106:     int cur = currentAudioLayerId_.load(std::memory_order_acquire);
+1107:     return cur != 0 && cur == layerId;
+1108: }
+1109:
+1110: } // namespace hsvj
+1111: /**
+1112:  * @file AudioProcessor.cpp
+1113:  * @brief ????????
+1114:  *
+1115:  * ????????????????
+1116:  * - FFT????
+1117:  * - ??????
+1118:  * - ?????
+1119:  * - ????????
+1120:  */
+1121:
+1122: #include "audio/AudioProcessor.h"
+1123: #include "utils/Logger.h"
+1124: #include <algorithm>
+1125: #include <cmath>
+1126: #include <cstring>
+1127:
+1128: #ifdef __ANDROID__
+1129: #include <time.h>
+1130: #include <sys/time.h>
+1131: #else
+1132: #include <chrono>
+1133: #endif
+1134:
+1135: namespace hsvj {
+1136:
+1137: AudioProcessor::AudioProcessor()
+1138:     : fftWindowSize_(1024),
+1139:       intensityThreshold_(0.3f),
+1140:       smoothedIntensity_(0.0f),
+1141:       smoothingFactor_(0.7f) {
+1142:     fftInputBuffer_.resize(fftWindowSize_, 0.0f);
+1143:     fftOutputBuffer_.resize(fftWindowSize_ * 2, 0.0f); // ?????????
+1144: }
+1145:
+1146: AudioProcessor::~AudioProcessor() {
+1147: }
+1148:
+1149: int64_t AudioProcessor::getCurrentTimeMs() const {
+1150: #ifdef __ANDROID__
+1151:     struct timespec ts;
+1152:     clock_gettime(CLOCK_MONOTONIC, &ts);
+1153:     return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+1154: #else
+1155:     auto now = std::chrono::steady_clock::now();
+1156:     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+1157:     return ms.count();
+1158: #endif
+1159: }
+1160:
+1161: void AudioProcessor::setFFTWindowSize(int32_t size) {
+1162:     // ??????????
+1163:     int32_t newSize = 1024;
+1164:     if (size >= 256 && size <= 4096) {
+1165:         // ?????????
+1166:         newSize = 1;
+1167:         while (newSize < size) {
+1168:             newSize <<= 1;
+1169:         }
+1170:         if (newSize > size) {
+1171:             newSize >>= 1;
+1172:         }
+1173:     }
+1174:
+1175:     if (newSize != fftWindowSize_) {
+1176:         fftWindowSize_ = newSize;
+1177:         fftInputBuffer_.resize(fftWindowSize_, 0.0f);
+1178:         fftOutputBuffer_.resize(fftWindowSize_ * 2, 0.0f);
+1179:         LOG_DEBUG("[?????] FFT????????%d", fftWindowSize_);
+1180:     }
+1181: }
+1182:
+1183: AudioSpectrum AudioProcessor::processPCM(const int16_t* pcmData, int32_t numFrames, int32_t sampleRate) {
+1184:     (void)sampleRate;
+1185:     AudioSpectrum spectrum;
+1186:
+1187:     if (!pcmData || numFrames <= 0) {
+1188:         return spectrum;
+1189:     }
+1190:
+1191:     // 1. ??????
+1192:     float intensity = calculateIntensity(pcmData, numFrames);
+1193:
+1194:     // 2. ????
+1195:     smoothedIntensity_ = smoothingFactor_ * smoothedIntensity_ + (1.0f - smoothingFactor_) * intensity;
+1196:     spectrum.intensity = smoothedIntensity_;
+1197:
+1198:     // 3. ?PCM??????????
+1199:     convertPCMToWaveData(pcmData, numFrames, spectrum.waveData);
+1200:
+1201:     // 5. ??FFT????????
+1202:     // ?PCM?????FFT?????????????????
+1203:     int32_t copyFrames = std::min(numFrames, fftWindowSize_);
+1204:     for (int32_t i = 0; i < copyFrames; i++) {
+1205:         // ????????????
+1206:         float sample = 0.0f;
+1207:         if (numFrames > 0) {
+1208:             // ????????????????
+1209:             int32_t leftIdx = i * 2;
+1210:             int32_t rightIdx = i * 2 + 1;
+1211:             if (leftIdx < numFrames * 2) {
+1212:                 float left = static_cast<float>(pcmData[leftIdx]) / 32768.0f;
+1213:                 float right = (rightIdx < numFrames * 2) ?
+1214:                               static_cast<float>(pcmData[rightIdx]) / 32768.0f : 0.0f;
+1215:                 sample = (left + right) * 0.5f;
+1216:             }
+1217:         }
+1218:
+1219:         // ??????????
+1220:         float window = 0.5f - 0.5f * cosf(2.0f * M_PI * i / (copyFrames - 1));
+1221:         fftInputBuffer_[i] = sample * window;
+1222:     }
+1223:
+1224:     // ??????
+1225:     for (int32_t i = copyFrames; i < fftWindowSize_; i++) {
+1226:         fftInputBuffer_[i] = 0.0f;
+1227:     }
+1228:
+1229:     // ??FFT
+1230:     performFFT(fftInputBuffer_, fftOutputBuffer_);
+1231:
+1232:     // ????????128????
+1233:     convertFFTToSpectrum(fftOutputBuffer_, spectrum.fftData);
+1234:
+1235:     return spectrum;
+1236: }
+1237:
+1238: float AudioProcessor::calculateIntensity(const int16_t* pcmData, int32_t numFrames) {
+1239:     if (!pcmData || numFrames <= 0) {
+1240:         return 0.0f;
+1241:     }
+1242:
+1243:     // ??RMS??????
+1244:     int64_t sumSquares = 0;
+1245:     int32_t sampleCount = numFrames * 2; // ????????????????
+1246:
+1247:     for (int32_t i = 0; i < sampleCount; i++) {
+1248:         int32_t sample = static_cast<int32_t>(pcmData[i]);
+1249:         sumSquares += static_cast<int64_t>(sample) * sample;
+1250:     }
+1251:
+1252:     float rms = sqrtf(static_cast<float>(sumSquares) / sampleCount);
+1253:
+1254:     // ????0.0-1.0????2768?int16?????
+1255:     float intensity = rms / 32768.0f;
+1256:
+1257:     // ????
+1258:     return std::max(0.0f, std::min(1.0f, intensity));
+1259: }
+1260:
+1261: // NOTE: detectPeak() removed - beat detection will be handled by AudioReactiveEngine (pending)
+1262:
+1263: void AudioProcessor::performFFT(const std::vector<float>& input, std::vector<float>& output) {
+1264:     // ???Cooley-Tukey FFT????2 FFT?O(N log N)????
+1265:     // ??????024??O(N?=1M?????O(N log N)=10K??????100??
+1266:
+1267:     int32_t N = static_cast<int32_t>(input.size());
+1268:     if (N == 0 || output.size() < static_cast<size_t>(N) * 2u) {
+1269:         return;
+1270:     }
+1271:
+1272:     // ??N??????
+1273:     if ((N & (N - 1)) != 0) {
+1274:         LOG_WARN("[AudioProcessor] FFT size must be power of 2, got %d", N);
+1275:         return;
+1276:     }
+1277:
+1278:     // ??????Bit-reversal permutation??
+1279:     std::vector<float> real(N);
+1280:     std::vector<float> imag(N);
+1281:
+1282:     for (int32_t i = 0; i < N; i++) {
+1283:         int32_t j = 0;
+1284:         int32_t temp = i;
+1285:         int32_t bits = 0;
+1286:         int32_t n = N;
+1287:         while (n > 1) {
+1288:             bits++;
+1289:             n >>= 1;
+1290:         }
+1291:         for (int32_t b = 0; b < bits; b++) {
+1292:             j = (j << 1) | (temp & 1);
+1293:             temp >>= 1;
+1294:         }
+1295:         real[j] = input[i];
+1296:         imag[j] = 0.0f;
+1297:     }
+1298:
+1299:     // Cooley-Tukey FFT????????????log2f ????????
+1300:     int32_t logN = 0;
+1301:     for (int32_t tmp = N; tmp > 1; tmp >>= 1) logN++;
+1302:     for (int32_t s = 1; s <= logN; s++) {
+1303:         int32_t m = 1 << s;  // 2^s
+1304:         int32_t m2 = m >> 1;
+1305:
+1306:         // ?????? w = e^(-2?i/m)
+1307:         float wReal = cosf(-2.0f * M_PI / m);
+1308:         float wImag = sinf(-2.0f * M_PI / m);
+1309:
+1310:         for (int32_t k = 0; k < N; k += m) {
+1311:             float wkReal = 1.0f;
+1312:             float wkImag = 0.0f;
+1313:
+1314:             for (int32_t j = 0; j < m2; j++) {
+1315:                 int32_t t = k + j;
+1316:                 int32_t u = t + m2;
+1317:
+1318:                 // ????
+1319:                 float tReal = real[t];
+1320:                 float tImag = imag[t];
+1321:                 float uReal = real[u] * wkReal - imag[u] * wkImag;
+1322:                 float uImag = real[u] * wkImag + imag[u] * wkReal;
+1323:
+1324:                 real[t] = tReal + uReal;
+1325:                 imag[t] = tImag + uImag;
+1326:                 real[u] = tReal - uReal;
+1327:                 imag[u] = tImag - uImag;
+1328:
+1329:                 // ??????
+1330:                 float tempReal = wkReal * wReal - wkImag * wImag;
+1331:                 wkImag = wkReal * wImag + wkImag * wReal;
+1332:                 wkReal = tempReal;
+1333:             }
+1334:         }
+1335:     }
+1336:
+1337:     // ????????????????
+1338:     for (int32_t i = 0; i < N; i++) {
+1339:         output[i * 2] = real[i];
+1340:         output[i * 2 + 1] = imag[i];
+1341:     }
+1342: }
+1343:
+1344: void AudioProcessor::convertFFTToSpectrum(const std::vector<float>& fftOutput, std::vector<float>& spectrum) {
+1345:     if (fftOutput.size() < 2 || spectrum.size() < 128) {
+1346:         return;
+1347:     }
+1348:
+1349:     int32_t fftSize = static_cast<int32_t>(fftOutput.size()) / 2;
+1350:     int32_t spectrumSize = 128;
+1351:
+1352:     // ??????????
+1353:     for (int32_t i = 0; i < spectrumSize; i++) {
+1354:         // ?FFT????????28????
+1355:         int32_t startBin = (i * fftSize) / spectrumSize;
+1356:         int32_t endBin = ((i + 1) * fftSize) / spectrumSize;
+1357:
+1358:         if (endBin > fftSize / 2) {
+1359:             endBin = fftSize / 2; // ???????????????
+1360:         }
+1361:
+1362:         float magnitude = 0.0f;
+1363:         int32_t count = 0;
+1364:
+1365:         for (int32_t bin = startBin; bin < endBin; bin++) {
+1366:             float real = fftOutput[bin * 2];
+1367:             float imag = fftOutput[bin * 2 + 1];
+1368:             float mag = sqrtf(real * real + imag * imag);
+1369:             magnitude += mag;
+1370:             count++;
+1371:         }
+1372:
+1373:         if (count > 0) {
+1374:             magnitude /= count;
+1375:         }
+1376:
+1377:         // ????????????????
+1378:         magnitude = magnitude / fftSize;
+1379:         if (magnitude > 0.0f) {
+1380:             magnitude = log10f(1.0f + magnitude * 9.0f); // ????
+1381:         }
+1382:
+1383:         spectrum[i] = std::max(0.0f, std::min(1.0f, magnitude));
+1384:     }
+1385: }
+1386:
+1387: void AudioProcessor::convertPCMToWaveData(const int16_t* pcmData, int32_t numFrames, std::vector<float>& waveData) {
+1388:     if (!pcmData || numFrames <= 0 || waveData.size() < 128) {
+1389:         return;
+1390:     }
+1391:
+1392:     // ?PCM??????128??
+1393:     int32_t step = std::max(1, numFrames / 128);
+1394:
+1395:     for (int32_t i = 0; i < 128 && i * step < numFrames; i++) {
+1396:         int32_t idx = i * step;
+1397:         // ??????????
+1398:         float sample = 0.0f;
+1399:         if (idx * 2 < numFrames * 2) {
+1400:             float left = static_cast<float>(pcmData[idx * 2]) / 32768.0f;
+1401:             float right = (idx * 2 + 1 < numFrames * 2) ?
+1402:                           static_cast<float>(pcmData[idx * 2 + 1]) / 32768.0f : 0.0f;
+1403:             sample = (left + right) * 0.5f;
+1404:         }
+1405:         waveData[i] = std::max(-1.0f, std::min(1.0f, sample));
+1406:     }
+1407: }
+1408:
+1409: } // namespace hsvj
+1410:
+1411: ﻿/**
+1412:  * @file RgaConverter.cpp
+1413:  * @brief RGA 硬件加速格式转换器实现
+1414:  */
+1415:
+1416: #include "capture/RgaConverter.h"
+1417: #include "utils/Logger.h"
+1418:
+1419: #ifdef __ANDROID__
+1420:
+1421: #include <fcntl.h>
+1422: #include <unistd.h>
+1423: #include <sys/ioctl.h>
+1424: #include <sys/mman.h>
+1425: #include <cstring>
+1426: #include <errno.h>
+1427: #include <linux/ioctl.h>
+1428: #include <linux/types.h>
+1429:
+1430: // DMA-Heap 定义 (避免依赖特定 kernel 头文
+1431: struct dma_heap_allocation_data {
+1432:     __u64 len;
+1433:     __u32 fd;
+1434:     __u32 fd_flags;
+1435:     __u64 heap_flags;
+1436: };
+1437:
+1438: #define DMA_HEAP_IOC_MAGIC 'H'
+1439: #define DMA_HEAP_IOCTL_ALLOC _IOWR(DMA_HEAP_IOC_MAGIC, 0, struct dma_heap_allocation_data)
+1440:
+1441: // RGA ioctl 命令
+1442: #define RGA_BLIT_SYNC   0x5017
+1443:
+1444: // RGA 格式定义
+1445: #define RGA_FMT_RGBA_8888    0x0
+1446: #define RGA_FMT_BGR_888      0x7
+1447:
+1448: // RGA 数据结构
+1449: typedef struct {
+1450:     unsigned long yrgb_addr;
+1451:     unsigned long uv_addr;
+1452:     unsigned long v_addr;
+1453:     unsigned int format;
+1454:     unsigned short act_w;
+1455:     unsigned short act_h;
+1456:     unsigned short x_offset;
+1457:     unsigned short y_offset;
+1458:     unsigned short vir_w;
+1459:     unsigned short vir_h;
+1460:     unsigned short endian_mode;
+1461:     unsigned short alpha_swap;
+1462: } rga_img_info_t;
+1463:
+1464: typedef struct {
+1465:     unsigned short xmin;
+1466:     unsigned short xmax;
+1467:     unsigned short ymin;
+1468:     unsigned short ymax;
+1469: } rga_rect_t;
+1470:
+1471: typedef struct {
+1472:     unsigned char mmu_en;
+1473:     unsigned long base_addr;
+1474:     unsigned int mmu_flag;
+1475: } rga_mmu_t;
+1476:
+1477: typedef struct {
+1478:     unsigned char render_mode;
+1479:     rga_img_info_t src;
+1480:     rga_img_info_t dst;
+1481:     rga_img_info_t pat;
+1482:     unsigned long rop_mask_addr;
+1483:     unsigned long LUT_addr;
+1484:     rga_rect_t clip;
+1485:     int sina;
+1486:     int cosa;
+1487:     unsigned short alpha_rop_flag;
+1488:     unsigned char scaleMode;
+1489:     unsigned int color_key_max;
+1490:     unsigned int color_key_min;
+1491:     unsigned int fg_color;
+1492:     unsigned int bgColor;
+1493:     unsigned char gr_color_r;
+1494:     unsigned char gr_color_g;
+1495:     unsigned char gr_color_b;
+1496:     unsigned char gr_color_a; // 补充占位
+1497:     unsigned char line_draw_info_start_point_x[2]; // 简化结构体定义避免 padding 问题
+1498:     unsigned char line_draw_info_end_point_x[2];
+1499:     unsigned int line_draw_info_color;
+1500:     unsigned int line_draw_info_flag;
+
+================================================================================
+后30页源代码（约1500行）
+================================================================================
+
+1501:
+1502: } // namespace hsvj
+1503:
+1504: }
+1505:            root.rfind("/mnt/usb_storage/", 0) == 0;
+1506:            root.rfind("/mnt/media_rw/", 0) == 0 ||
+1507:            root.rfind("/storage/", 0) == 0 ||
+1508:            root == "/storage/usb_storage" ||
+1509:            root == "/mnt/usb_storage" ||
+1510:            root == "/mnt/media_rw" ||
+1511:     return root == "/storage" ||
+1512: bool LocalSongFileScanner::shouldUseSuFind(const std::string& root) const {
+1513:
+1514: }
+1515:            ext == ".dat" || ext == ".wmv" || ext == ".flv";
+1516:            ext == ".vob" || ext == ".mkv" || ext == ".avi" || ext == ".mov" ||
+1517:     return ext == ".mp4" || ext == ".mpg" || ext == ".mpeg" || ext == ".ts" ||
+1518:     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+1519:     std::string ext = path.substr(dot);
+1520:     if (dot == std::string::npos) return false;
+1521:     const auto dot = path.find_last_of('.');
+1522: bool LocalSongFileScanner::isMediaFile(const std::string& path) const {
+1523:
+1524: }
+1525:     return {};
+1526:     }
+1527:         }
+1528:             return it->second;
+1529:         if (it != songLookup.end()) {
+1530:         auto it = songLookup.find(candidate);
+1531:     for (const auto& candidate : candidates) {
+1532:
+1533:     if (!current.empty()) candidates.push_back(current);
+1534:     }
+1535:         }
+1536:             current.clear();
+1537:             candidates.push_back(current);
+1538:         } else if (!current.empty()) {
+1539:             current.push_back(ch);
+1540:         if (std::isdigit(static_cast<unsigned char>(ch))) {
+1541:     for (char ch : fileName) {
+1542:     std::string current;
+1543:     std::vector<std::string> candidates;
+1544: std::string LocalSongFileScanner::extractSongNo(const std::string& fileName, const SongNoLookup& songLookup) const {
+1545:
+1546: }
+1547:     return true;
+1548:              matchedFiles.size(), uniqueMatches.size(), updated, uniqueMatches.size());
+1549:     LOG_WARN("[VOD] [本地歌曲对照] 写入完成：匹配文件=%zu 唯一歌曲=%zu 成功更新=%zu 当前可用=%d",
+1550:              matchedFiles.size(), uniqueMatches.size(), updated, uniqueMatches.size());
+1551:     LOG_INFO("[VOD] LocalSongFileScanner updated song paths: matched=%zu unique=%zu updated=%zu available=%d",
+1552:
+1553:     sqlite3_close(db);
+1554:     sqlite3_finalize(upsertAvailable);
+1555:     sqlite3_finalize(updateFiles);
+1556:     sqlite3_finalize(updateSearch);
+1557:     sqlite3_finalize(updateSongs);
+1558:
+1559:     sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+1560:     }
+1561:         }
+1562:             sqlite3_exec(db, "BEGIN;", nullptr, nullptr, nullptr);
+1563:             sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+1564:         if (updated % kUpdateBatchSize == 0) {
+1565:         updated++;
+1566:
+1567:         sqlite3_clear_bindings(upsertAvailable);
+1568:         sqlite3_reset(upsertAvailable);
+1569:         sqlite3_step(upsertAvailable);
+1570:         sqlite3_bind_int64(upsertAvailable, 6, checkedTime);
+1571:         sqlite3_bind_int64(upsertAvailable, 5, matched.modifiedTime);
+1572:         sqlite3_bind_int64(upsertAvailable, 4, matched.fileSize);
+1573:         bindText(upsertAvailable, 3, matched.fileName);
+1574:         bindText(upsertAvailable, 2, matched.absolutePath);
+1575:         bindText(upsertAvailable, 1, matched.songNo);
+1576:
+1577:         sqlite3_clear_bindings(updateFiles);
+1578:         sqlite3_reset(updateFiles);
+1579:         sqlite3_step(updateFiles);
+1580:         bindText(updateFiles, 5, matched.songNo);
+1581:         sqlite3_bind_int64(updateFiles, 4, checkedTime);
+1582:         sqlite3_bind_int64(updateFiles, 3, matched.fileSize);
+1583:         bindText(updateFiles, 2, matched.absolutePath);
+1584:         bindText(updateFiles, 1, matched.fileName);
+1585:
+1586:         sqlite3_clear_bindings(updateSearch);
+1587:         sqlite3_reset(updateSearch);
+1588:         sqlite3_step(updateSearch);
+1589:         bindText(updateSearch, 1, matched.songNo);
+1590:
+1591:         sqlite3_clear_bindings(updateSongs);
+1592:         sqlite3_reset(updateSongs);
+1593:         sqlite3_step(updateSongs);
+1594:         bindText(updateSongs, 5, matched.songNo);
+1595:         sqlite3_bind_int64(updateSongs, 4, checkedTime);
+1596:         sqlite3_bind_int64(updateSongs, 3, matched.fileSize);
+1597:         bindText(updateSongs, 2, matched.fileName);
+1598:         bindText(updateSongs, 1, matched.absolutePath);
+1599:         sqlite3_clear_bindings(updateSongs);
+1600:         sqlite3_reset(updateSongs);
+1601:
+1602:         const int64_t checkedTime = nowEpochMs();
+1603:         const auto& matched = pair.second;
+1604:     for (const auto& pair : uniqueMatches) {
+1605:     LOG_WARN("[VOD] [本地歌曲对照] 开始写入：唯一匹配=%zu，已清空旧对照缓存", uniqueMatches.size());
+1606:     sqlite3_exec(db, "DELETE FROM local_available_songs;", nullptr, nullptr, nullptr);
+1607:     sqlite3_exec(db, "BEGIN;", nullptr, nullptr, nullptr);
+1608:     size_t updated = 0;
+1609:
+1610:     }
+1611:         return false;
+1612:         sqlite3_close(db);
+1613:         if (upsertAvailable) sqlite3_finalize(upsertAvailable);
+1614:         if (updateFiles) sqlite3_finalize(updateFiles);
+1615:         if (updateSearch) sqlite3_finalize(updateSearch);
+1616:         if (updateSongs) sqlite3_finalize(updateSongs);
+1617:         LOG_WARN("[VOD] LocalSongFileScanner: prepare update statements failed: %s", sqlite3_errmsg(db));
+1618:         LOG_WARN("[VOD] [本地歌曲对照] 写入失败：准备SQL失败 error=%s", sqlite3_errmsg(db));
+1619:         sqlite3_prepare_v2(db, upsertAvailableSql, -1, &upsertAvailable, nullptr) != SQLITE_OK) {
+1620:         sqlite3_prepare_v2(db, updateFilesSql, -1, &updateFiles, nullptr) != SQLITE_OK ||
+1621:         sqlite3_prepare_v2(db, updateSearchSql, -1, &updateSearch, nullptr) != SQLITE_OK ||
+1622:     if (sqlite3_prepare_v2(db, updateSongsSql, -1, &updateSongs, nullptr) != SQLITE_OK ||
+1623:     sqlite3_stmt* upsertAvailable = nullptr;
+1624:     sqlite3_stmt* updateFiles = nullptr;
+1625:     sqlite3_stmt* updateSearch = nullptr;
+1626:     sqlite3_stmt* updateSongs = nullptr;
+1627:
+1628:     )";
+1629:         VALUES (?, ?, ?, ?, ?, ?);
+1630:         INSERT OR REPLACE INTO local_available_songs (songNo, absolutePath, fileName, fileSize, modifiedTime, updatedAt)
+1631:     const char* upsertAvailableSql = R"(
+1632:     )";
+1633:         WHERE songNo=?;
+1634:         SET fileName=?, absolutePath=?, fileExists=1, fileSize=?, lastCheckedTime=?, lastError=NULL
+1635:         UPDATE songFiles
+1636:     const char* updateFilesSql = R"(
+1637:     )";
+1638:         WHERE songNo=?;
+1639:         SET fileExists=1
+1640:         UPDATE songSearch
+1641:     const char* updateSearchSql = R"(
+1642:     )";
+1643:         WHERE songNo=?;
+1644:         SET absolutePath=?, fileName=?, fileExists=1, fileSize=?, updatedTime=?
+1645:         UPDATE songs
+1646:     const char* updateSongsSql = R"(
+1647:
+1648:     sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_local_available_songs_path ON local_available_songs(absolutePath);", nullptr, nullptr, nullptr);
+1649:     )", nullptr, nullptr, nullptr);
+1650:         );
+1651:             updatedAt INTEGER DEFAULT 0
+1652:             modifiedTime INTEGER DEFAULT 0,
+1653:             fileSize INTEGER DEFAULT 0,
+1654:             fileName TEXT,
+1655:             absolutePath TEXT NOT NULL,
+1656:             songNo TEXT PRIMARY KEY,
+1657:         CREATE TABLE IF NOT EXISTS local_available_songs (
+1658:     sqlite3_exec(db, R"(
+1659:     sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
+1660:     sqlite3_busy_timeout(db, 5000);
+1661:     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+1662:
+1663:     }
+1664:         return false;
+1665:         if (db) sqlite3_close(db);
+1666:         LOG_WARN("[VOD] LocalSongFileScanner: open db for update failed: %s", songDbPath.c_str());
+1667:         LOG_WARN("[VOD] [本地歌曲对照] 写入失败：打开数据库失败 db=%s", songDbPath.c_str());
+1668:     if (sqlite3_open(songDbPath.c_str(), &db) != SQLITE_OK) {
+1669:     sqlite3* db = nullptr;
+1670:
+1671:     }
+1672:         }
+1673:             uniqueMatches[matched.songNo] = matched;
+1674:         if (it == uniqueMatches.end() || matched.modifiedTime > it->second.modifiedTime) {
+1675:         auto it = uniqueMatches.find(matched.songNo);
+1676:     for (const auto& matched : matchedFiles) {
+1677:     uniqueMatches.reserve(matchedFiles.size());
+1678:     std::unordered_map<std::string, MatchedFile> uniqueMatches;
+1679:
+1680:     }
+1681:         LOG_INFO("[VOD] LocalSongFileScanner: no matched files to update");
+1682:         LOG_WARN("[VOD] [本地歌曲对照] 写入跳过：没有匹配到任何文件");
+1683:     if (matchedFiles.empty()) {
+1684: bool LocalSongFileScanner::updateDatabase(const std::string& songDbPath, const std::vector<MatchedFile>& matchedFiles) {
+1685:
+1686: }
+1687:     }
+1688:         LOG_WARN("[VOD] LocalSongFileScanner: su find exited with status=%d root=%s", status, root.c_str());
+1689:     if (status != 0) {
+1690:     const int status = pclose(pipe);
+1691:
+1692:     }
+1693:         matchedFiles.push_back(std::move(matched));
+1694:         matched.modifiedTime = nowEpochMs();
+1695:         matched.fileSize = 0;
+1696:         matched.fileName = fileName;
+1697:         matched.absolutePath = path;
+1698:         matched.songNo = songNo;
+1699:         MatchedFile matched;
+1700:
+1701:         }
+1702:             continue;
+1703:             unknownFiles++;
+1704:         if (songNo.empty()) {
+1705:         const std::string songNo = extractSongNo(fileName, songLookup);
+1706:         const std::string fileName = baseName(std::filesystem::path(path));
+1707:         scannedFiles++;
+1708:
+1709:         }
+1710:             continue;
+1711:         if (path.empty() || !isMediaFile(path)) {
+1712:         const std::string path = trimLineEnd(buffer);
+1713:     while (!stopRequested_.load() && fgets(buffer, sizeof(buffer), pipe)) {
+1714:     char buffer[4096];
+1715:
+1716:     }
+1717:         return;
+1718:         LOG_WARN("[VOD] LocalSongFileScanner: su find failed to start: %s", root.c_str());
+1719:     if (!pipe) {
+1720:     FILE* pipe = popen(command.c_str(), "r");
+1721:
+1722:         "-o -iname '*.dat' -o -iname '*.wmv' -o -iname '*.flv' \\) -print 2>/dev/null\"";
+1723:
+1724:
+1725: } // namespace hsvj
+1726:
+1727: }
+1728:     return (layerId >= 1 && layerId <= 64) ? layerId : 1;
+1729:
+1730:     sqlite3_clear_bindings(stmt);
+1731:     sqlite3_reset(stmt);
+1732:     }
+1733:         }
+1734:             layerId = std::atoi(value);
+1735:         if (value) {
+1736:         const char* value = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+1737:     if (sqlite3_step(stmt) == SQLITE_ROW) {
+1738:     int layerId = 1;
+1739:
+1740:     sqlite3_clear_bindings(stmt);
+1741:     sqlite3_reset(stmt);
+1742:     if (!stmt) return 1;
+1743:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+1744:     const char* sql = "SELECT value FROM vod_config WHERE key = 'target_layer';";
+1745:
+1746:     if (!db_) return 1;
+1747: int LocalVodDatabase::getTargetLayer() {
+1748:
+1749: }
+1750:     return rc == SQLITE_DONE;
+1751:     sqlite3_clear_bindings(stmt);
+1752:     sqlite3_reset(stmt);
+1753:     int rc = sqlite3_step(stmt);
+1754:
+1755:     sqlite3_bind_text(stmt, 1, value.c_str(), -1, SQLITE_TRANSIENT);
+1756:     std::string value = std::to_string(layerId);
+1757:
+1758:     sqlite3_clear_bindings(stmt);
+1759:     sqlite3_reset(stmt);
+1760:     if (!stmt) return false;
+1761:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+1762:
+1763:     )";
+1764:         VALUES ('target_layer', ?);
+1765:         INSERT OR REPLACE INTO vod_config (key, value)
+1766:     const char* sql = R"(
+1767:
+1768:     if (!db_ || layerId < 1 || layerId > 64) return false;
+1769: bool LocalVodDatabase::setTargetLayer(int layerId) {
+1770:
+1771: // ========== 配置管理 ==========
+1772:
+1773: }
+1774:     return execSql(db_, "DELETE FROM vod_selected WHERE status IN (2, 3);");
+1775:     if (!db_) return false;
+1776: bool LocalVodDatabase::clearPlayed() {
+1777:
+1778: }
+1779:     return count;
+1780:
+1781:     sqlite3_clear_bindings(stmt);
+1782:     sqlite3_reset(stmt);
+1783:     }
+1784:         count = sqlite3_column_int(stmt, 0);
+1785:     if (sqlite3_step(stmt) == SQLITE_ROW) {
+1786:     int count = 0;
+1787:
+1788:     sqlite3_clear_bindings(stmt);
+1789:     sqlite3_reset(stmt);
+1790:     if (!stmt) return 0;
+1791:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+1792:     const char* sql = "SELECT COUNT(*) FROM vod_selected WHERE status IN (2, 3);";
+1793:
+1794:     if (!db_) return 0;
+1795: int LocalVodDatabase::getPlayedCount() {
+1796:
+1797: }
+1798:     return result;
+1799:
+1800:     sqlite3_clear_bindings(stmt);
+1801:     sqlite3_reset(stmt);
+1802:     }
+1803:         result.push_back(std::move(item));
+1804:
+1805:         item.isPriority = sqlite3_column_int(stmt, 10);
+1806:         item.position = sqlite3_column_int(stmt, 9);
+1807:         item.status = sqlite3_column_int(stmt, 8);
+1808:         item.playedTime = sqlite3_column_int64(stmt, 7);
+1809:         item.addedTime = sqlite3_column_int64(stmt, 6);
+1810:         item.duration = sqlite3_column_double(stmt, 5);
+1811:
+1812:         if (songPath) item.songPath = songPath;
+1813:         const char* songPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+1814:
+1815:         if (singerName) item.singerName = singerName;
+1816:         const char* singerName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+1817:
+1818:         if (songName) item.songName = songName;
+1819:         const char* songName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+1820:
+1821:         if (songNo) item.songNo = songNo;
+1822:         const char* songNo = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+1823:
+1824:         item.id = sqlite3_column_int(stmt, 0);
+1825:         QueueItem item;
+1826:     while (sqlite3_step(stmt) == SQLITE_ROW) {
+1827:
+1828:     sqlite3_bind_int(stmt, 2, offset);
+1829:     sqlite3_bind_int(stmt, 1, limit);
+1830:
+1831:     sqlite3_clear_bindings(stmt);
+1832:     sqlite3_reset(stmt);
+1833:     if (!stmt) return result;
+1834:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+1835:
+1836:     )";
+1837:         LIMIT ? OFFSET ?;
+1838:         ORDER BY playedTime DESC
+1839:         WHERE status IN (2, 3)
+1840:         FROM vod_selected
+1841:                playedTime, status, position, isPriority
+1842:         SELECT id, songNo, songName, singerName, songPath, duration, addedTime,
+1843:     const char* sql = R"(
+1844:
+1845:     if (!db_) return result;
+1846:     std::vector<QueueItem> result;
+1847: std::vector<LocalVodDatabase::QueueItem> LocalVodDatabase::getPlayedList(int offset, int limit) {
+1848:
+1849: }
+1850:     return markAsFinished(selectedId, 2);
+1851: bool LocalVodDatabase::markAsPlayed(int selectedId) {
+1852:
+1853: // ========== 已唱列表管理 ==========
+1854:
+1855: }
+1856:     return execSql(db_, "DELETE FROM vod_selected WHERE status = 0;");
+1857:     if (!db_) return false;
+1858: bool LocalVodDatabase::clearSelected() {
+1859:
+1860: }
+1861:     return ok;
+1862:     execSql(db_, ok ? "COMMIT;" : "ROLLBACK;");
+1863:     sqlite3_clear_bindings(stmt);
+1864:     sqlite3_reset(stmt);
+1865:     }
+1866:         }
+1867:             break;
+1868:             ok = false;
+1869:         if (sqlite3_step(stmt) != SQLITE_DONE) {
+1870:         sqlite3_bind_int(stmt, 2, ids[i]);
+1871:         sqlite3_bind_int(stmt, 1, static_cast<int>(i) + 1);
+1872:         sqlite3_clear_bindings(stmt);
+1873:         sqlite3_reset(stmt);
+1874:     for (size_t i = 0; i < ids.size(); ++i) {
+1875:     bool ok = true;
+1876:     }
+1877:         return false;
+1878:         execSql(db_, "ROLLBACK;");
+1879:     if (!stmt) {
+1880:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+1881:     const char* sql = "UPDATE vod_selected SET position = ?, isPriority = 0 WHERE id = ? AND status = 0;";
+1882:     if (!execSql(db_, "BEGIN IMMEDIATE TRANSACTION;")) return false;
+1883:     std::shuffle(ids.begin(), ids.end(), gen);
+1884:     std::mt19937 gen(rd());
+1885:     std::random_device rd;
+1886:     if (ids.size() <= 1) return true;
+1887:     }
+1888:         if (item.status == 0) ids.push_back(item.id);
+1889:     for (const auto& item : items) {
+1890:     ids.reserve(items.size());
+1891:     std::vector<int> ids;
+1892:     auto items = getSelectedList(0, 1000);
+1893:     if (!db_) return false;
+1894: bool LocalVodDatabase::shuffleSelected() {
+1895:
+1896: }
+1897:     return rc == SQLITE_DONE && changes > 0;
+1898:     sqlite3_clear_bindings(stmt);
+1899:     sqlite3_reset(stmt);
+1900:     const int changes = sqlite3_changes(db_);
+1901:     int rc = sqlite3_step(stmt);
+1902:     sqlite3_bind_int(stmt, 1, id);
+1903:     sqlite3_clear_bindings(stmt);
+1904:     sqlite3_reset(stmt);
+1905:     if (!stmt) return false;
+1906:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+1907:     const char* sql = "UPDATE vod_selected SET isPriority = 1 WHERE id = ? AND status = 0;";
+1908:     execSql(db_, clearSql);
+1909:     const char* clearSql = "UPDATE vod_selected SET isPriority = 0 WHERE status = 0;";
+1910:
+1911:     if (!db_ || id <= 0) return false;
+1912: bool LocalVodDatabase::moveToTopById(int id) {
+1913:
+1914: }
+1915:     return rc == SQLITE_DONE && changes > 0;
+1916:     sqlite3_clear_bindings(stmt);
+1917:     sqlite3_reset(stmt);
+1918:     const int changes = sqlite3_changes(db_);
+1919:     int rc = sqlite3_step(stmt);
+1920:     sqlite3_bind_int(stmt, 1, item.id);
+1921:     sqlite3_clear_bindings(stmt);
+1922:     sqlite3_reset(stmt);
+1923:     if (!stmt) return false;
+1924:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+1925:     const char* sql = "UPDATE vod_selected SET isPriority = 1 WHERE id = ? AND status = 0;";
+1926:     execSql(db_, clearSql);
+1927:     const char* clearSql = "UPDATE vod_selected SET isPriority = 0 WHERE status = 0;";
+1928:
+1929:     const auto& item = items[0];
+1930:
+1931:     if (items.empty()) return false;
+1932:     auto items = getSelectedList(index, 1);
+1933:     // 获取该位置的歌曲信息
+1934:
+1935:     if (!db_ || index < 0) return false;
+1936: bool LocalVodDatabase::moveToTop(int index) {
+1937:
+1938: }
+1939:     return rc == SQLITE_DONE && changes > 0;
+1940:     sqlite3_finalize(stmt);
+1941:     }
+1942:                  selectedId, status, rc, changes, sqlite3_errmsg(db_));
+1943:         LOG_WARN("[VOD] LocalVodDatabase: markAsFinished failed id=%d status=%d rc=%d changes=%d error=%s",
+1944:     if (rc != SQLITE_DONE || changes <= 0) {
+1945:     const int changes = sqlite3_changes(db_);
+1946:     }
+1947:         std::this_thread::sleep_for(std::chrono::milliseconds(80));
+1948:         sqlite3_reset(stmt);
+1949:                  selectedId, status, attempt + 1, sqlite3_errmsg(db_));
+1950:         LOG_WARN("[VOD] LocalVodDatabase: markAsFinished database locked id=%d status=%d attempt=%d error=%s",
+1951:         if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) break;
+1952:         rc = sqlite3_step(stmt);
+1953:     for (int attempt = 0; attempt < 6; ++attempt) {
+1954:     int rc = SQLITE_BUSY;
+1955:     sqlite3_bind_int(stmt, 3, selectedId);
+1956:     sqlite3_bind_int64(stmt, 2, nowEpochMs());
+1957:     sqlite3_bind_int(stmt, 1, status);
+1958:     }
+1959:         return false;
+1960:                  selectedId, status, sqlite3_errmsg(db_));
+1961:         LOG_WARN("[VOD] LocalVodDatabase: markAsFinished prepare failed id=%d status=%d error=%s",
+1962:     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+1963:     sqlite3_stmt* stmt = nullptr;
+1964:     const char* sql = "UPDATE vod_selected SET status = ?, playedTime = ? WHERE id = ?;";
+1965:     if (status != 2 && status != 3) status = 2;
+1966:     if (!db_ || selectedId <= 0) return false;
+1967: bool LocalVodDatabase::markAsFinished(int selectedId, int status) {
+1968:
+1969: }
+1970:     return rc == SQLITE_DONE;
+1971:     sqlite3_clear_bindings(stmt);
+1972:     sqlite3_reset(stmt);
+1973:     int rc = sqlite3_step(stmt);
+1974:     sqlite3_bind_int(stmt, 1, selectedId);
+1975:     sqlite3_clear_bindings(stmt);
+1976:     sqlite3_reset(stmt);
+1977:     if (!stmt) return false;
+1978:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+1979:     const char* sql = "UPDATE vod_selected SET status = 1, isPriority = 0 WHERE id = ?;";
+1980:
+1981:     }
+1982:         sqlite3_clear_bindings(clearStmt);
+1983:         sqlite3_reset(clearStmt);
+1984:         sqlite3_step(clearStmt);
+1985:         sqlite3_bind_int64(clearStmt, 1, nowEpochMs());
+1986:         sqlite3_clear_bindings(clearStmt);
+1987:         sqlite3_reset(clearStmt);
+1988:     if (clearStmt) {
+1989:     sqlite3_stmt* clearStmt = getOrPrepareStmt(clearSql);
+1990:     const char* clearSql = "UPDATE vod_selected SET status = 2, playedTime = ? WHERE status = 1;";
+1991:     if (!db_ || selectedId <= 0) return false;
+1992: bool LocalVodDatabase::markAsPlaying(int selectedId) {
+1993:
+1994: }
+1995:     return rc == SQLITE_DONE && changes > 0;
+1996:     sqlite3_clear_bindings(stmt);
+1997:     sqlite3_reset(stmt);
+1998:     const int changes = sqlite3_changes(db_);
+1999:     int rc = sqlite3_step(stmt);
+2000:
+2001:     sqlite3_bind_int(stmt, 1, id);
+2002:
+2003:     sqlite3_clear_bindings(stmt);
+2004:     sqlite3_reset(stmt);
+2005:     if (!stmt) return false;
+2006:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+2007:     const char* sql = "DELETE FROM vod_selected WHERE id = ? AND status = 0;";
+2008:
+2009:     if (!db_ || id <= 0) return false;
+2010: bool LocalVodDatabase::removeFromSelectedById(int id) {
+2011:
+2012: }
+2013:     return removeFromSelectedById(id);
+2014:
+2015:     if (id < 0) return false;
+2016:
+2017:     sqlite3_clear_bindings(selectStmt);
+2018:     sqlite3_reset(selectStmt);
+2019:     }
+2020:         id = sqlite3_column_int(selectStmt, 0);
+2021:     if (sqlite3_step(selectStmt) == SQLITE_ROW) {
+2022:     int id = -1;
+2023:
+2024:     sqlite3_bind_int(selectStmt, 1, index);
+2025:
+2026:     sqlite3_clear_bindings(selectStmt);
+2027:     sqlite3_reset(selectStmt);
+2028:     if (!selectStmt) return false;
+2029:     sqlite3_stmt* selectStmt = getOrPrepareStmt(selectSql);
+2030:
+2031:     )";
+2032:         LIMIT 1 OFFSET ?;
+2033:                  position ASC
+2034:         ORDER BY isPriority DESC,
+2035:         WHERE status = 0
+2036:         SELECT id FROM vod_selected
+2037:     const char* selectSql = R"(
+2038:     // 先获取该位置的ID
+2039:
+2040:     if (!db_ || index < 0) return false;
+2041: bool LocalVodDatabase::removeFromSelected(int index) {
+2042:
+2043: }
+2044:     return count;
+2045:
+2046:     sqlite3_clear_bindings(stmt);
+2047:     sqlite3_reset(stmt);
+2048:     }
+2049:         count = sqlite3_column_int(stmt, 0);
+2050:     if (sqlite3_step(stmt) == SQLITE_ROW) {
+2051:     int count = 0;
+2052:
+2053:     sqlite3_clear_bindings(stmt);
+2054:     sqlite3_reset(stmt);
+2055:     if (!stmt) return 0;
+2056:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+2057:     const char* sql = "SELECT COUNT(*) FROM vod_selected WHERE status IN (0, 1);";
+2058:
+2059:     if (!db_) return 0;
+2060: int LocalVodDatabase::getSelectedCount() {
+2061:
+2062: }
+2063:     return found;
+2064:     sqlite3_clear_bindings(stmt);
+2065:     sqlite3_reset(stmt);
+2066:     }
+2067:         found = true;
+2068:         out.trackMode = sqlite3_column_int(stmt, 11);
+2069:         out.isPriority = sqlite3_column_int(stmt, 10);
+2070:         out.position = sqlite3_column_int(stmt, 9);
+2071:         out.status = sqlite3_column_int(stmt, 8);
+2072:         out.playedTime = sqlite3_column_int64(stmt, 7);
+2073:         out.addedTime = sqlite3_column_int64(stmt, 6);
+2074:         out.duration = sqlite3_column_double(stmt, 5);
+2075:         if (songPath) out.songPath = songPath;
+2076:         const char* songPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+2077:         if (singerName) out.singerName = singerName;
+2078:         const char* singerName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+2079:         if (songName) out.songName = songName;
+2080:         const char* songName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+2081:         if (songNo) out.songNo = songNo;
+2082:         const char* songNo = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+2083:         out.id = sqlite3_column_int(stmt, 0);
+2084:     if (sqlite3_step(stmt) == SQLITE_ROW) {
+2085:     bool found = false;
+2086:     sqlite3_bind_int(stmt, 1, id);
+2087:     sqlite3_clear_bindings(stmt);
+2088:     sqlite3_reset(stmt);
+2089:     if (!stmt) return false;
+2090:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+2091:     )";
+2092:         LIMIT 1;
+2093:         WHERE id = ?
+2094:         FROM vod_selected
+2095:                playedTime, status, position, isPriority, trackMode
+2096:         SELECT id, songNo, songName, singerName, songPath, duration, addedTime,
+2097:     const char* sql = R"(
+2098:     if (!db_ || id <= 0) return false;
+2099: bool LocalVodDatabase::getSelectedById(int id, QueueItem& out) {
+2100:
+2101: }
+2102:     return result;
+2103:
+2104:     sqlite3_clear_bindings(stmt);
+2105:     sqlite3_reset(stmt);
+2106:     }
+2107:         result.push_back(std::move(item));
+2108:
+2109:         item.trackMode = sqlite3_column_int(stmt, 11);
+2110:         item.isPriority = sqlite3_column_int(stmt, 10);
+2111:         item.position = sqlite3_column_int(stmt, 9);
+2112:         item.status = sqlite3_column_int(stmt, 8);
+2113:         item.playedTime = sqlite3_column_int64(stmt, 7);
+2114:         item.addedTime = sqlite3_column_int64(stmt, 6);
+2115:         item.duration = sqlite3_column_double(stmt, 5);
+2116:
+2117:         if (songPath) item.songPath = songPath;
+2118:         const char* songPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+2119:
+2120:         if (singerName) item.singerName = singerName;
+2121:         const char* singerName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+2122:
+2123:         if (songName) item.songName = songName;
+2124:         const char* songName = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+2125:
+2126:         if (songNo) item.songNo = songNo;
+2127:         const char* songNo = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+2128:
+2129:         item.id = sqlite3_column_int(stmt, 0);
+2130:         QueueItem item;
+2131:     while (sqlite3_step(stmt) == SQLITE_ROW) {
+2132:
+2133:     sqlite3_bind_int(stmt, 2, offset);
+2134:     sqlite3_bind_int(stmt, 1, limit);
+2135:
+2136:     sqlite3_clear_bindings(stmt);
+2137:     sqlite3_reset(stmt);
+2138:     if (!stmt) return result;
+2139:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+2140:
+2141:     )";
+2142:         LIMIT ? OFFSET ?;
+2143:                  position ASC
+2144:                  isPriority DESC,
+2145:         ORDER BY CASE WHEN status = 1 THEN 0 ELSE 1 END,
+2146:         WHERE status IN (0, 1)
+2147:         FROM vod_selected
+2148:                playedTime, status, position, isPriority, trackMode
+2149:         SELECT id, songNo, songName, singerName, songPath, duration, addedTime,
+2150:     const char* sql = R"(
+2151:
+2152:     if (!db_) return result;
+2153:     std::vector<QueueItem> result;
+2154: std::vector<LocalVodDatabase::QueueItem> LocalVodDatabase::getSelectedList(int offset, int limit) {
+2155:
+2156: }
+2157:     return rc == SQLITE_DONE;
+2158:     sqlite3_clear_bindings(stmt);
+2159:     sqlite3_reset(stmt);
+2160:     int rc = sqlite3_step(stmt);
+2161:
+2162:     sqlite3_bind_int(stmt, 9, trackMode);
+2163:     sqlite3_bind_int(stmt, 8, isPriority ? 1 : 0);
+2164:     sqlite3_bind_int(stmt, 7, nextPosition);
+2165:     sqlite3_bind_int64(stmt, 6, nowEpochMs());
+2166:     sqlite3_bind_double(stmt, 5, duration);
+2167:     sqlite3_bind_text(stmt, 4, songPath.c_str(), -1, SQLITE_TRANSIENT);
+2168:     sqlite3_bind_text(stmt, 3, singerName.c_str(), -1, SQLITE_TRANSIENT);
+2169:     sqlite3_bind_text(stmt, 2, songName.c_str(), -1, SQLITE_TRANSIENT);
+2170:     sqlite3_bind_text(stmt, 1, songNo.c_str(), -1, SQLITE_TRANSIENT);
+2171:
+2172:     sqlite3_clear_bindings(stmt);
+2173:     sqlite3_reset(stmt);
+2174:     if (!stmt) return false;
+2175:     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+2176:
+2177:     )";
+2178:         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?);
+2179:         (songNo, songName, singerName, songPath, duration, addedTime, status, position, isPriority, trackMode)
+2180:         INSERT INTO vod_selected
+2181:     const char* sql = R"(
+2182:
+2183:     }
+2184:         sqlite3_clear_bindings(maxStmt);
+2185:         sqlite3_reset(maxStmt);
+2186:     if (maxStmt) {
+2187:     }
+2188:         nextPosition = sqlite3_column_int(maxStmt, 0) + 1;
+2189:     if (maxStmt && sqlite3_step(maxStmt) == SQLITE_ROW) {
+2190:     int nextPosition = 1;
+2191:     sqlite3_stmt* maxStmt = getOrPrepareStmt(maxPosSql);
+2192:     const char* maxPosSql = "SELECT COALESCE(MAX(position), 0) FROM vod_selected WHERE status IN (0, 1);";
+2193:
+2194:     if (!db_ || songNo.empty() || songPath.empty()) return false;
+2195:                                      int trackMode) {
+2196:                                      bool isPriority,
+2197:                                      double duration,
+2198:                                      const std::string& songPath,
+2199:                                      const std::string& singerName,
+2200:                                      const std::string& songName,
+2201: bool LocalVodDatabase::addToSelected(const std::string& songNo,
+2202:
+2203: // ========== 已点队列管理 ==========
+2204:
+2205: }
+2206:     preparedStmtCache_.clear();
+2207:     }
+2208:         }
+2209:             sqlite3_finalize(pair.second);
+2210:         if (pair.second) {
+2211:     for (auto& pair : preparedStmtCache_) {
+2212: void LocalVodDatabase::clearPreparedStmtCache() {
+2213:
+2214: }
+2215:     return nullptr;
+2216:     LOG_ERROR("[VOD] LocalVodDatabase: Failed to prepare statement: %s", sqlite3_errmsg(db_));
+2217:
+2218:     }
+2219:         return stmt;
+2220:         preparedStmtCache_[sql] = stmt;
+2221:     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+2222:     sqlite3_stmt* stmt = nullptr;
+2223:
+2224:     }
+2225:         return it->second;
+2226:         sqlite3_clear_bindings(it->second);
+2227:         sqlite3_reset(it->second);
+2228:     if (it != preparedStmtCache_.end()) {
+2229:     auto it = preparedStmtCache_.find(sql);
+2230: sqlite3_stmt* LocalVodDatabase::getOrPrepareStmt(const std::string& sql) {
+2231:
+2232: }
+2233:     return true;
+2234:
+2235:     execSql(db_, "CREATE INDEX IF NOT EXISTS idx_vod_selected_played ON vod_selected(status, playedTime);");
+2236:     execSql(db_, "CREATE INDEX IF NOT EXISTS idx_vod_selected_queue ON vod_selected(status, isPriority, position);");
+2237:     }
+2238:         execSql(db_, "ALTER TABLE vod_selected_v2 RENAME TO vod_selected;");
+2239:         execSql(db_, "DROP TABLE vod_selected;");
+2240:         )");
+2241:             FROM vod_selected;
+2242:                    COALESCE(playedTime, 0), COALESCE(status, 0), COALESCE(position, id), COALESCE(isPriority, 0), COALESCE(trackMode, 0)
+2243:             SELECT id, songNo, songName, singerName, songPath, duration, addedTime,
+2244:             (id, songNo, songName, singerName, songPath, duration, addedTime, playedTime, status, position, isPriority, trackMode)
+2245:             INSERT INTO vod_selected_v2
+2246:         execSql(db_, R"(
+2247:         )");
+2248:             );
+2249:                 trackMode INTEGER DEFAULT 0
+2250:                 isPriority INTEGER DEFAULT 0,
+2251:                 position INTEGER DEFAULT 0,
+2252:                 status INTEGER DEFAULT 0,
+2253:                 playedTime INTEGER DEFAULT 0,
+2254:                 addedTime INTEGER DEFAULT 0,
+2255:                 duration REAL DEFAULT 0.0,
+2256:                 songPath TEXT NOT NULL,
+2257:                 singerName TEXT,
+2258:                 songName TEXT,
+2259:                 songNo TEXT NOT NULL,
+2260:                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+2261:             CREATE TABLE vod_selected_v2 (
+2262:         execSql(db_, R"(
+2263:         execSql(db_, "DROP TABLE IF EXISTS vod_selected_v2;");
+2264:     if (needsSelectedRebuild) {
+2265:     if (indexStmt) sqlite3_finalize(indexStmt);
+2266:     }
+2267:         }
+2268:             }
+2269:                 break;
+2270:                 needsSelectedRebuild = true;
+2271:             if (sqlite3_column_int(indexStmt, 2) != 0) {
+2272:         while (sqlite3_step(indexStmt) == SQLITE_ROW) {
+2273:     if (sqlite3_prepare_v2(db_, indexSql, -1, &indexStmt, nullptr) == SQLITE_OK) {
+2274:     sqlite3_stmt* indexStmt = nullptr;
+2275:     const char* indexSql = "PRAGMA index_list(vod_selected);";
+2276:     bool needsSelectedRebuild = false;
+2277:     }
+2278:         execSql(db_, "ALTER TABLE vod_selected ADD COLUMN trackMode INTEGER DEFAULT 0;");
+2279:     if (!columnExists(db_, "vod_selected", "trackMode")) {
+2280:     }
+2281:         execSql(db_, "ALTER TABLE vod_selected ADD COLUMN isPriority INTEGER DEFAULT 0;");
+2282:     if (!columnExists(db_, "vod_selected", "isPriority")) {
+2283:     }
+2284:         execSql(db_, "ALTER TABLE vod_selected ADD COLUMN position INTEGER DEFAULT 0;");
+2285:     if (!columnExists(db_, "vod_selected", "position")) {
+2286:     }
+2287:         execSql(db_, "ALTER TABLE vod_selected ADD COLUMN status INTEGER DEFAULT 0;");
+2288:     if (!columnExists(db_, "vod_selected", "status")) {
+2289:     }
+2290:         execSql(db_, "ALTER TABLE vod_selected ADD COLUMN playedTime INTEGER DEFAULT 0;");
+2291:     if (!columnExists(db_, "vod_selected", "playedTime")) {
+2292:     if (!execSql(db_, createIndexSql)) return false;
+2293:     if (!execSql(db_, createConfigSql)) return false;
+2294:     if (!execSql(db_, createPlayedSql)) return false;
+2295:     if (!execSql(db_, createSelectedSql)) return false;
+2296:
+2297:     )";
+2298:         CREATE INDEX IF NOT EXISTS idx_vod_played_played ON vod_played(playedTime DESC);
+2299:         CREATE INDEX IF NOT EXISTS idx_vod_selected_added ON vod_selected(addedTime DESC);
+2300:     const char* createIndexSql = R"(
+2301:     // 创建索引
+2302:
+2303:     )";
+2304:         );
+2305:             value TEXT
+2306:             key TEXT PRIMARY KEY,
+2307:         CREATE TABLE IF NOT EXISTS vod_config (
+2308:     const char* createConfigSql = R"(
+2309:     // 配置表
+2310:
+2311:     )";
+2312:         );
+2313:             playedTime INTEGER DEFAULT 0
+2314:             addedTime INTEGER DEFAULT 0,
+2315:             duration REAL DEFAULT 0.0,
+2316:             songPath TEXT,
+2317:             singerName TEXT,
+2318:             songName TEXT,
+2319:             songNo TEXT NOT NULL,
+2320:             id INTEGER PRIMARY KEY AUTOINCREMENT,
+2321:         CREATE TABLE IF NOT EXISTS vod_played (
+2322:     const char* createPlayedSql = R"(
+2323:     // 已唱列表表
+2324:
+2325:     )";
+2326:         );
+2327:             trackMode INTEGER DEFAULT 0
+2328:             isPriority INTEGER DEFAULT 0,
+2329:             position INTEGER DEFAULT 0,
+2330:             status INTEGER DEFAULT 0,
+2331:             playedTime INTEGER DEFAULT 0,
+2332:             addedTime INTEGER DEFAULT 0,
+2333:             duration REAL DEFAULT 0.0,
+2334:             songPath TEXT NOT NULL,
+2335:             singerName TEXT,
+2336:             songName TEXT,
+2337:             songNo TEXT NOT NULL,
+2338:             id INTEGER PRIMARY KEY AUTOINCREMENT,
+2339:         CREATE TABLE IF NOT EXISTS vod_selected (
+2340:     const char* createSelectedSql = R"(
+2341:     // 已点队列表
+2342:
+2343:     if (!db_) return false;
+2344: bool LocalVodDatabase::createTables() {
+2345:
+2346: }
+2347:     }
+2348:         db_ = nullptr;
+2349:         sqlite3_close(db_);
+2350:     if (db_) {
+2351:
+2352:     clearPreparedStmtCache();
+2353: void LocalVodDatabase::shutdown() {
+2354:
+2355: }
+2356:     return true;
+2357:     LOG_INFO("[VOD] LocalVodDatabase initialized: %s", dbPath.c_str());
+2358:
+2359:     }
+2360:         return false;
+2361:         shutdown();
+2362:         LOG_ERROR("[VOD] LocalVodDatabase: Failed to create tables");
+2363:     if (!createTables()) {
+2364:
+2365:     sqlite3_exec(db_, "PRAGMA temp_store=MEMORY;", nullptr, nullptr, nullptr);
+2366:     sqlite3_exec(db_, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
+2367:     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+2368:     sqlite3_busy_timeout(db_, 3000);
+2369:     // 性能优化设置
+2370:
+2371:     }
+2372:         return false;
+2373:         }
+2374:             db_ = nullptr;
+2375:             sqlite3_close(db_);
+2376:         if (db_) {
+2377:                  dbPath.c_str(), sqlite3_errmsg(db_));
+2378:         LOG_ERROR("[VOD] LocalVodDatabase: Failed to open %s: %s",
+2379:     if (rc != SQLITE_OK) {
+2380:     int rc = sqlite3_open(dbPath.c_str(), &db_);
+2381:
+2382:     }
+2383:         return true;
+2384:         LOG_WARN("[VOD] LocalVodDatabase already initialized");
+2385:     if (db_) {
+2386: bool LocalVodDatabase::initialize(const std::string& dbPath) {
+2387:
+2388: }
+2389:     shutdown();
+2390: LocalVodDatabase::~LocalVodDatabase() {
+2391:
+2392: } // namespace
+2393: }
+2394:     return exists;
+2395:     if (stmt) sqlite3_finalize(stmt);
+2396:     }
+2397:         }
+2398:             }
+2399:                 break;
+2400:                 exists = true;
+2401:             if (name && std::strcmp(name, column) == 0) {
+2402:             const char* name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+2403:         while (sqlite3_step(stmt) == SQLITE_ROW) {
+2404:     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+2405:     bool exists = false;
+2406:     sqlite3_stmt* stmt = nullptr;
+2407:     std::string sql = std::string("PRAGMA table_info(") + table + ");";
+2408:     if (!db || !table || !column) return false;
+2409: static bool columnExists(sqlite3* db, const char* table, const char* column) {
+2410:
+2411: }
+2412:     );
+2413:         ).count()
+2414:             std::chrono::system_clock::now().time_since_epoch()
+2415:         std::chrono::duration_cast<std::chrono::milliseconds>(
+2416:     return static_cast<int64_t>(
+2417: static int64_t nowEpochMs() {
+2418: // 获取当前时间戳（毫秒）
+2419:
+2420: }
+2421:     return true;
+2422:     }
+2423:         return false;
+2424:         if (errMsg) sqlite3_free(errMsg);
+2425:                  errMsg ? errMsg : "?", sql);
+2426:         LOG_ERROR("[VOD] LocalVodDatabase: SQL exec failed: %s, sql=%s",
+2427:     if (rc != SQLITE_OK) {
+2428:     int rc = sqlite3_exec(db, sql, nullptr, nullptr, &errMsg);
+2429:     char* errMsg = nullptr;
+2430:     if (!db || !sql) return false;
+2431: static bool execSql(sqlite3* db, const char* sql) {
+2432: // 辅助函数：执行SQL
+2433: namespace {
+2434:
+2435: namespace hsvj {
+2436:
+2437: #include <thread>
+2438: #include <random>
+2439: #include <cstring>
+2440: #include <chrono>
+2441: #include <algorithm>
+2442: #include "utils/Logger.h"
+2443: #include "vod/LocalVodDatabase.h"
+2444:
+2445:  */
+2446:  * @brief 本地VOD队列数据库实现
+2447:  * @file LocalVodDatabase.cpp
+2448: /**
+2449:
+2450: } // namespace hsvj
+2451:
+2452: }
+2453:     return localDb_->setTargetLayer(layerId);
+2454:     if (!localDb_) return false;
+2455:
+2456:     std::lock_guard<std::mutex> lock(mutex_);
+2457: bool LocalVodManager::setTargetLayerId(int layerId) {
+2458:
+2459: }
+2460:     return localDb_->getTargetLayer();
+2461:     if (!localDb_) return 1;
+2462: int LocalVodManager::getTargetLayerId() const {
+2463:
+2464: }
+2465:     return localDb_->clearPlayed();
+2466:     if (!localDb_) return false;
+2467:
+2468:     std::lock_guard<std::mutex> lock(mutex_);
+2469: bool LocalVodManager::clearPlayed() {
+2470:
+2471: }
+2472:     return localDb_->clearSelected();
+2473:     if (!localDb_) return false;
+2474:
+2475:     std::lock_guard<std::mutex> lock(mutex_);
+2476: bool LocalVodManager::clearQueue() {
+2477:
+2478: }
+2479:     return localDb_->shuffleSelected();
+2480:     if (!localDb_) return false;
+2481:
+2482:     std::lock_guard<std::mutex> lock(mutex_);
+2483: bool LocalVodManager::shuffleQueue() {
+2484:
+2485: }
+2486:     return localDb_->moveToTop(index);
+2487:     if (!localDb_) return false;
+2488:
+2489:     std::lock_guard<std::mutex> lock(mutex_);
+2490: bool LocalVodManager::prioritizeSong(int index) {
+2491:
+2492: }
+2493:     return localDb_->markAsPlaying(selectedId);
+2494:     if (!localDb_) return false;
+2495:
+2496:     std::lock_guard<std::mutex> lock(mutex_);
+2497: bool LocalVodManager::markSongPlaying(int selectedId) {
+2498:
+2499: }
+2500:     return localDb_->markAsFinished(selectedId, status);
+2501:     if (!localDb_) return false;
+2502:
+2503:     std::lock_guard<std::mutex> lock(mutex_);
+2504: bool LocalVodManager::markSongFinished(int selectedId, int status) {
+2505:
+2506: }
+2507:     return localDb_->markAsPlayed(selectedId);
+2508:     if (!localDb_) return false;
+2509:
+2510:     std::lock_guard<std::mutex> lock(mutex_);
+2511: bool LocalVodManager::markSongPlayed(int selectedId) {
+2512:
+2513: }
+2514:     return localDb_->removeFromSelected(index);
+2515:     if (!localDb_) return false;
+2516:
+2517:     std::lock_guard<std::mutex> lock(mutex_);
+2518: bool LocalVodManager::removeSong(int index) {
+2519:
+2520: }
+2521:     return localDb_->getPlayedList(offset, limit);
+2522:     if (!localDb_) return {};
+2523:
+2524:     std::lock_guard<std::mutex> lock(mutex_);
+2525: std::vector<LocalVodDatabase::QueueItem> LocalVodManager::getPlayedList(int offset, int limit) {
+2526:
+2527: }
+2528:     return localDb_->getSelectedById(id, out);
+2529:     if (!localDb_) return false;
+2530:     std::lock_guard<std::mutex> lock(mutex_);
+2531: bool LocalVodManager::getQueueItemById(int id, LocalVodDatabase::QueueItem& out) {
+2532:
+2533: }
+2534:     return localDb_->getSelectedList(offset, limit);
+2535:     if (!localDb_) return {};
+2536:
+2537:     std::lock_guard<std::mutex> lock(mutex_);
+2538: std::vector<LocalVodDatabase::QueueItem> LocalVodManager::getSelectedQueue(int offset, int limit) {
+2539:
+2540: }
+2541:     return false;
+2542:
+2543:              songNo.c_str(), songInfo.track, trackMode);
+2544:     LOG_WARN("[VOD] LocalVodManager: addToSelected failed songNo=%s track=%d trackMode=%d",
+2545:     }
+2546:         return true;
+2547:                 songInfo.songName.c_str(), songInfo.singerNames.c_str(), songInfo.track, trackMode);
+2548:         LOG_INFO("[VOD] LocalVodManager: Song selected: %s - %s track=%d trackMode=%d",
+2549:     if (localDb_->addToSelected(songNo, songInfo.songName, songInfo.singerNames, songPath, duration, isPriority, trackMode)) {
+2550:     // 添加到已点队列
+2551:
+2552:     }
+2553:         trackMode = 2;
+2554:     } else if (songInfo.track == 4 || songInfo.track == 5) {
+2555:         trackMode = 1;
+2556:     if (songInfo.track == 2 || songInfo.track == 3) {
+2557:     int trackMode = 0;
+2558:     double duration = songInfo.durationMs > 0 ? static_cast<double>(songInfo.durationMs) / 1000.0 : 0.0;
+2559:     }
+2560:         return false;
+2561:         LOG_WARN("[VOD] LocalVodManager: Song file not found: %s path=%s", songNo.c_str(), songPath.c_str());
+2562:     if (!FileUtils::isFile(songPath)) {
+2563:     songPath = FileUtils::normalizePath(songPath);
+2564:     }
+2565:         return false;
+2566:         LOG_WARN("[VOD] LocalVodManager: Song has no resolved file path: %s", songNo.c_str());
+2567:     if (songPath.empty()) {
+2568:     std::string songPath = songInfo.absolutePath;
+2569:
+2570:     }
+2571:         return false;
+2572:         LOG_WARN("[VOD] LocalVodManager: Song not found: %s", songNo.c_str());
+2573:     if (!songDb_->getSongByNo(songNo, songInfo)) {
+2574:     LocalSongDatabase::SongInfo songInfo;
+2575:
+2576:     if (!localDb_ || !songDb_) return false;
+2577:
+2578:     std::lock_guard<std::mutex> lock(mutex_);
+2579: bool LocalVodManager::selectSong(const std::string& songNo, bool isPriority) {
+2580:
+2581: }
+2582:     return true;
+2583:     LOG_INFO("[VOD] LocalVodManager initialized");
+2584:
+2585:     mubu_ = mubu;
+2586:     songDb_ = songDb;
+2587:     localDb_ = localDb;
+2588:
+2589:     }
+2590:         return false;
+2591:         LOG_ERROR("[VOD] LocalVodManager: Invalid parameters");
+2592:     if (!localDb || !songDb || !mubu) {
+2593:                                  Mubu* mubu) {
+2594:                                  LocalSongDatabase* songDb,
+2595: bool LocalVodManager::initialize(LocalVodDatabase* localDb,
+2596:
+2597: LocalVodManager::~LocalVodManager() = default;
+2598:
+2599: LocalVodManager::LocalVodManager() = default;
+2600:
+2601: namespace hsvj {
+2602:
+2603: #include "utils/Logger.h"
+2604: #include "utils/FileUtils.h"
+2605: #include "core/Mubu.h"
+2606: #include "vod/LocalVodManager.h"
+2607:
+2608:  */
+2609:  * @brief 本地VOD管理器实现
+2610:  * @file LocalVodManager.cpp
+2611: /**
+2612: } // namespace hsvj
+2613:
+2614: }
+2615:     return true;
+2616:
+2617:     videoLayer->setVolume(1.0f);
+2618:     musicVolume_.store(1.0f);
+2619:     videoLayer->setVisible(true);
+2620:
+2621:     }
+2622:         return false;
+2623:                   normalizedPath.c_str(), toString(playResult.code));
+2624:         LOG_ERROR("[VOD] LocalVodPlayer: Failed to play %s result=%s",
+2625:     if (!playResult.isSuccess()) {
+2626:         mubu_, layerId, normalizedPath, 1, PlaybackSource::LocalVod);
+2627:     PlaybackResult playResult = PlaybackRequestDispatcher::requestPlay(
+2628:
+2629:     }
+2630:         return false;
+2631:                   normalizedPath.c_str());
+2632:         LOG_ERROR("[VOD] LocalVodPlayer: Song file not found %s",
+2633:     if (normalizedPath.empty() || !FileUtils::isFile(normalizedPath)) {
+2634:     std::string normalizedPath = FileUtils::normalizePath(item.songPath);
+2635:     // 规范化路径
+2636:
+2637:     LayerVideo* videoLayer = static_cast<LayerVideo*>(layer);
+2638:
+2639:     }
+2640:         return false;
+2641:         LOG_ERROR("[VOD] LocalVodPlayer: Invalid layer %d", layerId);
+2642:     if (!layer || layer->getType() != LayerType::VIDEO) {
+2643:
+2644:     Layer* layer = mubu_->getLayer(layerId);
+2645:     int layerId = manager_->getTargetLayerId();
+2646:
+2647:     if (!mubu_) return false;
+2648: bool LocalVodPlayer::tryPlay(const LocalVodDatabase::QueueItem& item) {
+2649:
+2650: }
+2651:     return true;
+2652:              idleVideoIndex_, videos.size(), idleVolume, path.c_str());
+2653:     LOG_INFO("[VOD] LocalVodPlayer: Playing freesong [%zu/%zu] volume=%.2f: %s",
+2654:     currentPlayingId_ = 0;
+2655:     videoLayer->setVolume(idleVolume);
+2656:     }
+2657:         }
+2658:             idleVolume = cfg->volume;
+2659:         if (const LayerConfigData* cfg = systemConfig_->getLayerConfig(layerId)) {
+2660:     if (systemConfig_) {
+2661:     float idleVolume = videoLayer->getVolume();
+2662:     videoLayer->setVisible(true);
+2663:
+2664:     nextIdlePlayAllowedMs_ = nowMs + 1000;
+2665:     }
+2666:         return false;
+2667:                  path.c_str(), toString(playResult.code));
+2668:         LOG_WARN("[VOD] LocalVodPlayer: Failed to play freesong %s result=%s",
+2669:         nextIdlePlayAllowedMs_ = nowMs + std::max<int64_t>(playResult.retryAfterMs, 1000);
+2670:     if (!playResult.isSuccess()) {
+2671:     }
+2672:         return true;
+2673:                  playResult.retryAfterMs, path.c_str());
+2674:         LOG_INFO("[VOD] LocalVodPlayer: freesong request accepted pending, wait %dms: %s",
+2675:         nextIdlePlayAllowedMs_ = nowMs + std::max<int64_t>(playResult.retryAfterMs, 500);
+2676:     if (playResult.code == PlaybackResultCode::Accepted) {
+2677:         mubu_, layerId, path, 3, PlaybackSource::Freesong);
+2678:     PlaybackResult playResult = PlaybackRequestDispatcher::requestPlay(
+2679:     }
+2680:         return true;
+2681:                  path.c_str());
+2682:         LOG_INFO("[VOD] LocalVodPlayer: freesong already playing, skip duplicate play: %s",
+2683:         FileUtils::normalizePath(currentPath) == FileUtils::normalizePath(path)) {
+2684:          videoLayer->getState() == LayerVideo::PlayState::PAUSED) &&
+2685:     if ((videoLayer->getState() == LayerVideo::PlayState::PLAYING ||
+2686:     const std::string currentPath = videoLayer->getCurrentPath();
+2687:     const std::string path = videos[idleVideoIndex_++];
+2688:     if (idleVideoIndex_ >= videos.size()) idleVideoIndex_ = 0;
+2689:
+2690:     LayerVideo* videoLayer = static_cast<LayerVideo*>(layer);
+2691:     }
+2692:         return false;
+2693:         LOG_ERROR("[VOD] LocalVodPlayer: Invalid idle layer %d", layerId);
+2694:     if (!layer || layer->getType() != LayerType::VIDEO) {
+2695:     Layer* layer = mubu_->getLayer(layerId);
+2696:     int layerId = manager_->getTargetLayerId();
+2697:
+2698:     }
+2699:         return false;
+2700:         LOG_WARN("[VOD] LocalVodPlayer: idle video directory is empty");
+2701:     if (videos.empty()) {
+2702:     auto videos = listIdleVideos();
+2703:     }
+2704:         return false;
+2705:                  queue[0].id, queue[0].songName.c_str(), queue[0].status);
+2706:         LOG_WARN("[VOD] LocalVodPlayer: refuse to play freesong while selected queue is not empty id=%d song=%s status=%d",
+2707:     if (!queue.empty()) {
+2708:     auto queue = manager_->getSelectedQueue(0, 1);
+2709:     }
+2710:         return true;
+2711:                  pendingReleaseTasks);
+2712:         LOG_INFO("[VOD] LocalVodPlayer: delay freesong while decoder release pending=%zu",
+2713:         nextIdlePlayAllowedMs_ = nowMs + 1500;
+2714:     if (pendingReleaseTasks > 0) {
+2715:     const size_t pendingReleaseTasks = LayerVideo::getPendingDecoderReleaseTaskCount();
+2716:     }
+2717:         return true;
+2718:     if (nowMs < idlePlaybackSuppressedUntilMs_.load()) {
+2719:     }
+2720:         return true;
+2721:     if (nowMs < nextIdlePlayAllowedMs_) {
+2722:         std::chrono::steady_clock::now().time_since_epoch()).count();
+2723:     const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+2724:     if (!manager_ || !mubu_) return false;
+2725: bool LocalVodPlayer::playIdleVideo() {
+2726:
+2727: }
+2728:     return videos;
+2729:     LOG_INFO("[VOD] LocalVodPlayer: idle video scan dirs=%zu files=%zu", dirs.size(), videos.size());
+2730:     videos.erase(std::unique(videos.begin(), videos.end()), videos.end());
+2731:     std::sort(videos.begin(), videos.end());
+2732:     }
+2733:         }
+2734:             }
+2735:                 if (FileUtils::isFile(normalized)) videos.push_back(normalized);
+2736:                 std::string normalized = FileUtils::normalizePath(file);
+2737:                 hasVideoSuffix(".mkv") || hasVideoSuffix(".avi")) {
+2738:             if (hasVideoSuffix(".mp4") || hasVideoSuffix(".mov") ||
+2739:             };
+2740:                        lower.compare(lower.size() - suffixLen, suffixLen, suffix) == 0;
+2741:                 return lower.size() >= suffixLen &&
+2742:                 const size_t suffixLen = std::strlen(suffix);
+2743:             auto hasVideoSuffix = [&lower](const char* suffix) {
+2744:                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+2745:             std::transform(lower.begin(), lower.end(), lower.begin(),
+2746:             std::string lower = file;
+2747:         for (const auto& file : files) {
+2748:         auto files = FileUtils::listFiles(dir);
+2749:     for (const auto& dir : dirs) {
+2750:
+2751:     }
+2752:         dirs.push_back(FileUtils::normalizePath(storageDir + "/video"));
+2753:         dirs.push_back(FileUtils::normalizePath(storageDir + "/YN-song/video"));
+2754:     for (const auto& storageDir : storageDirs) {
+2755:     auto storageDirs = FileUtils::listDirectories("/storage");
+2756:
+2757:     };
+2758:         FileUtils::normalizePath(ROOT_PATH + "video")
+2759:     std::vector<std::string> dirs = {
+2760:     std::vector<std::string> videos;
+2761: std::vector<std::string> LocalVodPlayer::listIdleVideos() const {
+2762:
+2763: }
+2764:     LOG_INFO("[VOD] LocalVodPlayer: stopped and hidden target layer %d", layerId);
+2765:     videoLayer->setVisible(false);
+2766:     videoLayer->stop();
+2767:     LayerVideo* videoLayer = static_cast<LayerVideo*>(layer);
+2768:     }
+2769:         return;
+2770:         LOG_WARN("[VOD] LocalVodPlayer: stop target layer skipped invalid layer=%d", layerId);
+2771:     if (!layer || layer->getType() != LayerType::VIDEO) {
+2772:     Layer* layer = mubu_->getLayer(layerId);
+2773:     int layerId = manager_->getTargetLayerId();
+2774:     if (!manager_ || !mubu_) return;
+2775: void LocalVodPlayer::stopAndHideTargetLayerLocked() {
+2776:
+2777: }
+2778:     return ok;
+2779:              playedId, status, ok ? 1 : 0);
+2780:     LOG_INFO("[VOD] LocalVodPlayer: Mark current song finished id=%d status=%d result=%d",
+2781:     }
+2782:         currentPlayingId_ = 0;
+2783:     if (ok) {
+2784:     bool ok = manager_->markSongFinished(playedId, status);
+2785:     const int playedId = currentPlayingId_;
+2786:     if (!manager_ || currentPlayingId_ <= 0) return false;
+2787: bool LocalVodPlayer::finishCurrentSongLocked(int status) {
+2788:
+2789: }
+2790:     return false;
+2791:
+2792:     }
+2793:         }
+2794:             --effectiveSkippedQueueIndex;
+2795:         if (effectiveSkippedQueueIndex > itemQueueIndex) {
+2796:         manager_->removeSong(itemQueueIndex);
+2797:                  item.id, item.songNo.c_str(), item.songPath.c_str());
+2798:         LOG_WARN("[VOD] LocalVodPlayer: Skip invalid queue item after skip id=%d songNo=%s path=%s",
+2799:
+2800:         }
+2801:             return true;
+2802:                      item.songName.c_str(), item.singerName.c_str());
+2803:             LOG_INFO("[VOD] LocalVodPlayer: Playing after skip %s - %s",
+2804:             currentPlayingId_ = item.id;
+2805:             }
+2806:                 return false;
+2807:                 LOG_WARN("[VOD] LocalVodPlayer: skipCurrent failed to mark new song playing id=%d", item.id);
+2808:             if (!manager_->markSongPlaying(item.id)) {
+2809:             }
+2810:                 }
+2811:                     return false;
+2812:                              effectiveSkippedId);
+2813:                     LOG_WARN("[VOD] LocalVodPlayer: skipCurrent played next but failed to mark skipped id=%d finished",
+2814:                 if (!manager_->markSongFinished(effectiveSkippedId, 3)) {
+2815:             if (effectiveSkippedId > 0 && effectiveSkippedId != item.id) {
+2816:         if (tryPlay(item)) {
+2817:         }
+2818:             }
+2819:                 }
+2820:                     break;
+2821:                     effectiveSkippedQueueIndex = static_cast<int>(i);
+2822:                 if (queue[i].id == effectiveSkippedId) {
+2823:             for (size_t i = 1; i < queue.size(); ++i) {
+2824:         } else {
+2825:             itemQueueIndex = 1;
+2826:             item = queue[1];
+2827:             }
+2828:                 return true;
+2829:                 }
+2830:                     LOG_WARN("[VOD] LocalVodPlayer: skipCurrent no idle video after stopping current id=%d", effectiveSkippedId);
+2831:                 if (!playIdleVideo()) {
+2832:                 stopAndHideTargetLayerLocked();
+2833:                 currentPlayingId_ = 0;
+2834:                 }
+2835:                     return false;
+2836:                              effectiveSkippedId);
+2837:                     LOG_WARN("[VOD] LocalVodPlayer: skipCurrent failed to mark skipped id=%d finished",
+2838:                 if (!manager_->markSongFinished(effectiveSkippedId, 3)) {
+2839:                 LOG_INFO("[VOD] LocalVodPlayer: skipCurrent no next item after current id=%d", effectiveSkippedId);
+2840:             if (queue.size() < 2) {
+2841:         if (queue[0].id == effectiveSkippedId) {
+2842:         int itemQueueIndex = 0;
+2843:         hsvj::LocalVodDatabase::QueueItem item = queue[0];
+2844:         int effectiveSkippedQueueIndex = 0;
+2845:         const int effectiveSkippedId = skippedId > 0 ? skippedId : queue[0].id;
+2846:
+2847:         }
+2848:             return true;
+2849:             }
+2850:                 LOG_WARN("[VOD] LocalVodPlayer: skipCurrent empty queue and no idle video, target layer is black");
+2851:             if (!playIdleVideo()) {
+2852:             stopAndHideTargetLayerLocked();
+2853:             currentPlayingId_ = 0;
+2854:         if (queue.empty()) {
+2855:         auto queue = manager_->getSelectedQueue(0, 2);
+2856:     for (int attempts = 0; attempts < 10; ++attempts) {
+2857:
+2858:     const int skippedId = currentPlayingId_;
+2859:     LOG_INFO("[VOD] LocalVodPlayer: skipCurrent currentPlayingId=%d", currentPlayingId_);
+2860:     if (!manager_ || !mubu_) return false;
+2861:
+2862:     std::lock_guard<std::mutex> lock(mutex_);
+2863: bool LocalVodPlayer::skipCurrent() {
+2864:
+2865: }
+2866:     LOG_INFO("[VOD] LocalVodPlayer: music volume set to %.2f", volume);
+2867:     static_cast<LayerVideo*>(layer)->setVolume(volume);
+2868:     if (!layer || layer->getType() != LayerType::VIDEO) return;
+2869:     Layer* layer = mubu_->getLayer(layerId);
+2870:     int layerId = manager_->getTargetLayerId();
+2871:     if (!manager_ || !mubu_) return;
+2872:
+2873:     musicVolume_.store(volume);
+2874:     if (volume > 1.0f) volume = 1.0f;
+2875:     if (volume < 0.0f) volume = 0.0f;
+2876: void LocalVodPlayer::setMusicVolume(float volume) {
+2877:
+2878: }
+2879:     return false;
+2880:
+2881:     }
+2882:         manager_->removeSong(0);
+2883:                  item.id, item.songNo.c_str(), item.songPath.c_str());
+2884:         LOG_WARN("[VOD] LocalVodPlayer: Skip invalid queue item id=%d songNo=%s path=%s",
+2885:
+2886:         }
+2887:             return true;
+2888:                     item.songName.c_str(), item.singerName.c_str());
+2889:             LOG_INFO("[VOD] LocalVodPlayer: Playing %s - %s",
+2890:             currentPlayingId_ = item.id;
+2891:             manager_->markSongPlaying(item.id);
+2892:         if (tryPlay(item)) {
+2893:         const auto item = queue[0];
+2894:
+2895:         }
+2896:             return playIdleVideo();
+2897:             currentPlayingId_ = 0;
+2898:             LOG_DEBUG("LocalVodPlayer: Queue is empty");
+2899:         if (queue.empty()) {
+2900:         auto queue = manager_->getSelectedQueue(0, 1);
+2901:     for (int attempts = 0; attempts < 10; ++attempts) {
+2902:
+2903:     if (!manager_ || !mubu_) return false;
+2904:
+2905:     std::lock_guard<std::mutex> lock(mutex_);
+2906: bool LocalVodPlayer::playNext() {
+2907:
+2908: }
+2909:     }
+2910:         playNext();
+2911:     if (shouldPlayNext) {
+2912:
+2913:     }
+2914:         }
+2915:             shouldPlayNext = true;
+2916:             if (currentPlayingId_ > 0) finishCurrentSongLocked(2);
+2917:             // 如果有正在播放的歌曲ID，标记为已唱
+2918:         if (state == LayerVideo::PlayState::STOPPED) {
+2919:         // 如果当前没有播放或已停止，尝试播放下一首
+2920:
+2921:         auto state = videoLayer->getState();
+2922:         // 检查当前播放状态
+2923:
+2924:         }
+2925:             shouldPlayNext = true;
+2926:         if (!queue.empty() && currentPlayingId_ <= 0) {
+2927:         auto queue = manager_->getSelectedQueue(0, 1);
+2928:
+2929:         LayerVideo* videoLayer = static_cast<LayerVideo*>(layer);
+2930:
+2931:         if (!layer || layer->getType() != LayerType::VIDEO) return;
+2932:
+2933:         Layer* layer = mubu_->getLayer(layerId);
+2934:         int layerId = manager_->getTargetLayerId();
+2935:
+2936:         std::lock_guard<std::mutex> lock(mutex_);
+2937:     {
+2938:     bool shouldPlayNext = false;
+2939:
+2940:     if (!enabled_.load() || !manager_ || !mubu_) return;
+2941: void LocalVodPlayer::update() {
+2942:
+2943: }
+2944:     LOG_INFO("[VOD] LocalVodPlayer disabled");
+2945:     enabled_.store(false);
+2946: void LocalVodPlayer::disable() {
+2947:
+2948: }
+2949:     LOG_INFO("[VOD] LocalVodPlayer enabled");
+2950:     enabled_.store(true);
+2951: void LocalVodPlayer::enable() {
+2952:
+2953: }
+2954:     return true;
+2955:     LOG_INFO("[VOD] LocalVodPlayer initialized");
+2956:
+2957:     systemConfig_ = systemConfig;
+2958:     mubu_ = mubu;
+2959:     manager_ = manager;
+2960:
+2961:     }
+2962:         return false;
+2963:         LOG_ERROR("[VOD] LocalVodPlayer: Invalid parameters");
+2964:     if (!manager || !mubu) {
+2965: bool LocalVodPlayer::initialize(LocalVodManager* manager, Mubu* mubu, SystemConfig* systemConfig) {
+2966:
+2967: }
+2968:     idlePlaybackSuppressedUntilMs_.store(nowMs + durationMs);
+2969:         std::chrono::steady_clock::now().time_since_epoch()).count();
+2970:     const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+2971: void LocalVodPlayer::suppressIdlePlaybackForMs(int64_t durationMs) {
+2972:
+2973: LocalVodPlayer::~LocalVodPlayer() = default;
+2974:
+2975: LocalVodPlayer::LocalVodPlayer() = default;
+2976:
+2977: std::atomic<int64_t> LocalVodPlayer::idlePlaybackSuppressedUntilMs_{0};
+2978:
+2979: namespace hsvj {
+2980:
+2981: #include <cstring>
+2982: #include <chrono>
+2983: #include <cctype>
+2984: #include <algorithm>
+2985: #include "utils/FileUtils.h"
+2986: #include "utils/Logger.h"
+2987: #include "playcontrol/PlaybackResult.h"
+2988: #include "playcontrol/PlaybackRequestDispatcher.h"
+2989: #include "layer/LayerVideo.h"
+2990: #include "layer/Layer.h"
+2991: #include "core/SystemConfig.h"
+2992: #include "core/PathConfig.h"
+2993: #include "core/Mubu.h"
+2994: #include "vod/LocalVodManager.h"
+2995: #include "vod/LocalVodPlayer.h"
+2996:
+2997:  */
+2998:  * @brief 本地VOD自动播放器实现
+2999:  * @file LocalVodPlayer.cpp
+3000: /**
+
+================================================================================
+源代码文件清单
+================================================================================
+
+audio\AudioPlayer.cpp                                        (  985 行)
+audio\AudioPlayerManager.cpp                                 (  125 行)
+audio\AudioProcessor.cpp                                     (  300 行)
+capture\RgaConverter.cpp                                     (  327 行)
+capture\RgaConverter.h                                       (   85 行)
+capture\UsbCapture.cpp                                       (  348 行)
+capture\V4L2Capture.cpp                                      (  754 行)
+capture\V4L2SubdevQuery.cpp                                  (  235 行)
+capture\VpssConverter.cpp                                    (  349 行)
+capture\VpssConverter.h                                      (  121 行)
+core\CommandRouter.cpp                                       (  378 行)
+core\CommandRouter_Effect.cpp                                (   54 行)
+core\CommandRouter_Hint.cpp                                  (  122 行)
+core\CommandRouter_LayerManagement.cpp                       ( 1943 行)
+core\CommandRouter_LayerRender.cpp                           (  571 行)
+core\CommandRouter_Lyric.cpp                                 (  342 行)
+core\CommandRouter_Performance.cpp                           (   91 行)
+core\CommandRouter_Peripheral.cpp                            (   71 行)
+core\CommandRouter_Playlist.cpp                              (  184 行)
+core\CommandRouter_RegionConfig.cpp                          ( 3216 行)
+core\CommandRouter_Scene.cpp                                 (  530 行)
+core\CommandRouter_Sync.cpp                                  (  336 行)
+core\CommandRouter_System.cpp                                (  244 行)
+core\CommandRouter_Utils.cpp                                 (  183 行)
+core\CommandRouter_VideoPlayback.cpp                         ( 1541 行)
+core\Engine.cpp                                              ( 3230 行)
+core\Engine_Init.cpp                                         (  401 行)
+core\Engine_Playlist.cpp                                     ( 1248 行)
+core\Engine_Render.cpp                                       (  806 行)
+core\Engine_Update.cpp                                       (  421 行)
+core\LayerDefinitions.cpp                                    (  114 行)
+core\LicenseManager.cpp                                      (  759 行)
+core\LicenseVerify.cpp                                       (  372 行)
+core\Mubu.cpp                                                (  330 行)
+core\PathConfig.cpp                                          (  271 行)
+core\PeripheralManager.cpp                                   ( 2394 行)
+core\SceneManager.cpp                                        (  937 行)
+core\SystemConfig.cpp                                        ( 1547 行)
+database\MaterialIndex.cpp                                   (  430 行)
+database\PlaylistDatabase.cpp                                (  519 行)
+database\PlaylistDatabase_Create.cpp                         (  876 行)
+database\PlaylistDatabase_Query.cpp                          (  193 行)
+database\PlaylistDatabase_State.cpp                          (  303 行)
+database\PlaylistDatabase_Update.cpp                         (  422 行)
+database\PlaylistManager.cpp                                 (  590 行)
+database\VodDatabase.cpp                                     (   16 行)
+database\VodDatabase_Queue.cpp                               ( 1247 行)
+decoder\AudioOnlyPlayer.cpp                                  (  441 行)
+decoder\HardwareBufferHelper.cpp                             (  442 行)
+decoder\HardwareBufferHelper.h                               (  167 行)
+decoder\MediaCodecHelper.cpp                                 (  333 行)
+decoder\MediaCodecHelper.h                                   (  101 行)
+decoder\RkmppMpeg2Probe.cpp                                  (  331 行)
+decoder\VideoDecoder.cpp                                     (  568 行)
+decoder\VideoDecoderPool.cpp                                 (   89 行)
+decoder\core\DecoderCore.cpp                                 ( 1642 行)
+decoder\core\DecoderCore_Decode.cpp                          ( 2326 行)
+decoder\core\DecoderCore_OpenClose.cpp                       ( 1151 行)
+decoder\core\HardwareManager.cpp                             (  636 行)
+decoder\error\ErrorHandler.cpp                               (  196 行)
+decoder\frame\DecodedFrame.cpp                               (  149 行)
+decoder\frame\FramePool.cpp                                  (  129 行)
+decoder\state\PlaybackStateMachine.cpp                       (  201 行)
+decoder\sync\FrameSyncManager.cpp                            (  217 行)
+effect\AudioReactiveEngine.cpp                               ( 1138 行)
+effect\CNNDrumDetector.cpp                                   (  169 行)
+effect\CNNDrumWeights.cpp                                    (   36 行)
+effect\EffectManager.cpp                                     (  249 行)
+effect\MelFilterbank.cpp                                     (  125 行)
+layer\Layer.cpp                                              (  285 行)
+layer\LayerImage.cpp                                         (  879 行)
+layer\LayerMirror.cpp                                        (  232 行)
+layer\LayerText.cpp                                          (  385 行)
+layer\LayerVideo.cpp                                         (  426 行)
+layer\LayerVideo_Playback.cpp                                ( 1605 行)
+layer\LayerVideo_Render.cpp                                  ( 1001 行)
+lyric\ASSRenderer.cpp                                        (  175 行)
+lyric\Layer21LibassContext.cpp                               (  138 行)
+lyric\LayerText_Layer21.cpp                                  (  389 行)
+lyric\LyricRenderer.cpp                                      ( 2426 行)
+lyric\LyricRenderer_Adjust.cpp                               ( 1276 行)
+lyric\LyricRenderer_Gpu.cpp                                  (  310 行)
+lyric\SharedLibassHolder.cpp                                 (  120 行)
+network\CloudLicenseClient.cpp                               (  196 行)
+network\CloudSyncService.cpp                                 (  506 行)
+network\DeviceDiscoveryService.cpp                           (  221 行)
+network\Dmx512ChannelHandler.cpp                             (  291 行)
+network\Dmx512Receiver.cpp                                   (  574 行)
+network\HttpRequest.cpp                                      (  208 行)
+network\HttpRequest.h                                        (   56 行)
+network\HttpResponse.cpp                                     (  289 行)
+network\HttpResponse.h                                       (   71 行)
+network\HttpServer.cpp                                       (  203 行)
+network\HttpServer.h                                         (  208 行)
+network\HttpServer_AudioEffect.cpp                           (  712 行)
+network\HttpServer_Auth.cpp                                  (  248 行)
+network\HttpServer_Command.cpp                               (  340 行)
+network\HttpServer_Config.cpp                                (  260 行)
+network\HttpServer_Connection.cpp                            (  691 行)
+network\HttpServer_Core.cpp                                  (  207 行)
+network\HttpServer_DMX_Routes.cpp                            (  208 行)
+network\HttpServer_Effect.cpp                                (   60 行)
+network\HttpServer_Filesystem.cpp                            (  312 行)
+network\HttpServer_Helpers.cpp                               (  549 行)
+network\HttpServer_Helpers.h                                 (   21 行)
+network\HttpServer_Internal.h                                (  434 行)
+network\HttpServer_Layer.cpp                                 (  300 行)
+network\HttpServer_Material.cpp                              (  426 行)
+network\HttpServer_Playlist.cpp                              (  526 行)
+network\HttpServer_Runtime.cpp                               (  206 行)
+network\HttpServer_Scenes.cpp                                (  266 行)
+network\HttpServer_Stream.cpp                                ( 1116 行)
+network\HttpServer_System.cpp                                ( 1751 行)
+network\HttpServer_Upload.cpp                                (   35 行)
+network\HttpServer_VOD.cpp                                   ( 1216 行)
+network\HttpServer_Video.cpp                                 (   82 行)
+network\NetworkManager.cpp                                   (  286 行)
+network\OnlineVodHttpSyncClient.cpp                          (  268 行)
+network\OnlineVodWsClient.cpp                                (  914 行)
+network\PreviewStreamConverter.cpp                           (  211 行)
+network\PreviewStreamConverter.h                             (   64 行)
+network\Rs232Server.cpp                                      (  236 行)
+network\Rs485Server.cpp                                      (  262 行)
+network\SceneTemplateManager.cpp                             (  294 行)
+network\SceneTemplateManager.h                               (   63 行)
+network\TcpServer.cpp                                        (  336 行)
+network\UdpServer.cpp                                        (  391 行)
+network\WebSocketServer.cpp                                  (  532 行)
+playcontrol\DecoderResourceGate.cpp                          (  111 行)
+playcontrol\LayerPlaybackController.cpp                      (  248 行)
+playcontrol\MediaRuntimeDiagnostics.cpp                      (   75 行)
+playcontrol\PlaybackCoordinator.cpp                          (  122 行)
+playcontrol\PlaybackRequestDispatcher.cpp                    (   35 行)
+playcontrol\PlaybackResult.cpp                               (   37 行)
+renderer\CaptureRenderer.cpp                                 (  504 行)
+renderer\RKDRMRenderer.cpp                                   ( 1438 行)
+renderer\RegionRotationRenderer.cpp                          ( 1471 行)
+renderer\RegionRotationRenderer_Config.cpp                   (  448 行)
+renderer\RegionRotationRenderer_Mesh.cpp                     (  208 行)
+renderer\RegionRotationRenderer_MeshUpdate.cpp               (  571 行)
+renderer\RegionRotationRenderer_Render.cpp                   (  966 行)
+renderer\TexturePool.cpp                                     (  103 行)
+renderer\UsbCaptureRenderer.cpp                              (  548 行)
+renderer\VulkanRenderer.cpp                                  (  643 行)
+renderer\VulkanRenderer.h                                    ( 1471 行)
+renderer\VulkanRenderer_AssMask.cpp                          (  811 行)
+renderer\VulkanRenderer_Device.cpp                           (  178 行)
+renderer\VulkanRenderer_Effect.cpp                           ( 1748 行)
+renderer\VulkanRenderer_Frame.cpp                            (  550 行)
+renderer\VulkanRenderer_Internal.h                           (  275 行)
+renderer\VulkanRenderer_Kawase.cpp                           (  920 行)
+renderer\VulkanRenderer_Pipeline.cpp                         ( 2280 行)
+renderer\VulkanRenderer_PipelineCore.cpp                     (  698 行)
+renderer\VulkanRenderer_Render.cpp                           ( 1190 行)
+renderer\VulkanRenderer_Swapchain.cpp                        (  305 行)
+renderer\VulkanRenderer_Texture.cpp                          ( 3510 行)
+renderer\VulkanRenderer_extension.cpp                        (  124 行)
+text\LayerText_Layer40.cpp                                   (   31 行)
+text\LayerText_Layer41.cpp                                   (  127 行)
+text\MessageHintRenderer.cpp                                 ( 1035 行)
+text\VulkanTextOverlayBridge.cpp                             (  685 行)
+utils\ApngLoader.cpp                                         (  664 行)
+utils\FileUtils.cpp                                          (  481 行)
+utils\HttpClient.cpp                                         (  464 行)
+utils\JsonUtils.cpp                                          (   62 行)
+utils\Logger.cpp                                             (  314 行)
+utils\MediaController.cpp                                    (  325 行)
+utils\MediaUtils.cpp                                         (  249 行)
+utils\MediaUtils.h                                           (   97 行)
+utils\MemoryMonitor.cpp                                      (  166 行)
+utils\RkmppMjpegDecoder.cpp                                  (  288 行)
+utils\StringUtils.cpp                                        (   32 行)
+utils\SystemUtils.cpp                                        (  275 行)
+utils\SystemUtils.h                                          (  101 行)
+utils\V4L2DeviceDetector.cpp                                 (  465 行)
+utils\VideoTranscoder.cpp                                    (  684 行)
+vod\LocalSongDatabase.cpp                                    (  343 行)
+vod\LocalSongFileScanner.cpp                                 (  526 行)
+vod\LocalVodDatabase.cpp                                     (  726 行)
+vod\LocalVodManager.cpp                                      (  163 行)
+vod\LocalVodPlayer.cpp                                       (  389 行)

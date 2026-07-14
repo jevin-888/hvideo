@@ -1,0 +1,641 @@
+// 同步 trigger: 2026-01-15 18:45
+plugins {
+    id 'com.android.application'
+}
+
+def loadRootProperties = { String fileName ->
+    def props = new Properties()
+    def propsFile = rootProject.file(fileName)
+    if (propsFile.exists()) {
+        propsFile.withInputStream { props.load(it) }
+    }
+    props
+}
+
+def signingProps = loadRootProperties('signing.properties')
+def licenseProps = loadRootProperties('license.properties')
+
+def localProp = { Properties props, String key, String envKey, String fallback ->
+    def value = props.getProperty(key)
+    if (value == null || value.trim().isEmpty()) {
+        value = System.getenv(envKey)
+    }
+    (value == null || value.trim().isEmpty()) ? fallback : value.trim()
+}
+
+def signingProp = { String key, String fallback ->
+    def envKey = "HVIDEO_" + key.replaceAll('[^A-Za-z0-9]', '_').toUpperCase()
+    localProp(signingProps, key, envKey, fallback)
+}
+
+def signingFileProp = { String key, String fallback ->
+    def path = signingProp(key, fallback)
+    def candidate = new File(path)
+    candidate.isAbsolute() ? candidate : rootProject.file(path)
+}
+
+def licenseHmacKey = localProp(licenseProps, 'LICENSE_HMAC_KEY', 'LICENSE_HMAC_KEY', '')
+def escapedLicenseHmacKey = licenseHmacKey.replace('\\', '\\\\').replace('"', '\\"')
+def useSystemCodecStack = (project.findProperty('useSystemCodecStack') ?: 'false').toString().toBoolean()
+def useSystemMpp = useSystemCodecStack || (project.findProperty('useSystemMpp') ?: 'false').toString().toBoolean()
+def useSystemFfmpeg = useSystemCodecStack || (project.findProperty('useSystemFfmpeg') ?: 'false').toString().toBoolean()
+
+android {
+    namespace 'com.hsvj.engine'
+    compileSdk 34
+
+    buildFeatures {
+        buildConfig true
+        aidl true
+    }
+
+    // NDK版本配置（新方式，替代ndk.dir）
+    ndkVersion '26.1.10909125'
+
+    // ======================= 签名配置 =======================
+    // hw81 → vendor/security8.1/platform.keystore（硬件版本一）
+    // hw82 → vendor/security8.2/platform.keystore（硬件版本二）
+    signingConfigs {
+        hw81 {
+            storeFile signingFileProp('hw81.storeFile', 'vendor/security8.1/platform.keystore')
+            storePassword signingProp('hw81.storePassword', '')
+            keyAlias signingProp('hw81.keyAlias', 'android')
+            keyPassword signingProp('hw81.keyPassword', '')
+            v1SigningEnabled true
+            v2SigningEnabled true
+        }
+        hw82 {
+            storeFile signingFileProp('hw82.storeFile', 'vendor/security8.2/platform.keystore')
+            storePassword signingProp('hw82.storePassword', '')
+            keyAlias signingProp('hw82.keyAlias', 'platform')
+            keyPassword signingProp('hw82.keyPassword', '')
+            v1SigningEnabled true
+            v2SigningEnabled true
+        }
+    }
+
+    // ======================= 版本号自动生成 + Build Variants =======================
+    // 两个维度组合：
+    //   hardware（hw81 / hw82） 通道（stable / beta） buildType（释放 / debug）
+    //
+    // 仅保留有效组合：
+    //   hw81BetaDebug       硬件v1 调试版  签名:security8.1  versionName:"1.0.0-beta-debug"
+    //   hw82BetaDebug       硬件v2 调试版  签名:security8.2  versionName:"1.0.0-beta-debug"
+    //   hw81StableRelease   硬件v1 正式版  签名:security8.1  versionName:"1.0.0"
+    //   hw82StableRelease   硬件v2 正式版  签名:security8.2  versionName:"1.0.0"
+    //
+    // 已过滤无用组合：stableDebug、betaRelease
+    // Android Studio：右侧 Build Variants 面板选择
+    // 命令行：
+    //   ./gradlew assembleHw81BetaDebug       硬件v1 调试版
+    //   ./gradlew assembleHw82BetaDebug       硬件v2 调试版
+    //   ./gradlew assembleHw81StableRelease   硬件v1 正式版
+    //   ./gradlew assembleHw82StableRelease   硬件v2 正式版
+    flavorDimensions "hardware", "channel"
+    productFlavors {
+        // ---- 硬件维度 ----
+        hw81 {
+            dimension "hardware"
+            signingConfig signingConfigs.hw81
+            // 在 BuildConfig 中暴露硬件型号，方便代码里按需适配
+            buildConfigField "String", "HARDWARE", '"hw81"'
+        }
+        hw82 {
+            dimension "hardware"
+            signingConfig signingConfigs.hw82
+            buildConfigField "String", "HARDWARE", '"hw82"'
+        }
+
+        // ---- 渠道维度 ----
+        stable {
+            dimension "channel"
+            // 正式版：无后缀，versionName = "1.0.0"
+        }
+        beta {
+            dimension "channel"
+            // 尝鲜版：自动追加 -beta，versionName = "1.0.0-beta"
+            versionNameSuffix "-beta"
+        }
+    }
+
+    variantFilter { variant ->
+        def channel = variant.flavors.find { it.dimension == "channel" }?.name
+        def buildTypeName = variant.buildType.name
+        if ((channel == "stable" && buildTypeName == "debug") ||
+            (channel == "beta" && buildTypeName == "release")) {
+            variant.ignore = true
+        }
+    }
+    defaultConfig {
+        applicationId "com.hsvj.engine"
+        minSdk 27  // Mirror SDK 需要 API 27+
+        targetSdk 34
+
+        def versionPropsFile = rootProject.file('app/version.properties')
+        def versionProps = new Properties()
+        if (versionPropsFile.exists()) {
+            versionPropsFile.withInputStream { versionProps.load(it) }
+        }
+
+        def versionMajor = (versionProps['VERSION_MAJOR'] ?: '1').toInteger()
+        def versionMinor = (versionProps['VERSION_MINOR'] ?: '0').toInteger()
+        def versionPatch = (versionProps['VERSION_PATCH'] ?: '0').toInteger()
+
+        def isReleaseBuild = gradle.startParameter.taskNames.any { taskName ->
+            def lowerTaskName = taskName.toLowerCase()
+            (lowerTaskName.contains('assemble') || lowerTaskName.contains('bundle')) &&
+                    lowerTaskName.contains('release')
+        }
+
+        if (isReleaseBuild && !gradle.startParameter.taskNames.any { it.toLowerCase().contains('clean') }) {
+            versionPatch += 1
+            versionProps['VERSION_MAJOR'] = versionMajor.toString()
+            versionProps['VERSION_MINOR'] = versionMinor.toString()
+            versionProps['VERSION_PATCH'] = versionPatch.toString()
+            versionPropsFile.parentFile.mkdirs()
+            versionPropsFile.withOutputStream { versionProps.store(it, null) }
+        }
+
+        def computedVersionName = "${versionMajor}.${versionMinor}.${versionPatch}"
+        versionName computedVersionName
+
+        def computedVersionCode = versionMajor * 100 + versionMinor * 10 + versionPatch
+        versionCode computedVersionCode
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17 -frtti -fexceptions"
+                abiFilters 'arm64-v8a'
+                arguments "-DANDROID_STL=c++_shared"
+                arguments "-DANDROID_PLATFORM=android-27"  // Mirror SDK 需要 API 27+
+                arguments "-DUSE_LIBYUV=ON"  // 启用 libyuv 优化
+                arguments "-DHVIDEO_LICENSE_HMAC_KEY=${escapedLicenseHmacKey}"
+                // 注：原 RKNN 节拍/人声分离子系统已在 2026-05 整体下线，
+                //    此处不再注入 -DRKNN_SDK_PATH 与 librknnrt.so 链接。
+            }
+        }
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true   // 启用代码混淆和压缩
+            shrinkResources true // 启用资源压缩，移除未使用的资源
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // 签名由 productFlavors(hw81/hw82) 决定，这里不覆盖
+            // 稳定版 stableRelease → "1.0.0"，测试版 betaRelease → "1.0.0-beta"
+        }
+        debug {
+            debuggable true
+            minifyEnabled false  // Debug版本不压缩，便于调试
+            // 测试版统一追加 -debug：stableDebug → "1.0.0-debug"，betaDebug → "1.0.0-beta-debug"
+            versionNameSuffix "-debug"
+            // 清空 AGP 默认 debug.keystore，让硬件 flavor 的 signingConfig 生效。
+            // 否则 assembleHw82BetaDebug 会被 debug buildType 覆盖成 hw81/debug 签名。
+            signingConfig null
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 启用详细的过时 API 警告
+    tasks.withType(JavaCompile) {
+        options.compilerArgs << "-Xlint:deprecation"
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('../CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = useSystemMpp
+                    ? ['src/main/jniLibs']
+                    : ['src/main/jniLibs', '../vendor/rkmpp/android_lib/system-stub']
+            // web 复制到 build/generated/assets/web 参与打包，源码 assets 目录不再被构建任务修改
+            assets.srcDirs = [
+                    'src/main/assets',
+                    layout.buildDirectory.dir('generated/assets/web').get().asFile.absolutePath
+            ]
+        }
+    }
+
+    packagingOptions {
+        pickFirst 'lib/arm64-v8a/libc++_shared.so'
+        jniLibs {
+            useLegacyPackaging = false
+            // 排除其他ABI架构，只保留arm64-v8a
+            excludes += ['**/x86/**', '**/x86_64/**', '**/armeabi-v7a/**', '**/armeabi/**']
+            // 默认 adb/data-app 安装时系统 /vendor/lib64/libmpp.so 不在 classloader namespace，
+            // 因此只随包携带一份 libmpp.so；ROM 内置/厂商分区部署可传 -PuseSystemMpp=true 改走系统库。
+            excludes += useSystemMpp
+                    ? ['**/libmpp.so', '**/librockchip_mpp.so']
+                    : ['**/librockchip_mpp.so']
+            // ROM 内置 FFmpeg 时可传 -PuseSystemFfmpeg=true，APK 只保留链接依赖名，
+            // 运行时由系统/vendor namespace 提供 libav*/libsw*/libffmpeg_58。
+            if (useSystemFfmpeg) {
+                excludes += [
+                        '**/libavcodec.so',
+                        '**/libavdevice.so',
+                        '**/libavfilter.so',
+                        '**/libavformat.so',
+                        '**/libavutil.so',
+                        '**/libpostproc.so',
+                        '**/libswresample.so',
+                        '**/libswscale.so',
+                        '**/libffmpeg_58.so'
+                ]
+            }
+        }
+        resources {
+            excludes += ['/META-INF/{AL2.0,LGPL2.1}']
+        }
+    }
+
+    lintOptions {
+        abortOnError false
+    }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            def variantName = variant.name.replaceAll(/([a-z])([A-Z])/, '$1-$2').toLowerCase()
+            // 保持 APK 文件名稳定，避免 Android Studio 部署阶段拿到已变化的产物路径。
+            outputFileName = "hsvj-engine-${variantName}.apk"
+        }
+    }
+}
+
+// 复制 shader .spv 到 assets（在 CMake 编译之后执行，确保 .frag/.vert 增量编译结果被复制）
+tasks.register('copyShaders', Copy) {
+    into 'src/main/assets'
+    inputs.files(fileTree('../shaders') {
+        include '*.frag', '*.vert', 'effects/*.frag', 'effects/*.vert'
+    })
+    from('../shaders') {
+        include '*.spv'
+        into 'shaders'
+    }
+    from('../shaders/effects') {
+        include '*.spv'
+        into 'shaders/effects'
+    }
+    // [HSVJ_Fix] 移除 upToDateWhen 限制，让 Gradle 自动基于文件时间戳进行增量更新
+    // 否则每次都需要手动传 -PforceShaderCopy 才能生效
+
+    doFirst {
+        println '📂 正在同步 Shader 资源: ../shaders -> src/main/assets/shaders'
+    }
+    doLast {
+        def dest = file("${destinationDir}/shaders")
+        def count = dest.exists() ? fileTree(dest).include('**/*.spv').files.size() : 0
+        println "✅ Shaders 同步完成: 已同步 ${count} 个 .spv 文件到 Assets (未变化时 CMake/Ninja 不会重复编译)"
+    }
+}
+
+// 复制 Web 界面文件到 assets（用于首次安装时释放到 /sdcard/huoshan/web/）
+tasks.register('copyWeb', Copy) {
+    into layout.buildDirectory.dir('generated/assets/web')
+    from('../src/network/web') {
+        exclude '**/node_modules', '**/.git', '**/.DS_Store'
+        into 'web'
+    }
+
+    doFirst {
+        println ' 正在同步 Web 界面资源: ../src/network/web -> build/generated/assets/web/web'
+    }
+    doLast {
+        def dest = file("${destinationDir}/web")
+        def count = dest.exists() ? fileTree(dest).files.size() : 0
+        println "✅ Web 界面同步完成: 已更新 ${count} 个文件到 Assets (待打包入 APK)"
+    }
+}
+
+// copyShaders 在 CMake 编译之后执行（.spv 由 CMake 增量生成），再参与 mergeDebugAssets
+afterEvaluate {
+
+    tasks.matching { it.name ==~ /merge(Hw81|Hw82)(Stable|Beta)(Debug|Release)Assets/ }.configureEach {
+        def variantPart = (it.name =~ /^merge(.+)Assets$/)[0][1]
+        def nativeTask = tasks.findByName("externalNativeBuild${variantPart}")
+        if (nativeTask != null) {
+            copyShaders.dependsOn nativeTask
+        }
+        it.dependsOn copyShaders
+        it.dependsOn copyWeb
+    }
+
+    // 确保 lint 任务在 copyWeb 之后执行，避免隐式依赖警告
+    tasks.matching { it.name.contains('Lint') || it.name.contains('lint') }.configureEach { lintTask ->
+        lintTask.mustRunAfter copyWeb
+    }
+
+    // Gradle 8 任务验证：lint 相关任务会读取 assets 目录，需要显式声明依赖 copyShaders，
+    // 否则在任务并发执行时会出现 "implicit dependency" 警告并阻塞 release 构建
+    tasks.matching { task ->
+        task.name ==~ /lintVitalAnalyze.*/ ||
+        task.name ==~ /generate.*LintVitalReportModel/ ||
+        task.name ==~ /lintVital.*/
+    }.configureEach {
+        it.dependsOn copyShaders
+    }
+
+    // 无修改时也给出提示：copyShaders 为 UP-TO-DATE 时打印
+    gradle.taskGraph.afterTask { Task task, TaskState state ->
+        if (task.name == 'copyShaders' && state.upToDate) {
+            println "✅ Shaders: 无变更，使用已有 .spv（未重新编译）"
+        }
+    }
+}
+
+// [可选] 构建后自动推送 web 文件到设备（开发调试用）
+// 注意：web 文件夹已打包到 APK assets 中，首次安装会自动释放到 /sdcard/huoshan/web/
+// 此任务仅用于开发时快速更新 web 文件，无需重新编译 APK
+tasks.register('pushWebToDevice', Exec) {
+    group = 'build'
+    description = '将 web 源文件推送到设备的 huoshan/web 目录'
+
+    workingDir projectDir
+    def webSource = file('../src/network/web').absolutePath
+    def isWin = System.getProperty('os.name', '').toLowerCase().contains('windows')
+
+    // 某些设备的 /system/bin/sh 对 if 语法兼容性有问题，这里改为直接 ls 探测目录是否存在
+    def targetOut = new ByteArrayOutputStream()
+    def targetErr = new ByteArrayOutputStream()
+    def huoshanExists = false
+    def detectResult = exec {
+        ignoreExitValue = true
+        standardOutput = targetOut
+        errorOutput = targetErr
+        commandLine 'adb', 'shell', 'ls', '-ld', '/huoshan'
+    }
+    huoshanExists = detectResult.exitValue == 0 && targetOut.toString('UTF-8').contains('/huoshan')
+    def devicePath = huoshanExists ? '/huoshan/web/' : '/sdcard/huoshan/web/'
+
+    if (isWin) {
+        commandLine 'cmd', '/c', 'adb', 'push', webSource + '/.', devicePath
+    } else {
+        commandLine 'adb', 'push', webSource + '/.', devicePath
+    }
+
+    ignoreExitValue = true
+
+    doFirst {
+        println "📱 正在推送 web 到设备: ${devicePath}"
+        println "   源目录: ${webSource}"
+        println "   根路径判断: ${huoshanExists ? '/huoshan 存在，优先推送系统分区' : '/huoshan 不存在，回退到 /sdcard/huoshan'}"
+        def detectErrText = targetErr.toString('UTF-8').trim()
+        if (detectErrText) {
+            println "   路径探测信息: ${detectErrText}"
+        }
+    }
+
+    doLast {
+        int exitVal = executionResult.get().exitValue
+        if (exitVal == 0) {
+            println "✅ web 文件推送成功！"
+        } else {
+            println "⚠️ web 推送失败（设备未连接或无权限）。可手动执行: adb push ${webSource}/. ${devicePath}"
+        }
+    }
+}
+
+// 手动清理 generated web assets，源目录 src/network/web 和 src/main/assets 不受影响
+// 注意：不要在 assemble/install finalizedBy 中自动清理，避免破坏 AGP 增量 assets 缓存
+tasks.register('cleanWebAssetsAfterBuild') {
+    group = 'build'
+    description = 'Clean generated web files under build/generated/assets/web after build finishes.'
+    mustRunAfter pushWebToDevice
+    doLast {
+        def webAssetsDir = layout.buildDirectory.dir('generated/assets/web').get().asFile
+        if (webAssetsDir.exists()) {
+            delete webAssetsDir.listFiles()
+        } else {
+            webAssetsDir.mkdirs()
+        }
+        println " 已清理生成目录: ${webAssetsDir}"
+    }
+}
+def systemSignedApkVariants = [
+    betaDebug: [
+        [task: 'assembleHw81BetaDebug', outputDir: 'hw81Beta/debug'],
+        [task: 'assembleHw82BetaDebug', outputDir: 'hw82Beta/debug']
+    ],
+    stableRelease: [
+        [task: 'assembleHw81StableRelease', outputDir: 'hw81Stable/release'],
+        [task: 'assembleHw82StableRelease', outputDir: 'hw82Stable/release']
+    ]
+]
+
+def collectLatestSystemSignedApks = { List variants, String outputSubDir ->
+    def apkRoot = layout.buildDirectory.dir('outputs/apk').get().asFile
+    def targetDir = new File(apkRoot, outputSubDir)
+    delete targetDir
+    targetDir.mkdirs()
+
+    variants.each { variant ->
+        def variantDir = new File(apkRoot, variant.outputDir)
+        def apks = variantDir.exists()
+                ? variantDir.listFiles().findAll { it.name.endsWith('.apk') }
+                : []
+        if (apks.isEmpty()) {
+            throw new GradleException("No APK found for ${variant.task} under ${variantDir}")
+        }
+
+        def latestApk = apks.max { it.lastModified() }
+        copy {
+            from latestApk
+            into targetDir
+        }
+        println "已收集 ${variant.task}: ${latestApk.name}"
+    }
+
+    println "多系统签名 APK 已收集到: ${targetDir}"
+}
+
+tasks.register('assembleAllBetaDebug') {
+    group = 'build'
+    description = '一次构建 hw81/hw82 两套 beta debug 系统签名 APK，并收集到 build/outputs/apk/all-system-signed/beta-debug。'
+    dependsOn systemSignedApkVariants.betaDebug.collect { it.task }
+    doLast {
+        collectLatestSystemSignedApks(systemSignedApkVariants.betaDebug, 'all-system-signed/beta-debug')
+    }
+}
+
+tasks.register('assembleAllStableRelease') {
+    group = 'build'
+    description = '一次构建 hw81/hw82 两套 stable release 系统签名 APK，并收集到 build/outputs/apk/all-system-signed/stable-release。'
+    dependsOn systemSignedApkVariants.stableRelease.collect { it.task }
+    doLast {
+        collectLatestSystemSignedApks(systemSignedApkVariants.stableRelease, 'all-system-signed/stable-release')
+    }
+}
+
+tasks.register('assembleAllSystemSigned') {
+    group = 'build'
+    description = '一次构建 hw81/hw82 的 beta debug 与 stable release 系统签名 APK，并收集到 build/outputs/apk/all-system-signed/all。'
+    dependsOn(
+            systemSignedApkVariants.betaDebug.collect { it.task } +
+            systemSignedApkVariants.stableRelease.collect { it.task }
+    )
+    doLast {
+        collectLatestSystemSignedApks(
+                systemSignedApkVariants.betaDebug + systemSignedApkVariants.stableRelease,
+                'all-system-signed/all'
+        )
+    }
+}
+
+// 验证 web 文件是否已打包进 APK（调试用）
+tasks.register('verifyWebInApk') {
+    group = 'verification'
+    description = '验证 APK 中是否包含 web 资源'
+    dependsOn 'packageDebug'
+    doLast {
+        def apk = file("${buildDir}/outputs/apk/debug/app-debug.apk")
+        if (!apk.exists()) {
+            println "APK 不存在: ${apk}"
+            return
+        }
+        def jar = new java.util.zip.ZipFile(apk)
+        def webEntries = jar.entries().findAll { it.name.startsWith('assets/web/') && !it.directory }
+        jar.close()
+        println "APK 中包含 ${webEntries.size()} 个 web 文件 (assets/web/)"
+        if (webEntries.isEmpty()) {
+            println "说明: web 已改为仅通过 pushWebToDevice 推送到设备，APK 中无 assets/web/"
+        } else {
+            webEntries.take(5).each { println "   - ${it.name}" }
+            if (webEntries.size() > 5) println "   ... 等 ${webEntries.size()} 个文件"
+        }
+    }
+}
+
+// ======================= 一键“全量编译 / 全量安装”(强制) =======================
+// 说明：
+// - Android Studio 的绿色按钮（Run/Make）默认会大量走增量/UP-TO-DATE，所以你会感觉“没编译过程”。
+// - 如果你需要“每次都全量”（包含 CMake/Ninja 重新生成/重编），请用下面两个任务：
+//   - :app:fullRebuildDebug  （全量编译 Debug，不安装）
+//   - :app:fullInstallDebug  （全量编译 + 安装到设备）
+tasks.register('cleanCxx', Delete) {
+    delete "${projectDir}/.cxx"
+}
+
+tasks.register('fullRebuildDebug') {
+    group = 'build'
+    description = 'Force full rebuild for Hw81BetaDebug (including native .cxx), to show complete build process.'
+    dependsOn 'clean', 'cleanCxx', 'assembleHw81BetaDebug'
+}
+
+// 关键修正：确保 clean 在 assemble 之前发生，否则并发执行会导致构建产物被删
+tasks.matching { it.name ==~ /assemble(Hw81|Hw82)(Stable|Beta)(Debug|Release)/ }.configureEach {
+    mustRunAfter 'clean'
+    mustRunAfter 'cleanCxx'
+}
+
+tasks.register('fullInstallDebug') {
+    group = 'build'
+    description = 'Force full rebuild + installHw81BetaDebug (including native .cxx).'
+    dependsOn 'fullRebuildDebug', 'installHw81BetaDebug'
+}
+
+// ======================= FFmpeg 自动编译任务 =======================
+// 在 CMake 构建之前检查并编译 FFmpeg（启用 RKMPP 支持）
+//
+// 注意：此任务需要在 WSL/Linux 环境下运行，因为 FFmpeg 使用 configure/make 构建
+// 如果在 Windows 上直接运行 Gradle，此任务会跳过，使用预编译的库
+//
+
+def ffmpegDir = file("../vendor/ffmpeg-rockchip")
+def ffmpegBuildScript = file("${ffmpegDir}/build_android_rockchip.sh")
+def ffmpegLibDir = file("${ffmpegDir}/android/arm64/lib")
+def ffmpegMarkerFile = file("${ffmpegDir}/android/arm64/.build_complete")
+
+tasks.register('buildFFmpeg', Exec) {
+    description = 'Build FFmpeg with RKMPP support'
+    group = 'build'
+
+    workingDir ffmpegDir
+
+    // 检查是否在 Linux/WSL 环境
+    def isLinux = System.getProperty('os.name').toLowerCase().contains('linux')
+    def isWsl = System.getenv('WSL_DISTRO_NAME') != null
+
+    // 只在 Linux/WSL 环境下执行
+    onlyIf {
+        (isLinux || isWsl) &&
+        ffmpegBuildScript.exists() &&
+        !ffmpegMarkerFile.exists()
+    }
+
+    if (isLinux || isWsl) {
+        commandLine 'bash', ffmpegBuildScript.absolutePath
+
+        doLast {
+            // 创建标记文件表示编译完成
+            ffmpegMarkerFile.text = new Date().toString()
+            println "FFmpeg 编译完成！"
+        }
+    } else {
+        commandLine 'cmd', '/c', 'echo', 'Skipping FFmpeg build on Windows (use WSL)'
+        doFirst {
+            println "注意: FFmpeg 编译需要在 WSL/Linux 环境下运行"
+            println "请手动运行: wsl bash ${ffmpegBuildScript.absolutePath}"
+        }
+    }
+}
+
+// 添加强制重新编译 FFmpeg 的任务
+tasks.register('rebuildFFmpeg', Delete) {
+    description = 'Force rebuild FFmpeg (删除标记文件后重新编译)'
+    group = 'build'
+
+    delete ffmpegMarkerFile
+
+    finalizedBy 'buildFFmpeg'
+}
+
+// 检查 FFmpeg RKMPP 状态
+tasks.register('checkFFmpegRkmpp') {
+    description = 'Check if FFmpeg has RKMPP support'
+    group = 'verification'
+
+    doLast {
+        def libavcodec = file("${ffmpegLibDir}/libavcodec.so")
+        if (libavcodec.exists()) {
+            println "FFmpeg 库已找到: ${libavcodec.absolutePath}"
+            println "库大小: ${libavcodec.length() / 1024} KB"
+
+            // 检查符号（需要 nm 工具）
+            // exec 执行块
+            //     commandLine 调用 nm -D 检查 libavcodec
+            //     standardOutput 使用 ByteArrayOutputStream 接收输出
+            // }
+            println "\n要检查 RKMPP 支持，请在设备上运行应用并查看日志中的 [解码器诊断] 信息"
+        } else {
+            println "警告: FFmpeg 库未找到，请先编译 FFmpeg"
+            println "运行: ./gradlew buildFFmpeg (在 WSL/Linux 环境下)"
+            println "或手动运行: wsl bash vendor/ffmpeg-rockchip/build_android_rockchip.sh"
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.aar'])
+    // WFD Sink 已改造为 AOSP 系统服务，通过 Service管理器.getService("wfd_sink") 调用
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.core:core:1.12.0'
+    implementation 'com.google.android.material:material:1.10.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+
+    // SQLCipher for Android - 提供预编译的 libsqlcipher.so
+    implementation 'net.zetetic:android-database-sqlcipher:4.5.4'
+}

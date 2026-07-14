@@ -1,0 +1,9 @@
+prefix=/mnt/d/Hvideo/Third-Party/libdrm-android
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libdrm
+Description: Userspace interface to kernel DRM services
+Version: 2.4.120
+Libs: -L${libdir} -ldrm -lm
+Cflags: -I${includedir} -I${includedir}/libdrm

@@ -1,0 +1,20 @@
+// 顶层构建文件
+buildscript {
+    repositories {
+        // 使用阿里云镜像加速下载
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        // 备用镜像（如果阿里云不可用）
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.5.2'
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
+

@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>投影融合移动调试端</title>
+    <link rel="stylesheet" href="style.css?v=77">
+</head>
+
+<body>
+    <div class="app-shell">
+        <main class="workspace mobile-page active" id="page-fusion" data-page-title="投影融合调试">
+            <section class="mode-tabs" role="tablist" aria-label="调试模式">
+                <button class="mode-tab" data-mode="layout" type="button">布局</button>
+                <button class="mode-tab active" data-mode="geometry" type="button">几何</button>
+                <button class="mode-tab" data-mode="blend" type="button">融合</button>
+                <button class="mode-tab" data-mode="mask" type="button">遮罩</button>
+                <button class="mode-tab" data-mode="color" type="button">色彩</button>
+                <button class="mode-tab" data-mode="advanced" type="button">高级</button>
+            </section>
+
+            <section class="panel" id="panel-layout">
+                <div class="panel-title-row">
+                    <h2>矩阵布局</h2>
+                    <button class="ghost-btn" id="applyLayoutBtn" type="button">应用布局</button>
+                </div>
+                <div class="input-grid two">
+                    <label class="field">
+                        <span>输入宽</span>
+                        <input id="canvasInWidth" inputmode="numeric" type="number" min="1">
+                    </label>
+                    <label class="field">
+                        <span>输入高</span>
+                        <input id="canvasInHeight" inputmode="numeric" type="number" min="1">
+                    </label>
+                    <label class="field">
+                        <span>输入行</span>
+                        <input id="gridInRows" inputmode="numeric" type="number" min="1">
+                    </label>
+                    <label class="field">
+                        <span>输入列</span>
+                        <input id="gridInCols" inputmode="numeric" type="number" min="1">
+                    </label>
+                    <label class="field">
+                        <span>输出宽</span>
+                        <input id="canvasOutWidth" inputmode="numeric" type="number" min="1">
+                    </label>
+                    <label class="field">
+                        <span>输出高</span>
+                        <input id="canvasOutHeight" inputmode="numeric" type="number" min="1">
+                    </label>
+                    <label class="field">
+                        <span>输出行</span>
+                        <input id="gridOutRows" inputmode="numeric" type="number" min="1">
+                    </label>
+                    <label class="field">
+                        <span>输出列</span>
+                        <input id="gridOutCols" inputmode="numeric" type="number" min="1">
+                    </label>
+                </div>
+                <label class="field">
+                    <span>画布旋转</span>
+                    <input id="rotationAngle" inputmode="decimal" type="number" step="0.1">
+                </label>
+                <div class="region-picker" id="regionPicker"></div>
+            </section>
+
+            <section class="panel active" id="panel-geometry">
+                <div class="panel-title-row">
+                    <h2>几何校正</h2>
+                    <label class="switch-row">
+                        <input id="geometryGuideToggle" type="checkbox">
+                        <span>显示网格</span>
+                    </label>
+                </div>
+                <div class="preview-slot" data-preview-slot>
+                    <div class="preview-panel geometry-preview" id="fusionPreviewPanel">
+                        <div class="preview-head">
+                            <div>
+                                <span class="eyebrow">输出预览</span>
+                                <strong id="activeRegionLabel">区域 --</strong>
+                            </div>
+                            <div class="preview-grid-badge" id="previewGridBadge">--行 --列</div>
+                            <label class="switch-row compact">
+                                <input id="fusionMasterToggle" type="checkbox">
+                                <span>融合总开关</span>
+                            </label>
+                        </div>
+                        <canvas id="previewCanvas" class="preview-canvas"></canvas>
+                        <div class="action-row geometry-grid-actions">
+                            <button class="ghost-btn" data-grid-resize="grow_cols" type="button">列+</button>
+                            <button class="ghost-btn" data-grid-resize="shrink_cols" type="button">列-</button>
+                            <button class="ghost-btn" data-grid-resize="grow_rows" type="button">行+</button>
+                            <button class="ghost-btn" data-grid-resize="shrink_rows" type="button">行-</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="geometry-control-panel">
+                    <div class="geometry-nudge-options" aria-label="几何移动选项">
+                        <label class="mini-check">
+                            <input id="geometryFastMoveToggle" type="checkbox">
+                            <span>快移</span>
+                        </label>
+                        <label class="mini-check">
+                            <input id="geometryWholeMoveToggle" type="checkbox">
+                            <span>整屏</span>
+                        </label>
+                    </div>
+                    <div class="nudge-pad" data-pad="geometry">
+                        <button data-dir="up" type="button">↑</button>
+                        <button data-dir="left" type="button">←</button>
+                        <button class="nudge-mode-btn" id="geometryMoveModeBtn" type="button" aria-label="当前热点">1-1</button>
+                        <button data-dir="right" type="button">→</button>
+                        <button data-dir="down" type="button">↓</button>
+                    </div>
+                    <div class="action-row projector-switch-row">
+                        <button class="ghost-btn" data-region-switch="-1" type="button">上一个</button>
+                        <span class="projector-switch-count" data-projector-count>--/--</span>
+                        <button class="ghost-btn" data-region-switch="1" type="button">下一个</button>
+                    </div>
+                    <div class="action-row restore-row">
+                        <button class="ghost-btn" id="restoreGeometryBtn" type="button">还原几何</button>
+                        <button class="secondary-btn" id="saveGeometryBtn" type="button">保存几何</button>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel" id="panel-mask">
+                <div class="panel-title-row">
+                    <h2>全局遮罩</h2>
+                    <div class="switch-stack">
+                        <label class="switch-row">
+                            <input id="maskEnabledToggle" type="checkbox">
+                            <span>启用遮罩</span>
+                        </label>
+                        <label class="switch-row">
+                            <input id="maskGuideToggle" type="checkbox">
+                            <span>显示网格</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="preview-slot" data-preview-slot></div>
+                <div class="nudge-control-panel">
+                    <div class="geometry-nudge-options" aria-label="遮罩移动选项">
+                        <label class="mini-check">
+                            <input id="maskFastMoveToggle" type="checkbox">
+                            <span>快移</span>
+                        </label>
+                        <label class="mini-check">
+                            <input id="maskWholeMoveToggle" type="checkbox">
+                            <span>整屏</span>
+                        </label>
+                    </div>
+                    <div class="nudge-pad" data-pad="mask">
+                        <button data-dir="up" type="button">↑</button>
+                        <button data-dir="left" type="button">←</button>
+                        <button class="nudge-mode-btn" id="maskMoveModeBtn" type="button">点</button>
+                        <button data-dir="right" type="button">→</button>
+                        <button data-dir="down" type="button">↓</button>
+                    </div>
+                    <div class="action-row restore-row">
+                        <button class="ghost-btn" id="restoreMaskBtn" type="button">还原遮罩</button>
+                        <button class="secondary-btn" id="saveMaskBtn" type="button">保存遮罩</button>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel" id="panel-blend">
+                <div class="panel-title-row">
+                    <h2>融合带</h2>
+                    <div class="blend-header-controls">
+                        <label class="switch-row compact">
+                            <input id="blendMasterToggle" type="checkbox">
+                            <span>总开关</span>
+                        </label>
+                        <label class="switch-row compact blend-grid-toggle">
+                            <input id="blendGuideToggle" type="checkbox">
+                            <span>显示网格</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="preview-slot" data-preview-slot></div>
+                <div class="nudge-control-panel">
+                    <div class="blend-nudge-toolbar">
+                        <div class="geometry-nudge-options" aria-label="融合移动选项">
+                            <label class="mini-check">
+                                <input id="blendFastMoveToggle" type="checkbox">
+                                <span>快移</span>
+                            </label>
+                            <label class="mini-check">
+                                <input id="blendWholeMoveToggle" type="checkbox">
+                                <span>整屏</span>
+                            </label>
+                        </div>
+                        <div class="fusion-blending-side-selector blend-side-checks" aria-label="融合带方向">
+                            <label class="mini-check blend-side-check side-tab" data-side="top">
+                                <input type="checkbox" data-blend-side="top">
+                                <span>上</span>
+                            </label>
+                            <label class="mini-check blend-side-check side-tab" data-side="bottom">
+                                <input type="checkbox" data-blend-side="bottom">
+                                <span>下</span>
+                            </label>
+                            <label class="mini-check blend-side-check side-tab" data-side="left">
+                                <input type="checkbox" data-blend-side="left">
+                                <span>左</span>
+                            </label>
+                            <label class="mini-check blend-side-check side-tab" data-side="right">
+                                <input type="checkbox" data-blend-side="right">
+                                <span>右</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="nudge-pad" data-pad="blend">
+                        <button data-dir="up" type="button">↑</button>
+                        <button data-dir="left" type="button">←</button>
+                        <button class="nudge-mode-btn" id="blendMoveModeBtn" type="button">点</button>
+                        <button data-dir="right" type="button">→</button>
+                        <button data-dir="down" type="button">↓</button>
+                    </div>
+                    <div class="action-row projector-switch-row">
+                        <button class="ghost-btn" data-region-switch="-1" type="button">上一个</button>
+                        <span class="projector-switch-count" data-projector-count>--/--</span>
+                        <button class="ghost-btn" data-region-switch="1" type="button">下一个</button>
+                    </div>
+                    <div class="action-row restore-row">
+                        <button class="ghost-btn" id="restoreBlendBtn" type="button">还原融合</button>
+                        <button class="secondary-btn" id="saveBlendBtn" type="button">保存融合</button>
+                    </div>
+                </div>
+                <div class="fusion-control-group">
+                    <div class="fusion-control-title">融合带亮度</div>
+                    <div class="brightness-list">
+                        <label class="fusion-field">
+                            <span class="fusion-field-label red">R (红)</span>
+                            <div class="field-input-group brightness">
+                                <button class="btn" type="button" id="blendBrightRDecrease">−</button>
+                                <div class="brightness-drag-field" data-bright-input="blendBrightR">
+                                    <output id="blendBrightR" class="field-control" for="blendBrightRDecrease blendBrightRIncrease">128</output>
+                                </div>
+                                <button class="btn" type="button" id="blendBrightRIncrease">+</button>
+                                <button class="btn btn-icon" type="button" id="blendBrightRReset" title="重置">↻</button>
+                            </div>
+                        </label>
+                        <label class="fusion-field">
+                            <span class="fusion-field-label green">G (绿)</span>
+                            <div class="field-input-group brightness">
+                                <button class="btn" type="button" id="blendBrightGDecrease">−</button>
+                                <div class="brightness-drag-field" data-bright-input="blendBrightG">
+                                    <output id="blendBrightG" class="field-control" for="blendBrightGDecrease blendBrightGIncrease">128</output>
+                                </div>
+                                <button class="btn" type="button" id="blendBrightGIncrease">+</button>
+                                <button class="btn btn-icon" type="button" id="blendBrightGReset" title="重置">↻</button>
+                            </div>
+                        </label>
+                        <label class="fusion-field">
+                            <span class="fusion-field-label blue">B (蓝)</span>
+                            <div class="field-input-group brightness">
+                                <button class="btn" type="button" id="blendBrightBDecrease">−</button>
+                                <div class="brightness-drag-field" data-bright-input="blendBrightB">
+                                    <output id="blendBrightB" class="field-control" for="blendBrightBDecrease blendBrightBIncrease">128</output>
+                                </div>
+                                <button class="btn" type="button" id="blendBrightBIncrease">+</button>
+                                <button class="btn btn-icon" type="button" id="blendBrightBReset" title="重置">↻</button>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel" id="panel-color">
+                <div class="panel-title-row">
+                    <h2>区域色彩</h2>
+                    <button class="ghost-btn" id="resetColorBtn" type="button">重置</button>
+                </div>
+                <div class="slider-list">
+                    <label class="slider-field">
+                        <span>亮度 <strong id="colorBrightnessValue">1.00</strong></span>
+                        <input id="colorBrightness" type="range" min="0" max="2" step="0.01">
+                    </label>
+                    <label class="slider-field">
+                        <span>对比度 <strong id="colorContrastValue">1.00</strong></span>
+                        <input id="colorContrast" type="range" min="0" max="2" step="0.01">
+                    </label>
+                    <label class="slider-field">
+                        <span>饱和度 <strong id="colorSaturationValue">1.00</strong></span>
+                        <input id="colorSaturation" type="range" min="0" max="2" step="0.01">
+                    </label>
+                </div>
+                <div class="background-box">
+                    <div>
+                        <strong>调试背景</strong>
+                        <span id="backgroundInfo">未加载</span>
+                    </div>
+                    <div class="background-actions">
+                        <button class="ghost-btn" id="bgPrevBtn" type="button">上一张</button>
+                        <button class="ghost-btn" id="bgToggleBtn" type="button">显示</button>
+                        <button class="ghost-btn" id="bgNextBtn" type="button">下一张</button>
+                    </div>
+                </div>
+                <div class="fusion-control-group color-blend-params">
+                    <div class="fusion-control-title">融合参数</div>
+                    <div class="fusion-param-grid">
+                        <label class="fusion-field">
+                            <span class="fusion-field-label">Gamma</span>
+                            <div class="field-input-group">
+                                <button class="btn" type="button" id="blendGammaDecrease">−</button>
+                                <input id="blendGammaInput" class="field-control" type="number" min="1" max="3" step="0.1" value="1.8">
+                                <button class="btn" type="button" id="blendGammaIncrease">+</button>
+                                <button class="btn btn-icon" type="button" id="blendGammaReset" title="重置">↻</button>
+                            </div>
+                        </label>
+                        <label class="fusion-field">
+                            <span class="fusion-field-label">Slope</span>
+                            <div class="field-input-group">
+                                <button class="btn" type="button" id="blendSlopeDecrease">−</button>
+                                <input id="blendSlopeInput" class="field-control" type="number" min="1" max="3" step="0.1" value="1.0">
+                                <button class="btn" type="button" id="blendSlopeIncrease">+</button>
+                                <button class="btn btn-icon" type="button" id="blendSlopeReset" title="重置">↻</button>
+                            </div>
+                        </label>
+                    </div>
+                    <div class="blend-curve-box">
+                        <canvas id="blendCurveCanvas"></canvas>
+                    </div>
+                </div>
+                <button class="secondary-btn full" id="saveColorBtn" type="button">保存色彩</button>
+            </section>
+
+            <section class="panel" id="panel-advanced">
+                <div class="panel-title-row">
+                    <h2>高级校正</h2>
+                    <button class="danger-btn" id="resetFusionBtn" type="button">初始化融合</button>
+                </div>
+                <label class="switch-row wide">
+                    <input id="matrixCorrectionToggle" type="checkbox">
+                    <span>启用矩阵校正</span>
+                </label>
+                <div class="input-grid two">
+                    <label class="field"><span>Offset X</span><input id="offsetX" type="number" step="0.001" inputmode="decimal"></label>
+                    <label class="field"><span>Offset Y</span><input id="offsetY" type="number" step="0.001" inputmode="decimal"></label>
+                    <label class="field"><span>Scale X</span><input id="scaleX" type="number" step="0.001" inputmode="decimal"></label>
+                    <label class="field"><span>Scale Y</span><input id="scaleY" type="number" step="0.001" inputmode="decimal"></label>
+                    <label class="field"><span>Rotate Rad</span><input id="rotateRad" type="number" step="0.001" inputmode="decimal"></label>
+                    <label class="field"><span>Keystone X</span><input id="keystoneX" type="number" step="0.001" inputmode="decimal"></label>
+                    <label class="field"><span>Keystone Y</span><input id="keystoneY" type="number" step="0.001" inputmode="decimal"></label>
+                </div>
+                <button class="secondary-btn full" id="saveCorrectionBtn" type="button">应用矩阵校正</button>
+
+                <div class="advanced-divider"></div>
+                <label class="switch-row wide">
+                    <input id="caveToggle" type="checkbox">
+                    <span>启用 CAVE 投影</span>
+                </label>
+                <div class="input-grid two">
+                    <label class="field"><span>Wall Type</span><input id="wallType" type="number" step="1" inputmode="numeric"></label>
+                    <label class="field"><span>Eye Distance</span><input id="eyeDistance" type="number" step="0.001" inputmode="decimal"></label>
+                    <label class="field"><span>Near</span><input id="nearPlane" type="number" step="0.001" inputmode="decimal"></label>
+                    <label class="field"><span>Far</span><input id="farPlane" type="number" step="0.1" inputmode="decimal"></label>
+                </div>
+                <details class="details-box">
+                    <summary>CAVE 三点坐标</summary>
+                    <div class="input-grid three">
+                        <label class="field"><span>LL X</span><input id="llx" type="number" step="0.001"></label>
+                        <label class="field"><span>LL Y</span><input id="lly" type="number" step="0.001"></label>
+                        <label class="field"><span>LL Z</span><input id="llz" type="number" step="0.001"></label>
+                        <label class="field"><span>UL X</span><input id="ulx" type="number" step="0.001"></label>
+                        <label class="field"><span>UL Y</span><input id="uly" type="number" step="0.001"></label>
+                        <label class="field"><span>UL Z</span><input id="ulz" type="number" step="0.001"></label>
+                        <label class="field"><span>LR X</span><input id="lrx" type="number" step="0.001"></label>
+                        <label class="field"><span>LR Y</span><input id="lry" type="number" step="0.001"></label>
+                        <label class="field"><span>LR Z</span><input id="lrz" type="number" step="0.001"></label>
+                    </div>
+                </details>
+                <button class="secondary-btn full" id="saveCaveBtn" type="button">应用 CAVE 配置</button>
+            </section>
+        </main>
+
+        <main class="mobile-page" id="page-layer" data-page-title="图层矩阵">
+            <section class="panel active mobile-panel">
+                <div class="panel-title-row">
+                    <h2>图层矩阵</h2>
+                    <button class="ghost-btn" id="refreshLayerPageBtn" type="button">刷新</button>
+                </div>
+                <div class="metric-grid">
+                    <div class="metric-card">
+                        <span>图层总数</span>
+                        <strong id="layerTotalCount">--</strong>
+                    </div>
+                    <div class="metric-card">
+                        <span>显示中</span>
+                        <strong id="layerVisibleCount">--</strong>
+                    </div>
+                    <div class="metric-card">
+                        <span>视频图层</span>
+                        <strong id="layerVideoCount">--</strong>
+                    </div>
+                </div>
+                <div class="mobile-list" id="layerList">
+                    <div class="empty-state">正在加载图层...</div>
+                </div>
+                <div class="mobile-editor" id="layerEditor">
+                    <div class="empty-state">选择一个图层进行调试</div>
+                </div>
+            </section>
+        </main>
+
+        <main class="mobile-page" id="page-video" data-page-title="视频控制">
+            <section class="panel active mobile-panel">
+                <div class="panel-title-row">
+                    <h2>视频控制</h2>
+                    <button class="ghost-btn" id="refreshVideoPageBtn" type="button">刷新</button>
+                </div>
+                <div class="status-card">
+                    <span>当前图层</span>
+                    <strong id="videoActiveLayerLabel">--</strong>
+                    <small id="videoStatusText">正在读取播放状态...</small>
+                </div>
+                <div class="chip-row" id="videoLayerPicker"></div>
+                <div class="control-grid">
+                    <button class="secondary-btn" data-video-action="toggle" type="button" id="videoToggleBtn">播放</button>
+                    <button class="ghost-btn" data-video-action="stop" type="button">停止</button>
+                    <button class="ghost-btn" data-video-action="replay" type="button">重播</button>
+                    <button class="ghost-btn" data-video-action="mute" type="button" id="videoMuteBtn">静音</button>
+                    <button class="ghost-btn" data-video-action="volumeDown" type="button">音量-</button>
+                    <button class="ghost-btn" data-video-action="volumeUp" type="button">音量+</button>
+                </div>
+                <label class="slider-field system-volume-field">
+                    <span>系统音量 <strong id="systemVolumeValue">--</strong></span>
+                    <input id="systemVolumeSlider" type="range" min="0" max="100" step="1" value="50">
+                </label>
+                <label class="slider-field">
+                    <span>图层音量 <strong id="videoLayerVolumeValue">--</strong></span>
+                    <input id="videoLayerVolumeSlider" type="range" min="0" max="100" step="1" value="100">
+                </label>
+                <label class="slider-field video-seek-field">
+                    <span>播放进度 <strong id="videoSeekValue">--</strong></span>
+                    <input id="videoSeekSlider" type="range" min="0" max="0" step="0.1" value="0">
+                </label>
+            </section>
+        </main>
+
+        <main class="mobile-page" id="page-control" data-page-title="中控配置">
+            <section class="panel active mobile-panel">
+                <div class="panel-title-row">
+                    <h2>中控配置</h2>
+                    <button class="ghost-btn" id="refreshControlPageBtn" type="button">刷新</button>
+                </div>
+                <div class="segmented compact control-subtabs">
+                    <button class="seg-btn active" data-control-tab="dmx" type="button">DMX</button>
+                    <button class="seg-btn" data-control-tab="serial" type="button">串口</button>
+                    <button class="seg-btn" data-control-tab="network" type="button">网络</button>
+                </div>
+                <div class="control-subpage active" id="control-dmx">
+                    <div class="status-card">
+                        <span>DMX 状态</span>
+                        <strong id="dmxStatusText">--</strong>
+                        <small id="dmxModeText">正在读取...</small>
+                    </div>
+                    <label class="slider-field">
+                        <span>CH1 开启 <strong id="dmxMasterValue">0</strong></span>
+                        <input id="dmxMasterSlider" type="range" min="0" max="255" step="1" value="0">
+                    </label>
+                    <div class="dmx-mini-grid" id="dmxMiniGrid"></div>
+                </div>
+                <div class="control-subpage" id="control-serial">
+                    <div class="status-card">
+                        <span>串口端口</span>
+                        <strong id="serialPortCount">--</strong>
+                        <small>RS232 / RS485 / DMX 可用端口</small>
+                    </div>
+                    <div class="mobile-list compact" id="serialPortList">
+                        <div class="empty-state">正在读取串口...</div>
+                    </div>
+                </div>
+                <div class="control-subpage" id="control-network">
+                    <div class="status-card">
+                        <span>网络外设</span>
+                        <strong id="networkPeripheralStatus">UDP / TCP</strong>
+                        <small id="networkPeripheralText">保留 Web 版触发模板语义，移动端先做状态入口</small>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <main class="mobile-page" id="page-system" data-page-title="系统配置">
+            <section class="panel active mobile-panel">
+                <div class="panel-title-row">
+                    <h2>系统配置</h2>
+                    <button class="ghost-btn" id="refreshSystemPageBtn" type="button">刷新</button>
+                </div>
+                <div class="metric-grid">
+                    <div class="metric-card">
+                        <span>分辨率</span>
+                        <strong id="systemResolution">--</strong>
+                    </div>
+                    <div class="metric-card">
+                        <span>CPU</span>
+                        <strong id="systemCpu">--</strong>
+                    </div>
+                    <div class="metric-card">
+                        <span>内存</span>
+                        <strong id="systemMemory">--</strong>
+                    </div>
+                </div>
+                <div class="status-card">
+                    <span>设备</span>
+                    <strong id="systemDeviceName">--</strong>
+                    <small id="systemDeviceDetail">正在读取设备信息...</small>
+                </div>
+                <div class="mobile-list compact" id="systemInfoList"></div>
+            </section>
+        </main>
+
+        <nav class="bottom-nav" aria-label="主导航">
+            <a class="bottom-nav-item" href="#" data-app-page="layer">
+                <svg class="bottom-nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="3" y="4" width="7" height="7" rx="1.5"></rect>
+                    <rect x="14" y="4" width="7" height="7" rx="1.5"></rect>
+                    <rect x="3" y="15" width="7" height="5" rx="1.5"></rect>
+                    <rect x="14" y="15" width="7" height="5" rx="1.5"></rect>
+                </svg>
+                <span class="bottom-nav-main">图层</span>
+            </a>
+            <a class="bottom-nav-item" href="#" data-app-page="video">
+                <svg class="bottom-nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="3" y="6" width="12" height="12" rx="2"></rect>
+                    <path d="M15 10l5-3v10l-5-3z"></path>
+                </svg>
+                <span class="bottom-nav-main">视频</span>
+            </a>
+            <a class="bottom-nav-item active" href="#" data-app-page="fusion">
+                <svg class="bottom-nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 7h10a4 4 0 0 1 0 8H8"></path>
+                    <path d="M8 11l-4 4 4 4"></path>
+                    <path d="M16 9l4-4"></path>
+                    <path d="M17 5h3v3"></path>
+                </svg>
+                <span class="bottom-nav-main">融合</span>
+            </a>
+            <a class="bottom-nav-item" href="#" data-app-page="control">
+                <svg class="bottom-nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 8h16"></path>
+                    <path d="M4 16h16"></path>
+                    <circle cx="8" cy="8" r="2"></circle>
+                    <circle cx="16" cy="16" r="2"></circle>
+                </svg>
+                <span class="bottom-nav-main">控制</span>
+            </a>
+            <a class="bottom-nav-item" href="#" data-app-page="system">
+                <svg class="bottom-nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M12 3v3"></path>
+                    <path d="M12 18v3"></path>
+                    <path d="M3 12h3"></path>
+                    <path d="M18 12h3"></path>
+                    <path d="M5.6 5.6l2.1 2.1"></path>
+                    <path d="M16.3 16.3l2.1 2.1"></path>
+                    <path d="M18.4 5.6l-2.1 2.1"></path>
+                    <path d="M7.7 16.3l-2.1 2.1"></path>
+                </svg>
+                <span class="bottom-nav-main">系统</span>
+            </a>
+        </nav>
+    </div>
+
+    <div id="toast" class="toast" aria-live="polite"></div>
+    <script type="module" src="script.js?v=130"></script>
+</body>
+
+</html>

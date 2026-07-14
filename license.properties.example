@@ -1,0 +1,4 @@
+# Copy to license.properties and set the real HMAC key used by the engine
+# and license-tool. license.properties is intentionally ignored by Git.
+
+LICENSE_HMAC_KEY=change-me

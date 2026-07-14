@@ -1,0 +1,10 @@
+prefix=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/../rkmpp/android_lib
+exec_prefix=${prefix}
+libdir=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/../rkmpp/android_lib/system-stub/arm64-v8a
+includedir=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/../rkmpp/android_lib/include
+
+Name: rockchip_mpp
+Description: Rockchip Media Process Platform
+Version: 1.5.0
+Libs: -L${libdir} -lmpp
+Cflags: -I${includedir}

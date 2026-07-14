@@ -1,0 +1,38 @@
+// Gradle 初始化脚本 - 配置国内镜像源加速下载
+// 此脚本会自动在所有 Gradle 构建中生效
+
+gradle.projectsEvaluated {
+    gradle.rootProject.subprojects.find { it.name == 'app' }?.with { app ->
+        def b = app.buildDir
+        if (b != null) {
+            def r = new File(b, "intermediates/apk_ide_redirect_file/debug/createDebugApkListingFileRedirect/redirect.txt")
+            r.parentFile.mkdirs()
+            r.text = "#- File Locator -\nlistingFile=../../../../outputs/apk/debug/output-metadata.json\n"
+            new File(b, "intermediates/apk_ide_redirect_file/debug/createDebugApkListingFile").with { f -> f.parentFile.mkdirs(); f.text = r.text }
+            def m = new File(b, "outputs/apk/debug/output-metadata.json")
+            m.parentFile.mkdirs()
+            if (!m.exists()) m.text = '{"version":1}'
+        }
+    }
+}
+
+allprojects {
+    buildscript {
+        repositories {
+            maven { url 'https://maven.aliyun.com/repository/google' }
+            maven { url 'https://maven.aliyun.com/repository/central' }
+            maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+            google()
+            mavenCentral()
+        }
+    }
+    
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        google()
+        mavenCentral()
+    }
+}
+

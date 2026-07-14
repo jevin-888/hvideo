@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 工控设备专用主题 - 简洁配置 -->
+    <style name="Theme.HSVJEngine" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="colorPrimary">@android:color/black</item>
+        <item name="colorPrimaryDark">@android:color/black</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        
+        <item name="android:windowDisablePreview">true</item>
+        
+        <!-- [核心修复 2026-04-20] 禁用所有窗口动画 -->
+        <!-- 原因：窗口动画会触发 Surface 重建和属性变更 -->
+        <!-- 解决方案：禁用所有动画，减少 SurfaceFlinger 的合成压力 -->
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowEnterAnimation">@null</item>
+        <item name="android:windowExitAnimation">@null</item>
+        
+        <!-- [核心修复 2026-04-20] 禁用过渡动画 -->
+        <item name="android:windowActivityTransitions">false</item>
+        <item name="android:windowContentTransitions">false</item>
+        
+        <!-- [核心修复 2026-04-20] 强制硬件加速 -->
+        <!-- 原因：确保 Vulkan 渲染路径始终使用硬件加速 -->
+        <item name="android:hardwareAccelerated">true</item>
+    </style>
+    
+    <!-- 启动界面主题 -->
+    <style name="Theme.HSVJEngine.Startup" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="colorPrimary">#FF6B35</item>
+        <item name="colorPrimaryDark">@android:color/black</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+    </style>
+</resources>

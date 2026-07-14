@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 允许访问Download目录 -->
+    <external-path
+        name="downloads"
+        path="Download/" />
+    
+    <!-- 允许访问应用外部文件目录 -->
+    <external-files-path
+        name="external_files"
+        path="." />
+    
+    <!-- 允许访问应用缓存目录 -->
+    <cache-path
+        name="cache"
+        path="." />
+</paths>

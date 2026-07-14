@@ -1,0 +1,47 @@
+pluginManagement {
+    repositories {
+        // 优先使用阿里云镜像加速下载
+        maven { 
+            url 'https://maven.aliyun.com/repository/gradle-plugin'
+            allowInsecureProtocol = false
+        }
+        maven { 
+            url 'https://maven.aliyun.com/repository/google'
+            allowInsecureProtocol = false
+        }
+        maven { 
+            url 'https://maven.aliyun.com/repository/central'
+            allowInsecureProtocol = false
+        }
+        // 备用镜像（如果阿里云不可用）
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        // 优先使用阿里云镜像加速下载
+        maven { 
+            url 'https://maven.aliyun.com/repository/google'
+            allowInsecureProtocol = false
+        }
+        maven { 
+            url 'https://maven.aliyun.com/repository/central'
+            allowInsecureProtocol = false
+        }
+        maven { 
+            url 'https://maven.aliyun.com/repository/public'
+            allowInsecureProtocol = false
+        }
+        // 备用镜像（如果阿里云不可用）
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "HSVJEngine"
+include ':app'
+

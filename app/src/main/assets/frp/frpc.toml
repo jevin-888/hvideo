@@ -1,0 +1,11 @@
+serverAddr = "60.205.127.117"
+serverPort = 7000
+auth.method = "token"
+auth.token = "HvideoFrpTest2026_ChangeMe"
+
+[[proxies]]
+name = "hvideo-web-18081"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = 18081

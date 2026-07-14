@@ -1,0 +1,14 @@
+prefix=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/android/arm64
+exec_prefix=${prefix}
+libdir=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/android/arm64/lib
+includedir=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/android/arm64/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 58.29.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: -pthread -lm -L/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/../libdrm-android/lib -ldrm -L/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/../rkmpp/android_lib/system-stub/arm64-v8a -lmpp -latomic -landroid
+Cflags: -I${includedir}

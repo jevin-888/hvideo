@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000"
+    android:padding="32dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:maxWidth="1080dp"
+        android:orientation="vertical"
+        android:gravity="center">
+
+    <!-- Logo区域 -->
+    <ImageView
+        android:layout_width="120dp"
+        android:layout_height="120dp"
+        android:layout_marginBottom="32dp"
+        android:src="@drawable/ic_launcher"
+        android:contentDescription="HSVJ Engine Logo" />
+
+    <!-- 标题 -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="HSVJ Engine"
+        android:textColor="#FFFFFF"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="8dp" />
+
+    <!-- 版本信息 -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="专业视频融合引擎"
+        android:textColor="#CCCCCC"
+        android:textSize="14sp"
+        android:layout_marginBottom="48dp" />
+
+    <!-- 进度条 -->
+    <ProgressBar
+        android:id="@+id/progressBar"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="8dp"
+        android:layout_marginBottom="16dp"
+        android:progressTint="#FF6B35"
+        android:progressBackgroundTint="#333333" />
+
+    <!-- 进度百分比 -->
+    <TextView
+        android:id="@+id/progressText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="0%"
+        android:textColor="#FF6B35"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="8dp" />
+
+    <!-- 状态文本 -->
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="正在启动..."
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:gravity="center" />
+
+    <!-- 底部提示 -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="首次启动需要复制资源文件，请稍候..."
+        android:textColor="#888888"
+        android:textSize="12sp"
+        android:layout_marginTop="32dp"
+        android:gravity="center" />
+
+    </LinearLayout>
+
+</FrameLayout>

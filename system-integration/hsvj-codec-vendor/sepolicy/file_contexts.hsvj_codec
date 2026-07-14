@@ -1,0 +1,14 @@
+/vendor/lib64/libmpp\.so           u:object_r:same_process_hal_file:s0
+/vendor/lib64/libavcodec\.so       u:object_r:same_process_hal_file:s0
+/vendor/lib64/libavformat\.so      u:object_r:same_process_hal_file:s0
+/vendor/lib64/libavutil\.so        u:object_r:same_process_hal_file:s0
+/vendor/lib64/libavfilter\.so      u:object_r:same_process_hal_file:s0
+/vendor/lib64/libswscale\.so       u:object_r:same_process_hal_file:s0
+/vendor/lib64/libswresample\.so    u:object_r:same_process_hal_file:s0
+/vendor/lib64/libffmpeg_58\.so     u:object_r:same_process_hal_file:s0
+
+# Optional, only if these libraries are also moved into /vendor/lib64:
+/vendor/lib64/libavdevice\.so      u:object_r:same_process_hal_file:s0
+/vendor/lib64/libpostproc\.so      u:object_r:same_process_hal_file:s0
+/vendor/lib64/libdrm\.so           u:object_r:same_process_hal_file:s0
+/vendor/lib64/librockit\.so        u:object_r:same_process_hal_file:s0

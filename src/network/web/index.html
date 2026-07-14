@@ -1,0 +1,2095 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>HVIDEO控制软件</title>
+    <!-- 禁用浏览器缓存 -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <!-- 初始背景色，防止CSS加载前显示灰色 -->
+    <style>
+        html,
+        body {
+            background-color: #0f0f23;
+            color: #ffffff;
+            margin: 0;
+            padding: 0;
+            cursor: default;
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body * {
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+    </style>
+    <link rel="stylesheet" href="style.css?v=2.68">
+    <!-- QRCode.js - 二维码生成库 -->
+    <script src="qrcode.min.js"></script>
+</head>
+
+<body>
+    <header class="system-header">
+        <label for="sidebar-toggle" class="sidebar-toggle-btn" aria-label="菜单">
+            <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="3" y1="6" x2="21" y2="6" />
+                <line x1="3" y1="12" x2="21" y2="12" />
+                <line x1="3" y1="18" x2="21" y2="18" />
+            </svg>
+        </label>
+        <div class="header-left">
+            <h1 id="app-title">HVIDEO控制软件</h1>
+        </div>
+        <div class="header-right">
+            <div class="system-status">
+                <span id="status-text">运行中</span>
+                <span class="status-divider">|</span>
+                <span id="resolution">1920x1080</span>
+                <span class="status-divider">|</span>
+                <span class="resource-item" title="CPU使用率">
+                    <span class="resource-label">CPU</span>
+                    <span id="cpu-usage">0%</span>
+                </span>
+                <span class="status-divider">|</span>
+                <span class="resource-item" title="内存使用">
+                    <span class="resource-label">内存</span>
+                    <span id="mem-usage">0%</span>
+                </span>
+                <span class="status-divider">|</span>
+                <button id="restart-app-btn" class="header-btn" title="重启软件"><svg class="icon-svg" viewBox="0 0 24 24"
+                        fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                        <path d="M3 3v5h5" />
+                    </svg> 重启软件</button>
+                <button id="restart-system-btn" class="header-btn danger" title="重启系统"><svg class="icon-svg"
+                        viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+                    </svg> 重启系统</button>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-content">
+        <div class="sidebar-wrapper">
+            <input type="checkbox" id="sidebar-toggle" class="hidden" aria-hidden="true">
+            <label for="sidebar-toggle" class="sidebar-overlay" aria-label="关闭菜单"></label>
+            <aside class="sidebar">
+                <nav class="menu">
+                    <ul>
+                        <li class="menu-item active" data-page="system-status">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M3 3v18h18" />
+                                <path d="M18 17V9" />
+                                <path d="M13 17V5" />
+                                <path d="M8 17v-3" />
+                            </svg>
+                            <span class="menu-text">系统状态</span>
+                        </li>
+                        <li class="menu-item" data-page="layer-matrix">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <rect x="3" y="3" width="7" height="7" />
+                                <rect x="14" y="3" width="7" height="7" />
+                                <rect x="14" y="14" width="7" height="7" />
+                                <rect x="3" y="14" width="7" height="7" />
+                            </svg>
+                            <span class="menu-text">图层矩阵</span>
+                        </li>
+                        <li class="menu-item" data-page="video-control">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <polygon points="5 3 19 12 5 21 5 3" />
+                                <rect x="19" y="15" width="3" height="6" />
+                                <rect x="19" y="3" width="3" height="6" />
+                            </svg>
+                            <span class="menu-text">视频控制</span>
+                        </li>
+
+                        <li class="menu-item" data-page="scene-template">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <line x1="14" y1="2" x2="14" y2="6" />
+                                <line x1="20" y1="2" x2="20" y2="6" />
+                                <line x1="2" y1="10" x2="22" y2="10" />
+                                <line x1="2" y1="14" x2="22" y2="14" />
+                                <line x1="2" y1="18" x2="22" y2="18" />
+                            </svg>
+                            <span class="menu-text">场景模板</span>
+                        </li>
+                        <li class="menu-item" data-page="effect-control" style="display:none">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                                <path d="M2 17l10 5 10-5" />
+                                <path d="M2 12l10 5 10-5" />
+                            </svg>
+                            <span class="menu-text">特效管理</span>
+                        </li>
+
+                        <li class="menu-item" data-page="fusion">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <rect x="3" y="3" width="18" height="18" rx="2" />
+                                <path d="M9 9h6v6H9z" />
+                            </svg>
+                            <span class="menu-text">投影融合</span>
+                        </li>
+                        <li class="menu-item" data-page="projection-correction">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M4 6h16" />
+                                <path d="M4 18h16" />
+                                <path d="M8 6v12" />
+                                <path d="M16 6v12" />
+                                <circle cx="8" cy="12" r="2" />
+                                <circle cx="16" cy="12" r="2" />
+                            </svg>
+                            <span class="menu-text">CAVE校正</span>
+                        </li>
+                        <li class="menu-item" data-page="peripheral-management">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <rect x="2" y="4" width="20" height="16" rx="2" />
+                                <path d="M6 12h.01M10 12h.01M14 12h.01M18 12h.01" />
+                                <path d="M6 16h.01M10 16h.01M14 16h.01M18 16h.01" />
+                            </svg>
+                            <span class="menu-text">中控配置</span>
+                        </li>
+                        <li class="menu-item" data-page="system-settings">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <circle cx="12" cy="12" r="3" />
+                                <path
+                                    d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                            </svg>
+                            <span class="menu-text">系统设置</span>
+                        </li>
+                    </ul>
+                </nav>
+            </aside>
+        </div>
+
+        <section class="content-area">
+            <div class="page-content">
+                <div id="system-status-page" class="page active">
+                    <div class="status-grid">
+                        <div class="status-card">
+                            <h3>基本信息</h3>
+                            <div class="info-item">
+                                <span class="info-label">分辨率:</span>
+                                <span id="info-resolution" class="info-value">1920x1080</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="info-label">音频类型:</span>
+                                <span id="info-audio-type" class="info-value">HDMI1</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="info-label">设备类型:</span>
+                                <span id="info-device-type" class="info-value">专业版</span>
+                            </div>
+                            <div class="info-item">
+                                <span class="info-label">屏幕旋转:</span>
+                                <span id="info-screen-rotate" class="info-value">0°</span>
+                            </div>
+                        </div>
+                        <div class="status-card">
+                            <h3 class="section-title">图层状态</h3>
+                            <div id="layers-status-container"></div>
+                        </div>
+                        <div class="status-card">
+                            <h3 class="section-title">视频播放</h3>
+                            <div id="video-status-container"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="layer-matrix-page" class="page">
+                    <div class="matrix-container">
+                        <div id="layer-matrix" class="layer-matrix"></div>
+                    </div>
+
+                    <div class="layer-top-info">
+                        <div class="canvas-info">
+                            <span class="canvas-title">幕布</span>
+
+                            <div class="canvas-config-group">
+                                <label>分辨率:</label>
+                                <input type="number" id="canvas-width-input"
+                                    class="canvas-config-input canvas-config-readonly" placeholder="宽" min="1"
+                                    max="10000" readonly>
+                                <span>×</span>
+                                <input type="number" id="canvas-height-input"
+                                    class="canvas-config-input canvas-config-readonly" placeholder="高" min="1"
+                                    max="10000" readonly>
+                            </div>
+
+                            <div class="canvas-config-group">
+                                <label>幕布布局:</label>
+                                <input type="number" id="canvas-rows-input"
+                                    class="canvas-config-input canvas-config-readonly" placeholder="行" min="1" max="10"
+                                    readonly>
+                                <span>×</span>
+                                <input type="number" id="canvas-cols-input"
+                                    class="canvas-config-input canvas-config-readonly" placeholder="列" min="1" max="10"
+                                    readonly>
+                            </div>
+
+                            <!-- 旋转（只读） -->
+                            <span class="canvas-rotation-label">旋转:</span>
+                            <select id="canvas-rotation" class="canvas-rotation-input canvas-config-readonly" disabled>
+                                <option value="0">0°</option>
+                                <option value="90" selected>90°</option>
+                                <option value="180">180°</option>
+                                <option value="270">270°</option>
+                            </select>
+                        </div>
+
+                        <div class="template-controls">
+                            <button id="save-default-template" class="btn small">保存</button>
+                            <select id="select-template-dropdown" class="form-control small template-select">
+                                <option value="默认配置" selected>默认配置</option>
+                            </select>
+                            <button id="save-template" class="btn small">另存为</button>
+                        </div>
+                    </div>
+
+                    <div class="layer-main-content">
+                        <div class="layer-selection">
+                        </div>
+
+                        <div class="layer-canvas-main">
+                            <div class="layer-canvas-container">
+                                <canvas id="layer-canvas" width="800" height="220"></canvas>
+                            </div>
+
+                            <div id="control-params" class="control-params">
+                                <div id="layer-properties-form"></div>
+                            </div>
+                        </div>
+
+                        <div class="layer-operations">
+                            <div class="slice-panel-header">
+                                <h3>切片管理</h3>
+                                <button id="slice-1" class="btn small">创建切片</button>
+                            </div>
+                            <div id="slice-list" class="slice-list"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="video-control-page" class="page">
+                    <div class="video-control-container">
+                        <!-- 节目列表区域 -->
+                        <div class="playlist-section">
+                            <div class="playlist-container">
+                                <div class="playlist-sidebar">
+                                    <div class="playlist-buttons-container">
+                                        <div class="playlist-actions">
+                                            <button id="create-playlist-btn" class="btn primary small">新建列表</button>
+                                            <button id="remove-playlist-btn" class="btn danger small">删除列表</button>
+                                        </div>
+                                        <div class="playlist-add-item">
+                                            <select id="add-item-select" class="form-control full-width">
+                                                <option value="">请选择播放列表</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="playlist-content">
+                                    <div class="playlist-controls">
+                                        <button id="play-playlist-btn" class="btn success small">播放列表</button>
+                                        <button id="set-default-playlist-btn" class="btn small">设为默认</button>
+                                        <button id="playlist-settings-btn" class="btn small">设置</button>
+                                        <button id="delete-playlist-btn" class="btn danger small">清空</button>
+                                        <span id="playlist-item-count" class="playlist-count-badge hidden">0</span>
+                                    </div>
+                                    <div id="playlist-items" class="playlist-items">
+                                        <!-- 播放列表项 -->
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 素材管理区域 -->
+                        <div class="material-section">
+                            <div class="material-container">
+                                <div class="material-sidebar">
+                                    <div class="material-actions-bar">
+                                        <button id="upload-btn" class="btn primary">上传素材</button>
+                                        <button id="upload-folder-btn" class="btn secondary">上传文件夹</button>
+                                        <label class="preview-switch" title="预览开关">
+                                            <input type="checkbox" id="video-preview-switch">
+                                            <span class="switch-slider"></span>
+                                            <span class="switch-label">预览</span>
+                                        </label>
+                                        <input type="file" id="file-input" class="file-input-hidden" multiple>
+                                        <input type="file" id="folder-input" class="file-input-hidden" webkitdirectory>
+                                        <div id="upload-progress-container" class="upload-progress-container hidden">
+                                            <div class="upload-progress-header">
+                                                <span>上传进度</span>
+                                                <button id="upload-progress-close" class="btn-icon" title="关闭"><svg
+                                                        class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                        stroke="currentColor" stroke-width="2">
+                                                        <line x1="18" y1="6" x2="6" y2="18" />
+                                                        <line x1="6" y1="6" x2="18" y2="18" />
+                                                    </svg></button>
+                                            </div>
+                                            <div id="upload-progress-list" class="upload-progress-list">
+                                                <!-- 上传进度项将动态添加 -->
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="material-content">
+                                    <div class="material-toolbar">
+                                        <div class="search-box">
+                                            <input type="text" id="material-search" placeholder="搜索素材..."
+                                                class="form-control">
+                                        </div>
+                                        <button type="button" id="material-refresh-btn" class="btn secondary"
+                                            title="刷新全部并刷新列表">🔄 刷新全部</button>
+                                        <div id="selected-materials-actions-toolbar" class="folder-actions-toolbar"
+                                            style="display:none;">
+                                            <button type="button" id="transcode-selected-btn" class="btn small"
+                                                title="使用 h264_rkmpp 重新编码选中的视频">🔄 重新编码</button>
+                                            <button type="button" id="batch-transcode-btn" class="btn small"
+                                                title="检查视频优化状态，已优化的视频会自动跳过" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">🎬 批量优化</button>
+                                        </div>
+                                        <div id="folder-actions-toolbar" class="folder-actions-toolbar">
+                                            <!-- 文件夹操作按钮将动态添加到这里 -->
+                                        </div>
+                                        <div class="material-type-buttons">
+                                            <button class="btn type-btn active" data-type="video">视频</button>
+                                            <button class="btn type-btn" data-type="image">图片</button>
+                                            <button class="btn type-btn" data-type="audio">音乐</button>
+                                        </div>
+                                    </div>
+                                    <div id="material-folder-list" class="material-folder-list">
+                                        <!-- 文件夹标签将通过JS动态生成 -->
+                                    </div>
+                                    <div id="material-list" class="material-list grid-view">
+                                        <div class="drag-drop-hint">📂 拖拽文件或文件夹到此处上传</div>
+                                        <!-- 素材列表将通过JS动态生成 -->
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 音频控制区域 -->
+                        <div class="audio-control-main">
+                            <div class="audio-player-section">
+                                <div class="preview-header">
+                                    <h3>音频控制</h3>
+                                </div>
+                                <div class="audio-controls">
+                                    <div class="controls-main-row">
+                                        <div class="playback-controls-group">
+                                            <button id="play-pause-btn" class="control-btn playing"
+                                                data-state="playing">
+                                                <span class="icon icon-pause"><svg class="icon-svg" viewBox="0 0 24 24"
+                                                        fill="currentColor">
+                                                        <rect x="6" y="4" width="4" height="16" />
+                                                        <rect x="14" y="4" width="4" height="16" />
+                                                    </svg></span>
+                                                <span class="icon icon-play hidden"><svg class="icon-svg"
+                                                        viewBox="0 0 24 24" fill="currentColor">
+                                                        <path d="M8 5v14l11-7z" />
+                                                    </svg></span>
+                                                <span class="text">暂停</span>
+                                            </button>
+                                            <button id="replay-btn" class="control-btn">
+                                                <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                        stroke="currentColor" stroke-width="2">
+                                                        <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                                                        <path d="M3 3v5h5" />
+                                                    </svg></span>
+                                                <span class="text">重播</span>
+                                            </button>
+                                            <button id="next-btn" class="control-btn">
+                                                <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                        stroke="currentColor" stroke-width="2">
+                                                        <polygon points="5 4 15 12 5 20 5 4" />
+                                                        <line x1="19" y1="5" x2="19" y2="19" />
+                                                    </svg></span>
+                                                <span class="text">下一曲</span>
+                                            </button>
+                                        </div>
+                                        <div class="volume-buttons-group">
+                                            <button id="volume-down-btn" class="control-btn">
+                                                <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                        stroke="currentColor" stroke-width="2">
+                                                        <line x1="5" y1="12" x2="19" y2="12" />
+                                                    </svg></span>
+                                                <span class="text">音量减</span>
+                                            </button>
+                                            <button id="volume-up-btn" class="control-btn">
+                                                <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                        stroke="currentColor" stroke-width="2">
+                                                        <line x1="12" y1="5" x2="12" y2="19" />
+                                                        <line x1="5" y1="12" x2="19" y2="12" />
+                                                    </svg></span>
+                                                <span class="text">音量加</span>
+                                            </button>
+                                            <button id="mute-btn" class="control-btn">
+                                                <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                        stroke="currentColor" stroke-width="2">
+                                                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                                                        <line x1="23" y1="9" x2="17" y2="15" />
+                                                        <line x1="17" y1="9" x2="23" y2="15" />
+                                                    </svg></span>
+                                                <span class="text">静音</span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div class="volume-controls-row">
+                                        <div class="volume-control">
+                                            <label class="volume-label">图层音量:</label>
+                                            <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                    stroke="currentColor" stroke-width="2">
+                                                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                                                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                                                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                                                </svg></span>
+                                            <input type="range" id="layer-volume-slider" min="0" max="100" value="100"
+                                                class="slider">
+                                            <span id="layer-volume-value">100%</span>
+                                        </div>
+                                        <div class="volume-control">
+                                            <label class="volume-label">系统音量:</label>
+                                            <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                    stroke="currentColor" stroke-width="2">
+                                                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                                                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                                                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                                                </svg></span>
+                                            <input type="range" id="system-volume-slider" min="0" max="100" value="100"
+                                                class="slider">
+                                            <span id="system-volume-value">100%</span>
+                                        </div>
+                                        <div class="volume-control">
+                                            <label class="volume-label">播放速度:</label>
+                                            <div class="rate-stepper">
+                                                <button id="playback-rate-down-btn" class="btn small" type="button">-</button>
+                                                <button id="playback-rate-up-btn" class="btn small" type="button">+</button>
+                                            </div>
+                                            <span id="playback-rate-value">1.00x</span>
+                                        </div>
+                                        <div class="volume-control">
+                                            <label class="volume-label">播放进度:</label>
+                                            <input type="range" id="seek-position-slider" min="0" max="0" step="0.1" value="0"
+                                                class="slider">
+                                            <span id="seek-position-value">00:00</span>
+                                        </div>
+                                    </div>
+                                    <div class="audio-settings-controls-row">
+                                        <div class="audio-settings-group">
+                                            <div class="button-group">
+                                                <button id="playback-lock-btn" class="btn small" data-locked="false">
+                                                    <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                            stroke="currentColor" stroke-width="2">
+                                                            <rect x="5" y="11" width="14" height="10" rx="2" />
+                                                            <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+                                                        </svg></span>
+                                                    <span class="text">锁定</span>
+                                                </button>
+                                            </div>
+                                            <!-- 音轨切换按钮 -->
+                                            <div id="audio-track-select" class="button-group">
+                                                <button class="btn small active" data-value="0">音轨切换</button>
+                                            </div>
+                                            <!-- 声道设置 -->
+                                            <div id="audio-channel-select" class="button-group">
+                                                <button class="btn small active" data-value="stereo">立体声</button>
+                                                <button class="btn small" data-value="left">左声道</button>
+                                                <button class="btn small" data-value="right">右声道</button>
+                                            </div>
+                                            <div id="dsp-audio-route-test" class="button-group">
+                                                <button class="btn small" data-dsp-type="1" data-is-hdmin="0">DSP系统</button>
+                                                <button class="btn small" data-dsp-type="2" data-is-hdmin="1">DSP输入</button>
+                                                <button class="btn small" data-dsp-type="3" data-is-hdmin="0">DSP麦克</button>
+                                                <button class="btn small" data-dsp-type="0" data-is-hdmin="0">DSP关闭</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- 流视频测试区域 -->
+                                <div class="stream-test-section glass-card">
+                                    <div class="preview-header">
+                                        <h3>流视频测试</h3>
+                                    </div>
+                                    <div class="stream-test-controls glass-card-inner">
+                                        <div class="glass-card-section">
+                                            <label class="stream-url-label">流URL:</label>
+                                            <input type="text" id="stream-url-input" class="stream-url-input"
+                                                value="http://192.168.1.56:8080/video/tset.mp4"
+                                                placeholder="http://192.168.1.56:8080/video/tset.mp4">
+                                        </div>
+                                        <button id="stream-test-btn" class="btn primary stream-submit-btn">
+                                            <svg class="icon-svg" viewBox="0 0 24 24" fill="currentColor">
+                                                <path d="M8 5v14l11-7z" />
+                                            </svg> 测试播放
+                                        </button>
+                                        <div id="stream-test-status" class="stream-log hidden"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="scene-template-page" class="page">
+                    <div class="scene-template-container">
+                        <!-- 左侧：场景列表（始终可见） -->
+                        <div class="template-list">
+                            <h3 class="section-title">场景列表</h3>
+                            <div id="template-list-container"></div>
+                        </div>
+
+                        <!-- 右侧：详情与配置页签面板 -->
+                        <div class="template-content-right">
+                            <div class="scene-right-panel glass-panel">
+                                <div class="panel-header-tabs">
+                                    <button class="panel-tab active" data-scene-tab="scene-tab-templates">场景详情</button>
+                                    <button class="panel-tab" data-scene-tab="scene-tab-config">默认配置</button>
+                                </div>
+
+                                <div class="panel-body padding-lg">
+                                    <div id="scene-tab-templates" class="scene-tab active">
+                                        <div class="effect-card-header">
+                                            <button id="refresh-scene-btn" class="btn small"><svg class="icon-svg"
+                                                    viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                                    stroke-width="2">
+                                                    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                                                    <path d="M3 3v5h5" />
+                                                </svg> 刷新</button>
+                                            <button id="save-scene-btn" class="btn small primary"><svg class="icon-svg"
+                                                    viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                                    stroke-width="2">
+                                                    <path
+                                                        d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+                                                    <polyline points="17 21 17 13 7 13 7 21" />
+                                                    <polyline points="7 3 7 8 15 8" />
+                                                </svg> 保存修改</button>
+                                            <span id="current-scene-name-label"
+                                                class="effect-card-header-label">未选中场景</span>
+                                        </div>
+                                        <div id="template-details-container">
+                                            <textarea id="scene-json-editor"
+                                                class="form-control code-block code-block--full"
+                                                placeholder="请从左侧场景列表选择一个场景进行查看或编辑..."></textarea>
+                                        </div>
+                                    </div>
+
+                                    <div id="scene-tab-config" class="scene-tab">
+                                        <div class="effect-card-header">
+                                            <button id="load-config-json-btn" class="btn small"><svg class="icon-svg"
+                                                    viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                                    stroke-width="2">
+                                                    <circle cx="11" cy="11" r="8" />
+                                                    <path d="m21 21-4.35-4.35" />
+                                                </svg> 加载配置</button>
+                                            <button id="save-config-json-btn" class="btn small primary"><svg
+                                                    class="icon-svg" viewBox="0 0 24 24" fill="none"
+                                                    stroke="currentColor" stroke-width="2">
+                                                    <path
+                                                        d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+                                                    <polyline points="17 21 17 13 7 13 7 21" />
+                                                    <polyline points="7 3 7 8 15 8" />
+                                                </svg> 提交修改</button>
+                                            <span class="badge"><svg class="icon-svg icon-svg--sm" viewBox="0 0 24 24"
+                                                    fill="none" stroke="currentColor" stroke-width="2">
+                                                    <circle cx="12" cy="12" r="3" />
+                                                    <path
+                                                        d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                                                </svg> 修改系统核心配置 (config.json)，修改后必须重启软件</span>
+                                        </div>
+                                        <textarea id="config-json-editor"
+                                            class="form-control code-block code-block--full code-block--warn"
+                                            placeholder="点击'加载配置'以开始编辑系统核心配置..."></textarea>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="effect-control-page" class="page">
+                    <div class="effect-container">
+                        <div class="effect-list">
+                            <h3 class="section-title">特效列表</h3>
+                            <div id="effect-list-container"></div>
+                        </div>
+                        <div class="effect-properties">
+                            <div id="effect-properties-container"></div>
+                        </div>
+                    </div>
+                </div>
+
+
+
+
+                <div id="peripheral-management-page" class="page">
+                    <div class="peripheral-management-container">
+                        <!-- 左侧：外设列表 -->
+                        <div class="peripheral-list">
+                            <h3 class="section-title">外设列表</h3>
+                            <div id="peripheral-selection-list">
+                                <div class="peripheral-item active" data-peripheral="dmx512">
+                                    <div class="peripheral-item-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+                                        </svg>
+                                    </div>
+                                    <div class="peripheral-item-info">
+                                        <span class="peripheral-item-title">DMX512 控制</span>
+                                        <span class="peripheral-item-desc">网络/串口 DMX512 协议</span>
+                                    </div>
+                                </div>
+                                <div class="peripheral-item" data-peripheral="serial">
+                                    <div class="peripheral-item-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="2" y="4" width="20" height="16" rx="2" />
+                                            <path d="M6 12h.01M10 12h.01M14 12h.01M18 12h.01" />
+                                        </svg>
+                                    </div>
+                                    <div class="peripheral-item-info">
+                                        <span class="peripheral-item-title">串口配置</span>
+                                        <span class="peripheral-item-desc">RS232/RS485 串口通信配置</span>
+                                    </div>
+                                </div>
+                                <div class="peripheral-item" data-peripheral="udp">
+                                    <div class="peripheral-item-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path
+                                                d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                                            <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+                                            <line x1="12" y1="22.08" x2="12" y2="12" />
+                                        </svg>
+                                    </div>
+                                    <div class="peripheral-item-info">
+                                        <span class="peripheral-item-title">UDP 网络</span>
+                                        <span class="peripheral-item-desc">用户数据报协议 (无连接)</span>
+                                    </div>
+                                </div>
+                                <div class="peripheral-item" data-peripheral="tcp">
+                                    <div class="peripheral-item-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path
+                                                d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                                            <polyline points="7.5 4.21 12 6.81 16.5 4.21" />
+                                            <polyline points="7.5 19.79 7.5 14.6 3 12" />
+                                            <polyline points="21 12 16.5 9.4 16.5 19.79" />
+                                            <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+                                            <line x1="12" y1="22.08" x2="12" y2="12" />
+                                        </svg>
+                                    </div>
+                                    <div class="peripheral-item-info">
+                                        <span class="peripheral-item-title">TCP 网络</span>
+                                        <span class="peripheral-item-desc">传输控制协议 (面向连接)</span>
+                                    </div>
+                                </div>
+                                <div class="peripheral-item" data-peripheral="function-config">
+                                    <div class="peripheral-item-icon">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M12 2v4" />
+                                            <path d="M12 18v4" />
+                                            <path d="M4.93 4.93l2.83 2.83" />
+                                            <path d="M16.24 16.24l2.83 2.83" />
+                                            <path d="M2 12h4" />
+                                            <path d="M18 12h4" />
+                                            <circle cx="12" cy="12" r="4" />
+                                        </svg>
+                                    </div>
+                                    <div class="peripheral-item-info">
+                                        <span class="peripheral-item-title">功能配置</span>
+                                        <span class="peripheral-item-desc">移动端灯光 / 空调功能</span>
+                                    </div>
+                                </div>
+
+                            </div>
+                        </div>
+
+                        <!-- 右侧：详情与配置 -->
+                        <div class="peripheral-content-right">
+                            <div class="peripheral-right-panel glass-panel">
+                                <div class="panel-header-tabs">
+                                    <button class="panel-tab active"
+                                        data-peripheral-tab="peripheral-tab-config">参数配置</button>
+                                    <button class="panel-tab" data-peripheral-tab="peripheral-tab-test">测试与诊断</button>
+                                </div>
+
+                                <div class="panel-body">
+                                    <!-- 配置页签 -->
+                                    <div id="peripheral-tab-config" class="peripheral-tab active">
+                                        <!-- 说明：DMX512 配置 -->
+                                        <div id="config-dmx512" class="config-section active">
+                                            <div class="peripheral-form">
+                                                <div class="peripheral-config-row">
+                                                    <div class="setting-item width-mode">
+                                                        <label>模式:</label>
+                                                        <select id="dmx-input-mode" class="form-control">
+                                                            <option value="local" selected>本机模式</option>
+                                                            <option value="external">外接模式</option>
+                                                        </select>
+                                                    </div>
+                                                    <div class="setting-item width-port">
+                                                        <label>端口:</label>
+                                                        <select id="dmx-port" class="form-control">
+                                                            <option value="/dev/ttySWK0" selected>RS485 DMX (/dev/ttySWK0)
+                                                            </option>
+                                                            <option value="/dev/ttyUSB0">USB DMX (/dev/ttyUSB0)</option>
+                                                            <option value="artnet">Art-Net (Network)</option>
+                                                            <option value="sacn">sACN (Network)</option>
+                                                        </select>
+                                                    </div>
+                                                    <div class="setting-item width-port dmx-external-only" style="display:none">
+                                                        <label>232接口:</label>
+                                                        <select id="dmx-external-port" class="form-control">
+                                                            <option value="/dev/ttySWK4" selected>RS232 (/dev/ttySWK4)</option>
+                                                        </select>
+                                                    </div>
+                                                    <div class="setting-item width-baud">
+                                                        <label>波特率:</label>
+                                                        <select id="dmx-baudrate" class="form-control" disabled>
+                                                            <option value="250000" selected>250000 (DMX)</option>
+                                                            <option value="115200">115200 (RS232)</option>
+                                                        </select>
+                                                    </div>
+                                                    <div class="setting-item width-addr">
+                                                        <label>地址码:</label>
+                                                        <input type="number" id="dmx-start-address" class="form-control"
+                                                            min="1" max="512" step="1" value="1">
+                                                    </div>
+                                                    <div class="setting-item width-mode">
+                                                        <label>命令提示:</label>
+                                                        <label class="preview-switch">
+                                                            <input type="checkbox" id="dmx-info-show">
+                                                            <span class="switch-slider"></span>
+                                                        </label>
+                                                    </div>
+                                                    <div class="setting-item apply-cell">
+                                                        <label>&nbsp;</label>
+                                                        <button id="save-dmx-btn"
+                                                            class="btn primary peripheral-apply-btn">应用配置</button>
+                                                    </div>
+                                                </div>
+
+                                                <!-- 小监视器网格（实时反馈） -->
+                                                <div class="monitor-section">
+                                                    <h3 class="monitor-section-title">DMX通道值 (1-12)</h3>
+                                                    <div id="dmx-mini-monitor-grid" class="dmx-mini-grid">
+                                                        <!-- 示例/字段：动态单元格会注入到这里（示例项） -->
+                                                        <div class="dmx-mini-cell bg-dmx-yellow"><span
+                                                                class="dmx-mini-ch-num">1</span><span
+                                                                class="dmx-mini-val">138</span></div>
+                                                        <div class="dmx-mini-cell bg-dmx-red"><span
+                                                                class="dmx-mini-ch-num">2</span><span
+                                                                class="dmx-mini-val">255</span></div>
+                                                        <div class="dmx-mini-cell bg-dmx-lime"><span
+                                                                class="dmx-mini-ch-num">3</span><span
+                                                                class="dmx-mini-val">91</span></div>
+                                                        <div class="dmx-mini-cell"><span
+                                                                class="dmx-mini-ch-num">4</span><span
+                                                                class="dmx-mini-val">0</span></div>
+                                                        <div class="dmx-mini-cell bg-dmx-active-green"><span
+                                                                class="dmx-mini-ch-num">5</span><span
+                                                                class="dmx-mini-val">1</span></div>
+                                                        <div class="dmx-mini-cell"><span
+                                                                class="dmx-mini-ch-num">6</span><span
+                                                                class="dmx-mini-val">0</span></div>
+                                                        <div class="dmx-mini-cell"><span
+                                                                class="dmx-mini-ch-num">7</span><span
+                                                                class="dmx-mini-val">0</span></div>
+                                                        <div class="dmx-mini-cell"><span
+                                                                class="dmx-mini-ch-num">8</span><span
+                                                                class="dmx-mini-val">0</span></div>
+                                                        <div class="dmx-mini-cell"><span
+                                                                class="dmx-mini-ch-num">9</span><span
+                                                                class="dmx-mini-val">0</span></div>
+                                                        <div class="dmx-mini-cell"><span
+                                                                class="dmx-mini-ch-num">10</span><span
+                                                                class="dmx-mini-val">0</span></div>
+                                                        <div class="dmx-mini-cell"><span
+                                                                class="dmx-mini-ch-num">11</span><span
+                                                                class="dmx-mini-val">0</span></div>
+                                                        <div class="dmx-mini-cell"><span
+                                                                class="dmx-mini-ch-num">12</span><span
+                                                                class="dmx-mini-val">0</span></div>
+                                                        <div class="dmx-mini-cell"><span
+                                                                class="dmx-mini-ch-num">13</span><span
+                                                                class="dmx-mini-val">0</span></div>
+                                                    </div>
+                                                </div>
+
+                                                <!-- 说明：映射区域 -->
+                                                <div class="mapping-section mt-10">
+                                                    <div class="flex-between flex-end mb-5">
+                                                        <div class="field-group">
+                                                            <button class="btn small transparent dmx-mode-btn"
+                                                                id="dmx-mode-toggle-btn"><svg class="icon-svg"
+                                                                    viewBox="0 0 24 24" fill="none"
+                                                                    stroke="currentColor" stroke-width="2">
+                                                                    <path d="M5 12.55a11 11 0 0 1 14.08 0" />
+                                                                    <path d="M1.42 9a16 16 0 0 1 21.16 0" />
+                                                                    <path d="M8.53 16.11a6 6 0 0 1 6.95 0" />
+                                                                    <line x1="12" y1="20" x2="12.01" y2="20" />
+                                                                </svg> 实时数据</button>
+                                                        </div>
+                                                    </div>
+                                                    <div id="dmx-mapping-container">
+                                                        <!-- 说明：推子卡片会添加到这里 -->
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <!-- 说明：串口配置 -->
+                                        <div id="config-serial" class="config-section">
+                                            <!-- 说明：新串口布局容器 -->
+                                            <div class="serial-layout-container">
+                                                <!-- 说明：顶部栏：设置与操作 -->
+                                                <div class="serial-header-card glass-panel">
+                                                    <div class="serial-settings-row">
+                                                        <div class="setting-item">
+                                                            <label>串口号:</label>
+                                                            <select id="serial-port-select"
+                                                                class="form-control dark-input peripheral-config-input">
+                                                                <option value="/dev/ttyS0">COM1 (/dev/ttyS0)</option>
+                                                                <option value="/dev/ttyS1">COM2 (/dev/ttyS1)</option>
+                                                                <option value="/dev/ttyUSB0">USB0 (/dev/ttyUSB0)
+                                                                </option>
+                                                            </select>
+                                                        </div>
+                                                        <div class="setting-item">
+                                                            <label>波特率:</label>
+                                                            <select id="serial-baud-select"
+                                                                class="form-control dark-input peripheral-config-input">
+                                                                <option value="1200">1200</option>
+                                                                <option value="9600">9600</option>
+                                                                <option value="19200">19200</option>
+                                                                <option value="115200">115200</option>
+                                                            </select>
+                                                        </div>
+                                                    </div>
+
+                                                    <div class="serial-actions-row">
+                                                        <div class="switch-wrapper">
+                                                            <span>学习:</span>
+                                                            <label class="preview-switch">
+                                                                <input type="checkbox" id="serial-learn-mode">
+                                                                <span class="switch-slider"></span>
+                                                            </label>
+                                                        </div>
+                                                        <button id="save-serial-config-btn"
+                                                            class="btn primary peripheral-apply-btn">应用配置</button>
+                                                    </div>
+                                                </div>
+
+                                                <!-- 说明：主体：三列布局 -->
+                                                <div class="serial-main-body">
+                                                    <!-- 说明：左侧：模板列表 -->
+                                                    <div class="serial-col template-col glass-panel">
+                                                        <div class="col-toolbar">
+                                                            <select class="mini-select">
+                                                                <option>墙板名称</option>
+                                                            </select>
+                                                            <div class="search-input">
+                                                                <input type="text" placeholder="请输入内容">
+                                                                <button class="icon-btn"><svg class="icon-svg"
+                                                                        viewBox="0 0 24 24" fill="none"
+                                                                        stroke="currentColor" stroke-width="2">
+                                                                        <circle cx="11" cy="11" r="8" />
+                                                                        <path d="m21 21-4.35-4.35" />
+                                                                    </svg></button>
+                                                            </div>
+                                                        </div>
+
+                                                        <div class="template-actions-bar">
+                                                            <button id="serial-add-template-btn"
+                                                                class="btn small secondary">手动添加命令码</button>
+                                                            <button id="serial-clear-templates-btn"
+                                                                class="btn small danger">清空模板</button>
+                                                        </div>
+
+                                                        <div class="template-table-header">
+                                                            <span>墙板编码</span>
+                                                            <span>墙板名称</span>
+                                                            <span>操作</span>
+                                                        </div>
+                                                        <div class="template-list-content">
+                                                            <!-- 模板列表将从API动态加载 -->
+                                                            <div class="empty-state">
+                                                                <div class="empty-state-icon"><svg
+                                                                        class="icon-svg icon-svg--xl"
+                                                                        viewBox="0 0 24 24" fill="none"
+                                                                        stroke="currentColor" stroke-width="2">
+                                                                        <path
+                                                                            d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+                                                                        <rect x="8" y="2" width="8" height="4" rx="1"
+                                                                            ry="1" />
+                                                                    </svg>
+                                                                </div>
+                                                                <div>正在加载模板列表...</div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+
+                                                    <!-- 说明：中间：工作区 -->
+                                                    <div class="serial-col workspace-col glass-panel">
+                                                        <div class="workspace-header">
+                                                            <span class="badge-tag">未选择模板</span>
+                                                            <span class="section-label">配置功能</span>
+                                                            <button id="save-template-functions-btn"
+                                                                class="btn small primary ml-auto hidden">保存功能配置</button>
+                                                        </div>
+                                                        <div class="workspace-canvas">
+                                                            <!-- 由JS动态渲染，不在HTML中写死默认功能 -->
+                                                        </div>
+                                                    </div>
+
+                                                    <!-- 说明：右侧：函数列表 -->
+                                                    <div class="serial-col functions-col glass-panel">
+                                                        <div class="col-header">
+                                                            <span class="header-text">功能列表 ⓘ</span>
+                                                        </div>
+                                                        <div class="simple-search-bar">
+                                                            <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24"
+                                                                    fill="none" stroke="currentColor" stroke-width="2">
+                                                                    <circle cx="11" cy="11" r="8" />
+                                                                    <path d="m21 21-4.35-4.35" />
+                                                                </svg></span>
+                                                            <input type="text" placeholder="请输入内容">
+                                                        </div>
+                                                        <div class="layer-filter-bar">
+                                                            <button class="layer-filter-btn active"
+                                                                data-layer="all">全部</button>
+                                                            <button class="layer-filter-btn" data-layer="1">图层1</button>
+                                                            <button class="layer-filter-btn" data-layer="2">图层2</button>
+                                                            <button class="layer-filter-btn" data-layer="3">图层3</button>
+                                                            <button class="layer-filter-btn" data-layer="4">图层4</button>
+                                                        </div>
+                                                        <div class="function-buttons-grid">
+                                                            <!-- 功能列表将从API动态加载 -->
+                                                            <div class="empty-state">
+                                                                <div class="empty-state-icon"><svg
+                                                                        class="icon-svg icon-svg--xl"
+                                                                        viewBox="0 0 24 24" fill="none"
+                                                                        stroke="currentColor" stroke-width="2">
+                                                                        <circle cx="12" cy="12" r="3" />
+                                                                        <path
+                                                                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                                                                    </svg>
+                                                                </div>
+                                                                <div>正在加载功能列表...</div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <!-- 说明：UDP 配置 -->
+                                        <div id="config-udp" class="config-section">
+                                            <!-- 新墙板风格布局（镜像串口墙板） -->
+                                            <div class="serial-layout-container">
+                                                <!-- 说明：顶部栏：设置与操作 -->
+                                                <div class="serial-header-card glass-panel">
+                                                    <div class="serial-settings-row">
+                                                        <div class="setting-item">
+                                                            <label>监听地址:</label>
+                                                            <input type="text" id="udp-bind-address"
+                                                                class="form-control dark-input peripheral-config-input"
+                                                                value="0.0.0.0" placeholder="0.0.0.0">
+                                                        </div>
+                                                        <div class="setting-item">
+                                                            <label>监听端口:</label>
+                                                            <input type="number" id="udp-bind-port"
+                                                                class="form-control dark-input peripheral-config-input"
+                                                                value="8000" min="1" max="65535">
+                                                        </div>
+                                                        <div class="setting-item">
+                                                            <label>回包目标端口:</label>
+                                                            <input type="number" id="udp-target-port"
+                                                                class="form-control dark-input peripheral-config-input"
+                                                                value="8000" min="1" max="65535">
+                                                        </div>
+                                                        <div class="setting-item">
+                                                            <label>组播地址:
+                                                                <span class="setting-hint" style="display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;margin-left:4px;border:1px solid rgba(203,213,225,.9);border-radius:50%;color:#cbd5e1;font-size:10px;font-weight:700;line-height:14px;vertical-align:middle;cursor:help;" title="将本机加入指定组播组（224.0.0.0~239.255.255.255），同组的机器才能收到消息">?</span>
+                                                            </label>
+                                                            <input type="text" id="udp-multicast-group"
+                                                                class="form-control dark-input peripheral-config-input"
+                                                                placeholder="如：224.0.0.100">
+                                                        </div>
+                                                    </div>
+                                                    <div class="serial-actions-row">
+                                                        <button id="save-udp-config-btn"
+                                                            class="btn primary peripheral-apply-btn">应用配置</button>
+                                                    </div>
+                                                </div>
+
+                                                <!-- 说明：主体：三列布局 -->
+                                                <div class="serial-main-body">
+                                                    <!-- 左侧：触发列表（UDP 触发指令列表） -->
+                                                    <div class="serial-col template-col glass-panel">
+                                                        <div class="col-toolbar">
+                                                            <button id="add-udp-trigger-btn"
+                                                                class="btn small primary">+ 添加触发</button>
+                                                            <div class="search-input">
+                                                                <input type="text" id="udp-trigger-search"
+                                                                    placeholder="请输入内容">
+                                                                <button class="icon-btn"><svg class="icon-svg"
+                                                                        viewBox="0 0 24 24" fill="none"
+                                                                        stroke="currentColor" stroke-width="2">
+                                                                        <circle cx="11" cy="11" r="8" />
+                                                                        <path d="m21 21-4.35-4.35" />
+                                                                    </svg></button>
+                                                            </div>
+                                                        </div>
+
+                                                        <div class="template-actions-bar">
+                                                            <button id="udp-clear-templates-btn"
+                                                                class="btn small danger">清空触发</button>
+                                                        </div>
+
+                                                        <div class="template-table-header">
+                                                            <span>触发字符串</span>
+                                                            <span>名称</span>
+                                                            <span>操作</span>
+                                                        </div>
+                                                        <div class="template-list-content" id="udp-trigger-list">
+                                                            <!-- 由JS渲染 -->
+                                                            <div class="empty-state">
+                                                                <div class="empty-state-icon"><svg
+                                                                        class="icon-svg icon-svg--xl"
+                                                                        viewBox="0 0 24 24" fill="none"
+                                                                        stroke="currentColor" stroke-width="2">
+                                                                        <path
+                                                                            d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+                                                                        <rect x="8" y="2" width="8" height="4" rx="1"
+                                                                            ry="1" />
+                                                                    </svg>
+                                                                </div>
+                                                                <div>暂无触发指令，点击"+ 添加触发"创建</div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+
+                                                    <!-- 说明：中间：工作区 -->
+                                                    <div class="serial-col workspace-col glass-panel">
+                                                        <div class="workspace-header">
+                                                            <span class="badge-tag">未选择触发</span>
+                                                            <span class="section-label">配置功能</span>
+                                                            <button id="save-udp-template-functions-btn"
+                                                                class="btn small primary ml-auto hidden">保存功能配置</button>
+                                                        </div>
+                                                        <div class="workspace-canvas">
+                                                            <!-- 由JS渲染 -->
+                                                        </div>
+                                                    </div>
+
+                                                    <!-- 说明：右侧：函数列表 -->
+                                                    <div class="serial-col functions-col glass-panel">
+                                                        <div class="col-header">
+                                                            <span class="header-text">功能列表 ⓘ</span>
+                                                        </div>
+                                                        <div class="simple-search-bar">
+                                                            <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24"
+                                                                    fill="none" stroke="currentColor" stroke-width="2">
+                                                                    <circle cx="11" cy="11" r="8" />
+                                                                    <path d="m21 21-4.35-4.35" />
+                                                                </svg></span>
+                                                            <input type="text" placeholder="请输入内容">
+                                                        </div>
+                                                        <div class="layer-filter-bar">
+                                                            <button class="layer-filter-btn active"
+                                                                data-layer="all">全部</button>
+                                                            <button class="layer-filter-btn" data-layer="1">图层1</button>
+                                                            <button class="layer-filter-btn" data-layer="2">图层2</button>
+                                                            <button class="layer-filter-btn" data-layer="3">图层3</button>
+                                                            <button class="layer-filter-btn" data-layer="4">图层4</button>
+                                                        </div>
+                                                        <div class="function-buttons-grid">
+                                                            <div class="empty-state">
+                                                                <div class="empty-state-icon"><svg
+                                                                        class="icon-svg icon-svg--xl"
+                                                                        viewBox="0 0 24 24" fill="none"
+                                                                        stroke="currentColor" stroke-width="2">
+                                                                        <circle cx="12" cy="12" r="3" />
+                                                                        <path
+                                                                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                                                                    </svg>
+                                                                </div>
+                                                                <div>正在加载功能列表...</div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <!-- 说明：TCP 配置 -->
+                                        <div id="config-tcp" class="config-section">
+                                            <!-- 新墙板风格布局（镜像串口墙板） -->
+                                            <div class="serial-layout-container">
+                                                <!-- 说明：顶部栏：设置与操作 -->
+                                                <div class="serial-header-card glass-panel">
+                                                    <div class="serial-settings-row">
+                                                        <div class="setting-item">
+                                                            <label>监听地址:</label>
+                                                            <input type="text" id="tcp-bind-address"
+                                                                class="form-control dark-input peripheral-config-input"
+                                                                value="0.0.0.0" placeholder="0.0.0.0">
+                                                        </div>
+                                                        <div class="setting-item">
+                                                            <label>监听端口:</label>
+                                                            <input type="number" id="tcp-bind-port"
+                                                                class="form-control dark-input peripheral-config-input"
+                                                                value="9000" min="1" max="65535">
+                                                        </div>
+                                                        <div class="setting-item">
+                                                            <label>连接模式:</label>
+                                                            <select id="tcp-mode"
+                                                                class="form-control dark-input peripheral-config-input">
+                                                                <option value="server" selected>服务器模式</option>
+                                                                <option value="client">客户端模式</option>
+                                                            </select>
+                                                        </div>
+                                                    </div>
+                                                    <div class="serial-actions-row">
+                                                        <button id="save-tcp-config-btn"
+                                                            class="btn primary peripheral-apply-btn">应用配置</button>
+                                                    </div>
+                                                </div>
+
+                                                <!-- 说明：主体：三列布局 -->
+                                                <div class="serial-main-body">
+                                                    <!-- 左侧：触发列表（TCP 触发指令列表） -->
+                                                    <div class="serial-col template-col glass-panel">
+                                                        <div class="col-toolbar">
+                                                            <button id="add-tcp-trigger-btn"
+                                                                class="btn small primary">+ 添加触发</button>
+                                                            <div class="search-input">
+                                                                <input type="text" id="tcp-trigger-search"
+                                                                    placeholder="请输入内容">
+                                                                <button class="icon-btn"><svg class="icon-svg"
+                                                                        viewBox="0 0 24 24" fill="none"
+                                                                        stroke="currentColor" stroke-width="2">
+                                                                        <circle cx="11" cy="11" r="8" />
+                                                                        <path d="m21 21-4.35-4.35" />
+                                                                    </svg></button>
+                                                            </div>
+                                                        </div>
+
+                                                        <div class="template-actions-bar">
+                                                            <button id="tcp-clear-templates-btn"
+                                                                class="btn small danger">清空触发</button>
+                                                        </div>
+
+                                                        <div class="template-table-header">
+                                                            <span>触发字符串</span>
+                                                            <span>名称</span>
+                                                            <span>操作</span>
+                                                        </div>
+                                                        <div class="template-list-content" id="tcp-trigger-list">
+                                                            <!-- 由JS渲染 -->
+                                                            <div class="empty-state">
+                                                                <div class="empty-state-icon"><svg
+                                                                        class="icon-svg icon-svg--xl"
+                                                                        viewBox="0 0 24 24" fill="none"
+                                                                        stroke="currentColor" stroke-width="2">
+                                                                        <path
+                                                                            d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+                                                                        <rect x="8" y="2" width="8" height="4" rx="1"
+                                                                            ry="1" />
+                                                                    </svg>
+                                                                </div>
+                                                                <div>暂无触发指令，点击"+ 添加触发"创建</div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+
+                                                    <!-- 说明：中间：工作区 -->
+                                                    <div class="serial-col workspace-col glass-panel">
+                                                        <div class="workspace-header">
+                                                            <span class="badge-tag">未选择触发</span>
+                                                            <span class="section-label">配置功能</span>
+                                                            <button id="save-tcp-template-functions-btn"
+                                                                class="btn small primary ml-auto hidden">保存功能配置</button>
+                                                        </div>
+                                                        <div class="workspace-canvas">
+                                                            <!-- 由JS渲染 -->
+                                                        </div>
+                                                    </div>
+
+                                                    <!-- 说明：右侧：函数列表 -->
+                                                    <div class="serial-col functions-col glass-panel">
+                                                        <div class="col-header">
+                                                            <span class="header-text">功能列表 ⓘ</span>
+                                                        </div>
+                                                        <div class="simple-search-bar">
+                                                            <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24"
+                                                                    fill="none" stroke="currentColor" stroke-width="2">
+                                                                    <circle cx="11" cy="11" r="8" />
+                                                                    <path d="m21 21-4.35-4.35" />
+                                                                </svg></span>
+                                                            <input type="text" placeholder="请输入内容">
+                                                        </div>
+                                                        <div class="layer-filter-bar">
+                                                            <button class="layer-filter-btn active"
+                                                                data-layer="all">全部</button>
+                                                            <button class="layer-filter-btn" data-layer="1">图层1</button>
+                                                            <button class="layer-filter-btn" data-layer="2">图层2</button>
+                                                            <button class="layer-filter-btn" data-layer="3">图层3</button>
+                                                            <button class="layer-filter-btn" data-layer="4">图层4</button>
+                                                        </div>
+                                                        <div class="function-buttons-grid">
+                                                            <div class="empty-state">
+                                                                <div class="empty-state-icon"><svg
+                                                                        class="icon-svg icon-svg--xl"
+                                                                        viewBox="0 0 24 24" fill="none"
+                                                                        stroke="currentColor" stroke-width="2">
+                                                                        <circle cx="12" cy="12" r="3" />
+                                                                        <path
+                                                                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                                                                    </svg>
+                                                                </div>
+                                                                <div>正在加载功能列表...</div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <!-- 说明：移动端功能配置 -->
+                                        <div id="config-function-config" class="config-section">
+                                            <div class="function-config-layout">
+                                                <div class="serial-header-card glass-panel function-config-header">
+                                                    <div class="function-config-title-block">
+                                                        <div class="function-config-title">移动端功能配置</div>
+                                                        <div class="function-config-subtitle">按移动控制页区域配置按钮，并为每个按钮绑定执行功能</div>
+                                                    </div>
+                                                    <div class="serial-actions-row">
+                                                        <button id="save-function-config-btn"
+                                                            class="btn primary peripheral-apply-btn">应用配置</button>
+                                                    </div>
+                                                </div>
+
+                                                <div class="function-config-workbench">
+                                                    <div class="serial-col template-col glass-panel">
+                                                        <div class="col-header">
+                                                            <span class="header-text">页面区域</span>
+                                                        </div>
+                                                        <div class="function-region-list" id="function-region-list"></div>
+                                                        <div class="function-region-settings" id="function-region-settings"></div>
+                                                    </div>
+
+                                                    <div class="serial-col workspace-col glass-panel">
+                                                        <div class="workspace-header">
+                                                            <span class="badge-tag" id="function-active-button-badge">未选择按钮</span>
+                                                            <span class="section-label">按钮绑定功能</span>
+                                                        </div>
+                                                        <div class="function-button-list" id="function-button-list"></div>
+                                                        <div class="workspace-canvas" id="function-button-workspace"></div>
+                                                    </div>
+
+                                                    <div class="serial-col functions-col glass-panel">
+                                                        <div class="col-header">
+                                                            <span class="header-text">功能列表 ⓘ</span>
+                                                        </div>
+                                                        <div class="simple-search-bar">
+                                                            <span class="icon"><svg class="icon-svg" viewBox="0 0 24 24"
+                                                                    fill="none" stroke="currentColor" stroke-width="2">
+                                                                    <circle cx="11" cy="11" r="8" />
+                                                                    <path d="m21 21-4.35-4.35" />
+                                                                </svg></span>
+                                                            <input type="text" id="function-config-search" placeholder="请输入内容">
+                                                        </div>
+                                                        <div class="layer-filter-bar" id="function-config-layer-filter">
+                                                            <button class="layer-filter-btn active" data-layer="all">全部</button>
+                                                            <button class="layer-filter-btn" data-layer="1">图层1</button>
+                                                            <button class="layer-filter-btn" data-layer="2">图层2</button>
+                                                            <button class="layer-filter-btn" data-layer="3">图层3</button>
+                                                            <button class="layer-filter-btn" data-layer="4">图层4</button>
+                                                        </div>
+                                                        <div class="function-buttons-grid" id="function-config-functions-grid">
+                                                            <div class="empty-state">
+                                                                <div>正在加载功能列表...</div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                    </div>
+
+                                    <!-- 测试页签 -->
+                                    <div id="peripheral-tab-test" class="peripheral-tab">
+                                        <div class="test-panel-wrapper">
+                                            <div class="test-controls-row">
+                                                <div class="setting-item flex-1">
+                                                    <label>当前调试对象:</label>
+                                                    <span id="current-test-target-label" class="badge">DMX512</span>
+                                                </div>
+                                                <div class="setting-item flex-3">
+                                                    <label>发送指令 (Hex):</label>
+                                                    <div class="field-group">
+                                                        <input type="text" id="test-command" class="field__control"
+                                                            placeholder="输入 Hex ...">
+                                                        <button id="send-test-btn" class="btn primary">发送</button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div class="log-section mt-20">
+                                                <div class="log-header">
+                                                    <label>交互日志:</label>
+                                                    <button id="clear-peripheral-log-btn"
+                                                        class="btn small transparent">清空</button>
+                                                </div>
+                                                <div id="peripheral-test-log" class="log-container large"></div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+
+
+                <div id="system-settings-page" class="page">
+                    <div class="settings-form">
+                        <div class="settings-tabs">
+                            <button class="settings-tab active" data-tab="basic-settings">授权管理</button>
+                            <button class="settings-tab" data-tab="common-config">公共配置</button>
+                            <button class="settings-tab" data-tab="matrix-config">矩阵配置</button>
+                            <button class="settings-tab" data-tab="lan-sync">配置同步</button>
+                            <button class="settings-tab" data-tab="import-folders">导入文件夹</button>
+                            <button class="settings-tab" data-tab="log-viewer">日志管理</button>
+                        </div>
+
+                        <div id="basic-settings-tab" class="settings-tab-content active">
+                            <div class="license-layout">
+                                <div class="license-card glass-panel">
+                                    <div class="license-card-header">
+                                        <span class="license-card-icon" aria-hidden="true"><svg class="icon-svg"
+                                                viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                                stroke-linecap="round" stroke-linejoin="round">
+                                                <circle cx="7.5" cy="15.5" r="2.5" />
+                                                <path d="M10 15L21 4" />
+                                                <path d="M15 4l2 2 4-4" />
+                                            </svg></span>
+                                        <h3>授权状态</h3>
+                                        <span class="license-status-badge" id="license-status-badge">未授权</span>
+                                        <div class="license-header-actions">
+                                            <button id="import-license-btn" class="btn-sm primary"><svg class="icon-svg"
+                                                    viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                                    stroke-width="2">
+                                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                                    <polyline points="7 10 12 15 17 10" />
+                                                    <line x1="12" y1="15" x2="12" y2="3" />
+                                                </svg> 导入授权文件</button>
+                                            <button id="refresh-device-info-btn" class="btn-sm"><svg class="icon-svg"
+                                                    viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                                    stroke-width="2">
+                                                    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                                                    <path d="M3 3v5h5" />
+                                                </svg></button>
+                                            <input type="file" id="license-file-input" class="hidden" accept=".dat">
+                                        </div>
+                                    </div>
+                                    <div class="license-card-body">
+                                        <div class="license-info-columns">
+                                            <table class="license-info-table">
+                                                <tbody>
+                                                    <tr>
+                                                        <td class="info-label">设备型号</td>
+                                                        <td class="info-value" id="device-model">--</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td class="info-label">设备名称</td>
+                                                        <td class="info-value" id="device-name">--</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td class="info-label">设备序列号</td>
+                                                        <td class="info-value" id="device-serial">--</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td class="info-label">MAC 地址</td>
+                                                        <td class="info-value" id="device-mac">--</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td class="info-label">IP 地址</td>
+                                                        <td class="info-value" id="device-ip">--</td>
+                                                    </tr>
+                                                    <tr class="license-info-hidden">
+                                                        <td class="info-label">设备指纹</td>
+                                                        <td class="info-value fingerprint" id="device-fingerprint">--
+                                                        </td>
+                                                    </tr>
+                                                </tbody>
+                                            </table>
+                                            <table class="license-info-table">
+                                                <tbody>
+                                                    <tr>
+                                                        <td class="info-label">供应商名称</td>
+                                                        <td class="info-value" id="license-supplier">--</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td class="info-label">客户名称</td>
+                                                        <td class="info-value" id="license-customer">--</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td class="info-label">商业模式</td>
+                                                        <td class="info-value" id="license-usage-mode">--</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td class="info-label">到期时间</td>
+                                                        <td class="info-value" id="license-expiry">--</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td class="info-label">剩余天数</td>
+                                                        <td class="info-value" id="license-days-remaining">--</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td class="info-label">输入通道数</td>
+                                                        <td class="info-value" id="license-input-channel-count">--</td>
+                                                    </tr>
+                                                    <tr class="license-info-hidden">
+                                                        <td class="info-label">欠费金额</td>
+                                                        <td class="info-value" id="license-arrears">--</td>
+                                                    </tr>
+                                                </tbody>
+                                            </table>
+                                        </div>
+
+                                        <div class="license-modules-section">
+                                            <h4>授权模块</h4>
+                                            <div class="license-modules-grid" id="license-modules-grid">
+                                                <div class="module-tag disabled">KTV</div>
+                                                <div class="module-tag disabled">VOD</div>
+                                                <div class="module-tag disabled">投影融合</div>
+                                                <div class="module-tag disabled">特效</div>
+                                            </div>
+                                        </div>
+
+                                        <div class="license-modules-section">
+                                            <h4>授权图层</h4>
+                                            <div class="license-layers-grid" id="license-layers-grid">
+                                                <span class="info-value muted">未配置</span>
+                                            </div>
+                                        </div>
+
+                                    </div>
+                                </div>
+                            </div>
+
+
+
+                        </div>
+
+                        <div id="common-config-tab" class="settings-tab-content">
+                            <div class="setting-group">
+                                <div class="section-title-with-actions">
+                                    <h3 class="section-title">公共配置</h3>
+                                    <div class="actions">
+                                        <button type="button" id="save-common-config-btn" class="btn primary">保存配置</button>
+                                    </div>
+                                </div>
+                                <p class="hint" style="color: #888; font-size: 0.875rem; margin-bottom: 1rem;">
+                                    多图层同时播放时的全局选项，修改后需在「矩阵配置」或本页保存后生效。</p>
+                                <div class="common-config-panel">
+                                    <div class="common-config-card common-config-select-card">
+                                        <div class="common-config-card-title">定时开关机</div>
+                                        <div class="common-config-grid">
+                                            <div class="setting-item setting-item-inline">
+                                                <label for="common-power-schedule-enabled">启用定时</label>
+                                                <input id="common-power-schedule-enabled" type="checkbox" title="启用或关闭系统定时开机/关机功能">
+                                            </div>
+                                            <div class="setting-item setting-item-inline">
+                                                <label for="common-power-on-schedule-enabled">定时开机</label>
+                                                <input id="common-power-on-schedule-enabled" type="checkbox" title="单独启用定时开机">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-power-on-date">开机日期</label>
+                                                <input id="common-power-on-date" type="date" class="form-control">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-power-on-time">开机时间</label>
+                                                <input id="common-power-on-time" type="time" class="form-control">
+                                            </div>
+                                            <div class="setting-item setting-item-inline">
+                                                <label for="common-power-off-schedule-enabled">定时关机</label>
+                                                <input id="common-power-off-schedule-enabled" type="checkbox" title="单独启用定时关机">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-power-off-date">关机日期</label>
+                                                <input id="common-power-off-date" type="date" class="form-control">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-power-off-time">关机时间</label>
+                                                <input id="common-power-off-time" type="time" class="form-control">
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="common-config-card common-config-select-card">
+                                        <div class="common-config-card-title">IP 配置</div>
+                                        <div class="common-config-grid">
+                                            <div class="setting-item">
+                                                <label for="common-network-ip-mode">IP 模式</label>
+                                                <select id="common-network-ip-mode" class="form-control"
+                                                    title="选择动态获取 IP 或固定指定 IP">
+                                                    <option value="dynamic">动态 IP</option>
+                                                    <option value="static">固定 IP</option>
+                                                </select>
+                                            </div>
+                                            <div class="setting-item" id="common-network-static-ip-group" style="display: none;">
+                                                <label for="common-network-static-ip">指定 IP</label>
+                                                <input id="common-network-static-ip" type="text" class="form-control"
+                                                    placeholder="例如 192.168.1.100">
+                                            </div>
+                                            <div class="setting-item" id="common-network-gateway-group" style="display: none;">
+                                                <label for="common-network-gateway">网关</label>
+                                                <input id="common-network-gateway" type="text" class="form-control"
+                                                    placeholder="例如 192.168.1.1">
+                                            </div>
+                                            <div class="setting-item" id="common-network-dns-group" style="display: none;">
+                                                <label for="common-network-dns">DNS</label>
+                                                <input id="common-network-dns" type="text" class="form-control"
+                                                    placeholder="例如 223.5.5.5">
+                                            </div>
+                                            <div class="setting-item setting-item-inline">
+                                                <label for="common-debug-hotspot-enabled">调试热点</label>
+                                                <input id="common-debug-hotspot-enabled" type="checkbox" title="开启后启动 HVIDEO 调试热点，关闭后保留普通 WiFi 联网">
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="common-config-card common-config-select-card" id="online-vod-card">
+                                        <div class="common-config-card-title">VOD 配置</div>
+                                        <div class="common-config-grid">
+                                            <div class="setting-item">
+                                                <label for="common-audio-output-layer-id">音频输出图层</label>
+                                                <select id="common-audio-output-layer-id" class="form-control"
+                                                    title="自动时优先选择当前最上层正在播放的媒体图层，找不到媒体图层则不输出声音">
+                                                    <option value="0">自动</option>
+                                                    <option value="1">图层1</option>
+                                                    <option value="2">图层2</option>
+                                                    <option value="3">图层3</option>
+                                                    <option value="4">图层4</option>
+                                                </select>
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-vod-mode">点播模式</label>
+                                                <select id="common-vod-mode" class="form-control"
+                                                    title="选择点播模式：关闭/本地VOD/在线VOD">
+                                                    <option value="0">关闭</option>
+                                                    <option value="1">本地VOD</option>
+                                                    <option value="2">在线VOD</option>
+                                                </select>
+                                            </div>
+                                            <div class="setting-item" id="online-vod-host-group" style="display: none;">
+                                                <label for="common-online-vod-host">服务器 Host</label>
+                                                <input id="common-online-vod-host" type="text" class="form-control"
+                                                    placeholder="例如 192.168.1.10">
+                                            </div>
+                                            <div class="setting-item" id="online-vod-room-group" style="display: none;">
+                                                <label for="common-online-vod-room-id">房间 ID</label>
+                                                <input id="common-online-vod-room-id" type="text" class="form-control"
+                                                    value="current" placeholder="current(终端IP)">
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="common-config-card common-config-select-card">
+                                        <div class="common-config-card-title">显示配置</div>
+                                        <div class="common-config-grid">
+                                            <div class="setting-item">
+                                                <label for="common-render-frame-rate-mode">合成帧率</label>
+                                                <select id="common-render-frame-rate-mode" class="form-control"
+                                                    title="选择最终画面合成帧率策略">
+                                                    <option value="auto">自动</option>
+                                                    <option value="fixed30">固定 30fps</option>
+                                                </select>
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-render-quality">渲染质量</label>
+                                                <select id="common-render-quality" class="form-control"
+                                                    title="选择 Engine Surface 渲染质量；修改后重启应用生效">
+                                                    <option value="smooth">流畅</option>
+                                                    <option value="normal">标准</option>
+                                                    <option value="high">高清</option>
+                                                    <option value="ultra">超清</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="common-config-card common-config-check-card">
+                                        <div class="common-config-card-title">勾选选项</div>
+                                        <div class="common-config-check-list">
+                                            <div class="setting-item setting-item-inline" id="local-song-file-scan-group">
+                                                <label for="common-local-song-file-scan-enabled">启动扫描</label>
+                                                <input id="common-local-song-file-scan-enabled" type="checkbox"
+                                                    title="单机点播启动时扫描歌曲目录，并按 songNo 对照更新 song.db 文件路径">
+                                            </div>
+                                            <div class="setting-item setting-item-inline">
+                                                <label for="common-app-update-enabled">App 更新</label>
+                                                <input id="common-app-update-enabled" type="checkbox"
+                                                    title="关闭后启动时不再触发 App 自动更新检查">
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="matrix-config-tab" class="settings-tab-content">
+                            <div class="setting-group">
+                                <div class="section-title-with-actions">
+                                    <h3 class="section-title">矩阵配置</h3>
+                                    <div class="actions">
+                                        <button id="apply-flexible-mapping" class="btn primary">保存</button>
+                                        <button id="reset-flexible-mapping" class="btn">重置</button>
+                                    </div>
+                                </div>
+                                <div class="flexible-mapping-container">
+                                    <div class="mapping-section">
+                                        <h4 id="input-section-title">输入</h4>
+                                        <div class="config-inputs">
+                                            <div class="setting-item">
+                                                <label>分辨率:</label>
+                                                <input type="number" id="flexible-canvas-width"
+                                                    class="form-control input-w-100" placeholder="宽" min="1" max="10000"
+                                                    step="1">
+                                                <span>×</span>
+                                                <input type="number" id="flexible-canvas-height"
+                                                    class="form-control input-w-100" placeholder="高" min="1" max="10000"
+                                                    step="1">
+                                            </div>
+                                            <div class="setting-item flexible-input-layout-fields">
+                                                <label>布局:</label>
+                                                <input type="number" id="flexible-canvas-rows"
+                                                    class="form-control input-w-80" placeholder="行" min="1" max="64"
+                                                    step="1">
+                                                <span>×</span>
+                                                <input type="number" id="flexible-canvas-cols"
+                                                    class="form-control input-w-80" placeholder="列" min="1" max="64"
+                                                    step="1">
+                                            </div>
+                                            <div class="setting-item setting-item-layout-mode">
+                                                <label>布局:</label>
+                                                <select id="flexible-canvas-layout-mode" class="form-control input-w-160">
+                                                    <option value="">请先加载授权</option>
+                                                </select>
+                                            </div>
+                                            <div class="setting-item setting-item-rotation">
+                                                <label>旋转:</label>
+                                                <select id="flexible-canvas-rotation" class="form-control input-w-120">
+                                                    <option value="0">0°</option>
+                                                    <option value="90">90°</option>
+                                                    <option value="180">180°</option>
+                                                    <option value="270">270°</option>
+                                                </select>
+                                            </div>
+
+                                        </div>
+                                        <div id="input-grid" class="mapping-grid"></div>
+                                    </div>
+
+                                    <div class="mapping-section">
+                                        <h4 id="output-section-title">输出</h4>
+                                        <div class="config-inputs">
+                                            <div class="setting-item">
+                                                <label>分辨率:</label>
+                                                <input type="number" id="flexible-output-width"
+                                                    class="form-control input-w-100" placeholder="宽" min="1" max="10000"
+                                                    step="1">
+                                                <span>×</span>
+                                                <input type="number" id="flexible-output-height"
+                                                    class="form-control input-w-100" placeholder="高" min="1" max="10000"
+                                                    step="1">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label>布局:</label>
+                                                <input type="number" id="flexible-output-rows"
+                                                    class="form-control input-w-80" placeholder="行" min="1" max="64"
+                                                    step="1">
+                                                <span>×</span>
+                                                <input type="number" id="flexible-output-cols"
+                                                    class="form-control input-w-80" placeholder="列" min="1" max="64"
+                                                    step="1">
+                                            </div>
+                                        </div>
+                                        <div id="output-grid" class="mapping-grid"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="lan-sync-tab" class="settings-tab-content">
+                            <div class="setting-group lan-sync-setting-group">
+                                <div class="section-title-with-actions">
+                                    <h3 class="section-title">局域网配置同步</h3>
+                                    <div class="actions lan-sync-mode-actions">
+                                        <button type="button" id="lan-sync-mode-pull-btn" class="btn"
+                                            title="从选中设备拉取到本机，勾选右侧本机文件夹">同步到本机</button>
+                                        <button type="button" id="lan-sync-mode-push-btn" class="btn primary"
+                                            title="推送到选中设备，勾选左侧设备文件夹">同步到选中设备</button>
+                                    </div>
+                                </div>
+                                <div class="lan-sync-cards">
+                                    <div class="lan-sync-card lan-sync-card-devices">
+                                        <h4 class="lan-sync-card-title">扫描设备</h4>
+                                        <div class="lan-sync-card-body">
+                                            <button type="button" id="lan-sync-scan-btn" class="btn btn-sm"
+                                                title="扫描设备">扫描</button>
+                                            <div id="lan-sync-device-list" class="lan-sync-device-list">
+                                                <div class="lan-sync-device-placeholder">点击「扫描」发现设备</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="lan-sync-card lan-sync-card-folders">
+                                        <div class="lan-sync-card-head">
+                                            <h4 class="lan-sync-card-title">文件夹</h4>
+                                            <button type="button" id="lan-sync-exec-btn" class="btn primary"
+                                                title="执行同步">同步</button>
+                                        </div>
+                                        <div class="lan-sync-folders-inner">
+                                            <div class="lan-sync-folder-panel lan-sync-folder-device">
+                                                <h5 id="lan-sync-device-folder-title"
+                                                    class="lan-sync-folder-panel-title">请选择设备</h5>
+                                                <div id="lan-sync-dirs-device-list" class="lan-sync-dirs-list"></div>
+                                            </div>
+                                            <div class="lan-sync-arrow-col">
+                                                <span class="lan-sync-arrow-cell" aria-hidden="true"></span>
+                                            </div>
+                                            <div class="lan-sync-folder-panel lan-sync-folder-local">
+                                                <h5 class="lan-sync-folder-panel-title">本机文件夹</h5>
+                                                <div id="lan-sync-dirs-local-list" class="lan-sync-dirs-list"></div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="import-folders-tab" class="settings-tab-content">
+                            <div class="setting-group">
+                                <h3 class="section-title">导入文件夹到 huoshan 目录</h3>
+                                <p id="import-folder-root-desc" class="setting-desc">选择本地文件夹，将其内容导入到设备的当前数据根目录下。适用于批量导入视频、图片、字体等资源。</p>
+
+                                <div class="import-folders-section">
+                                    <div class="import-folder-card glass-panel">
+                                        <div class="import-folder-header">
+                                            <h4>选择文件夹</h4>
+                                            <button type="button" id="import-folder-btn" class="btn primary">
+                                                <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                                    <polyline points="7 10 12 15 17 10" />
+                                                    <line x1="12" y1="15" x2="12" y2="3" />
+                                                </svg>
+                                                选择文件夹
+                                            </button>
+                                            <input type="file" id="import-folder-input" class="hidden" webkitdirectory directory multiple>
+                                        </div>
+
+                                        <div class="import-folder-body">
+                                            <div id="import-folder-info" class="import-info">
+                                                <p>未选择文件夹</p>
+                                            </div>
+
+                                            <div id="import-folder-preview" class="import-preview" style="display: none;">
+                                                <div class="import-target">
+                                                    <label>目标路径:</label>
+                                                    <input type="text" id="import-target-path" class="form-control dark-input"
+                                                           placeholder="例如: video, image, ttf" value="">
+                                                    <p id="import-target-root-help" class="help-text">输入目标子目录名称（相对于当前数据根目录），留空则导入到根目录</p>
+                                                </div>
+
+                                                <div class="import-file-list">
+                                                    <h5>文件列表 (<span id="import-file-count">0</span> 个文件)</h5>
+                                                    <div id="import-file-list-container" class="file-list-container"></div>
+                                                </div>
+
+                                                <div class="import-actions">
+                                                    <button type="button" id="import-execute-btn" class="btn primary" disabled>
+                                                        <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                                            <polyline points="17 8 12 3 7 8" />
+                                                            <line x1="12" y1="3" x2="12" y2="15" />
+                                                        </svg>
+                                                        开始导入
+                                                    </button>
+                                                    <button type="button" id="import-cancel-btn" class="btn">
+                                                        取消
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div id="import-progress-section" class="import-progress-section" style="display: none;">
+                                        <div class="progress-card glass-panel">
+                                            <h4>导入进度</h4>
+                                            <div class="progress-bar-container">
+                                                <div id="import-progress-bar" class="progress-bar" style="width: 0%;"></div>
+                                            </div>
+                                            <div class="progress-info">
+                                                <span id="import-progress-text">准备中...</span>
+                                                <span id="import-progress-percent">0%</span>
+                                            </div>
+                                            <div id="import-progress-log" class="progress-log"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="log-viewer-tab" class="settings-tab-content">
+                            <div class="setting-group">
+                                <div class="section-title-with-actions">
+                                    <h3 class="section-title">日志管理</h3>
+                                    <div class="actions">
+                                        <button id="refresh-log-list-btn" class="btn small">刷新</button>
+                                        <button id="download-log-btn" class="btn primary small" disabled>下载日志</button>
+                                    </div>
+                                </div>
+                                <div class="log-viewer-layout">
+                                    <div class="log-panel log-date-panel">
+                                        <div class="log-panel-title">日志目录</div>
+                                        <div id="log-date-list" class="log-list">
+                                            <div class="log-empty">暂无日志目录</div>
+                                        </div>
+                                    </div>
+                                    <div class="log-panel log-file-panel">
+                                        <div class="log-panel-title">文件列表</div>
+                                        <div id="log-file-list" class="log-list">
+                                            <div class="log-empty">请选择日期</div>
+                                        </div>
+                                    </div>
+                                    <div class="log-panel log-detail-panel">
+                                        <div class="log-panel-title log-detail-title">
+                                            <span>详情</span>
+                                            <div class="log-search-box">
+                                                <input id="log-search-input" type="text" class="form-control" placeholder="搜索日志">
+                                                <button id="log-search-prev-btn" class="btn small" type="button">上一个</button>
+                                                <button id="log-search-next-btn" class="btn small" type="button">下一个</button>
+                                                <span id="log-search-count" class="log-search-count">0/0</span>
+                                            </div>
+                                        </div>
+                                        <pre id="log-detail-content" class="log-detail-content">请选择日志文件</pre>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="system-footer">
+        <div class="footer-content">
+            <h3>命令日志</h3>
+            <div id="command-log" class="log-container"></div>
+        </div>
+    </footer>
+
+    <div id="save-scene-dialog" class="dialog">
+        <div class="dialog-content">
+            <h3>保存场景</h3>
+            <div class="dialog-body">
+                <div class="setting-item">
+                    <label for="scene-name">场景名称:</label>
+                    <input type="text" id="scene-name" class="form-control" placeholder="请输入场景名称">
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button id="cancel-save-btn" class="btn">取消</button>
+                <button id="confirm-save-btn" class="btn primary">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="load-scene-dialog" class="dialog">
+        <div class="dialog-content">
+            <h3>加载场景</h3>
+            <div class="dialog-body">
+                <div class="setting-item">
+                    <label for="load-scene-select">选择场景:</label>
+                    <select id="load-scene-select" class="form-control"></select>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button id="cancel-load-btn" class="btn">取消</button>
+                <button id="confirm-load-btn" class="btn primary">加载</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="playlist-settings-dialog" class="dialog">
+        <div class="dialog-content">
+            <h3>播放列表设置</h3>
+            <div class="dialog-body">
+                <div class="setting-item">
+                    <label>循环模式:</label>
+                    <div id="playlist-loop-mode" class="button-group">
+                        <button class="btn small" data-value="0">循环全部</button>
+                        <button class="btn small" data-value="1">一次播放</button>
+                        <button class="btn small" data-value="2">单个循环</button>
+                        <button class="btn small" data-value="3">顺序循环</button>
+                        <button class="btn small image-only-loop-option" data-value="4">固定播放</button>
+                    </div>
+                </div>
+                <div class="setting-item">
+                    <label for="playlist-dmx-id">DMX512:</label>
+                    <input type="number" id="playlist-dmx-id" class="form-control" min="0" max="255" step="10"
+                        placeholder="0=不绑定，10/20/30...255 对应通道6">
+                </div>
+                <div id="playlist-slideshow-section" class="setting-item slideshow-settings hidden">
+                    <label>幻灯片参数（图片列表）</label>
+                    <div class="slideshow-fields">
+                        <div class="form-group-inline">
+                            <label for="playlist-display-duration">显示时长(秒):</label>
+                            <input type="number" id="playlist-display-duration" class="form-control number-input"
+                                min="0" max="36000" step="0.5" value="3" placeholder="0=固定显示">
+                        </div>
+                        <div class="form-group-inline">
+                            <label for="playlist-fade-in-time">淡入(秒):</label>
+                            <input type="number" id="playlist-fade-in-time" class="form-control number-input" min="0"
+                                max="10" step="0.1" value="0.5">
+                        </div>
+                        <div class="form-group-inline">
+                            <label for="playlist-fade-out-time">淡出(秒):</label>
+                            <input type="number" id="playlist-fade-out-time" class="form-control number-input" min="0"
+                                max="10" step="0.1" value="0.5">
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button id="cancel-playlist-settings-btn" class="btn">取消</button>
+                <button id="confirm-playlist-settings-btn" class="btn primary">保存</button>
+            </div>
+        </div>
+    </div>
+    <div id="create-playlist-dialog" class="dialog">
+        <div class="dialog-content">
+            <h3>新建播放列表</h3>
+            <div class="dialog-body">
+                <div class="setting-item">
+                    <label for="new-playlist-name">列表名称:</label>
+                    <input type="text" id="new-playlist-name" class="form-control" placeholder="请输入名称">
+                </div>
+                <div class="setting-item">
+                    <label for="new-playlist-target-layer">目标播放图层:</label>
+                    <select id="new-playlist-target-layer" class="form-control">
+                        <option value="1" selected>图层 1 (视频)</option>
+                        <option value="2">图层 2 (视频)</option>
+                        <option value="3">图层 3 (视频)</option>
+                        <option value="4">图层 4 (视频)</option>
+                        <option value="60">图片图层</option>
+                    </select>
+                </div>
+                <div class="setting-item">
+                    <label for="new-playlist-dmx-id">DMX512:</label>
+                    <input type="number" id="new-playlist-dmx-id" class="form-control" min="0" max="255" step="10"
+                        placeholder="0=不绑定，10/20/30...255 对应通道6">
+                </div>
+                <div class="setting-item">
+                    <label>循环模式:</label>
+                    <div id="new-playlist-loop-mode" class="button-group">
+                        <button class="btn small active" data-value="0">循环全部</button>
+                        <button class="btn small" data-value="1">一次播放</button>
+                        <button class="btn small" data-value="2">单个循环</button>
+                        <button class="btn small" data-value="3">顺序循环</button>
+                        <button class="btn small image-only-loop-option" data-value="4">固定播放</button>
+                    </div>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button id="cancel-create-playlist-btn" class="btn">取消</button>
+                <button id="confirm-create-playlist-btn" class="btn primary">创建</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edge浏览器cursor修复 -->
+    <script>
+        // 修复Edge浏览器cursor圆点问题
+        (function () {
+            let isEdge = /Edg\//.test(navigator.userAgent);
+            if (!isEdge) return; // 只在Edge浏览器中执行
+            let cursorObserver = null;
+
+            function fixCursor() {
+                try {
+                    // 强制设置html和body的cursor
+                    document.documentElement.style.setProperty('cursor', 'default', 'important');
+                    document.body.style.setProperty('cursor', 'default', 'important');
+
+                    // 为所有主要容器设置cursor
+                    const containers = document.querySelectorAll('.main-content, .sidebar, .content-area, .page-content, .panel-header, .panel-body, .panel-actions, div, section, article, aside, header, footer, nav, main');
+                    containers.forEach(function (el) {
+                        if (!el.style.cursor || el.style.cursor === '') {
+                            el.style.setProperty('cursor', 'default', 'important');
+                        }
+                    });
+
+                    if (!cursorObserver) {
+                        cursorObserver = new MutationObserver(function (mutations) {
+                            mutations.forEach(function (mutation) {
+                                mutation.addedNodes.forEach(function (node) {
+                                    if (node.nodeType === 1) { // Element node
+                                        const interactiveSelectors = 'button, a, input, textarea, select, [role="button"], [onclick], .btn, [class*="button"], [class*="btn"]';
+                                        if (!node.matches || !node.matches(interactiveSelectors)) {
+                                            if (!node.style.cursor || node.style.cursor === '') {
+                                                node.style.setProperty('cursor', 'default', 'important');
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                        });
+                        cursorObserver.observe(document.body, {
+                            childList: true,
+                            subtree: true
+                        });
+                    }
+                } catch (e) {
+                }
+            }
+
+            // 页面加载完成后执行
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', fixCursor);
+            } else {
+                fixCursor();
+            }
+
+            // 多次延迟执行，确保所有样式已加载
+            setTimeout(fixCursor, 50);
+            setTimeout(fixCursor, 200);
+            setTimeout(fixCursor, 500);
+            setTimeout(fixCursor, 1000);
+        })();
+    </script>
+    <script type="module" src="script.js?v=3.09"></script>
+</body>
+
+</html>
+
+
+

@@ -1,0 +1,13 @@
+vec2 hsvjApplyMatrixProjection(vec2 posNDC, vec4 projParams, vec4 projParams2) {
+    float c = cos(projParams2.x);
+    float s = sin(projParams2.x);
+    vec2 p = posNDC;
+
+    float wk = 1.0 + projParams2.y * p.y + projParams2.z * p.x;
+    p /= wk;
+
+    p *= projParams.zw;
+    p = vec2(p.x * c - p.y * s, p.x * s + p.y * c);
+    p += projParams.xy;
+    return p;
+}

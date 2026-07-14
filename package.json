@@ -1,0 +1,55 @@
+{
+  "name": "huoshan-unified-system",
+  "version": "2.0.0",
+  "description": "统一的KTV和VOD系统架构",
+  "main": "src/network/web/shared/App.js",
+  "scripts": {
+    "build": "webpack --config webpack.config.js",
+    "build:dev": "webpack --config webpack.config.js --mode development",
+    "build:prod": "webpack --config webpack.config.js --mode production",
+    "watch": "webpack --config webpack.config.js --watch",
+    "dev": "webpack serve --config webpack.config.js --mode development",
+    "test": "jest",
+    "lint": "eslint src/**/*.js",
+    "lint:fix": "eslint src/**/*.js --fix",
+    "clean": "rimraf dist",
+    "prebuild": "npm run clean",
+    "postbuild": "node scripts/post-build.js",
+    "check:api-contract": "python scripts/check_api_contract.py"
+  },
+  "keywords": [
+    "ktv",
+    "vod",
+    "unified-architecture",
+    "web-application"
+  ],
+  "author": "Huoshan Team",
+  "license": "MIT",
+  "devDependencies": {
+    "babel-loader": "^9.1.0",
+    "copy-webpack-plugin": "^11.0.0",
+    "css-loader": "^6.8.0",
+    "eslint": "^8.57.1",
+    "eslint-plugin-unused-imports": "^4.4.1",
+    "eslint-webpack-plugin": "^4.0.0",
+    "html-webpack-plugin": "^5.5.0",
+    "jest": "^29.6.0",
+    "mini-css-extract-plugin": "^2.7.0",
+    "prettier": "^3.8.1",
+    "prettier-plugin-tailwindcss": "^0.7.2",
+    "rimraf": "^5.0.0",
+    "style-loader": "^3.3.0",
+    "terser-webpack-plugin": "^5.3.0",
+    "webpack": "^5.88.0",
+    "webpack-cli": "^5.1.0",
+    "webpack-dev-server": "^4.15.0"
+  },
+  "dependencies": {
+    "core-js": "^3.30.0"
+  },
+  "browserslist": [
+    "> 1%",
+    "last 2 versions",
+    "not dead"
+  ]
+}

@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>登录 - HVIDEO控制软件</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html,
+        body,
+        body * {
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #0f0f23 0%, #1a1a3e 100%);
+            color: #ffffff;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 32px;
+        }
+
+        .login-shell {
+            width: 100%;
+            max-width: 1120px;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(320px, 400px);
+            gap: 28px;
+            align-items: stretch;
+        }
+
+        .login-container,
+        .guide-container {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 48px;
+            width: 100%;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .login-container {
+            max-width: 400px;
+        }
+
+        .login-header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .login-header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #ffffff;
+        }
+
+        .login-header p {
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        .form-group {
+            margin-bottom: 24px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.8);
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+            color: #ffffff;
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: #4a9eff;
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .form-group input::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+        }
+
+        .login-button {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(135deg, #4a9eff 0%, #2d7dd2 100%);
+            border: none;
+            border-radius: 8px;
+            color: #ffffff;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .login-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(74, 158, 255, 0.4);
+        }
+
+        .login-button:active {
+            transform: translateY(0);
+        }
+
+        .login-button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .error-message {
+            color: #ff4d4f;
+            font-size: 14px;
+            margin-top: 16px;
+            text-align: center;
+            display: none;
+        }
+
+        .error-message.show {
+            display: block;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #ffffff;
+            animation: spin 0.8s linear infinite;
+            margin-right: 8px;
+        }
+
+        .guide-container {
+            padding: 36px;
+        }
+
+        .guide-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .guide-title h2 {
+            font-size: 22px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .guide-title p {
+            color: rgba(255, 255, 255, 0.62);
+            font-size: 14px;
+            line-height: 1.7;
+        }
+
+        .guide-badge {
+            flex: 0 0 auto;
+            padding: 6px 12px;
+            border: 1px solid rgba(74, 158, 255, 0.45);
+            border-radius: 999px;
+            color: #9fcbff;
+            background: rgba(74, 158, 255, 0.12);
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .guide-steps {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .guide-step {
+            display: grid;
+            grid-template-columns: 36px minmax(0, 1fr);
+            gap: 12px;
+            min-height: 88px;
+            padding: 16px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .guide-step-number {
+            width: 36px;
+            height: 36px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            color: #ffffff;
+            background: linear-gradient(135deg, #4a9eff 0%, #22c55e 100%);
+            font-weight: 800;
+            font-size: 14px;
+        }
+
+        .guide-step h3 {
+            font-size: 15px;
+            font-weight: 700;
+            margin: 0 0 6px;
+            color: rgba(255, 255, 255, 0.94);
+        }
+
+        .guide-step p {
+            font-size: 13px;
+            line-height: 1.6;
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        .guide-note {
+            margin-top: 18px;
+            padding: 14px 16px;
+            border-radius: 8px;
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.28);
+            color: rgba(255, 255, 255, 0.76);
+            font-size: 13px;
+            line-height: 1.7;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @media (max-width: 900px) {
+            body {
+                align-items: flex-start;
+            }
+
+            .login-shell {
+                max-width: 520px;
+                grid-template-columns: 1fr;
+            }
+
+            .login-container {
+                max-width: none;
+            }
+
+            .guide-steps {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 520px) {
+            body {
+                padding: 16px;
+            }
+
+            .login-container,
+            .guide-container {
+                padding: 28px 22px;
+                border-radius: 12px;
+            }
+
+            .guide-header {
+                display: block;
+            }
+
+            .guide-badge {
+                display: inline-block;
+                margin-top: 14px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="login-shell">
+        <section class="guide-container" aria-labelledby="login-guide-title">
+            <div class="guide-header">
+                <div class="guide-title">
+                    <h2 id="login-guide-title">登录使用指引</h2>
+                    <p>建议按以下顺序完成调试配置，先建立授权与基础画布，再配置播放、外设和投影效果。</p>
+                </div>
+                <span class="guide-badge">8 步流程</span>
+            </div>
+
+            <div class="guide-steps">
+                <article class="guide-step">
+                    <span class="guide-step-number">1</span>
+                    <div>
+                        <h3>授权系统</h3>
+                        <p>确认设备授权、模块权限和授权服务地址。</p>
+                    </div>
+                </article>
+                <article class="guide-step">
+                    <span class="guide-step-number">2</span>
+                    <div>
+                        <h3>矩阵配置</h3>
+                        <p>设置输出分辨率、行列布局和屏幕旋转。</p>
+                    </div>
+                </article>
+                <article class="guide-step">
+                    <span class="guide-step-number">3</span>
+                    <div>
+                        <h3>图层配置</h3>
+                        <p>创建图层，调整位置、尺寸、优先级和切片。</p>
+                    </div>
+                </article>
+                <article class="guide-step">
+                    <span class="guide-step-number">4</span>
+                    <div>
+                        <h3>播放列表创建</h3>
+                        <p>新建视频或图片播放列表并绑定目标图层。</p>
+                    </div>
+                </article>
+                <article class="guide-step">
+                    <span class="guide-step-number">5</span>
+                    <div>
+                        <h3>上传素材</h3>
+                        <p>上传素材文件，并添加到对应播放列表。</p>
+                    </div>
+                </article>
+                <article class="guide-step">
+                    <span class="guide-step-number">6</span>
+                    <div>
+                        <h3>中控配置</h3>
+                        <p>配置灯光、音效、空调等中控设备参数。</p>
+                    </div>
+                </article>
+                <article class="guide-step">
+                    <span class="guide-step-number">7</span>
+                    <div>
+                        <h3>投影融合</h3>
+                        <p>完成几何校正、融合带和遮罩调试。</p>
+                    </div>
+                </article>
+                <article class="guide-step">
+                    <span class="guide-step-number">8</span>
+                    <div>
+                        <h3>特效管理</h3>
+                        <p>配置特效图层、音频联动和效果参数。</p>
+                    </div>
+                </article>
+            </div>
+
+            <div class="guide-note">登录后可从左侧菜单进入各模块；完成每一步后保存配置，再进入下一项调试。</div>
+        </section>
+
+        <div class="login-container">
+            <div class="login-header">
+                <h1>HVIDEO控制软件</h1>
+                <p>请登录以继续</p>
+            </div>
+            <form id="login-form">
+                <div class="form-group">
+                    <label for="username">用户名</label>
+                    <input type="text" id="username" name="username" placeholder="请输入用户名" required autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="password">密码</label>
+                    <input type="password" id="password" name="password" placeholder="请输入密码" required autocomplete="current-password">
+                </div>
+                <button type="submit" class="login-button" id="login-button">登录</button>
+                <div class="error-message" id="error-message">用户名或密码错误</div>
+            </form>
+        </div>
+    </div>
+
+    <script type="module" src="modules/pages/login.js"></script>
+</body>
+
+</html>

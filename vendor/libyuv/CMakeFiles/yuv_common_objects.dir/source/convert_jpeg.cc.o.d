@@ -1,0 +1,24 @@
+Third-Party/libyuv/CMakeFiles/yuv_common_objects.dir/source/convert_jpeg.cc.o: \
+  D:/Hvideo/Third-Party/libyuv/source/convert_jpeg.cc \
+  D:/Hvideo/Third-Party/libyuv/include/libyuv/convert.h \
+  D:/Hvideo/Third-Party/libyuv/include/libyuv/basic_types.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/c++/v1/stddef.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/c++/v1/__config \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/c++/v1/__config_site \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/features.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/sys/cdefs.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/android/versioning.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/android/api-level.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/bits/get_device_api_level_inlines.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/android/ndk-version.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/17/include/stddef.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/17/include/__stddef_max_align_t.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/c++/v1/stdint.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/17/include/stdint.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/stdint.h \
+  C:/Users/wh-pc/AppData/Local/Android/Sdk/ndk/26.1.10909125/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/bits/wchar_limits.h \
+  D:/Hvideo/Third-Party/libyuv/include/libyuv/rotate.h \
+  D:/Hvideo/Third-Party/libyuv/include/libyuv/convert_argb.h \
+  D:/Hvideo/Third-Party/libyuv/include/libyuv/scale.h \
+  D:/Hvideo/Third-Party/libyuv/include/libyuv/convert_from.h \
+  D:/Hvideo/Third-Party/libyuv/include/libyuv/planar_functions.h
