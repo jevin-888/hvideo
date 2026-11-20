@@ -1,17 +1,14 @@
 # CMakeLists for libyuv
 # Originally created for "roxlu build system" to compile libyuv on windows
-# Run with -DUNIT_TEST=ON to build unit tests
-
 cmake_minimum_required( VERSION 3.16 )
 project ( YUV C CXX )	# "C" is required even for C++ projects
-option( UNIT_TEST "Built unit tests" OFF )
+option( LIBYUV_BUILD_SHARED "Build the shared libyuv library" ON )
 
 include(CheckCSourceCompiles)
 
 set ( ly_base_dir	${PROJECT_SOURCE_DIR} )
 set ( ly_src_dir	${ly_base_dir}/source )
 set ( ly_inc_dir	${ly_base_dir}/include )
-set ( ly_tst_dir	${ly_base_dir}/unit_test )
 set ( ly_lib_name	yuv )
 set ( ly_lib_static	${ly_lib_name} )
 set ( ly_lib_shared	${ly_lib_name}_shared )
@@ -60,9 +57,6 @@ set ( ly_common_source_files
   ${ly_src_dir}/scale_uv.cc
   ${ly_src_dir}/scale_win.cc
   ${ly_src_dir}/video_common.cc)
-
-file ( GLOB_RECURSE	ly_unittest_sources ${ly_tst_dir}/*.cc )
-list ( SORT			ly_unittest_sources )
 
 include_directories( BEFORE ${ly_inc_dir} )
 
@@ -172,12 +166,14 @@ endif()
 # this creates the static library (.a)
 add_library( ${ly_lib_static} STATIC ${ly_lib_parts})
 
-# this creates the shared library (.so)
-add_library( ${ly_lib_shared} SHARED ${ly_lib_parts})
-set_target_properties( ${ly_lib_shared} PROPERTIES OUTPUT_NAME "${ly_lib_name}" )
-set_target_properties( ${ly_lib_shared} PROPERTIES PREFIX "lib" )
-if(WIN32)
-  set_target_properties( ${ly_lib_shared} PROPERTIES IMPORT_PREFIX "lib" )
+# this creates the optional shared library (.so)
+if(LIBYUV_BUILD_SHARED)
+  add_library( ${ly_lib_shared} SHARED ${ly_lib_parts})
+  set_target_properties( ${ly_lib_shared} PROPERTIES OUTPUT_NAME "${ly_lib_name}" )
+  set_target_properties( ${ly_lib_shared} PROPERTIES PREFIX "lib" )
+  if(WIN32)
+    set_target_properties( ${ly_lib_shared} PROPERTIES IMPORT_PREFIX "lib" )
+  endif()
 endif()
 
 # this creates the cpuid tool
@@ -195,56 +191,18 @@ target_link_libraries  ( yuvconstants ${ly_lib_static} )
 find_package ( JPEG )
 if (JPEG_FOUND)
   include_directories( ${JPEG_INCLUDE_DIR} )
-  target_link_libraries( ${ly_lib_shared} ${JPEG_LIBRARY} )
+  if(LIBYUV_BUILD_SHARED)
+    target_link_libraries( ${ly_lib_shared} ${JPEG_LIBRARY} )
+  endif()
   add_definitions( -DHAVE_JPEG )
 endif()
-
-if(UNIT_TEST)
-  find_library(GTEST_LIBRARY gtest)
-  if(GTEST_LIBRARY STREQUAL "GTEST_LIBRARY-NOTFOUND")
-    set(GTEST_SRC_DIR_DEFAULT /usr/src/gtest)
-    if (CMAKE_CROSSCOMPILING)
-      set(GTEST_SRC_DIR_DEFAULT ${CMAKE_SOURCE_DIR}/third_party/googletest/src/googletest)
-    endif()
-    set(GTEST_SRC_DIR ${GTEST_SRC_DIR_DEFAULT} CACHE STRING "Location of gtest sources")
-    if(EXISTS ${GTEST_SRC_DIR}/src/gtest-all.cc)
-      message(STATUS "building gtest from sources in ${GTEST_SRC_DIR}")
-      set(gtest_sources ${GTEST_SRC_DIR}/src/gtest-all.cc)
-      add_library(gtest STATIC ${gtest_sources})
-      include_directories(${GTEST_SRC_DIR})
-      include_directories(${GTEST_SRC_DIR}/include)
-      set(GTEST_LIBRARY gtest)
-    else()
-      message(FATAL_ERROR "UNIT_TEST is set but unable to find gtest library")
-    endif()
-  endif()
-
-  add_executable(libyuv_unittest ${ly_unittest_sources})
-  target_link_libraries(libyuv_unittest ${ly_lib_name} ${GTEST_LIBRARY})
-  find_library(PTHREAD_LIBRARY pthread)
-  if(NOT PTHREAD_LIBRARY STREQUAL "PTHREAD_LIBRARY-NOTFOUND")
-    target_link_libraries(libyuv_unittest pthread)
-  endif()
-  if (JPEG_FOUND)
-    target_link_libraries(libyuv_unittest ${JPEG_LIBRARY})
-  endif()
-
-  if(NACL AND NACL_LIBC STREQUAL "newlib")
-    target_link_libraries(libyuv_unittest glibc-compat)
-  endif()
-
-  find_library(GFLAGS_LIBRARY gflags)
-  if(NOT GFLAGS_LIBRARY STREQUAL "GFLAGS_LIBRARY-NOTFOUND")
-    target_link_libraries(libyuv_unittest gflags)
-    add_definitions(-DLIBYUV_USE_GFLAGS)
-  endif()
-endif()
-
 
 # install the conversion tool, .so, .a, and all the header files
 install ( TARGETS yuvconvert DESTINATION bin )
 install ( TARGETS ${ly_lib_static}						DESTINATION lib )
-install ( TARGETS ${ly_lib_shared} LIBRARY DESTINATION lib RUNTIME DESTINATION bin ARCHIVE DESTINATION lib )
+if(LIBYUV_BUILD_SHARED)
+  install ( TARGETS ${ly_lib_shared} LIBRARY DESTINATION lib RUNTIME DESTINATION bin ARCHIVE DESTINATION lib )
+endif()
 install ( DIRECTORY ${PROJECT_SOURCE_DIR}/include/		DESTINATION include )
 
 # create the .deb and .rpm packages using cpack

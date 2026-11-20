@@ -35,21 +35,6 @@ export function hideDialog(dialogId) {
     }
 }
 
-// 显示保存场景对话框
-function showSaveSceneDialog() {
-    showDialog('save-scene-dialog');
-}
-
-// 显示加载场景对话框
-function showLoadSceneDialog() {
-    showDialog('load-scene-dialog');
-}
-
-// 显示删除场景对话框
-function showDeleteSceneDialog() {
-    showDialog('delete-scene-dialog');
-}
-
 // 显示播放列表设置对话框
 export function showPlaylistSettingsDialog() {
     showDialog('playlist-settings-dialog');

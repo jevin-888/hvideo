@@ -6,7 +6,6 @@
 #include "layer/initializer/MirrorLayerInitializer.h"
 #include "layer/LayerMirror.h"
 #include "utils/Logger.h"
-#include <algorithm>
 
 namespace hsvj {
 
@@ -22,16 +21,15 @@ LayerInitResult MirrorLayerInitializer::initialize(
         layer->setRenderer(context.renderer);
     }
 
-    int fitMode = std::clamp(config.fitMode, 0, 1);
-    layer->setFitMode(fitMode);
+    // fitMode is intentionally ignored; tvVerticalCropPx is the only source crop.
     if (auto* mirrorLayer = dynamic_cast<LayerMirror*>(layer)) {
         mirrorLayer->setReadyHintVisible(config.mirrorReadyHintVisible);
         mirrorLayer->setTvVerticalCropPx(config.tvVerticalCropPx);
     }
 
-    LOG_INFO("[MirrorLayerInit] Layer %d initialized visible=%d size=%dx%d priority=%d fitMode=%d readyHint=%d tvCrop=%d",
+    LOG_INFO("[MirrorLayerInit] Layer %d initialized visible=%d size=%dx%d priority=%d readyHint=%d tvCrop=%d",
              layer->getLayerId(), config.visible ? 1 : 0,
-             config.size.width, config.size.height, config.priority, fitMode,
+             config.size.width, config.size.height, config.priority,
              config.mirrorReadyHintVisible ? 1 : 0, config.tvVerticalCropPx);
     return LayerInitResult::Success();
 }

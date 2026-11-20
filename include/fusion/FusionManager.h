@@ -61,6 +61,7 @@ public:
   Json::Value setCorrectionState(int regionId, const Json::Value &payload);
   Json::Value getCaveWallApi(int regionId);
   Json::Value setCaveWallState(int regionId, const Json::Value &payload);
+  Json::Value initializeCaveWall(int regionId, int wallType);
 
 private:
   FusionProjectState &state_;

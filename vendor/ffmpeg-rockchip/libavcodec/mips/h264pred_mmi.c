@@ -238,7 +238,7 @@ void ff_pred8x8l_top_dc_8_mmi(uint8_t *src, int has_topleft,
           RESTRICT_ASM_ALL64
           RESTRICT_ASM_ADDRT
           [src]"+&r"(src)
-        : [dc]"f"(dc.f),                    [stride]"r"((mips_reg)? stride)
+        : [dc]"f"(dc.f),                    [stride]"r"((mips_reg)stride)
         : "memory"
     );
 }
@@ -345,7 +345,7 @@ void ff_pred8x8l_dc_8_mmi(uint8_t *src, int has_topleft, int has_topright,
           RESTRICT_ASM_ALL64
           RESTRICT_ASM_ADDRT
           [src]"+&r"(src)
-        : [dc]"f"(dc.f),                    [stride]"r"((mips_reg)? stride)
+        : [dc]"f"(dc.f),                    [stride]"r"((mips_reg)stride)
         : "memory"
     );
 }
@@ -427,7 +427,7 @@ void ff_pred8x8l_vertical_8_mmi(uint8_t *src, int has_topleft,
         : [ftmp0]"=&f"(ftmp[0]),            [tmp0]"=&r"(tmp[0]),
           RESTRICT_ASM_ALL64
           [src]"+&r"(src)
-        : [stride]"r"((mips_reg)? stride)
+        : [stride]"r"((mips_reg)stride)
         : "memory"
     );
 }
@@ -484,7 +484,7 @@ void ff_pred8x8_vertical_8_mmi(uint8_t *src, ptrdiff_t stride)
         "bnez       %[tmp1],    1b                                      \n\t"
         : [tmp0]"=&r"(tmp[0]),              [tmp1]"=&r"(tmp[1]),
           [addr0]"=&r"(addr[0]),            [addr1]"=&r"(addr[1])
-        : [src]"r"((mips_reg)src),          [stride]"r"((mips_reg)? stride)
+        : [src]"r"((mips_reg)src),          [stride]"r"((mips_reg)stride)
         : "memory"
     );
 }
@@ -569,7 +569,7 @@ void ff_pred8x8_top_dc_8_mmi(uint8_t *src, ptrdiff_t stride)
           RESTRICT_ASM_ALL64
           [addr0]"=&r"(addr[0]),
           [src]"+&r"(src)
-        : [stride]"r"((mips_reg)? stride)
+        : [stride]"r"((mips_reg)stride)
         : "memory"
     );
 }
@@ -675,7 +675,7 @@ void ff_pred8x8_dc_8_mmi(uint8_t *src, ptrdiff_t stride)
           [addr2]"=&r"(addr[2]),            [addr3]"=&r"(addr[3]),
           [addr4]"=&r"(addr[4]),            [addr5]"=&r"(addr[5]),
           [addr6]"=&r"(addr[6])
-        : [src]"r"((mips_reg)src),          [stride]"r"((mips_reg)? stride)
+        : [src]"r"((mips_reg)src),          [stride]"r"((mips_reg)stride)
         : "memory"
     );
 }

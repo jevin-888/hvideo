@@ -26,7 +26,6 @@ static inline float sigmoid(float x) {
 
 CNNDrumDetector::CNNDrumDetector(int fftSize, int sampleRate)
     : mel_(std::make_unique<MelFilterbank>(CNN_NUM_MEL, fftSize, sampleRate)),
-      numMel_(CNN_NUM_MEL),
       modelTrained_(CNN_MODEL_TRAINED) {
     melHistory_.assign(CNN_CONTEXT_FRAMES * CNN_NUM_MEL, 0.0f);
 }
@@ -86,8 +85,6 @@ void CNNDrumDetector::runInference() {
             // 跨 kernel 时间步和输入通道
             for (int k = 0; k < CNN_CONV_KERNEL; ++k) {
                 const float* inRow = &input[(t + k) * CNN_NUM_MEL];
-                const float* wRow = &CNN_CONV1_W[oc][0][k];
-                // wRow 步长 = CNN_CONV_KERNEL（W[oc][ic][k]，遍历 ic）
                 for (int ic = 0; ic < CNN_NUM_MEL; ++ic) {
                     sum += inRow[ic] * CNN_CONV1_W[oc][ic][k];
                 }

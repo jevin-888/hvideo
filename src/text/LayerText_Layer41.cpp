@@ -12,7 +12,7 @@
  */
 
 #include "layer/LayerText.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "text/MessageHintRenderer.h"
 #include "text/SharedTextOverlayHolder.h"
 #include "renderer/VulkanRenderer.h"
@@ -93,26 +93,27 @@ void LayerText::showOperationHint(HintType type, const std::string& customText, 
   LOG_DEBUG("LayerText 41: messageHintRenderer_->showOperationHint returned");
 }
 
-void LayerText::showProtectedOperationHint(HintType type, const std::string& customText) {
+bool LayerText::showProtectedOperationHint(HintType type, const std::string& customText,
+                                         bool interruptible, bool refreshOnly) {
   if (layerId_ != 41) {
     LOG_WARN("LayerText %d: showProtectedOperationHint only supported for layer 41", layerId_);
-    return;
+    return false;
   }
 
   if (!messageHintRenderer_) {
     LOG_ERROR("LayerText 41: messageHintRenderer_ is NULL!");
-    return;
+    return false;
   }
   if (!messageHintRenderer_->isInitialized()) {
     LOG_INFO("LayerText 41: Initializing MessageHintRenderer for protected hint");
     if (sharedTextOverlay_) {
       if (!messageHintRenderer_->initialize(sharedTextOverlay_->getBridge(), 1920, 1080)) {
         LOG_ERROR("LayerText 41: Failed to initialize MessageHintRenderer with shared bridge");
-        return;
+        return false;
       }
     } else {
       LOG_ERROR("LayerText 41: No sharedTextOverlay_ available for initialization!");
-      return;
+      return false;
     }
   }
   messageHintRenderer_->setFontSize(fontSize_);
@@ -120,8 +121,12 @@ void LayerText::showProtectedOperationHint(HintType type, const std::string& cus
   messageHintRenderer_->setTextColor(textColor_.r, textColor_.g, textColor_.b, textColor_.a);
   messageHintRenderer_->setBgColor(bgColor_.r, bgColor_.g, bgColor_.b, bgColor_.a);
 
+  if (!messageHintRenderer_->showProtectedOperationHint(type, customText,
+                                                       interruptible, refreshOnly)) {
+    return false;
+  }
   setVisible(true);
-  messageHintRenderer_->showProtectedOperationHint(type, customText);
+  return true;
 }
 
 } // 命名空间 hsvj

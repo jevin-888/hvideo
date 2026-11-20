@@ -4,10 +4,10 @@
  */
 
 #include "core/CommandRouter.h"
-#include "utils/SliceConfigJson.h"
+#include "core/SliceConfigJson.h"
 #include "core/Engine.h"
 #include "core/Mubu.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SceneManager.h"
 #include "core/SystemConfig.h"
 #include "layer/Layer.h"
@@ -17,6 +17,7 @@
 #include "layer/LayerVideo.h"
 #include "utils/FileUtils.h"
 #include "utils/Logger.h"
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <sys/stat.h>
@@ -431,11 +432,22 @@ CommandResponse CommandRouter::handleScene(const std::string &paramJson) {
         config.invert = layer->getInvert();
         config.gaussianBlur = layer->getGaussianBlur();
         config.fitMode = layer->getFitMode();
+        config.cropLeft = layer->getCropLeft();
+        config.cropTop = layer->getCropTop();
+        config.cropRight = layer->getCropRight();
+        config.cropBottom = layer->getCropBottom();
 
         // 图层类型特有属性同步
         if (layer->getType() == LayerType::VIDEO) {
           LayerVideo *videoLayer = static_cast<LayerVideo *>(layer);
-          config.volume = videoLayer->getVolume();
+          const int configuredVodLayerId =
+              systemConfig_ ? std::max(1, systemConfig_->getVodLayerId()) : 1;
+          const bool isOnlineVodLayer =
+              engine_ && engine_->isOnlineVodRuntimeEnabled() &&
+              layerId == configuredVodLayerId;
+          if (!isOnlineVodLayer) {
+            config.volume = videoLayer->getVolume();
+          }
           config.playbackRate = videoLayer->getPlaybackRate();
           config.audioTrack = videoLayer->getCurrentAudioTrack();
           config.audioChannel = videoLayer->getAudioChannel();

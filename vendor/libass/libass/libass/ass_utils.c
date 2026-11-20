@@ -307,6 +307,23 @@ int ass_lookup_style(ASS_Track *track, char *name)
         if (strcmp(track->styles[i].Name, name) == 0)
             return i;
     }
+    // Some Sayatoo karaoke files define "歌名:" but reference "歌名".
+    // Resolve the optional trailing colon before falling back to Default:
+    // after fallback the renderer no longer knows this was a title event.
+    // Preserve exact-match precedence and all unrelated missing-style behavior.
+    size_t name_len = strlen(name);
+    if (name_len && name[name_len - 1] == ':')
+        --name_len;
+    if (name_len) {
+        for (i = track->n_styles - 1; i >= 0; --i) {
+            const char *style_name = track->styles[i].Name;
+            size_t style_len = strlen(style_name);
+            if (style_len && style_name[style_len - 1] == ':')
+                --style_len;
+            if (style_len == name_len && !strncmp(style_name, name, name_len))
+                return i;
+        }
+    }
     i = track->default_style;
     ass_msg(track->library, MSGL_WARN,
             "[%p]: Warning: no style named '%s' found, using '%s'",

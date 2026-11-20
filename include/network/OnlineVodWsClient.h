@@ -7,7 +7,7 @@
  * - 下行 JSON：getPlayList、roomStateChanged、playListChanged、command
  * - 上行 JSON（可选）：join_room（字段 roomId）、ping（应用层）；由 post* 入队发送
  * - RFC6455：服务端 Ping 控制帧自动回复 Pong；另每 25s 客户端发协议 Ping 保活
- * - 将状态/队列写入 Vod数据库(vod_queue.db)；播放类 command 直接回调给 Engine 执行，非播放 command 通过 sync_meta 交主线程路由
+ * - 将状态/队列写入 Vod数据库(vod_queue.db)；所有 command 均通过回调进入 Engine 主线程可靠队列，按接收顺序执行
  */
 
 #ifndef HSVJ_ONLINE_VOD_WS_CLIENT_H
@@ -16,6 +16,7 @@
 #include "database/VodDatabase.h"
 #include <json/json.h>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -45,6 +46,10 @@ public:
     void stop();
 
     bool isRunning() const { return running_.load(); }
+    std::string localAddress() const {
+        std::lock_guard<std::mutex> lock(localAddressMutex_);
+        return localAddress_;
+    }
 
     /**
      * @brief 设置房间状态变化回调（在 handleRoomUpdate 后触发）
@@ -68,6 +73,13 @@ public:
      */
     void setOnPlaybackCommand(std::function<bool(const std::string&, const Json::Value&, const std::string&)> cb) {
         onPlaybackCommand_ = std::move(cb);
+    }
+
+    /**
+     * @brief 设置非播放 command 回调；由 Engine 主线程队列按接收顺序执行
+     */
+    void setOnPeripheralCommand(std::function<bool(const std::string&, const Json::Value&, const std::string&)> cb) {
+        onPeripheralCommand_ = std::move(cb);
     }
 
     /**
@@ -95,17 +107,23 @@ public:
     void postJoinRoom(const std::string& roomId);
     /** 应用层心跳，与 RFC6455 Ping 帧无关；服务端通常回复 JSON type=pong */
     void postAppLayerPing();
+    /** 上报命令在播放器主线程中的真实执行结果；服务端转换为 commandResult 广播给控制端。 */
+    void postCommandResult(const std::string& action, bool ok, int error,
+                           const std::string& message);
 
 private:
+    std::mutex lifecycleMutex_;
+    mutable std::mutex localAddressMutex_;
+    std::string localAddress_;
     void threadMain();
 
     // 说明：--- websocket low-level ---
     bool connectAndHandshake();
     void wakeSocket();
     void closeSocket();
-    bool readFrameText(std::string& outText);
+    bool readFrameText(std::string& outText, bool& receivedFrame);
     bool sendPing();
-    void flushOutboundTextFrames();
+    bool flushOutboundTextFrames();
     bool sendMaskedTextFrame(const std::string& utf8Payload);
 
     // 说明：--- message handling ---
@@ -133,9 +151,12 @@ private:
 
     VodDatabase* db_ = nullptr;
     std::string resolvedRoomUuid_; // 从 roomStateChanged 解析出的真实 room uuid
+    bool initialRoomStateReceived_ = false; // WS worker only
+    std::chrono::steady_clock::time_point nextJoinRetryAt_{};
     std::function<void(const VodDatabase::OnlineVodState&)> onRoomStateChanged_;
     std::function<void(std::vector<VodDatabase::OnlineVodQueueItem>, int listType)> onPlayListUpdated_;
     std::function<bool(const std::string&, const Json::Value&, const std::string&)> onPlaybackCommand_;
+    std::function<bool(const std::string&, const Json::Value&, const std::string&)> onPeripheralCommand_;
     std::function<void(bool connected)> onConnectionStateChanged_;
     std::function<void()> onFreesongNotify_;
 

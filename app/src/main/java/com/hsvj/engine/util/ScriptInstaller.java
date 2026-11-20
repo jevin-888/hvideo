@@ -43,17 +43,49 @@ public final class ScriptInstaller {
     }
 
     /**
-     * 通过 su 执行 shell 命令（非阻塞）
-     *
-     * @param cmd 完整的 shell 命令字符串
-     * @param label 日志标签，用于标识调用来源
+     * 提交 shell 命令并在有限时间内回收 launcher 进程。命令自身可按需
+     * 使用 setsid/background 启动长期任务，但 Java launcher 不会泄漏。
      */
-    public static void execRootCommand(String cmd, String label) {
+    public static boolean execRootCommand(String cmd, String label) {
         try {
-            Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd});
-            Log.i(TAG, "[" + label + "] 命令已提交");
+            ProcessRunner.Result result = ProcessRunner.run(3000L, "su", "0", "sh", "-c", cmd);
+            if (result.succeeded()) {
+                Log.i(TAG, "[" + label + "] 命令已提交");
+                return true;
+            }
+            Log.e(TAG, "[" + label + "] 命令提交失败，exitCode=" + result.exitCode
+                    + ", timedOut=" + result.timedOut);
+            return false;
         } catch (Exception e) {
             Log.e(TAG, "[" + label + "] 命令提交失败: " + e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 执行 shell 命令并校验退出码，适用于必须确认安装/切换成功后才能继续的控制流程。
+     */
+    public static boolean execRootCommandAndWait(
+            String cmd, String label, long timeoutMs) {
+        try {
+            ProcessRunner.Result result = ProcessRunner.run(timeoutMs, "su", "0", "sh", "-c", cmd);
+            if (result.timedOut) {
+                Log.e(TAG, "[" + label + "] 命令执行超时: " + timeoutMs + "ms");
+                return false;
+            }
+            if (!result.succeeded()) {
+                Log.e(TAG, "[" + label + "] 命令执行失败，exitCode=" + result.exitCode);
+                return false;
+            }
+            Log.i(TAG, "[" + label + "] 命令执行成功");
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            Log.e(TAG, "[" + label + "] 命令等待被中断", e);
+            return false;
+        } catch (Exception e) {
+            Log.e(TAG, "[" + label + "] 命令执行失败: " + e.getMessage(), e);
+            return false;
         }
     }
 }

@@ -26,6 +26,7 @@ if(ANDROID)
         VulkanRenderer_Texture.cpp
         VulkanRenderer_extension.cpp
         VulkanRenderer_DrmKms.cpp
+        SideBarDetector.cpp
         CaptureRenderer.cpp     # HDMI/MIPI 专用（DmaBuf 直采）
         UsbCaptureRenderer.cpp  # USB 专用（MJPEG RKMPP 硬解 + DMA-BUF 直采）
         ProjectionMatrixCalculator.cpp
@@ -36,7 +37,6 @@ if(ANDROID)
         RegionRotationRenderer_Mesh.cpp
         RegionRotationRenderer_MeshUpdate.cpp
         RegionRotationRenderer_Geometry.cpp
-        RKDRMRenderer.cpp
         DrmKmsProbe.cpp
     )
 
@@ -55,6 +55,7 @@ add_library(hsvj_renderer STATIC ${RENDERER_SOURCES})
         ${PROJECT_ROOT}/vendor/ffmpeg-rockchip/android/${FFMPEG_ABI}/include
         # libdrm 头文件
         ${PROJECT_ROOT}/vendor/libdrm-android/include
+        ${PROJECT_ROOT}/vendor/libdrm-android/include/libdrm
     )
 
     target_link_libraries(hsvj_renderer PRIVATE
@@ -90,3 +91,13 @@ else()
         hsvj_lyric
     )
 endif()
+
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_renderer PRIVATE
+    hsvj_capture
+    hsvj_core
+    hsvj_decoder
+    hsvj_foundation
+    hsvj_layer
+    hsvj_utils
+)

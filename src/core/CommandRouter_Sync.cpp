@@ -1,81 +1,73 @@
 #include "core/CommandRouter.h"
 #include "core/Engine.h"
+#include "network/SyncContract.h"
+#include "network/DeviceFileSync.h"
 #include "utils/FileUtils.h"
 #include "utils/HttpClient.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
 #include "utils/SystemUtils.h"
+#include <chrono>
+#include <ctime>
+#include <mutex>
+#include <set>
 #include <sstream>
+#include <vector>
 
 namespace hsvj {
 
-/** 同步时最大收集文件数 */
-static constexpr size_t kSyncMaxFilesSync = 5000;
-/** 同步时单文件最大字节数（50MB） */
-static constexpr size_t kSyncMaxFileSizeSync = 50 * 1024 * 1024;
-static const char kCurrentRootBasePath[] = "current";
+namespace {
 
-static bool isValidSyncBasePath(const std::string& basePath) {
-  return basePath == kCurrentRootBasePath;
-}
+std::mutex gDeviceSyncMutex;
 
-static std::string syncBase64Encode(const unsigned char* bytes, size_t len) {
-  static const char tbl[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string out;
-  size_t i = 0;
-  unsigned char c3[3], c4[4];
-  while (len--) {
-    c3[i++] = *bytes++;
-    if (i == 3) {
-      c4[0] = (c3[0] & 0xfc) >> 2;
-      c4[1] = ((c3[0] & 0x03) << 4) + ((c3[1] & 0xf0) >> 4);
-      c4[2] = ((c3[1] & 0x0f) << 2) + ((c3[2] & 0xc0) >> 6);
-      c4[3] = c3[2] & 0x3f;
-      for (i = 0; i < 4; i++) out += tbl[c4[i]];
-      i = 0;
+static bool parseSuccessfulApiResponse(const std::string& responseBody,
+                                       Json::Value& data,
+                                       std::string& error) {
+  if (responseBody.empty()) {
+    error = "request failed or timed out";
+    return false;
+  }
+
+  Json::Value response;
+  std::string parseError;
+  if (!JsonUtils::parseJson(responseBody, response, parseError)) {
+    error = "invalid JSON response";
+    return false;
+  }
+
+  const bool ok = response.isObject() && response.isMember("ok") &&
+                  response["ok"].isBool() && response["ok"].asBool() &&
+                  response.isMember("data") && response.isMember("error") &&
+                  response["error"].isNull();
+  if (!ok) {
+    if (response.isMember("error") && response["error"].isObject() &&
+        response["error"].isMember("message") &&
+        response["error"]["message"].isString()) {
+      error = response["error"]["message"].asString();
+      // Older peers may return text that was already damaged in their source.
+      if (error.find(std::string(2, '?')) != std::string::npos ||
+          error.find("\xEF\xBF\xBD") != std::string::npos) {
+        error = "远端设备返回的错误信息已损坏，请更新远端程序后重试";
+      }
+    } else {
+      error = "invalid API response";
     }
+    return false;
   }
-  if (i) {
-    for (size_t j = i; j < 3; j++) c3[j] = '\0';
-    c4[0] = (c3[0] & 0xfc) >> 2;
-    c4[1] = ((c3[0] & 0x03) << 4) + ((c3[1] & 0xf0) >> 4);
-    c4[2] = ((c3[1] & 0x0f) << 2) + ((c3[2] & 0xc0) >> 6);
-    c4[3] = c3[2] & 0x3f;
-    for (size_t j = 0; j < i + 1; j++) out += tbl[c4[j]];
-    while (i++ < 3) out += '=';
-  }
-  return out;
+
+  data = response["data"];
+  return true;
 }
 
-static void syncCollectFilesUnder(const std::string& baseDir,
-                                  const std::string& relDir,
-                                  std::vector<std::string>& outPaths,
-                                  size_t& totalCount) {
-  if (totalCount >= kSyncMaxFilesSync) return;
-  std::string dirPath =
-      relDir.empty() ? baseDir
-                     : hsvj::FileUtils::normalizePath(
-                           hsvj::FileUtils::joinPath(baseDir, relDir));
-  if (!hsvj::FileUtils::exists(dirPath) ||
-      !hsvj::FileUtils::isDirectory(dirPath)) return;
-  std::vector<std::string> files = hsvj::FileUtils::listFiles(dirPath, "*");
-  for (const std::string& f : files) {
-    if (totalCount >= kSyncMaxFilesSync) return;
-    if (hsvj::FileUtils::isDirectory(f)) continue;
-    if (!hsvj::FileUtils::isFile(f)) continue;
-    std::string rel =
-        hsvj::FileUtils::joinPath(relDir, hsvj::FileUtils::getFilename(f));
-    outPaths.push_back(rel);
-    totalCount++;
-  }
-  std::vector<std::string> subdirs = hsvj::FileUtils::listDirectories(dirPath);
-  for (const std::string& d : subdirs) {
-    std::string subRel =
-        hsvj::FileUtils::joinPath(relDir, hsvj::FileUtils::getFilename(d));
-    syncCollectFilesUnder(baseDir, subRel, outPaths, totalCount);
-  }
+static void setSyncError(CommandResponse& response, const std::string& message,
+                         const Json::Value& data = Json::Value(Json::objectValue)) {
+  response.ok = false;
+  response.error = 0x000A;
+  response.message = message;
+  response.dataJson = JsonUtils::toString(data);
 }
+
+}  // namespace
 
 CommandResponse CommandRouter::handleSync(const std::string &paramJson) {
   CommandResponse response;
@@ -83,219 +75,171 @@ CommandResponse CommandRouter::handleSync(const std::string &paramJson) {
   response.timestamp = std::time(nullptr);
 
   Json::Value param;
-  if (!parseParam(paramJson, param, response)) {
-    return response;
-  }
-
+  if (!parseParam(paramJson, param, response)) return response;
   if (!param.isMember("action") || !param["action"].isString()) {
     setParamError(response, "Missing or invalid 'action' parameter");
     return response;
   }
 
-  std::string action = param["action"].asString();
+  const std::string action = param["action"].asString();
   Json::Value data;
 
   if (action == "sync_device") {
-    // 设备同步
+    std::unique_lock<std::mutex> syncLock(gDeviceSyncMutex, std::try_to_lock);
+    if (!syncLock.owns_lock()) {
+      setSyncError(response, "Another device sync is already running");
+      return response;
+    }
+
     if (!param.isMember("sync_data") || !param["sync_data"].isObject()) {
       setParamError(response, "Missing sync_data parameter");
       return response;
     }
 
     const Json::Value &syncData = param["sync_data"];
-    int64_t timestamp = syncData.isMember("timestamp")
-                            ? syncData["timestamp"].asInt64()
-                            : std::time(nullptr);
-    int syncMode =
-        syncData.isMember("sync_mode") ? syncData["sync_mode"].asInt() : 0;
-
-    std::string requestedBasePath =
-        syncData.isMember("base_path") && syncData["base_path"].isString()
-            ? syncData["base_path"].asString()
-            : kCurrentRootBasePath;
-    if (!isValidSyncBasePath(requestedBasePath)) {
-      response.ok = false;
-      response.error = 0x000A;
-      response.message = "base_path must be current";
-      response.dataJson = "{}";
+    if (!syncData.isMember("base_path") ||
+        !syncData["base_path"].isString() ||
+        syncData["base_path"].asString() != sync_contract::kBasePath) {
+      setSyncError(response, "base_path must be current");
       return response;
     }
-    std::string basePath = kCurrentRootBasePath;
-    Json::Value dirsJson = syncData.isMember("dirs") && syncData["dirs"].isArray()
-                              ? syncData["dirs"]
-                              : Json::Value(Json::arrayValue);
-    std::vector<std::string> dirs;
-    for (Json::ArrayIndex i = 0; i < dirsJson.size(); i++) {
-      if (dirsJson[i].isString()) dirs.push_back(dirsJson[i].asString());
+    if (!syncData.isMember("dirs") || !syncData["dirs"].isArray()) {
+      setSyncError(response, "Missing or invalid dirs array");
+      return response;
     }
 
-    // 从其他设备同步到本机：由本机请求源设备的 push-to，源设备推送到本机
-    if (syncData.isMember("source_ip") && syncData["source_ip"].isString()) {
-      std::string sourceIp = syncData["source_ip"].asString();
-      std::string myIp = SystemUtils::getLocalIp();
-      if (myIp.empty()) {
-        Json::Value ifs = SystemUtils::getNetworkInterfaces();
-        if (ifs.isArray() && ifs.size() > 0 && ifs[0].isMember("ip")) {
-          myIp = ifs[0]["ip"].asString();
+    std::vector<std::string> directories;
+    const Json::Value& directoriesJson = syncData["dirs"];
+    for (Json::ArrayIndex i = 0; i < directoriesJson.size(); ++i) {
+      if (!directoriesJson[i].isString()) {
+        setSyncError(response, "dirs must contain only strings");
+        return response;
+      }
+      directories.push_back(directoriesJson[i].asString());
+    }
+    std::string validationError;
+    if (!sync_contract::validateDirectories(directories, validationError)) {
+      setSyncError(response, validationError);
+      return response;
+    }
+
+    const bool hasSourceIp = syncData.isMember("source_ip");
+    const bool hasTargetIps = syncData.isMember("target_ips");
+    if (hasSourceIp == hasTargetIps) {
+      setSyncError(response,
+                   "Exactly one of source_ip or target_ips must be provided");
+      return response;
+    }
+
+    if (hasSourceIp) {
+      if (!syncData["source_ip"].isString()) {
+        setSyncError(response, "source_ip must be a string");
+        return response;
+      }
+      const std::string sourceIp = syncData["source_ip"].asString();
+      if (!sync_contract::isLanIpv4(sourceIp)) {
+        setSyncError(response, "source_ip must be a private LAN IPv4 address");
+        return response;
+      }
+
+      for (const auto& interface : SystemUtils::getNetworkInterfaces()) {
+        if (interface["ip"].isString() && sourceIp == interface["ip"].asString()) {
+          setSyncError(response, "source_ip cannot be the local device");
+          return response;
         }
       }
-      if (myIp.empty()) {
-        response.ok = false;
-        response.error = 0x000A;
-        response.message = "无法获取本机 IP，无法执行拉取同步";
-        response.dataJson = "{}";
+      if (!syncData["source_serial"].isString() || syncData["source_serial"].asString().empty()) {
+        setSyncError(response, "缺少来源设备序列号，请重新扫描");
         return response;
       }
-      Json::Value pushBody;
-      pushBody["base_path"] = kCurrentRootBasePath;
-      pushBody["dirs"] = dirsJson;
-      pushBody["target_ips"] = Json::Value(Json::arrayValue);
-      pushBody["target_ips"].append(myIp);
-      std::string pushUrl = "http://" + sourceIp + ":8080/api/v1/sync/push-to";
-      const int kPostTimeoutSec = 120;
-      std::string respBody = httpPostJson(pushUrl, jsonToString(pushBody), kPostTimeoutSec);
-      if (respBody.empty()) {
-        response.ok = false;
-        response.error = 0x000A;
-        response.message = "请求源设备失败或超时: " + sourceIp;
-        response.dataJson = "{}";
+      std::string peerError;
+      if (!verifyDeviceSyncPeer(sourceIp, syncData["source_serial"].asString(),
+                                SystemUtils::getHardwareModel(), peerError)) {
+        setSyncError(response, peerError);
         return response;
       }
-      std::string err;
-      Json::Value resp;
-      if (!JsonUtils::parseJson(respBody, resp, err)) {
-        response.ok = false;
-        response.error = 0x000A;
-        response.message = "源设备响应无效";
-        response.dataJson = "{}";
+      DeviceDataGuard pullGuard(ROOT_PATH, DeviceDataGuard::Purpose::Pull, peerError, sourceIp);
+      if (!pullGuard.acquired()) { setSyncError(response, peerError); return response; }
+      const std::string localSerial = SystemUtils::getRegistrationSerial();
+      if (localSerial.empty()) { setSyncError(response, "本机序列号不可用，无法安全同步"); return response; }
+      const std::string sourceSerial = syncData["source_serial"].asString();
+      const std::string pushUrl = "http://" + sourceIp + ":" +
+          std::to_string(sync_contract::kHttpPort) + "/api/v1/sync/push-to";
+      int httpStatus = 0;
+      const std::string responseBody = httpPostJson(pushUrl,
+          [&directoriesJson, &localSerial, &sourceSerial](const std::string& connectedLocalIp) {
+            if (!sync_contract::isLanIpv4(connectedLocalIp)) return std::string();
+            Json::Value pushBody(Json::objectValue);
+            pushBody["protocol"] = sync_contract::kProtocolVersion;
+            pushBody["base_path"] = sync_contract::kBasePath;
+            pushBody["dirs"] = directoriesJson;
+            pushBody["target_ips"] = Json::Value(Json::arrayValue);
+            pushBody["target_ips"].append(connectedLocalIp);
+            pushBody["target_serials"][connectedLocalIp] = localSerial;
+            pushBody["expected_source_serial"] = sourceSerial;
+            return JsonUtils::toString(pushBody);
+          }, sync_contract::kOrchestrationTimeoutSeconds, "", &httpStatus);
+      Json::Value sourceData;
+      std::string sourceError;
+      const bool sourceOk = parseSuccessfulApiResponse(responseBody, sourceData, sourceError);
+      if (httpStatus != 200 || !sourceOk) {
+        if (httpStatus == 0 || sourceError.empty())
+          sourceError = "请求中断，提交状态未确认，请检查本机同步状态";
+        setSyncError(response, "Source device " + sourceIp + ": " + sourceError);
         return response;
       }
-      const bool ok = resp.isObject() && resp.isMember("ok") &&
-                      resp["ok"].isBool() && resp["ok"].asBool() &&
-                      resp.isMember("data") && resp.isMember("error") &&
-                      resp["error"].isNull();
-      if (ok) {
-        response.ok = true;
-        response.error = 0x0000;
-        response.message = "已从 " + sourceIp + " 同步到本机";
-        response.dataJson = jsonToString(resp["data"]);
-      } else {
-        response.ok = false;
-        response.error = 0x000A;
-        response.message = resp.isMember("error") && resp["error"].isObject() &&
-                                   resp["error"].isMember("message")
-                               ? resp["error"]["message"].asString()
-                               : ("源设备 " + sourceIp + " 同步失败");
-        response.dataJson = "{}";
+      const Json::Value localStatus = getDeviceFileSyncStatus(ROOT_PATH);
+      if (!sourceData.isObject() || !sourceData["transfer_id"].isString() ||
+          localStatus["state"].asString() != "pending_restart" ||
+          localStatus["transfer_id"] != sourceData["transfer_id"] ||
+          !sourceData["restart_required"].isBool() || !sourceData["restart_required"].asBool()) {
+        setSyncError(response, "本机未确认完整接收，提交状态需检查；请重新扫描查看同步状态");
+        return response;
       }
+
+      response.ok = true;
+      response.error = 0x0000;
+      response.message = "已从 " + sourceIp + " 完整接收并校验，请重启本机系统后应用";
+      response.dataJson = JsonUtils::toString(sourceData);
       return response;
     }
 
-    Json::Value ipsJson =
-        syncData.isMember("target_ips") && syncData["target_ips"].isArray()
-            ? syncData["target_ips"]
-            : Json::Value(Json::arrayValue);
-    std::vector<std::string> targetIps;
-    for (Json::ArrayIndex i = 0; i < ipsJson.size(); i++) {
-      if (ipsJson[i].isString()) targetIps.push_back(ipsJson[i].asString());
-    }
-    if (targetIps.empty()) {
-      response.ok = false;
-      response.error = 0x000A;
-      response.message = "target_ips is empty (或请使用 source_ip 从其他设备同步到本机)";
-      response.dataJson = "{}";
+    if (!syncData["target_ips"].isArray()) {
+      setSyncError(response, "target_ips must be an array");
       return response;
     }
-    std::string rootPath = hsvj::ROOT_PATH;
-    if (rootPath.empty()) {
-      response.ok = false;
-      response.error = 0x000A;
-      response.message = "ROOT_PATH is not initialized";
-      response.dataJson = "{}";
+    const Json::Value& targetIpsJson = syncData["target_ips"];
+    if (targetIpsJson.empty() ||
+        targetIpsJson.size() > sync_contract::kMaxTargetDevices) {
+      setSyncError(response, "target_ips must contain between 1 and " +
+                                 std::to_string(sync_contract::kMaxTargetDevices) +
+                                 " devices");
       return response;
     }
-    if (rootPath.back() != '/') rootPath += '/';
-    std::vector<std::string> allRelPaths;
-    size_t totalCount = 0;
-    for (const std::string& dir : dirs) {
-      if (dir.empty() || dir.find("..") != std::string::npos ||
-          dir[0] == '/' || dir[0] == '\\') continue;
-      syncCollectFilesUnder(rootPath, dir, allRelPaths, totalCount);
+
+    std::set<std::string> localIps;
+    for (const auto& interface : SystemUtils::getNetworkInterfaces()) {
+      if (interface["ip"].isString()) localIps.insert(interface["ip"].asString());
     }
-    Json::Value filesJson(Json::arrayValue);
-    for (const std::string& relPath : allRelPaths) {
-      std::string fullPath =
-          hsvj::FileUtils::normalizePath(hsvj::FileUtils::joinPath(rootPath, relPath));
-      if (!hsvj::FileUtils::exists(fullPath) ||
-          !hsvj::FileUtils::isFile(fullPath)) continue;
-      int64_t sz = hsvj::FileUtils::getFileSize(fullPath);
-      if (sz < 0 || static_cast<size_t>(sz) > kSyncMaxFileSizeSync) continue;
-      std::vector<char> bin = hsvj::FileUtils::readBinaryFile(fullPath);
-      if (bin.empty() && sz > 0) continue;
-      std::string b64 = syncBase64Encode(
-          reinterpret_cast<const unsigned char*>(bin.data()), bin.size());
-      Json::Value fileEntry;
-      fileEntry["path"] = relPath;
-      fileEntry["content_base64"] = b64;
-      filesJson.append(fileEntry);
-    }
-    Json::Value payload;
-    payload["base_path"] = kCurrentRootBasePath;
-    payload["files"] = filesJson;
-    std::string body = jsonToString(payload);
-    auto startTime = std::chrono::steady_clock::now();
-    int syncedCount = 0;
-    int failedCount = 0;
-    Json::Value details(Json::arrayValue);
-    const int kPostTimeoutSec = 120;
-    for (const std::string& ip : targetIps) {
-      std::string url = "http://" + ip + ":8080/api/v1/sync/receive";
-      std::string respBody = httpPostJson(url, body, kPostTimeoutSec);
-      if (respBody.empty()) {
-        failedCount++;
-        details.append(ip + ": request failed or timeout");
-        continue;
-      }
-      std::string err;
-      Json::Value resp;
-      if (!JsonUtils::parseJson(respBody, resp, err)) {
-        failedCount++;
-        details.append(ip + ": invalid response");
-        continue;
-      }
-      const bool ok = resp.isObject() && resp.isMember("ok") &&
-                      resp["ok"].isBool() && resp["ok"].asBool() &&
-                      resp.isMember("data") && resp.isMember("error") &&
-                      resp["error"].isNull();
-      if (ok) {
-        syncedCount++;
-        details.append(ip + ": ok");
-      } else {
-        failedCount++;
-        std::string msg = resp.isMember("error") && resp["error"].isObject() &&
-                                  resp["error"].isMember("message")
-                              ? resp["error"]["message"].asString()
-                              : "invalid API response";
-        details.append(ip + ": " + msg);
+    for (const auto& ip : targetIpsJson) {
+      if (!ip.isString() || localIps.count(ip.asString())) {
+        setSyncError(response, "同步目标不能是本机或无效 IP");
+        return response;
       }
     }
-    auto endTime = std::chrono::steady_clock::now();
-    int64_t syncTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             endTime - startTime).count();
-    data["synced_count"] = syncedCount;
-    data["failed_count"] = failedCount;
-    data["details"] = details;
-    data["files_count"] = static_cast<Json::Int>(filesJson.size());
-    data["timestamp"] = static_cast<Json::Int64>(timestamp);
-    data["sync_mode"] = syncMode;
-    data["sync_time_ms"] = static_cast<Json::Int64>(syncTimeMs);
-    response.ok = true;
-    response.error = 0x0000;
-    response.message =
-        failedCount == 0 ? "设备同步成功"
-                        : ("同步完成: " + std::to_string(syncedCount) + " 成功, " +
-                           std::to_string(failedCount) + " 失败");
-    response.dataJson = jsonToString(data);
+    if (ROOT_PATH.empty()) {
+      setSyncError(response, "ROOT_PATH is not initialized");
+      return response;
+    }
+    std::string syncError;
+    response.ok = sendDeviceFiles(ROOT_PATH, directoriesJson, targetIpsJson,
+                                  syncData["target_serials"],
+                                  SystemUtils::getHardwareModel(), data, syncError);
+    response.error = response.ok ? 0x0000 : 0x000A;
+    response.message = response.ok
+        ? "同步已完整校验，请重启接收设备系统后应用"
+        : syncError;
+    response.dataJson = JsonUtils::toString(data);
 
   } else if (action == "online_vod_room_sync_start") {
     if (!engine_) {

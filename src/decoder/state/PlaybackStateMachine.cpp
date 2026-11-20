@@ -28,6 +28,7 @@ PlaybackStateMachine::allowedTransitions_ = {
 
 PlaybackStateMachine::PlaybackStateMachine()
     : currentState_(State::IDLE),
+      stateBeforeSeek_(State::PLAYING),
       stateChangeCallback_(nullptr) {
 }
 
@@ -65,14 +66,14 @@ bool PlaybackStateMachine::triggerEvent(Event event) {
       
     case Event::SEEK:
       if (currentState == State::PLAYING || currentState == State::PAUSED) {
+        stateBeforeSeek_ = currentState;
         newState = State::SEEKING;
       }
       break;
       
     case Event::SEEK_COMPLETED:
       if (currentState == State::SEEKING) {
-        // 返回到跳转前的状态（这里简化为 PLAYING）
-        newState = State::PLAYING;
+        newState = stateBeforeSeek_;
       }
       break;
       

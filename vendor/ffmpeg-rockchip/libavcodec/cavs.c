@@ -96,7 +96,7 @@ static inline int get_bs(cavs_vector *mvP, cavs_vector *mvQ, int b)
 /**
  * in-loop deblocking filter for a single macroblock
  *
- * boundary strength (bs) ? mapping:
+ * boundary strength (bs) mapping:
  *
  * --4---5--
  * 0   2   |

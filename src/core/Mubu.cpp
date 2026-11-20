@@ -12,6 +12,7 @@
 #include "core/Mubu.h"
 #include "lyric/SharedLibassHolder.h"
 #include "layer/Layer.h"
+#include "layer/LayerBluetoothAudio.h"
 #include "layer/LayerVideo.h"
 #include "layer/LayerMirror.h"
 #include "layer/LayerImage.h"
@@ -50,14 +51,6 @@ void Mubu::shutdown() {
     LOG_DEBUG("Mubu shutdown");
 }
 
-void Mubu::setSharedLibassHolder(std::shared_ptr<SharedLibassHolder> holder) {
-    sharedLibassHolder_ = std::move(holder);
-}
-
-SharedLibassHolder* Mubu::getSharedLibassHolder() const {
-    return sharedLibassHolder_ ? sharedLibassHolder_.get() : nullptr;
-}
-
 void Mubu::setSharedTextOverlayHolder(std::shared_ptr<SharedTextOverlayHolder> holder) {
     sharedTextOverlayHolder_ = std::move(holder);
 }
@@ -66,7 +59,7 @@ SharedTextOverlayHolder* Mubu::getSharedTextOverlayHolder() const {
     return sharedTextOverlayHolder_ ? sharedTextOverlayHolder_.get() : nullptr;
 }
 
-bool Mubu::createLayer(int layerId, LayerType type, bool silent) {
+bool Mubu::createLayer(int layerId, LayerType type, bool silent, bool initiallyVisible) {
     std::lock_guard<std::recursive_mutex> lock(layersMutex_);
     if (layers_.find(layerId) != layers_.end()) {
         if (!silent) {
@@ -83,13 +76,27 @@ bool Mubu::createLayer(int layerId, LayerType type, bool silent) {
         case LayerType::MIRROR:
             layer = std::make_shared<LayerMirror>(layerId, getSharedTextOverlayHolder());
             break;
+        case LayerType::BLUETOOTH_AUDIO:
+            layer = std::make_shared<LayerBluetoothAudio>(
+                layerId, getSharedTextOverlayHolder());
+            break;
         case LayerType::IMAGE:
         case LayerType::QRCODE:  // 二维码图层使用 LayerImage 实现
         case LayerType::EFFECT:  // 特效图层使用 LayerImage 实现
             layer = std::make_shared<LayerImage>(layerId, type);
             break;
         case LayerType::TEXT:
-            layer = std::make_shared<LayerText>(layerId, getSharedLibassHolder(), getSharedTextOverlayHolder());
+            // Layer 21 can be created after startup by configuration or license updates.
+            if (layerId == 21 && !sharedLibassHolder_) {
+                auto holder = std::make_shared<SharedLibassHolder>();
+                if (!holder->isInitialized()) {
+                    LOG_ERROR("[Lyric] Cannot create Layer 21: libass initialization failed");
+                    return false;
+                }
+                sharedLibassHolder_ = std::move(holder);
+                LOG_INFO("[Lyric] Created libass resources for Layer 21");
+            }
+            layer = std::make_shared<LayerText>(layerId, sharedLibassHolder_.get(), getSharedTextOverlayHolder());
             break;
         default:
             if (!silent) {
@@ -107,7 +114,10 @@ bool Mubu::createLayer(int layerId, LayerType type, bool silent) {
         }
         return false;
     }
-    
+
+    // Insert the layer only after its initial visibility is final, so the render
+    // thread cannot display a default full-canvas frame during atomic creation.
+    layer->setVisible(initiallyVisible);
     layers_[layerId] = layer;
     layerOrder_.push_back(layerId);
     sortLayersByPriority();
@@ -308,7 +318,8 @@ int Mubu::getActiveVideoLayerCount() const {
     for (const auto& pair : layers_) {
         if (pair.second->getType() == LayerType::VIDEO) {
             LayerVideo* videoLayer = static_cast<LayerVideo*>(pair.second.get());
-            if (videoLayer && videoLayer->getState() == LayerVideo::PlayState::PLAYING) {
+            if (videoLayer && !videoLayer->isCaptureLayer() &&
+                videoLayer->getState() == LayerVideo::PlayState::PLAYING) {
                 count++;
             }
         }

@@ -1,9 +1,9 @@
-// 图层矩阵页面模块 - 主入口文件
+﻿// 图层矩阵页面模块 - 主入口文件
 // 整合所有子模块，提供统一的对外接口
 
 // 导入核心依赖
 import { apiGet, apiPost, apiPut } from '../core/api.js';
-import { addToCommandLog } from '../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 
 // 导入状态管理
 import * as state from './layerMatrix/state.js';
@@ -33,12 +33,18 @@ import * as sliceManagement from './layerMatrix/sliceManagement.js';
 import * as eventHandlers from './layerMatrix/eventHandlers.js';
 
 import * as geometry from './layerMatrix/geometry.js';
+import {
+    LAYER_MATRIX_DRAG_TYPE,
+    getMatrixDropRegionAtPoint,
+    getMatrixRegionAtPoint,
+    getMatrixSubdivisionKey
+} from './layerMatrix/matrixLayout.js';
 
 // 导入UI渲染
-import * as uiRenderer from './layerMatrix/uiRenderer.js?v=layout_fix_alpha_pos';
+import * as uiRenderer from './layerMatrix/uiRenderer.js?v=layout_20260906_2';
 
 // 导入二维码辅助
-import * as qrCodeHelpers from './layerMatrix/qrCodeHelpers.js';
+import * as qrCodeHelpers from './layerMatrix/qrCodeHelpers.js?v=qr_address_2';
 
 // 通用输入读取器（updateLayerFromInputs / applyLayerProperties 共用）
 import { readLayerCommonInputs } from './layerMatrix/panels/InputReader.js';
@@ -47,6 +53,15 @@ import { readLayerCommonInputs } from './layerMatrix/panels/InputReader.js';
 import { showQuickAlignMenu, hideQuickAlignMenu } from './layerMatrix/panels/QuickAlignMenu.js';
 
 import { showConfirm } from '../components/toast.js';
+
+const MATRIX_SUBDIVISION_MIN_SIZE = 2;
+const MATRIX_SUBDIVISION_MAX_SIZE = 12;
+
+let matrixDropTarget = null;
+let matrixSubdivisions = [];
+let activeMatrixSubdivisionKey = '';
+let pendingMatrixSubdivision = null;
+let matrixSubdivisionCustomVisible = false;
 
 function setState(updates) {
     if (updates.selectedLayer !== undefined) state.setSelectedLayer(updates.selectedLayer);
@@ -72,7 +87,12 @@ function initializeCanvas() {
         onCanvasMouseDown, onCanvasMouseMove, onCanvasMouseUp, onCanvasDoubleClick,
         updateCursor, canvas.cssToCanvasCoord, updateCanvasSizeByLayout, drawCanvas,
         state.canvasConfig,
-        onCanvasContextMenu
+        onCanvasContextMenu,
+        {
+            onDragOver: onCanvasLayerDragOver,
+            onDragLeave: onCanvasLayerDragLeave,
+            onDrop: onCanvasLayerDrop
+        }
     );
     if (result) {
         state.setCanvasState(result.canvas, result.ctx, result.dpr);
@@ -85,20 +105,36 @@ function updateCanvasSizeByLayout() {
     );
 }
 
-let drawRequested = false;
-function drawCanvas() {
-    if (drawRequested) return;
-    drawRequested = true;
-    requestAnimationFrame(() => {
-        canvas.drawCanvas(
-            state.canvas, state.ctx, state.dpr, state.layers,
-            state.selectedLayer, state.selectedSlice, state.canvasConfig,
-            drawLayerRect, drawLayerSlices, canvas.systemToCanvas,
-            canvas.getLayerColor, utils.getLayerDisplayName, state.ALL_AVAILABLE_LAYERS,
-            canvas.drawResizeHandles, utils.validateConfig, state.selectedItems, state.snapGuides
-        );
-        drawRequested = false;
+let drawFrameId = null;
+function renderCanvasNow() {
+    canvas.drawCanvas(
+        state.canvas, state.ctx, state.dpr, state.layers,
+        state.selectedLayer, state.selectedSlice, state.canvasConfig,
+        drawLayerRect, drawLayerSlices, canvas.systemToCanvas,
+        canvas.getLayerColor, utils.getLayerDisplayName, state.ALL_AVAILABLE_LAYERS,
+        canvas.drawResizeHandles, utils.validateConfig, state.selectedItems, state.snapGuides,
+        matrixDropTarget, matrixSubdivisions, activeMatrixSubdivisionKey
+    );
+}
+
+function drawCanvas(immediate = false) {
+    if (immediate) {
+        drawCanvasNow();
+        return;
+    }
+    if (drawFrameId !== null) return;
+    drawFrameId = requestAnimationFrame(() => {
+        drawFrameId = null;
+        renderCanvasNow();
     });
+}
+
+function drawCanvasNow() {
+    if (drawFrameId !== null) {
+        cancelAnimationFrame(drawFrameId);
+        drawFrameId = null;
+    }
+    renderCanvasNow();
 }
 
 function drawLayerRect(layer, isSelected) {
@@ -156,10 +192,10 @@ function selectLayerInternal(layerId) {
     );
 }
 
-async function createLayerInternal(layerId, layerType) {
+async function createLayerInternal(layerId, layerType, initialBounds = null) {
     return layerManagement.createLayer(
         layerId, layerType, updateLayerMatrix, state.layers, refreshLayerInfo,
-        renderLayerMatrix, drawCanvas, updateLayerSelection
+        renderLayerMatrix, drawCanvas, updateLayerSelection, initialBounds
     );
 }
 
@@ -332,6 +368,13 @@ function updateSliceInfo(layerId) {
     );
 }
 
+async function toggleSliceVisibility(layerId, sliceKey) {
+    return sliceManagement.toggleSliceVisibility(
+        layerId, sliceKey, state.layers, refreshLayerInfo, updateSliceInfo,
+        showSliceProperties, drawCanvas
+    );
+}
+
 async function applySliceProperties(layerId, sliceKey) {
     return sliceManagement.applySliceProperties(
         layerId, sliceKey, state.layers, drawCanvas
@@ -377,13 +420,240 @@ async function showSliceProperties(layerId, sliceKey) {
         layerId, sliceKey, state.layers, utils.getLayerTypeFlags, utils.parseSliceCoordinate,
         utils.parseColor, utils.rgbaStringToCssColor, utils.cssColorToRgbaString,
         renderQRCodeDashboard, setupQRCodeDashboardListeners,
-        applySliceProperties, sliceManagement.toggleSliceVisibility, deleteSlice,
+        applySliceProperties, toggleSliceVisibility, deleteSlice,
         updateSliceInfo, drawCanvas, layerManagement.loadImage, addToCommandLog, apiGet, apiPost
     );
 }
 
 // 事件处理相关函数包装
+function normalizeMatrixSubdivisionDimension(value) {
+    const size = Math.trunc(Number(value));
+    if (!Number.isFinite(size)) return MATRIX_SUBDIVISION_MIN_SIZE;
+    return Math.max(MATRIX_SUBDIVISION_MIN_SIZE, Math.min(MATRIX_SUBDIVISION_MAX_SIZE, size));
+}
+
+function getCanvasSystemPointFromEvent(event) {
+    if (!state.canvas || !utils.validateConfig(state.canvasConfig)) return null;
+    const rect = state.canvas.getBoundingClientRect();
+    const cssX = event.clientX - rect.left;
+    const cssY = event.clientY - rect.top;
+    const canvasCoord = canvas.cssToCanvasCoord(cssX, cssY);
+    return canvas.canvasToSystem(
+        canvasCoord.x,
+        canvasCoord.y,
+        state.canvas,
+        state.dpr,
+        state.canvasConfig
+    );
+}
+
+function getBaseMatrixRegionFromCanvasEvent(event) {
+    const systemPoint = getCanvasSystemPointFromEvent(event);
+    if (!systemPoint) return null;
+    return getMatrixRegionAtPoint(systemPoint.x, systemPoint.y, state.canvasConfig);
+}
+
+function getMatrixDropRegionFromCanvasEvent(event) {
+    const systemPoint = getCanvasSystemPointFromEvent(event);
+    if (!systemPoint) return null;
+    return getMatrixDropRegionAtPoint(
+        systemPoint.x,
+        systemPoint.y,
+        state.canvasConfig,
+        matrixSubdivisions
+    );
+}
+
+function setMatrixDropTarget(region) {
+    const nextRegion = region ? { ...region } : null;
+    if (
+        matrixDropTarget?.x === nextRegion?.x &&
+        matrixDropTarget?.y === nextRegion?.y &&
+        matrixDropTarget?.width === nextRegion?.width &&
+        matrixDropTarget?.height === nextRegion?.height
+    ) {
+        return;
+    }
+    matrixDropTarget = nextRegion;
+    drawCanvas();
+}
+
+function syncMatrixSubdivisionControls() {
+    const presetSelect = document.getElementById('matrix-subdivision-preset');
+    const customToggle = document.getElementById('matrix-subdivision-custom-toggle');
+    const customFields = document.getElementById('matrix-subdivision-custom-fields');
+    const rowsInput = document.getElementById('matrix-subdivision-rows');
+    const colsInput = document.getElementById('matrix-subdivision-cols');
+
+    customToggle?.classList.toggle('active', matrixSubdivisionCustomVisible);
+    if (customFields) {
+        customFields.classList.toggle('hidden', !matrixSubdivisionCustomVisible);
+    }
+    if (pendingMatrixSubdivision && matrixSubdivisionCustomVisible) {
+        if (rowsInput) rowsInput.value = String(pendingMatrixSubdivision.rows);
+        if (colsInput) colsInput.value = String(pendingMatrixSubdivision.cols);
+    }
+    if (presetSelect) {
+        presetSelect.disabled = matrixSubdivisionCustomVisible;
+    }
+
+    const applyButton = document.getElementById('matrix-subdivision-apply');
+    if (applyButton) {
+        applyButton.classList.toggle('active', pendingMatrixSubdivision !== null);
+        applyButton.textContent = pendingMatrixSubdivision === null
+            ? '\u9009\u62e9\u533a\u57df'
+            : '\u7b49\u5f85\u70b9\u51fb\u5e55\u5e03';
+    }
+
+    const status = document.getElementById('matrix-subdivision-status');
+    if (status) {
+        if (pendingMatrixSubdivision) {
+            status.textContent = `\u8bf7\u70b9\u51fb\u57fa\u7840\u533a\u57df\uff0c\u5e94\u7528 ${pendingMatrixSubdivision.rows}\u00d7${pendingMatrixSubdivision.cols}`;
+        } else if (matrixSubdivisions.length > 0) {
+            const active = matrixSubdivisions.find(subdivision =>
+                getMatrixSubdivisionKey(subdivision.baseRow, subdivision.baseCol) === activeMatrixSubdivisionKey
+            ) || matrixSubdivisions[matrixSubdivisions.length - 1];
+            status.textContent = `${matrixSubdivisions.length} \u4e2a\u5206\u5272\u533a\u57df\uff1b\u5f53\u524d\u7b2c ${active.baseRow + 1} \u884c\u7b2c ${active.baseCol + 1} \u5217 ${active.rows}\u00d7${active.cols}`;
+        } else {
+            status.textContent = '\u672a\u8bbe\u7f6e\u5206\u5272\u533a\u57df';
+        }
+    }
+
+    state.canvas?.classList.toggle(
+        'matrix-subdivision-selecting',
+        pendingMatrixSubdivision !== null
+    );
+}
+
+function startMatrixSubdivisionSelection(rows, cols) {
+    pendingMatrixSubdivision = {
+        rows: normalizeMatrixSubdivisionDimension(rows),
+        cols: normalizeMatrixSubdivisionDimension(cols)
+    };
+    setMatrixDropTarget(null);
+    syncMatrixSubdivisionControls();
+}
+
+function cancelMatrixSubdivisionSelection() {
+    if (pendingMatrixSubdivision === null) return;
+    pendingMatrixSubdivision = null;
+    syncMatrixSubdivisionControls();
+}
+
+function applyMatrixSubdivisionAtEvent(event) {
+    if (pendingMatrixSubdivision === null || event.button !== 0) return false;
+
+    const baseRegion = getBaseMatrixRegionFromCanvasEvent(event);
+    if (!baseRegion) return false;
+
+    event.preventDefault();
+    event.stopPropagation();
+    const { rows, cols } = pendingMatrixSubdivision;
+    const key = getMatrixSubdivisionKey(baseRegion.row, baseRegion.col);
+    matrixSubdivisions = matrixSubdivisions.filter(subdivision =>
+        getMatrixSubdivisionKey(subdivision.baseRow, subdivision.baseCol) !== key
+    );
+    matrixSubdivisions.push({
+        baseRow: baseRegion.row,
+        baseCol: baseRegion.col,
+        rows,
+        cols
+    });
+    activeMatrixSubdivisionKey = key;
+    pendingMatrixSubdivision = null;
+    syncMatrixSubdivisionControls();
+    drawCanvas();
+    addToCommandLog(
+        '\u533a\u57df\u5206\u5272',
+        'success',
+        `\u7b2c ${baseRegion.row + 1} \u884c\u7b2c ${baseRegion.col + 1} \u5217\u5df2\u5206\u5272\u4e3a ${rows}\u00d7${cols}`
+    );
+    return true;
+}
+
+function clearMatrixSubdivisions() {
+    const hadSubdivisions = matrixSubdivisions.length > 0 || pendingMatrixSubdivision !== null;
+    matrixSubdivisions = [];
+    activeMatrixSubdivisionKey = '';
+    pendingMatrixSubdivision = null;
+    setMatrixDropTarget(null);
+    syncMatrixSubdivisionControls();
+    drawCanvas();
+    if (hadSubdivisions) {
+        addToCommandLog(
+            '\u533a\u57df\u5206\u5272',
+            'info',
+            '\u5df2\u6e05\u9664\u5168\u90e8\u533a\u57df\u5206\u5272\u8f85\u52a9\u7ebf'
+        );
+    }
+}
+
+function hasLayerDragPayload(event) {
+    return Array.from(event.dataTransfer?.types || []).includes(LAYER_MATRIX_DRAG_TYPE);
+}
+
+function onCanvasLayerDragOver(event) {
+    if (!hasLayerDragPayload(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = event.dataTransfer.effectAllowed === 'copy' ? 'copy' : 'move';
+    }
+    setMatrixDropTarget(getMatrixDropRegionFromCanvasEvent(event));
+}
+
+function onCanvasLayerDragLeave(event) {
+    if (event.relatedTarget && state.canvas?.contains(event.relatedTarget)) return;
+    setMatrixDropTarget(null);
+}
+
+async function placeLayerInMatrixRegion(payload, region) {
+    const layerId = normalizeLayerId(payload?.layerId);
+    const layerType = payload?.layerType;
+    if (layerId === null || !layerType || !region) return false;
+
+    const existingLayer = state.layers.find(layer => Number(layer.id) === layerId);
+    if (!existingLayer) {
+        return addLayerToMatrix(layerId, layerType, region);
+    }
+
+    geometry.setItemBounds(
+        geometry.createLayerItem(layerId),
+        state.layers,
+        region,
+        state.canvasConfig
+    );
+    state.setSelectedLayer(null);
+    state.setSelectedSlice(null);
+    state.setSelectedItems([]);
+    selectLayerInternal(layerId);
+    updatePropertyInputs(existingLayer);
+    drawCanvas();
+    await layerManagement.syncLayerToServer(existingLayer);
+    return true;
+}
+
+async function onCanvasLayerDrop(event) {
+    if (!hasLayerDragPayload(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    const region = getMatrixDropRegionFromCanvasEvent(event);
+    const rawPayload = event.dataTransfer?.getData(LAYER_MATRIX_DRAG_TYPE);
+    setMatrixDropTarget(null);
+    if (!region || !rawPayload) return;
+
+    try {
+        const payload = JSON.parse(rawPayload);
+        await placeLayerInMatrixRegion(payload, region);
+    } catch (error) {
+        addToCommandLog('图层放置', 'error', `拖放图层失败: ${error.message || '未知错误'}`);
+    }
+}
+
 function onCanvasMouseDown(e) {
+    if (applyMatrixSubdivisionAtEvent(e)) return null;
+
     const result = eventHandlers.onCanvasMouseDown(
         e, state.canvas, state.dpr, canvas.cssToCanvasCoord, getClickedHandle, getClickedSlice, getClickedLayer,
         state.resizeHandle,
@@ -489,10 +759,10 @@ function onCanvasContextMenu(e) {
 }
 
 // 场景管理相关函数包装
-async function loadDefaultScene() {
-    return sceneManagement.loadDefaultScene(
-        state.selectedLayer, state.selectedSlice, updateLayerMatrix
-    );
+
+async function handleSceneLoaded() {
+    setState({ selectedLayer: null, selectedSlice: null, selectedItems: [] });
+    await updateLayerMatrix();
 }
 
 async function saveDefaultScene() {
@@ -500,9 +770,7 @@ async function saveDefaultScene() {
 }
 
 async function showSceneSelector() {
-    return sceneManagement.showSceneSelector(
-        state.selectedLayer, state.selectedSlice, updateLayerMatrix
-    );
+    return sceneManagement.showSceneSelector(handleSceneLoaded);
 }
 
 async function saveCurrentScene() {
@@ -510,7 +778,7 @@ async function saveCurrentScene() {
 }
 
 // 其他辅助函数
-async function addLayerToMatrix(layerId, layerType) {
+async function addLayerToMatrix(layerId, layerType, initialBounds = null) {
     try {
         const resolvedLayer = resolveLayerForCreate(layerId, layerType, 1);
         if (!resolvedLayer || !resolvedLayer.type) {
@@ -527,9 +795,12 @@ async function addLayerToMatrix(layerId, layerType) {
         }
 
         addToCommandLog('添加图层', 'info', `正在添加图层 ${resolvedLayer.id}，类型: ${resolvedLayer.type}`);
-        const success = await createLayerInternal(resolvedLayer.id, resolvedLayer.type);
+        const success = await createLayerInternal(
+            resolvedLayer.id,
+            resolvedLayer.type,
+            initialBounds
+        );
         if (success) {
-            await updateLayerMatrix();
             // 新建后强制选中该图层：先清空再选中，避免 selectLayerInternal 的早退判断
             // （layerId === selectedLayer && selectedSlice == null）在罕见边界场景下跳过刷新。
             state.setSelectedLayer(null);
@@ -729,7 +1000,7 @@ async function handleSceneCustomDropdownAction(event) {
         if (sceneDropdown.value === sceneName) {
             sceneDropdown.value = '默认配置';
             sceneManagement.setCurrentSceneName('默认配置');
-            await sceneManagement.loadDefaultScene(state.selectedLayer, state.selectedSlice, updateLayerMatrix);
+            await sceneManagement.loadDefaultScene(handleSceneLoaded);
         }
         await sceneManagement.refreshSceneDropdown('select-template-dropdown');
         return true;
@@ -740,9 +1011,9 @@ async function handleSceneCustomDropdownAction(event) {
     sceneDropdown.value = sceneName;
     closeSceneCustomDropdown();
     if (sceneManagement.isDefaultSceneName(sceneName)) {
-        await sceneManagement.loadDefaultScene(state.selectedLayer, state.selectedSlice, updateLayerMatrix);
+        await sceneManagement.loadDefaultScene(handleSceneLoaded);
     } else {
-        await sceneManagement.loadScene(sceneName, state.selectedLayer, state.selectedSlice, updateLayerMatrix);
+        await sceneManagement.loadScene(sceneName, handleSceneLoaded);
     }
     sceneManagement.setCurrentSceneName(sceneName);
     renderSceneCustomDropdown(sceneDropdown);
@@ -793,7 +1064,7 @@ function renderSceneCustomDropdown(select) {
 
         const text = document.createElement('span');
         text.className = 'custom-select-option-text';
-        text.textContent = option.textContent || option.value;
+        text.textContent = (globalThis.PlayerI18n?.sourceText(option) ?? option.textContent) || option.value;
         item.appendChild(text);
 
         if (!isDefaultScene) {
@@ -837,6 +1108,62 @@ async function initializeEventListeners() {
     // 先清理之前的监听器
     cleanupEventListeners();
 
+    const subdivisionPresetSelect = document.getElementById('matrix-subdivision-preset');
+    const subdivisionCustomToggle = document.getElementById('matrix-subdivision-custom-toggle');
+    const subdivisionRowsInput = document.getElementById('matrix-subdivision-rows');
+    const subdivisionColsInput = document.getElementById('matrix-subdivision-cols');
+    const subdivisionApplyButton = document.getElementById('matrix-subdivision-apply');
+    const subdivisionClearButton = document.getElementById('matrix-subdivision-clear');
+    const subdivisionPresetChangeHandler = () => {
+        matrixSubdivisionCustomVisible = false;
+        cancelMatrixSubdivisionSelection();
+        syncMatrixSubdivisionControls();
+    };
+    const subdivisionCustomToggleHandler = () => {
+        matrixSubdivisionCustomVisible = !matrixSubdivisionCustomVisible;
+        cancelMatrixSubdivisionSelection();
+        syncMatrixSubdivisionControls();
+        if (matrixSubdivisionCustomVisible) subdivisionRowsInput?.focus();
+    };
+    const subdivisionApplyHandler = () => {
+        if (matrixSubdivisionCustomVisible) {
+            startMatrixSubdivisionSelection(
+                subdivisionRowsInput?.value,
+                subdivisionColsInput?.value
+            );
+            return;
+        }
+        const size = subdivisionPresetSelect?.value;
+        startMatrixSubdivisionSelection(size, size);
+    };
+    const subdivisionInputKeyHandler = (event) => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        subdivisionApplyHandler();
+    };
+    const subdivisionEscapeHandler = (event) => {
+        if (event.key === 'Escape') cancelMatrixSubdivisionSelection();
+    };
+
+    subdivisionPresetSelect?.addEventListener('change', subdivisionPresetChangeHandler);
+    subdivisionCustomToggle?.addEventListener('click', subdivisionCustomToggleHandler);
+    subdivisionApplyButton?.addEventListener('click', subdivisionApplyHandler);
+    subdivisionClearButton?.addEventListener('click', clearMatrixSubdivisions);
+    subdivisionRowsInput?.addEventListener('keydown', subdivisionInputKeyHandler);
+    subdivisionColsInput?.addEventListener('keydown', subdivisionInputKeyHandler);
+    document.addEventListener('keydown', subdivisionEscapeHandler);
+    eventListenerCleanupFunctions.push(() => {
+        subdivisionPresetSelect?.removeEventListener('change', subdivisionPresetChangeHandler);
+        subdivisionCustomToggle?.removeEventListener('click', subdivisionCustomToggleHandler);
+        subdivisionApplyButton?.removeEventListener('click', subdivisionApplyHandler);
+        subdivisionClearButton?.removeEventListener('click', clearMatrixSubdivisions);
+        subdivisionRowsInput?.removeEventListener('keydown', subdivisionInputKeyHandler);
+        subdivisionColsInput?.removeEventListener('keydown', subdivisionInputKeyHandler);
+        document.removeEventListener('keydown', subdivisionEscapeHandler);
+    });
+    syncMatrixSubdivisionControls();
+
+
     const saveDefaultTemplateBtn = document.getElementById('save-default-template');
     if (saveDefaultTemplateBtn) {
         saveDefaultTemplateBtn.addEventListener('click', saveDefaultScene);
@@ -863,9 +1190,9 @@ async function initializeEventListeners() {
             if (!scene) return;
 
             if (sceneManagement.isDefaultSceneName(scene)) {
-                await sceneManagement.loadDefaultScene(state.selectedLayer, state.selectedSlice, updateLayerMatrix);
+                await sceneManagement.loadDefaultScene(handleSceneLoaded);
             } else {
-                await sceneManagement.loadScene(scene, state.selectedLayer, state.selectedSlice, updateLayerMatrix);
+                await sceneManagement.loadScene(scene, handleSceneLoaded);
             }
             sceneManagement.setCurrentSceneName(scene);
             renderSceneCustomDropdown(sceneDropdown);
@@ -947,7 +1274,7 @@ async function initializeEventListeners() {
                     await sceneManagement.refreshSceneDropdown('select-template-dropdown');
                     sceneDropdown.value = '默认配置';
                     sceneManagement.setCurrentSceneName('默认配置');
-                    await sceneManagement.loadDefaultScene(state.selectedLayer, state.selectedSlice, updateLayerMatrix);
+                    await sceneManagement.loadDefaultScene(handleSceneLoaded);
                 } catch (error) {
                     console.error('删除场景失败:', error);
                 }
@@ -974,7 +1301,8 @@ async function initializeEventListeners() {
     if (saveTemplateBtn) {
         const saveTemplateHandler = async () => {
             const savedScene = await saveCurrentScene();
-            // 说明：保存新模板后刷新下拉框
+            if (!savedScene) return;
+            // 保存成功后刷新，保留失败提示并避免取消时发起额外请求
             await sceneManagement.refreshSceneDropdown('select-template-dropdown');
             if (savedScene && sceneDropdown) {
                 sceneDropdown.value = savedScene;
@@ -1017,7 +1345,7 @@ async function initializeEventListeners() {
         resizeTimeout = setTimeout(async () => {
             if (utils.isConfigValid(state.canvasConfig)) {
                 await updateCanvasSizeByLayout();
-                drawCanvas();
+                drawCanvasNow();
             }
         }, 100);
     };
@@ -1083,10 +1411,20 @@ export async function createLayer(layerId, layerType) {
 export function cleanupLayerMatrix() {
     cleanupEventListeners();
     canvas.cleanupCanvas();
+    if (drawFrameId !== null) {
+        cancelAnimationFrame(drawFrameId);
+        drawFrameId = null;
+    }
     qrCodeHelpers.cleanupQRCodeListeners();
     qrCodeHelpers.cleanupLayer40Listeners();
     qrCodeHelpers.cleanupQRCodePreview();
     hideQuickAlignMenu();
+    state.canvas?.classList.remove('matrix-subdivision-selecting');
+    matrixDropTarget = null;
+    matrixSubdivisions = [];
+    activeMatrixSubdivisionKey = '';
+    pendingMatrixSubdivision = null;
+    matrixSubdivisionCustomVisible = false;
     state.setSelectedItems([]);
     state.setDragState({ interactionSession: null, snapGuides: [] });
 

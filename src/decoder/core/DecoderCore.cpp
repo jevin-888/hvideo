@@ -29,6 +29,7 @@
 #include "audio/AudioPlayer.h"
 
 #include "decoder/core/HardwareManager.h"
+#include "decoder/VideoProfile.h"
 
 #include "utils/Logger.h"
 
@@ -155,7 +156,8 @@ DecoderCore::DecoderCore()
 
       startTime_(0.0), pausedTime_(0.0), pauseStartTime_(0.0),
 
-      isSeeking_(false), isFinished_(false), decodeThreadExited_(false), hardwareManager_(nullptr), framePool_(nullptr),
+      shouldStop_(false), decodeThreadExited_(false), isPaused_(false),
+      isSeeking_(false), isFinished_(false), hardwareManager_(nullptr), framePool_(nullptr),
 
       frameSyncManager_(nullptr), errorHandler_(nullptr),
 
@@ -185,7 +187,89 @@ DecoderCore::DecoderCore()
 
 
 
-DecoderCore::~DecoderCore() { close(); }
+DecoderCore::~DecoderCore() {
+  close();
+  stopFrameReleaseThread();
+}
+
+void DecoderCore::enqueueFrameRelease(DecodedFrame *frame) {
+  if (!frame) {
+    return;
+  }
+#ifdef __ANDROID__
+  {
+    std::lock_guard<std::mutex> lock(pendingFrameReleaseMutex_);
+    if (!frameReleaseThread_.joinable()) {
+      frameReleaseStopping_ = false;
+      frameReleaseThread_ = std::thread(&DecoderCore::frameReleaseLoop, this);
+    }
+    pendingFrameReleases_.push_back(frame);
+  }
+  pendingFrameReleaseCv_.notify_one();
+#else
+  frame->release();
+#endif
+}
+
+void DecoderCore::waitPendingFrameReleaseTasks() {
+#ifdef __ANDROID__
+  std::unique_lock<std::mutex> lock(pendingFrameReleaseMutex_);
+  pendingFrameReleaseCv_.wait(lock, [this] {
+    return pendingFrameReleases_.empty() && !frameReleaseActive_;
+  });
+#endif
+}
+
+void DecoderCore::stopFrameReleaseThread() {
+#ifdef __ANDROID__
+  {
+    std::lock_guard<std::mutex> lock(pendingFrameReleaseMutex_);
+    frameReleaseStopping_ = true;
+  }
+  pendingFrameReleaseCv_.notify_all();
+  if (frameReleaseThread_.joinable()) {
+    frameReleaseThread_.join();
+  }
+#endif
+}
+
+void DecoderCore::frameReleaseLoop() {
+#ifdef __ANDROID__
+  while (true) {
+    DecodedFrame *frame = nullptr;
+    {
+      std::unique_lock<std::mutex> lock(pendingFrameReleaseMutex_);
+      pendingFrameReleaseCv_.wait(lock, [this] {
+        return frameReleaseStopping_ || !pendingFrameReleases_.empty();
+      });
+      if (frameReleaseStopping_ && pendingFrameReleases_.empty()) {
+        frameReleaseActive_ = false;
+        pendingFrameReleaseCv_.notify_all();
+        return;
+      }
+      frame = pendingFrameReleases_.front();
+      pendingFrameReleases_.pop_front();
+      frameReleaseActive_ = true;
+    }
+
+    const auto releaseStart = std::chrono::steady_clock::now();
+    frame->release();
+    const auto releaseMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - releaseStart)
+                               .count();
+    if (releaseMs >= 1000) {
+      LOG_WARN("[DecoderCore] deferred frame release blocked for %lldms layer=%d",
+               static_cast<long long>(releaseMs), layerId_);
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(pendingFrameReleaseMutex_);
+      frameReleaseActive_ = false;
+    }
+    pendingFrameReleaseCv_.notify_all();
+  }
+#endif
+}
 
 
 
@@ -238,6 +322,7 @@ void DecoderCore::requestStopAllDecodeThreads(bool drainWorkers) {
   videoDecodeShouldStop_.store(true, std::memory_order_release);
   audioPacketQueueCv_.notify_all();
   videoPacketQueueCv_.notify_all();
+  frameQueueCv_.notify_all();
 #else
   (void)drainWorkers;
 #endif
@@ -305,7 +390,18 @@ void DecoderCore::setAudioOutputSuppressed(bool suppressed) {
 
 #ifdef __ANDROID__
 
+  const double position = getCurrentPlayTime();
   audioOutputSuppressed_.store(suppressed, std::memory_order_release);
+  if (suppressed && audioPlayer_ &&
+      AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId_)) {
+    // This is the first pause on the song-switch path, before LayerVideo's
+    // old-decoder teardown. Reach silence here while AAudio still runs.
+    audioPlayer_->fadeOut(8);
+    audioPlayer_->pause();
+    audioPlayer_->flush();
+  }
+  // A shared AAudio queue no longer represents this layer after focus changes.
+  resetAudioMasterClock(position);
 
 #else
 
@@ -379,7 +475,10 @@ bool DecoderCore::startDecoding(double syncStartTime) {
 
   isPaused_ = false;
 
-  audioOutputSuppressed_.store(false, std::memory_order_release);
+  const double wallNow = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const bool syncWarmup = syncStartTime > wallNow + 0.02;
+  audioOutputSuppressed_.store(syncWarmup, std::memory_order_release);
 
   isFinished_ = false;
 
@@ -390,6 +489,7 @@ bool DecoderCore::startDecoding(double syncStartTime) {
   pauseStartTime_ = 0.0;
 
   firstFrameAligned_ = false;
+  explicitSyncStart_ = syncStartTime > 0.0;
 
   lastAcceptedPts_ = 0.0;
 
@@ -419,10 +519,6 @@ bool DecoderCore::startDecoding(double syncStartTime) {
 
   lastClockRealignMs_ = 0;
 
-  lastClockRealignPts_ = -1.0;
-
-  repeatedClockRealignCount_ = 0;
-
   consecutiveAudioWriteFailures_ = 0;
 
   lastAudioWriteFailureMs_ = 0;
@@ -431,13 +527,16 @@ bool DecoderCore::startDecoding(double syncStartTime) {
 
   switchingOut_.store(false, std::memory_order_release); // Reset: pool-reused 解码器 may have stale switchingOut_=true
 
-  skippedAudioDuringCatchup_ = false;
 
   audioFirstFrameLogged_ = false;
 
   audioWriteCountAfterSwitch_ = 0;
 
   audioWriteIncompleteWarnCount_ = 0;
+  preparedAudioRouteGeneration_.store(0, std::memory_order_release);
+  demuxInputEnded_.store(false, std::memory_order_release);
+  resetAudioMasterClock(0.0);
+  lastPresentedVideoPts_.store(-1.0, std::memory_order_release);
 
 
 
@@ -476,93 +575,26 @@ bool DecoderCore::startDecoding(double syncStartTime) {
 
 
 
-  // Start audio player：有音频流时先确 管理器 已创建播放器（构造时 audioPlayer_ 可能null），再取指针start
-
+  // Register the decoder as a VIDEO audio source. The selected route may still
+  // be layer 0 while media metadata is opening, so initialization is retryable.
 #ifdef __ANDROID__
-
   hasReleasedFocus_ = false;
-
   hasRequestedFocus_ = false;
-
+  // close() stops the audio worker even when no shared player exists yet.
+  // The first demux session must retain PCM packets while Engine selects the
+  // audio layer; waiting until startAudioDecodeThread() drops the opening
+  // packets and leaves the audio clock permanently ahead of the video queue.
+  audioDecodeShouldStop_.store(false, std::memory_order_release);
+  audioDecodeDrainOnStop_.store(false, std::memory_order_release);
   if (audioCodecCtx_ && swrContext_) {
-
-    bool initOk = AudioPlayerManager::getInstance().ensureInitialized(44100, 2);
-
-    if (initOk) {
-
-      audioPlayer_ = AudioPlayerManager::getInstance().getAudioPlayer();
-
-      if (audioPlayer_) {
-
-        // 仅当本图层持有音频焦点时 flush，避免清空其他图层（VOD 图层）正在播放的音频队列
-
-    if (AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId_)) {
-
-          audioPlayer_->flush();
-
-        }
-
-        // 注意：不再在这里设置 AudioPlayer 的音量
-        // 音量现在在音频数据层面应用（解码器Core_Decode.cpp），每个图层独立控制
-        // AudioPlayer 的音量保持为 1.0，由系统音量控制
-
-        if (!pendingAudioChannel_.empty()) {
-
-          if (pendingAudioChannel_ == "left") {
-
-            audioPlayer_->setAudioChannelMode(AudioChannelMode::LEFT);
-
-          } else if (pendingAudioChannel_ == "right") {
-
-            audioPlayer_->setAudioChannelMode(AudioChannelMode::RIGHT);
-
-          } else if (pendingAudioChannel_ == "stereo") {
-
-            audioPlayer_->setAudioChannelMode(AudioChannelMode::STEREO);
-
-          }
-
-          pendingAudioChannel_.clear();
-
-        }
-
-        if (pendingAudioDataCallback_) {
-
-          audioPlayer_->setAudioDataCallback(pendingAudioDataCallback_);
-
-          pendingAudioDataCallback_ = nullptr;
-
-        }
-
-        bool startOk = true;
-        if (!isMpegPsStream_ || !useRkmppMpeg2Direct_) {
-          startOk = audioPlayer_->start();
-        }
-
-        // 双解码器切换时，共享 AudioPlayer 可能已被旧解码器 start，再 requestStart 会失败// 无论 start() 是否成功，只要有音频就必 requestFocus，否则旧解码release // videoRefCount_ 会变 0 导致 stop()，新解码器写入被丢弃、切换后无声
-        AudioPlayerManager::getInstance().requestFocus(AudioFocusSource::VIDEO);
-
-        hasRequestedFocus_ = true;
-
-      } else {
-
-        LOG_ERROR("[DecoderCore] AudioPlayer init ok but getAudioPlayer() null");
-
-      }
-
-    }
-
+    auto &audioManager = AudioPlayerManager::getInstance();
+    audioManager.requestFocus(AudioFocusSource::VIDEO);
+    hasRequestedFocus_ = true;
+    ensureAudioOutputStartedInternal(true);
   }
-
 #endif
 
-  if (audioCodecCtx_ && swrContext_) {
-    startAudioDecodeThread();
-  }
-
-
-
-  // 启动 decode thread
+  // Start the demux thread after the optional audio worker is ready.
 
   decodeThread_ = std::thread(&DecoderCore::decodeThreadFunc, this);
 
@@ -580,7 +612,11 @@ bool DecoderCore::startDecoding(double syncStartTime) {
     }
     LOG_DEBUG("[DecoderCore] RKMPP direct audio start after preroll: pending=%d target=%d waited=%dms",
              pendingFrames, kDirectAudioStartMinPendingFrames, waitedMs);
-    audioPlayer_->start();
+    auto &audioManager = AudioPlayerManager::getInstance();
+    if (audioManager.hasFocus(AudioFocusSource::VIDEO) &&
+        audioManager.hasAudioFocusForLayer(layerId_)) {
+      audioPlayer_->start();
+    }
   }
 #endif
 
@@ -593,6 +629,136 @@ bool DecoderCore::startDecoding(double syncStartTime) {
 }
 
 
+
+
+bool DecoderCore::ensureAudioOutputStarted() {
+#ifdef __ANDROID__
+  return ensureAudioOutputStartedInternal(false);
+#else
+  return false;
+#endif
+}
+
+bool DecoderCore::ensureAudioOutputStartedInternal(bool deferMpegPsDirectStart) {
+#ifdef __ANDROID__
+  // EOF drain/seek intentionally stop the worker. Do not resurrect it between
+  // pause, codec flush and PCM preroll. Never stall the engine update on seek.
+  std::unique_lock<std::mutex> transitionLock(eofDrainMutex_, std::try_to_lock);
+  if (!transitionLock.owns_lock() || isSeeking_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  if (!audioCodecCtx_ || !swrContext_ || shouldStop_ || hasReleasedFocus_ ||
+      demuxInputEnded_.load(std::memory_order_acquire)) {
+    return false;
+  }
+
+  auto &audioManager = AudioPlayerManager::getInstance();
+  if (!hasRequestedFocus_) {
+    audioManager.requestFocus(AudioFocusSource::VIDEO);
+    hasRequestedFocus_ = true;
+  }
+
+  const bool ownsAudioRoute =
+      audioManager.hasFocus(AudioFocusSource::VIDEO) &&
+      audioManager.hasAudioFocusForLayer(layerId_);
+  if (!ownsAudioRoute) {
+    // A background decoder may use an already-created shared player to keep its
+    // codec warm, but it must never create or reconfigure that shared stream.
+    audioPlayer_ = audioManager.getAudioPlayer();
+    if (audioPlayer_) {
+      startAudioDecodeThread();
+    }
+    return false;
+  }
+
+  if (!audioManager.ensureInitializedForLayer(
+          AudioFocusSource::VIDEO, layerId_, 44100, 2)) {
+    return false;
+  }
+
+  audioPlayer_ = audioManager.getAudioPlayer();
+  if (!audioPlayer_) {
+    LOG_ERROR("[DecoderCore] Route owner layer %d has no AudioPlayer after initialization",
+              layerId_);
+    return false;
+  }
+
+  bool needsDecodeThread =
+      !audioDecodeThreadRunning_.load(std::memory_order_acquire);
+  const uint64_t routeGeneration = audioManager.getAudioClockGeneration();
+  const uint64_t preparedGeneration =
+      preparedAudioRouteGeneration_.load(std::memory_order_acquire);
+  const bool regainedRouteWhileRunning =
+      routeGeneration != 0 && routeGeneration != preparedGeneration &&
+      !needsDecodeThread && videoStreamIdx_ >= 0;
+
+  if (regainedRouteWhileRunning) {
+    const double routePosition = getCurrentPlayTime();
+
+    // A background layer keeps demuxing and its audio worker keeps the codec
+    // warm, but decoded PCM is intentionally discarded while it lacks focus.
+    // Rebuild the active packet queue around the live position before this
+    // layer starts feeding the newly selected shared PCM generation.
+    stopAudioDecodeThread(false);
+    const bool historyRestored =
+        restoreAudioPacketQueueFromHistory(audioStreamIdx_, routePosition);
+    if (historyRestored) {
+      armAudioTrackSwitchGate(routePosition);
+      resetAudioMasterClock(routePosition);
+      LOG_INFO("[AudioRoute] Restored focused layer %d at %.3f for generation=%llu",
+               layerId_, routePosition,
+               static_cast<unsigned long long>(routeGeneration));
+    } else {
+      LOG_WARN("[AudioRoute] No packet history for focused layer %d at %.3f; "
+               "continuing from live demux generation=%llu",
+               layerId_, routePosition,
+               static_cast<unsigned long long>(routeGeneration));
+    }
+    needsDecodeThread = true;
+  }
+
+  if (needsDecodeThread) {
+    // Build a small preroll without blocking creation of the demux thread.
+    // Keep AAudio from consuming the first decoder packet before the next
+    // packet is available. The write path starts once this bounded preroll is
+    // queued; no helper thread races route changes.
+    audioPlayer_->prepareForPlayback(16384, 1000);
+  }
+
+  if (!pendingAudioChannel_.empty()) {
+    if (pendingAudioChannel_ == "left") {
+      audioPlayer_->setAudioChannelMode(AudioChannelMode::LEFT);
+    } else if (pendingAudioChannel_ == "right") {
+      audioPlayer_->setAudioChannelMode(AudioChannelMode::RIGHT);
+    } else if (pendingAudioChannel_ == "stereo") {
+      audioPlayer_->setAudioChannelMode(AudioChannelMode::STEREO);
+    }
+    pendingAudioChannel_.clear();
+  }
+
+  if (pendingAudioDataCallback_) {
+    audioPlayer_->setAudioDataCallback(pendingAudioDataCallback_);
+    pendingAudioDataCallback_ = nullptr;
+  }
+
+  startAudioDecodeThread();
+  if (needsDecodeThread && !shouldStop_ && !isPaused_ &&
+      (!deferMpegPsDirectStart || !isMpegPsStream_ || !useRkmppMpeg2Direct_)) {
+    audioPlayer_->start();
+  }
+
+  if (needsDecodeThread) {
+    LOG_INFO("[DecoderCore] Audio route activated for layer %d; decode thread recovered",
+             layerId_);
+  }
+  preparedAudioRouteGeneration_.store(routeGeneration,
+                                      std::memory_order_release);
+  return audioDecodeThreadRunning_.load(std::memory_order_acquire);
+#else
+  (void)deferMpegPsDirectStart;
+  return false;
+#endif
+}
 
 void DecoderCore::stopDecoding() {
 
@@ -644,23 +810,29 @@ void DecoderCore::stopDecoding() {
 
 #endif
 
+  audioMasterClockValid_.store(false, std::memory_order_release);
 }
 
 
 
 void DecoderCore::pauseDecoding() {
+  {
+    std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+    if (isPaused_.load(std::memory_order_acquire)) return;
+    pausedPosition_.store(getCurrentPlayTime(), std::memory_order_release);
+    videoPacketQueueCv_.notify_all();
+    audioPacketQueueCv_.notify_all();
+    frameQueueCv_.notify_all();
 
-  isPaused_ = true;
-  videoPacketQueueCv_.notify_all();
-  audioPacketQueueCv_.notify_all();
 
 
+    // Record pause 时间 using system 时间, not playback 时间
 
-  // Record pause 时间 using system 时间, not playback 时间
+    auto now = std::chrono::steady_clock::now();
 
-  auto now = std::chrono::steady_clock::now();
-
-  pauseStartTime_ = std::chrono::duration<double>(now.time_since_epoch()).count();
+    pauseStartTime_ = std::chrono::duration<double>(now.time_since_epoch()).count();
+    isPaused_.store(true, std::memory_order_release);
+  }
 
 
 
@@ -679,28 +851,29 @@ void DecoderCore::pauseDecoding() {
 
 
 void DecoderCore::resumeDecoding() {
+  {
+    std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+    if (!isPaused_.load(std::memory_order_acquire)) return;
+    const double resumePosition = getCurrentPlayTime();
 
-  // 计算暂停时长并累加到总暂停时间
+    // Re-anchor both clocks at the frozen position after audio focus handoff.
 
-  if (pauseStartTime_ > 0) {
+    const double currentTime = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    startTime_ = currentTime - resumePosition / std::max(0.1f, playbackRate_);
+    pausedTime_ = 0.0;
+    continuousWallClockOffset_.store(0.0, std::memory_order_release);
+    resetAudioMasterClock(resumePosition);
+    pauseStartTime_ = 0.0;
 
-    auto now = std::chrono::steady_clock::now();
 
-    double currentTime = std::chrono::duration<double>(now.time_since_epoch()).count();
 
-    double pauseDuration = currentTime - pauseStartTime_;
-
-    pausedTime_ += pauseDuration;
-
+    isPaused_ = false;
   }
-
-
-
-  isPaused_ = false;
   videoPacketQueueCv_.notify_all();
   audioPacketQueueCv_.notify_all();
+  frameQueueCv_.notify_all();
 
-  pauseStartTime_ = 0.0;
 
 
 
@@ -783,13 +956,20 @@ bool DecoderCore::seek(double position, const std::string &traceId) {
   isSeeking_ = true;
   videoPacketQueueCv_.notify_all();
   audioPacketQueueCv_.notify_all();
+  frameQueueCv_.notify_all();
+  std::lock_guard<std::mutex> transitionLock(eofDrainMutex_);
+  if (shouldStop_.load(std::memory_order_acquire)) {
+    isSeeking_ = false;
+    return false;
+  }
+  const bool resumeDrainedStreams = demuxInputEnded_.exchange(false);
   LOG_INFO("[SEEK_DIAG] trace=%s layer=%d stage=core.flag_set target=%.3f total_ms=%lld",
            traceId.c_str(), layerId_, position, elapsedMs());
 
   const bool restartVideoThread =
-      videoDecodeThreadRunning_.load(std::memory_order_acquire) && videoCodecCtx_;
+      (resumeDrainedStreams || videoDecodeThreadRunning_.load(std::memory_order_acquire)) && videoCodecCtx_;
   const bool restartAudioThread =
-      audioDecodeThreadRunning_.load(std::memory_order_acquire) && audioCodecCtx_ &&
+      (resumeDrainedStreams || audioDecodeThreadRunning_.load(std::memory_order_acquire)) && audioCodecCtx_ &&
       swrContext_ && audioPlayer_;
   LOG_INFO("[SEEK_DIAG] trace=%s layer=%d stage=core.restart_plan video=%d audio=%d "
            "videoCodec=%p audioCodec=%p swr=%p audioPlayer=%p total_ms=%lld",
@@ -809,6 +989,13 @@ bool DecoderCore::seek(double position, const std::string &traceId) {
            elapsedMs());
   const auto stopAudioStart = std::chrono::steady_clock::now();
   stopAudioDecodeThread(false);
+
+  // Seek establishes its own target gate below. A pending audio-track switch
+  // gate is based on the pre-seek timeline and must not reject post-seek audio.
+  audioTrackSwitching_.store(false, std::memory_order_release);
+  audioTrackSwitchTargetPts_ = -1.0;
+  audioTrackSwitchDropCount_ = 0;
+
   LOG_INFO("[SEEK_DIAG] trace=%s layer=%d stage=core.stop_audio_done cost_ms=%lld total_ms=%lld",
            traceId.c_str(), layerId_,
            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -964,29 +1151,7 @@ bool DecoderCore::seek(double position, const std::string &traceId) {
 
   // 清空缓冲队列
 
-  {
-
-    const auto frameQueueFlushStart = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(queueMutex_);
-
-    while (!frameQueue_.empty()) {
-
-      frameQueue_.front()->release();
-
-      frameQueue_.pop_front();
-
-    }
-    LOG_INFO("[SEEK_DIAG] trace=%s layer=%d stage=core.frame_queue_flushed cost_ms=%lld total_ms=%lld",
-             traceId.c_str(), layerId_,
-             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                 std::chrono::steady_clock::now() - frameQueueFlushStart).count()),
-             elapsedMs());
-
-  }
-
-
-
-  // 重置 帧 counter
+  // Reset frame counters after seek.
 
   totalDecodedFrames_ = 0;
   flowReceiveCount_ = 0;
@@ -1015,9 +1180,18 @@ bool DecoderCore::seek(double position, const std::string &traceId) {
 
       std::chrono::duration<double>(now.time_since_epoch()).count();
 
-  startTime_ = currentTime - (position / std::max(0.1f, playbackRate_));
-
-  pausedTime_ = 0.0;
+  {
+    std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+    startTime_ = currentTime - (position / std::max(0.1f, playbackRate_));
+    continuousWallClockOffset_.store(0.0, std::memory_order_release);
+    resetAudioMasterClock(position);
+    lastPresentedVideoPts_.store(-1.0, std::memory_order_release);
+    pausedTime_ = 0.0;
+    if (isPaused_.load(std::memory_order_acquire)) {
+      pausedPosition_.store(position, std::memory_order_release);
+      pauseStartTime_ = currentTime;
+    }
+  }
 
   lastAcceptedPts_ = -1.0;
   seekDropTarget_.store(position, std::memory_order_release);
@@ -1147,6 +1321,22 @@ bool DecoderCore::seek(double position, const std::string &traceId) {
 
 }
 
+bool DecoderCore::finishPlaybackIfAtEnd(double endTolerance) {
+  std::unique_lock<std::mutex> transitionLock(eofDrainMutex_, std::try_to_lock);
+  if (!transitionLock.owns_lock() || isSeeking_.load(std::memory_order_acquire) ||
+      isPaused_.load(std::memory_order_acquire) ||
+      shouldStop_.load(std::memory_order_acquire) ||
+      demuxInputEnded_.load(std::memory_order_acquire) || duration_ <= 1.0 ||
+      getCurrentPlayTime() < duration_ + endTolerance) {
+    return false;
+  }
+  // This is an accepted natural-end fallback, not an explicit user stop.
+  // Publish EOF before stopping so autoplay cannot wait on a running wall clock.
+  isFinished_.store(true, std::memory_order_release);
+  signalStop();
+  return true;
+}
+
 
 
 // Decode thread, video/audio decode, frame processing 解码器Core_Decode.cpp
@@ -1255,9 +1445,15 @@ bool DecoderCore::armAudioTrackSwitchGate(double position) {
   audioFirstFrameLogged_ = false;
   audioTrackSwitchTargetPts_ = position;
   audioTrackSwitchDropCount_ = 0;
-  size_t dropped = dropAudioPacketsBefore(audioStreamIdx_, position);
+  const bool decodeCatchup =
+      audioTrackRestoreNeedsDecodeCatchup_.exchange(false,
+                                                    std::memory_order_acq_rel);
+  const size_t dropped =
+      decodeCatchup ? 0 : dropAudioPacketsBefore(audioStreamIdx_, position);
   audioTrackSwitching_.store(true, std::memory_order_release);
-  LOG_INFO("[AudioTrack] audio switch gate armed position=%.3f stream=%d", position, audioStreamIdx_);
+  LOG_INFO("[AudioTrack] audio switch gate armed position=%.3f stream=%d "
+           "decodeCatchup=%d",
+           position, audioStreamIdx_, decodeCatchup ? 1 : 0);
   LOG_INFO("[AudioTrack] audio switch target queue dropped=%zu", dropped);
   logPlaybackDiagnostics("audio-track-switch-gate-armed");
   return true;
@@ -1310,7 +1506,81 @@ bool DecoderCore::setAudioTrack(int track) {
   bool isSuppressed = audioOutputSuppressed_.load(std::memory_order_acquire);
 
   // 只切音频 解码器，不暂停整条解码线程，尽量保持视频与时钟连续。
-  const double switchPlayTime = getCurrentPlayTime();
+  // During a rapid media replacement, a stale startTime_ can briefly produce
+  // a position far beyond the new duration. Never seek the shared timeline with it.
+  const auto switchTargetCapturedAt = std::chrono::steady_clock::now();
+  const double switchTargetSystemTime =
+      std::chrono::duration<double>(
+          switchTargetCapturedAt.time_since_epoch()).count();
+  const bool pausedAtSwitch = isPaused_.load(std::memory_order_acquire);
+  const double rawSwitchPlayTime = getCurrentPlayTime();
+  const double videoPosition =
+      lastPresentedVideoPts_.load(std::memory_order_acquire);
+  const double reportedPosition =
+      lastReportedPlayTime_.load(std::memory_order_acquire);
+  double wallSwitchPlayTime =
+      (switchTargetSystemTime - startTime_ - pausedTime_) * playbackRate_;
+  if (pausedAtSwitch && pauseStartTime_ > 0.0) {
+    wallSwitchPlayTime -=
+        (switchTargetSystemTime - pauseStartTime_) * playbackRate_;
+  }
+
+  double switchPlayTime = rawSwitchPlayTime;
+  const auto isValidSwitchPosition = [this](double position) {
+    return std::isfinite(position) && position >= 0.0 &&
+           (duration_ <= 0.0 || position <= duration_ + 1.0);
+  };
+  if (!isValidSwitchPosition(switchPlayTime)) {
+    if (isValidSwitchPosition(videoPosition)) {
+      switchPlayTime = videoPosition;
+    } else if (isValidSwitchPosition(reportedPosition)) {
+      switchPlayTime = reportedPosition;
+    } else if (isValidSwitchPosition(wallSwitchPlayTime)) {
+      switchPlayTime = wallSwitchPlayTime;
+    } else {
+      switchPlayTime = 0.0;
+    }
+    LOG_WARN("[AudioTrack] Corrected invalid switch target raw=%.3f "
+             "wall=%.3f video=%.3f reported=%.3f duration=%.3f "
+             "selected=%.3f",
+             rawSwitchPlayTime, wallSwitchPlayTime, videoPosition,
+             reportedPosition, duration_, switchPlayTime);
+  }
+
+  // A rapid sequence of track switches can repeatedly invalidate the audio
+  // master clock before fresh PCM becomes audible. In that window the wall
+  // clock and the frame currently shown are better continuity references.
+  // Only accept a small forward correction so stale media state cannot seek
+  // the new item far away from its real position.
+  constexpr double kMaxTrackSwitchForwardSeconds = 3.0;
+  const auto considerForwardSwitchPosition =
+      [&](const char* source, double candidate) {
+        if (!isValidSwitchPosition(candidate) ||
+            candidate <= switchPlayTime) {
+          return;
+        }
+        const double ahead = candidate - switchPlayTime;
+        if (ahead <= kMaxTrackSwitchForwardSeconds) {
+          switchPlayTime = candidate;
+        } else {
+          LOG_WARN("[AudioTrack] Ignoring stale forward switch target "
+                   "source=%s candidate=%.3f selected=%.3f ahead=%.3f",
+                   source, candidate, switchPlayTime, ahead);
+        }
+      };
+  considerForwardSwitchPosition("wall", wallSwitchPlayTime);
+  considerForwardSwitchPosition("video", videoPosition);
+  considerForwardSwitchPosition("reported", reportedPosition);
+
+  if (duration_ > 0.0) {
+    switchPlayTime = std::clamp(switchPlayTime, 0.0, duration_);
+  }
+  if (switchPlayTime > rawSwitchPlayTime + 0.01) {
+    LOG_INFO("[AudioTrack] Advanced switch target raw=%.3f wall=%.3f "
+             "video=%.3f reported=%.3f selected=%.3f",
+             rawSwitchPlayTime, wallSwitchPlayTime, videoPosition,
+             reportedPosition, switchPlayTime);
+  }
   const float originalVolume = volume_;
 
   // 关键：切轨前必须停掉 audio 异步线程，否则它可能正在用旧的 audioCodecCtx_/swrContext_
@@ -1362,9 +1632,77 @@ bool DecoderCore::setAudioTrack(int track) {
     audioWriteCountAfterSwitch_ = 0;
     audioWriteIncompleteWarnCount_ = 0;
     stats_.reset();
+    audioTrackRestoreNeedsDecodeCatchup_.store(false,
+                                                  std::memory_order_release);
+    audioTrackReplayThrottleEndPts_.store(-1.0, std::memory_order_release);
+    // The active decode queue is consumed immediately, so a plain per-stream
+    // queue cannot retain the audible position after the demuxer reads ahead.
+    // Rebuild the selected queue from the independent packet history first.
+    // Only a genuine history miss falls back to a shared timeline seek.
+    const bool historyRestored =
+        restoreAudioPacketQueueFromHistory(audioStreamIdx_, switchPlayTime);
+    if (!historyRestored) {
+      LOG_INFO("[AudioTrack] Selected stream %d history misses %.3f; re-seeking timeline",
+               audioStreamIdx_, switchPlayTime);
+      const bool timelineResynced = seek(switchPlayTime, "audio-track-switch");
+      if (!timelineResynced) {
+        LOG_ERROR("[AudioTrack] Failed to re-seek timeline for track %d at %.3f",
+                  currentAudioTrack_, switchPlayTime);
+        setNominalVolume(originalVolume);
+        logPlaybackDiagnostics("audio-track-switch-seek-failed");
+        return false;
+      }
+    }
+
+    // Remove PCM from the previous track before the new audio clock becomes
+    // valid. Keeping that buffered tail makes the audible clock lag behind the
+    // switch target, which freezes video until the old PCM drains. Only the
+    // layer that owns audio focus may flush the shared AudioPlayer.
+    if (audioPlayer_ && hasLayerFocus) {
+      audioPlayer_->flush();
+      LOG_INFO("[AudioTrack] Flushed previous track PCM at %.3f", switchPlayTime);
+    }
+
+    // Track reconfiguration itself must not pause the public timeline. Without
+    // this compensation, many back-to-back switches accumulate into seconds of
+    // frozen audio-master time while video decoding keeps moving forward.
+    const auto switchNow = std::chrono::steady_clock::now();
+    const double switchSystemTime =
+        std::chrono::duration<double>(switchNow.time_since_epoch()).count();
+    if (!pausedAtSwitch) {
+      const double reconfigureAdvance =
+          (switchSystemTime - switchTargetSystemTime) * playbackRate_;
+      if (std::isfinite(reconfigureAdvance) && reconfigureAdvance > 0.0 &&
+          reconfigureAdvance <= kMaxTrackSwitchForwardSeconds) {
+        switchPlayTime += reconfigureAdvance;
+        if (duration_ > 0.0) {
+          switchPlayTime = std::min(switchPlayTime, duration_);
+        }
+      } else if (reconfigureAdvance > kMaxTrackSwitchForwardSeconds) {
+        LOG_WARN("[AudioTrack] Track reconfiguration took %.3fs; "
+                 "not advancing switch target",
+                 reconfigureAdvance);
+      }
+    }
+
     LOG_INFO("[AudioTrack] Arming audio track switch gate at current play time %.3f", switchPlayTime);
     bool gateOk = armAudioTrackSwitchGate(switchPlayTime);
     LOG_INFO("[AudioTrack] Audio track switch gate returned %d", gateOk ? 1 : 0);
+
+    // The previous audio queue no longer provides a valid audible-audio clock.
+    // Re-anchor the continuously advancing wall clock at the switch position,
+    // then let fresh writes from the selected track establish a new audio clock.
+    {
+      std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+      startTime_ = switchSystemTime -
+                   (switchPlayTime / std::max(0.1f, playbackRate_)) - pausedTime_;
+      if (isPaused_.load(std::memory_order_acquire) && pauseStartTime_ > 0.0) {
+        startTime_ -= switchSystemTime - pauseStartTime_;
+      }
+      continuousWallClockOffset_.store(0.0, std::memory_order_release);
+      resetAudioMasterClock(switchPlayTime);
+    }
+
     startAudioDecodeThread();
     setNominalVolume(originalVolume);
     logPlaybackDiagnostics("audio-track-switch-success");
@@ -1485,74 +1823,103 @@ void DecoderCore::setAudioDataCallback(std::function<void(const int16_t*, int32_
 
 DecodedFrame *DecoderCore::getCurrentFrame() {
 
-  std::lock_guard<std::mutex> lock(queueMutex_);
+  std::vector<DecodedFrame *> expiredFrames;
+  DecodedFrame *best = nullptr;
 
-  if (frameQueue_.empty()) {
-    ++flowGetFrameEmptyCount_;
-    const int64_t traceNowMs = steadyNowMsCore();
-    if (flowGetFrameEmptyCount_ <= 1 ||
-        traceNowMs - lastFlowGetFrameEmptyLogMs_ >= kPlaybackFlowLogIntervalMs) {
-      lastFlowGetFrameEmptyLogMs_ = traceNowMs;
-      LOG_WARN("[PLAY_FLOW] decoder_get_empty layer=%d count=%lld decoded=%lld "
-               "received=%lld enqueued=%lld play=%.3f stateStop=%d finished=%d",
-               layerId_, static_cast<long long>(flowGetFrameEmptyCount_),
-               static_cast<long long>(totalDecodedFrames_),
-               static_cast<long long>(flowReceiveCount_),
-               static_cast<long long>(flowEnqueueCount_),
-               getCurrentPlayTime(), shouldStop_.load() ? 1 : 0,
-               isFinished_.load() ? 1 : 0);
+  {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+
+    if (frameQueue_.empty()) {
+      ++flowGetFrameEmptyCount_;
+      const int64_t traceNowMs = steadyNowMsCore();
+      if (flowGetFrameEmptyCount_ <= 1 ||
+          traceNowMs - lastFlowGetFrameEmptyLogMs_ >= kPlaybackFlowLogIntervalMs) {
+        lastFlowGetFrameEmptyLogMs_ = traceNowMs;
+        LOG_WARN("[PLAY_FLOW] decoder_get_empty layer=%d count=%lld decoded=%lld "
+                 "received=%lld enqueued=%lld play=%.3f stateStop=%d finished=%d",
+                 layerId_, static_cast<long long>(flowGetFrameEmptyCount_),
+                 static_cast<long long>(totalDecodedFrames_),
+                 static_cast<long long>(flowReceiveCount_),
+                 static_cast<long long>(flowEnqueueCount_),
+                 getCurrentPlayTime(), shouldStop_.load() ? 1 : 0,
+                 isFinished_.load() ? 1 : 0);
+      }
+      return nullptr;
     }
-    return nullptr;
-  }
 
-  double now = getCurrentPlayTime();
+    if (isPaused_.load(std::memory_order_acquire)) {
+      // Keep the paused frame; presentation must not drain or realign its clock.
+      best = frameQueue_.front();
+      best->addRef();
+      return best;
+    }
+    double now = getCurrentPlayTime();
 
-  const bool isRkmppCodec =
-      videoCodecCtx_ && videoCodecCtx_->codec && videoCodecCtx_->codec->name &&
-      std::strstr(videoCodecCtx_->codec->name, "rkmpp") != nullptr;
-  const bool useConservativeClockPullback =
-      isRkmppCodec && !isMpegPsStream_ && videoWidth_ >= 3840 && videoHeight_ >= 720;
-  const double clockPullbackThreshold = useConservativeClockPullback ? 3.0 : 1.5;
+    const bool isRkmppCodec =
+        videoCodecCtx_ && videoCodecCtx_->codec && videoCodecCtx_->codec->name &&
+        std::strstr(videoCodecCtx_->codec->name, "rkmpp") != nullptr;
+  // High-resolution RKMPP playback must keep the audio/wall clock monotonic.
+  // Pulling the shared clock back to a late video frame starves audio and turns
+  // a video decode delay into whole-playback stutter.
+  const bool allowPresentationClockPullback =
+      !(isRkmppCodec && !isMpegPsStream_ && shouldUseAudioMasterClock());
+  constexpr double clockPullbackThreshold = 1.5;
+  constexpr double kSamePullbackPtsTolerance = 0.005;
+  constexpr double kEmergencyClockPullbackDrift = 8.0;
 
   // 简单策略：找到队列中最适合当前播放时间的帧。
   // 跳过已过期的帧——后面还有更新的帧时才跳过当前帧。
-  size_t expiredDropped = 0;
-  while (frameQueue_.size() > 1 && frameQueue_[1]->pts <= now) {
-    frameQueue_.front()->release();
+    size_t expiredDropped = 0;
+    while (frameQueue_.size() > 1 && frameQueue_[1]->pts <= now) {
+      expiredFrames.push_back(frameQueue_.front());
     frameQueue_.pop_front();
     ++expiredDropped;
-  }
-
-  if (expiredDropped > 0) {
-    flowGetFrameExpiredDropCount_ += static_cast<int64_t>(expiredDropped);
-    const int64_t traceNowMs = steadyNowMsCore();
-    if (traceNowMs - lastFlowGetFrameDropLogMs_ >= kPlaybackFlowLogIntervalMs) {
-      lastFlowGetFrameDropLogMs_ = traceNowMs;
-      LOG_WARN("[PLAY_FLOW] decoder_get_drop_expired layer=%d dropped=%zu total=%lld "
-               "queue=%zu play=%.3f frontPts=%.3f",
-               layerId_, expiredDropped,
-               static_cast<long long>(flowGetFrameExpiredDropCount_),
-               frameQueue_.size(), now,
-               frameQueue_.empty() ? -1.0 : frameQueue_.front()->pts);
     }
-  }
+    if (expiredDropped > 0) {
+      frameQueueCv_.notify_all();
+    }
 
-  // 时钟回拉：解码明显落后播放时钟时才拉回；高分辨率 RKMPP 显示背压下阈值更保守。
-  // 但如果反复回拉到同一个 frontPts，说明解码/显示已经卡在同一帧；
-  // 继续回拉会把播放时钟锁死，并掩盖上层卡帧 watchdog。
-  if (!frameQueue_.empty()) {
-    double frontPts = frameQueue_.front()->pts;
-    double drift = now - frontPts;
-    if (drift > clockPullbackThreshold && !isInStartupGracePeriod()) {
+  // Advancing by one queued frame is normal presentation progress. Only the
+  // extra frames skipped in the same render tick are genuine expired drops.
+  const size_t genuinelyDropped = expiredDropped > 1 ? expiredDropped - 1 : 0;
+    if (genuinelyDropped > 0) {
+      flowGetFrameExpiredDropCount_ += static_cast<int64_t>(genuinelyDropped);
+      const int64_t traceNowMs = steadyNowMsCore();
+      if (traceNowMs - lastFlowGetFrameDropLogMs_ >= kPlaybackFlowLogIntervalMs) {
+        lastFlowGetFrameDropLogMs_ = traceNowMs;
+        LOG_WARN("[PLAY_FLOW] decoder_get_drop_expired layer=%d dropped=%zu total=%lld "
+                 "queue=%zu play=%.3f frontPts=%.3f",
+                 layerId_, genuinelyDropped,
+                 static_cast<long long>(flowGetFrameExpiredDropCount_),
+                 frameQueue_.size(), now,
+                 frameQueue_.empty() ? -1.0 : frameQueue_.front()->pts);
+      }
+    }
+  // 时钟回拉仅用于非高分辨率 RKMPP 的故障恢复。4K RKMPP 必须让视频
+  // 跟随音频/墙钟，不能让显示线程把整条播放时钟拖慢。
+  // 如果其他解码路径反复回拉到同一个 frontPts，继续回拉也会锁死时钟，
+  // 因此仍保留重复回拉抑制和上层卡帧 watchdog。
+    if (!frameQueue_.empty()) {
+      double frontPts = frameQueue_.front()->pts;
+      double drift = now - frontPts;
+    const bool playbackActive =
+        !isFinished_.load(std::memory_order_acquire) &&
+        !shouldStop_.load(std::memory_order_acquire);
+    if (playbackActive && allowPresentationClockPullback &&
+        drift > clockPullbackThreshold && !isInStartupGracePeriod()) {
       const double pullbackPts = frontPts - 0.03;
       if (lastGetFrameClockPullbackPts_ >= 0.0 &&
-          std::abs(pullbackPts - lastGetFrameClockPullbackPts_) < 0.05) {
+          std::abs(pullbackPts - lastGetFrameClockPullbackPts_) <
+              kSamePullbackPtsTolerance) {
         ++getFrameClockPullbackRepeatCount_;
       } else {
         getFrameClockPullbackRepeatCount_ = 1;
       }
       lastGetFrameClockPullbackPts_ = pullbackPts;
-      const bool suppressPullback = getFrameClockPullbackRepeatCount_ >= 4;
+      const bool suppressRepeatedPullback = getFrameClockPullbackRepeatCount_ >= 4;
+      const bool forceEmergencyPullback = drift >= kEmergencyClockPullbackDrift;
+      const bool suppressPullback =
+          suppressRepeatedPullback && !forceEmergencyPullback;
       if (suppressPullback) {
         const int64_t suppressNowMs = steadyNowMsCore();
         if (lastGetFrameClockPullbackSuppressLogMs_ == 0 ||
@@ -1561,12 +1928,14 @@ DecodedFrame *DecoderCore::getCurrentFrame() {
           lastGetFrameClockPullbackSuppressLogMs_ = suppressNowMs;
           LOG_WARN("[PLAY_FLOW] decoder_get_clock_realign_suppressed layer=%d "
                    "repeat=%d drift=%.3f frontPts=%.3f play=%.3f queue=%zu "
-                   "size=%dx%d",
+                   "size=%dx%d repeated=%d emergency=%d",
                    layerId_, getFrameClockPullbackRepeatCount_, drift,
-                   frontPts, now, frameQueue_.size(), videoWidth_, videoHeight_);
+                   frontPts, now, frameQueue_.size(), videoWidth_, videoHeight_,
+                   suppressRepeatedPullback ? 1 : 0,
+                   forceEmergencyPullback ? 1 : 0);
         }
       } else {
-        realignClock(pullbackPts);
+        realignClock(pullbackPts, false);
         now = getCurrentPlayTime();
       }
       static thread_local int64_t s_lastRealignLogMs = 0;
@@ -1584,26 +1953,32 @@ DecodedFrame *DecoderCore::getCurrentFrame() {
       lastGetFrameClockPullbackPts_ = -1.0;
       getFrameClockPullbackRepeatCount_ = 0;
     }
+    }
+
+    best = frameQueue_.front();
+    best->addRef();
+    lastPresentedVideoPts_.store(best->pts, std::memory_order_release);
+    ++flowGetFrameCount_;
+    const int64_t traceNowMs = steadyNowMsCore();
+    if (flowGetFrameCount_ <= 1 ||
+        traceNowMs - lastFlowGetFrameLogMs_ >= kPlaybackFlowLogIntervalMs) {
+      lastFlowGetFrameLogMs_ = traceNowMs;
+      LOG_DEBUG("[PLAY_FLOW] decoder_get_frame layer=%d count=%lld frame=%lld "
+                "pts=%.3f play=%.3f diff=%.3f queue=%zu type=%d fd=%d decoded=%lld "
+                "received=%lld enqueued=%lld size=%dx%d",
+                layerId_, static_cast<long long>(flowGetFrameCount_),
+                static_cast<long long>(best->frameNumber), best->pts, now,
+                best->pts - now, frameQueue_.size(),
+                static_cast<int>(best->frameType), best->mppDmaBufFd,
+                static_cast<long long>(totalDecodedFrames_),
+                static_cast<long long>(flowReceiveCount_),
+                static_cast<long long>(flowEnqueueCount_),
+                videoWidth_, videoHeight_);
+    }
   }
 
-  DecodedFrame *best = frameQueue_.front();
-  best->addRef();
-  ++flowGetFrameCount_;
-  const int64_t traceNowMs = steadyNowMsCore();
-  if (flowGetFrameCount_ <= 1 ||
-      traceNowMs - lastFlowGetFrameLogMs_ >= kPlaybackFlowLogIntervalMs) {
-    lastFlowGetFrameLogMs_ = traceNowMs;
-    LOG_DEBUG("[PLAY_FLOW] decoder_get_frame layer=%d count=%lld frame=%lld "
-              "pts=%.3f play=%.3f diff=%.3f queue=%zu type=%d fd=%d decoded=%lld "
-              "received=%lld enqueued=%lld size=%dx%d",
-              layerId_, static_cast<long long>(flowGetFrameCount_),
-              static_cast<long long>(best->frameNumber), best->pts, now,
-              best->pts - now, frameQueue_.size(),
-              static_cast<int>(best->frameType), best->mppDmaBufFd,
-              static_cast<long long>(totalDecodedFrames_),
-              static_cast<long long>(flowReceiveCount_),
-              static_cast<long long>(flowEnqueueCount_),
-              videoWidth_, videoHeight_);
+  for (DecodedFrame *frame : expiredFrames) {
+    enqueueFrameRelease(frame);
   }
   return best;
 }
@@ -1630,38 +2005,226 @@ int64_t DecoderCore::secondsToPTS(double seconds,
 
 
 double DecoderCore::getCurrentPlayTime() const {
-
-  auto now = std::chrono::steady_clock::now();
-
-  double currentTime =
-
-      std::chrono::duration<double>(now.time_since_epoch()).count();
-
-
-
-  // 计算实际播放时间：总时间 - 暂停时间
-
-  double elapsed = (currentTime - startTime_ - pausedTime_) * playbackRate_;
-
-
-
-  // 如果当前处于暂停状态，需要扣除当前暂停时长
-
-  if (isPaused_ && pauseStartTime_ > 0) {
-
-    double currentPauseDuration = currentTime - pauseStartTime_;
-
-    elapsed -= currentPauseDuration * playbackRate_;
-
+  std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+  if (isPaused_.load(std::memory_order_acquire)) {
+    return pausedPosition_.load(std::memory_order_acquire);
+  }
+  if (isFinished_.load(std::memory_order_acquire) &&
+      lastErrorCode_ == DecodeErrorCode::None && duration_ > 0.0) {
+    return duration_;
   }
 
+  const auto now = std::chrono::steady_clock::now();
+  const double currentTime =
+      std::chrono::duration<double>(now.time_since_epoch()).count();
 
+  double rawWallElapsed = (currentTime - startTime_ - pausedTime_) * playbackRate_;
+  if (isPaused_.load(std::memory_order_acquire) && pauseStartTime_ > 0.0) {
+    rawWallElapsed -= (currentTime - pauseStartTime_) * playbackRate_;
+  }
+  rawWallElapsed = std::max(0.0, rawWallElapsed);
 
-  return elapsed;
+  double wallCandidate = std::max(
+      0.0, rawWallElapsed +
+               continuousWallClockOffset_.load(std::memory_order_acquire));
 
+#ifdef __ANDROID__
+  const auto &audioManager = AudioPlayerManager::getInstance();
+  const uint64_t currentGeneration = audioManager.getAudioClockGeneration();
+  const bool audioClockValid =
+      shouldUseAudioMasterClock() &&
+      audioMasterClockValid_.load(std::memory_order_acquire) &&
+      audioMasterClockGeneration_.load(std::memory_order_acquire) ==
+          currentGeneration;
+  const double anchorPts = audioMasterClockPts_.load(std::memory_order_acquire);
+  const double anchorTime =
+      audioMasterClockSystemTime_.load(std::memory_order_acquire);
+  const double bufferedEnd =
+      audioMasterBufferedEndPts_.load(std::memory_order_acquire);
+  // A shorter audio track (or a demux underrun) must not pin the video clock
+  // at the last PCM timestamp forever. Allow the queued audio to drain plus
+  // a short grace period, then use the existing continuous wall-clock handoff.
+  // Fresh PCM automatically takes ownership again without a position jump.
+  constexpr double kAudioClockDrainGraceSeconds = 0.5;
+  const bool audioClockDrained = audioClockValid &&
+      currentTime > anchorTime + std::max(0.0, bufferedEnd - anchorPts) +
+                        kAudioClockDrainGraceSeconds;
+  const bool audioClockUsable = audioClockValid && !audioClockDrained;
+
+  if (audioClockUsable) {
+    double audioCandidate = lastReportedPlayTime_.load(std::memory_order_acquire);
+    if (!isPaused_.load(std::memory_order_acquire)) {
+      audioCandidate = anchorPts + std::max(0.0, currentTime - anchorTime);
+      // Audio can legitimately end before video. Extrapolate through that
+      // silent tail so the handoff below never freezes the final video frames.
+      audioCandidate = std::max(0.0, audioCandidate);
+    }
+
+    if (audioClockHandoffGeneration_.load(std::memory_order_acquire) !=
+        currentGeneration) {
+      const double handoffPosition = std::max(
+          wallCandidate, lastReportedPlayTime_.load(std::memory_order_acquire));
+      audioClockHandoffOffset_.store(handoffPosition - audioCandidate,
+                                     std::memory_order_release);
+      audioClockHandoffGeneration_.store(currentGeneration,
+                                          std::memory_order_release);
+    }
+
+    const double candidate = std::max(
+        0.0, audioCandidate +
+                 audioClockHandoffOffset_.load(std::memory_order_acquire));
+    continuousWallClockOffset_.store(candidate - rawWallElapsed,
+                                      std::memory_order_release);
+
+    double reported = lastReportedPlayTime_.load(std::memory_order_acquire);
+    while (candidate > reported &&
+           !lastReportedPlayTime_.compare_exchange_weak(
+               reported, candidate, std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+    return std::max(candidate, reported);
+  }
+
+  if (audioClockHandoffGeneration_.exchange(0, std::memory_order_acq_rel) != 0) {
+    const double handoffPosition =
+        lastReportedPlayTime_.load(std::memory_order_acquire);
+    if (audioClockDrained) {
+      LOG_INFO("[AV_SYNC] PCM clock drained; continue on wall clock layer=%d "
+               "position=%.3f bufferedEnd=%.3f duration=%.3f",
+               layerId_, handoffPosition, bufferedEnd, duration_);
+    }
+    continuousWallClockOffset_.store(handoffPosition - rawWallElapsed,
+                                      std::memory_order_release);
+    wallCandidate = std::max(0.0, handoffPosition);
+  }
+#endif
+
+  double reported = lastReportedPlayTime_.load(std::memory_order_acquire);
+  while (wallCandidate > reported &&
+         !lastReportedPlayTime_.compare_exchange_weak(
+             reported, wallCandidate, std::memory_order_acq_rel,
+             std::memory_order_acquire)) {
+  }
+  return std::max(wallCandidate, reported);
+}
+
+bool DecoderCore::hasReachedVideoStreamEnd() const {
+  // MPEG-PS normalizes timestamps onto a separate timeline; do not compare
+  // those frames with raw container timestamps. Unknown ends keep recovery on.
+  if (isMpegPsStream_ || videoStreamEndPts_ <= 0.0) return false;
+  const double presented = lastPresentedVideoPts_.load(std::memory_order_acquire);
+  const double tolerance = std::max(0.25, std::min(0.5, 4.0 / std::max(1.0, frameRate_)));
+  return presented >= 0.0 && presented >= videoStreamEndPts_ - tolerance;
+}
+
+bool DecoderCore::setSyncStartTime(double syncStartTime) {
+  std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+  if (syncStartTime <= 0.0 || shouldStop_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  startTime_ = syncStartTime;
+  pausedTime_ = 0.0;
+  pauseStartTime_ = 0.0;
+  explicitSyncStart_ = true;
+  firstFrameAligned_ = true;
+  resetAudioMasterClock(0.0);
+  LOG_INFO("[SyncPlayback] layer=%d decoder start time updated to %.6f",
+           layerId_, syncStartTime);
+  return true;
+}
+
+bool DecoderCore::shouldUseAudioMasterClock() const {
+#ifdef __ANDROID__
+  if (isMpegPsStream_ || videoStreamIdx_ < 0 || audioStreamIdx_ < 0 ||
+      !audioPlayer_ || !audioPlayer_->isOutputProgressing() ||
+      std::abs(playbackRate_ - 1.0f) > 0.01f ||
+      audioOutputSuppressed_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  if (!isRkmppDecoder()) {
+    return false;
+  }
+  return AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId_);
+#else
+  return false;
+#endif
+}
+
+void DecoderCore::resetAudioMasterClock(double position) {
+  std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+  const double safePosition = std::max(0.0, position);
+  audioMasterClockValid_.store(false, std::memory_order_release);
+  audioMasterClockPts_.store(safePosition, std::memory_order_relaxed);
+  audioMasterClockSystemTime_.store(0.0, std::memory_order_relaxed);
+  audioMasterBufferedEndPts_.store(safePosition, std::memory_order_relaxed);
+  audioMasterClockGeneration_.store(0, std::memory_order_relaxed);
+  audioClockHandoffGeneration_.store(0, std::memory_order_release);
+  audioClockHandoffOffset_.store(0.0, std::memory_order_release);
+  lastReportedPlayTime_.store(safePosition, std::memory_order_release);
+  lastAudioMasterClockLogMs_.store(0, std::memory_order_release);
+}
+
+void DecoderCore::updateAudioMasterClock(double framePts, int writtenFrames,
+                                         int sampleRate,
+                                         uint64_t audioClockGeneration) {
+#ifdef __ANDROID__
+  if (!shouldUseAudioMasterClock() || framePts < 0.0 || writtenFrames <= 0 ||
+      sampleRate <= 0 || !audioPlayer_) {
+    return;
+  }
+
+  const auto &audioManager = AudioPlayerManager::getInstance();
+  if (audioManager.getAudioClockGeneration() != audioClockGeneration) {
+    return;
+  }
+  const int32_t pendingFrames = audioPlayer_->getPendingFrames();
+  const int32_t inFlightFrames = audioPlayer_->getAAudioInFlightFrames();
+  const double outputDelay = audioPlayer_->estimatedOutputDelaySeconds();
+  const double audioEndPts =
+      framePts + static_cast<double>(writtenFrames) / sampleRate;
+  const double pendingSeconds =
+      static_cast<double>(std::max(0, pendingFrames)) / sampleRate;
+  const double audiblePts =
+      std::clamp(audioEndPts - pendingSeconds - outputDelay, 0.0, audioEndPts);
+  const double systemTime = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+
+  std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+  audioMasterClockPts_.store(audiblePts, std::memory_order_relaxed);
+  audioMasterClockSystemTime_.store(systemTime, std::memory_order_relaxed);
+  audioMasterBufferedEndPts_.store(audioEndPts, std::memory_order_relaxed);
+  audioMasterClockGeneration_.store(audioClockGeneration,
+                                    std::memory_order_relaxed);
+  audioMasterClockValid_.store(true, std::memory_order_release);
+
+  const int64_t nowMs = static_cast<int64_t>(systemTime * 1000.0);
+  int64_t lastLogMs =
+      lastAudioMasterClockLogMs_.load(std::memory_order_acquire);
+  if (lastLogMs == 0 || nowMs - lastLogMs >= 5000) {
+    if (lastAudioMasterClockLogMs_.compare_exchange_strong(
+            lastLogMs, nowMs, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      const double play = getCurrentPlayTime();
+      const double videoPts =
+          lastPresentedVideoPts_.load(std::memory_order_acquire);
+      const double avDiff = videoPts >= 0.0 ? videoPts - play : 0.0;
+      LOG_INFO("[AV_SYNC] layer=%d audioFramePts=%.3f audioEnd=%.3f "
+               "master=%.3f play=%.3f videoPts=%.3f avDiff=%+.3f "
+               "pending=%d inFlight=%d outputDelay=%.3f bufferedEnd=%.3f",
+               layerId_, framePts, audioEndPts, audiblePts, play, videoPts,
+               avDiff, pendingFrames, inFlightFrames, outputDelay, audioEndPts);
+    }
+  }
+#else
+  (void)framePts;
+  (void)writtenFrames;
+  (void)sampleRate;
+  (void)audioClockGeneration;
+#endif
 }
 
 void DecoderCore::setPlaybackRate(float rate) {
+  std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
   if (rate < 0.1f) rate = 0.1f;
   if (rate > 4.0f) rate = 4.0f;
 
@@ -1672,6 +2235,7 @@ void DecoderCore::setPlaybackRate(float rate) {
 
   playbackRate_ = rate;
   startTime_ = currentTime - (currentPlayTime / playbackRate_) - pausedTime_;
+  continuousWallClockOffset_.store(0.0, std::memory_order_release);
   if (isPaused_ && pauseStartTime_ > 0.0) {
     double currentPauseDuration = currentTime - pauseStartTime_;
     startTime_ -= currentPauseDuration;
@@ -1850,8 +2414,18 @@ double DecoderCore::normalizeMpegPsVideoPts(double rawPts, const char *demuxerNa
 
 
 void DecoderCore::alignFirstFrame(double firstPts) {
+  std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
 
   if (firstFrameAligned_) return;
+
+  // A sync plan owns the wall-clock anchor. Do not replace its future start
+  // deadline with the first decoded PTS when the decoder warms up early.
+  if (explicitSyncStart_) {
+    firstFrameAligned_ = true;
+    LOG_DEBUG("[SyncPlayback] layer=%d first-frame alignment kept explicit startTime=%.6f pts=%.3f",
+              layerId_, startTime_, firstPts);
+    return;
+  }
 
   if (isMpegPsStream_ && useRkmppMpeg2Direct_) {
     static thread_local bool directMpegPsDeferLogged = false;
@@ -1948,37 +2522,25 @@ void DecoderCore::alignFirstFrame(double firstPts) {
 
 
 
-void DecoderCore::realignClock(double pts) {
+void DecoderCore::realignClock(double pts, bool resetAudioPipeline) {
+  {
+    std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
 
-  auto now = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
 
-  double currentSystemTime = std::chrono::duration<double>(now.time_since_epoch()).count();
+    double currentSystemTime = std::chrono::duration<double>(now.time_since_epoch()).count();
 
-  if (lastClockRealignPts_ >= 0.0 && std::abs(pts - lastClockRealignPts_) < 0.05) {
-    ++repeatedClockRealignCount_;
-  } else {
-    repeatedClockRealignCount_ = 0;
+    startTime_ = currentSystemTime - (pts / std::max(0.1f, playbackRate_));
+    continuousWallClockOffset_.store(0.0, std::memory_order_release);
+
+    pausedTime_ = 0.0;
+
+    const bool paused = isPaused_.load(std::memory_order_acquire);
+    pauseStartTime_ = paused ? currentSystemTime : 0.0;
+    if (paused) pausedPosition_.store(std::max(0.0, pts), std::memory_order_release);
+
+    resetAudioMasterClock(pts);
   }
-  lastClockRealignPts_ = pts;
-
-  if (repeatedClockRealignCount_ >= 3) {
-    LOG_WARN("[DecoderCore] repeated clock realign around same pts=%.3f count=%d, marking audio for reinit",
-             pts, repeatedClockRealignCount_);
-#ifdef __ANDROID__
-    if (audioPlayer_) {
-      audioPlayer_->markNeedsReinit("repeated_clock_realign");
-    }
-#endif
-    repeatedClockRealignCount_ = 0;
-  }
-
-  startTime_ = currentSystemTime - (pts / std::max(0.1f, playbackRate_));
-
-  pausedTime_ = 0.0;
-
-  pauseStartTime_ = 0.0;
-
-  skippedAudioDuringCatchup_ = false;
 
   // 时钟重对齐后进入追赶模式，放宽 FrameSync 阈值，避免 Vulkan 重建等场景下帧队列积压导致 pts 增长缓慢
   if (frameSyncManager_) {
@@ -1989,8 +2551,15 @@ void DecoderCore::realignClock(double pts) {
 
   // 否则 AudioPlayer 会播放旧的超前音频，导致音画不同
 #ifdef __ANDROID__
+  // Presentation clock correction must not starve AAudio. Reset the audio
+  // pipeline only for callers that explicitly handle a severe sync fault.
+  if (!resetAudioPipeline) {
+    LOG_INFO("[DecoderCore] Clock realigned to pts=%.3f without audio pipeline reset", pts);
+    return;
+  }
   // 超宽视频（4096x768）渲染慢导致频繁时钟重对齐，禁用音频刷新避免音频中断卡顿
-  const bool isUltraWide = videoWidth_ >= 4096 && videoHeight_ < 1080;
+  const bool isUltraWide =
+      video_profile::isUltraWideVideo(videoWidth_, videoHeight_);
   if (isMpegPsStream_ || isUltraWide) {
     LOG_WARN("[DecoderCore] Clock realign: skip audio flush (MPEG-PS=%d ultraWide=%d)",
              isMpegPsStream_ ? 1 : 0, isUltraWide ? 1 : 0);

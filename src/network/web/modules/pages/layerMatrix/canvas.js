@@ -1,4 +1,4 @@
-// 画布绘制模块
+﻿// 画布绘制模块
 import { isConfigValid } from './utils.js';
 import { parseSliceCoordinate } from './utils.js';
 import {
@@ -8,9 +8,22 @@ import {
     isSliceVisible
 } from './sliceModel.js';
 import { getItemBounds, getItemKey } from './geometry.js';
+import { getMatrixLayout, getMatrixRegionBounds, getMatrixSubdivisionKey } from './matrixLayout.js';
 
 // 存储清理函数
 let canvasCleanupFunctions = [];
+const canvasResizeStates = new WeakMap();
+
+function cancelPendingCanvasResize(canvas) {
+    const resizeState = canvasResizeStates.get(canvas);
+    if (!resizeState) return;
+
+    if (resizeState.frameId !== null) {
+        cancelAnimationFrame(resizeState.frameId);
+    }
+    resizeState.resolvers.splice(0).forEach(resolve => resolve(false));
+    canvasResizeStates.delete(canvas);
+}
 
 /**
  * 清理画布相关资源
@@ -35,7 +48,8 @@ export function initializeCanvas(
     onCanvasMouseDown, onCanvasMouseMove, onCanvasMouseUp, onCanvasDoubleClick,
     updateCursor, cssToCanvasCoord, updateCanvasSizeByLayout, drawCanvas,
     canvasConfig,
-    onCanvasContextMenu  // 可选：右键菜单（快速对齐）。未传时与旧行为一致：仅阻止系统菜单。
+    onCanvasContextMenu,  // 可选：右键菜单（快速对齐）。未传时与旧行为一致：仅阻止系统菜单。
+    layerDropHandlers = {}
 ) {
     // 先清理之前的资源
     cleanupCanvas();
@@ -69,6 +83,30 @@ export function initializeCanvas(
         canvas.addEventListener('contextmenu', onContextMenu);
         canvasCleanupFunctions.push(() => {
             canvas.removeEventListener('contextmenu', onContextMenu);
+        });
+
+        const onLayerDragOver = (e) => {
+            if (typeof layerDropHandlers.onDragOver === 'function') {
+                layerDropHandlers.onDragOver(e);
+            }
+        };
+        const onLayerDragLeave = (e) => {
+            if (typeof layerDropHandlers.onDragLeave === 'function') {
+                layerDropHandlers.onDragLeave(e);
+            }
+        };
+        const onLayerDrop = (e) => {
+            if (typeof layerDropHandlers.onDrop === 'function') {
+                layerDropHandlers.onDrop(e);
+            }
+        };
+        canvas.addEventListener('dragover', onLayerDragOver);
+        canvas.addEventListener('dragleave', onLayerDragLeave);
+        canvas.addEventListener('drop', onLayerDrop);
+        canvasCleanupFunctions.push(() => {
+            canvas.removeEventListener('dragover', onLayerDragOver);
+            canvas.removeEventListener('dragleave', onLayerDragLeave);
+            canvas.removeEventListener('drop', onLayerDrop);
         });
 
         let capturedPointerId = null;
@@ -232,17 +270,27 @@ export function initializeCanvas(
             });
         }
 
+        let lastObservedWidth = 0;
+        let lastObservedHeight = 0;
         const resizeObserver = new ResizeObserver(entries => {
-            for (let entry of entries) {
-                if (entry.target === canvas.parentElement) {
-                    const width = entry.contentRect.width;
-                    const height = entry.contentRect.height;
+            for (const entry of entries) {
+                if (entry.target !== canvas.parentElement) continue;
 
-                    if (width > 0 && height > 0) {
-                        if (isConfigValid(canvasConfig)) {
-                            updateCanvasSizeByLayout().then(() => drawCanvas());
-                        }
-                    }
+                const width = Math.round(entry.contentRect.width * 100) / 100;
+                const height = Math.round(entry.contentRect.height * 100) / 100;
+                if (
+                    width <= 0 || height <= 0 ||
+                    (width === lastObservedWidth && height === lastObservedHeight)
+                ) {
+                    continue;
+                }
+
+                lastObservedWidth = width;
+                lastObservedHeight = height;
+                if (isConfigValid(canvasConfig)) {
+                    updateCanvasSizeByLayout().then(changed => {
+                        if (changed) drawCanvas(true);
+                    });
                 }
             }
         });
@@ -251,6 +299,7 @@ export function initializeCanvas(
             resizeObserver.observe(canvas.parentElement);
             canvasCleanupFunctions.push(() => {
                 resizeObserver.disconnect();
+                cancelPendingCanvasResize(canvas);
             });
         }
 
@@ -266,83 +315,97 @@ export function initializeCanvas(
  */
 export function updateCanvasSizeByLayout(canvas, ctx, dpr, canvasConfig) {
     if (!canvas || !isConfigValid(canvasConfig)) {
-        return Promise.resolve();
+        return Promise.resolve(false);
     }
 
-    return new Promise((resolve) => {
-        requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-                const container = canvas.parentElement;
-                if (!container) {
-                    resolve();
-                    return;
+    let resizeState = canvasResizeStates.get(canvas);
+    if (!resizeState) {
+        resizeState = { frameId: null, resolvers: [] };
+        canvasResizeStates.set(canvas, resizeState);
+    }
+
+    return new Promise(resolve => {
+        resizeState.resolvers.push(resolve);
+        if (resizeState.frameId !== null) return;
+
+        resizeState.frameId = requestAnimationFrame(() => {
+            resizeState.frameId = null;
+            let changed = false;
+            const container = canvas.parentElement;
+
+            if (container) {
+                const containerStyle = window.getComputedStyle(container);
+                const horizontalPadding = parseFloat(containerStyle.paddingLeft || '0')
+                    + parseFloat(containerStyle.paddingRight || '0');
+                const verticalPadding = parseFloat(containerStyle.paddingTop || '0')
+                    + parseFloat(containerStyle.paddingBottom || '0');
+                const canvasStyle = window.getComputedStyle(canvas);
+                const horizontalBorder = parseFloat(canvasStyle.borderLeftWidth || '0')
+                    + parseFloat(canvasStyle.borderRightWidth || '0');
+                const verticalBorder = parseFloat(canvasStyle.borderTopWidth || '0')
+                    + parseFloat(canvasStyle.borderBottomWidth || '0');
+                const availableWidth = container.clientWidth - horizontalPadding;
+                const availableHeight = container.clientHeight - verticalPadding;
+                const containerWidth = availableWidth - horizontalBorder;
+                const containerHeight = availableHeight - verticalBorder;
+                const matrixLayout = getMatrixLayout(canvasConfig);
+
+                if (containerWidth > 0 && containerHeight > 0 && matrixLayout) {
+                    const canvasAspectRatio = matrixLayout.width / matrixLayout.height;
+                    const aspectRatio = matrixLayout.width + ' / ' + matrixLayout.height;
+                    let canvasWidth;
+                    let canvasHeight;
+                    if (containerWidth / containerHeight > canvasAspectRatio) {
+                        canvasHeight = containerHeight;
+                        canvasWidth = canvasHeight * canvasAspectRatio;
+                    } else {
+                        canvasWidth = containerWidth;
+                        canvasHeight = canvasWidth / canvasAspectRatio;
+                    }
+
+                    dpr = window.devicePixelRatio || 1;
+
+                    const usesBorderBox = canvasStyle.boxSizing === 'border-box';
+                    const styleWidth = Math.min(
+                        Math.round(canvasWidth + (usesBorderBox ? horizontalBorder : 0)),
+                        Math.floor(availableWidth)
+                    );
+                    const styleHeight = Math.min(
+                        Math.round(canvasHeight + (usesBorderBox ? verticalBorder : 0)),
+                        Math.floor(availableHeight)
+                    );
+                    const backingWidth = Math.round(canvasWidth * dpr);
+                    const backingHeight = Math.round(canvasHeight * dpr);
+
+                    if (canvas.style.aspectRatio !== aspectRatio) {
+                        canvas.style.aspectRatio = aspectRatio;
+                        changed = true;
+                    }
+                    if (canvas.style.width !== styleWidth + 'px') {
+                        canvas.style.width = styleWidth + 'px';
+                        changed = true;
+                    }
+                    if (canvas.style.height !== styleHeight + 'px') {
+                        canvas.style.height = styleHeight + 'px';
+                        changed = true;
+                    }
+                    if (canvas.width !== backingWidth) {
+                        canvas.width = backingWidth;
+                        changed = true;
+                    }
+                    if (canvas.height !== backingHeight) {
+                        canvas.height = backingHeight;
+                        changed = true;
+                    }
+
+                    if (changed) {
+                        ctx = canvas.getContext('2d');
+                    }
                 }
+            }
 
-                const containerRect = container.getBoundingClientRect();
-                if (containerRect.width <= 0 || containerRect.height <= 0) {
-                    resolve();
-                    return;
-                }
-
-                const containerWidth = containerRect.width - 20;
-                const reservedHeightForCanvasMath = 0;
-                const containerHeight = Math.max(200, containerRect.height - 20 - reservedHeightForCanvasMath);
-
-                if (containerWidth <= 0 || containerHeight <= 0) {
-                    resolve();
-                    return;
-                }
-
-                if (!canvasConfig.width || !canvasConfig.height || canvasConfig.height <= 0) {
-                    resolve();
-                    return;
-                }
-
-                const canvasAspectRatio = canvasConfig.width / canvasConfig.height;
-                let canvasWidth, canvasHeight;
-                if (containerWidth / containerHeight > canvasAspectRatio) {
-                    canvasHeight = containerHeight;
-                    canvasWidth = canvasHeight * canvasAspectRatio;
-                } else {
-                    canvasWidth = containerWidth;
-                    canvasHeight = canvasWidth / canvasAspectRatio;
-                }
-
-                const minSize = 200;
-                if (canvasWidth < minSize) {
-                    canvasWidth = minSize;
-                    canvasHeight = canvasWidth / canvasAspectRatio;
-                }
-                if (canvasHeight < minSize) {
-                    canvasHeight = minSize;
-                    canvasWidth = canvasHeight * canvasAspectRatio;
-                }
-
-                dpr = window.devicePixelRatio || 1;
-
-                const styleWidth = Math.round(canvasWidth);
-                const styleHeight = Math.round(canvasHeight);
-                const backingWidth = Math.round(canvasWidth * dpr);
-                const backingHeight = Math.round(canvasHeight * dpr);
-
-                if (canvas.style.width !== styleWidth + 'px') {
-                    canvas.style.width = styleWidth + 'px';
-                }
-                if (canvas.style.height !== styleHeight + 'px') {
-                    canvas.style.height = styleHeight + 'px';
-                }
-
-                if (canvas.width !== backingWidth) {
-                    canvas.width = backingWidth;
-                }
-                if (canvas.height !== backingHeight) {
-                    canvas.height = backingHeight;
-                }
-
-                ctx = canvas.getContext('2d');
-
-                resolve();
-            });
+            const resolvers = resizeState.resolvers.splice(0);
+            resolvers.forEach(pendingResolve => pendingResolve(changed));
         });
     });
 }
@@ -683,9 +746,6 @@ export function drawSliceRect(
         height = (layer.size?.height && layer.size.height > 0) ? layer.size.height : canvasConfig.height;
     }
 
-    const canvasPos = systemToCanvas(x, y, canvas, dpr, canvasConfig);
-    const canvasSize = systemToCanvas(width, height, canvas, dpr, canvasConfig);
-
     const sliceIndex = sliceKey.replace('slice', '');
     const sliceName = `${getLayerDisplayName(layer, ALL_AVAILABLE_LAYERS)} 切片${sliceIndex}`;
 
@@ -781,6 +841,135 @@ export function drawSnapGuides(ctx, canvas, dpr, canvasConfig, guides, systemToC
     ctx.restore();
 }
 
+export function drawMatrixLayout(ctx, canvas, dpr, canvasConfig) {
+    const layout = getMatrixLayout(canvasConfig);
+    if (!ctx || !canvas || !layout) return;
+
+    const logicalWidth = canvas.width / dpr;
+    const logicalHeight = canvas.height / dpr;
+
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.38)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([7, 5]);
+
+    for (let col = 1; col < layout.cols; col++) {
+        const x = Math.round((logicalWidth * col) / layout.cols) + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, logicalHeight);
+        ctx.stroke();
+    }
+    for (let row = 1; row < layout.rows; row++) {
+        const y = Math.round((logicalHeight * row) / layout.rows) + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(logicalWidth, y);
+        ctx.stroke();
+    }
+
+    ctx.setLineDash([]);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(0.5, 0.5, Math.max(0, logicalWidth - 1), Math.max(0, logicalHeight - 1));
+    ctx.restore();
+}
+
+export function drawMatrixSubdivisionGuides(
+    ctx, canvas, dpr, canvasConfig, subdivisions = [], activeSubdivisionKey = ''
+) {
+    const layout = getMatrixLayout(canvasConfig);
+    if (!ctx || !canvas || !layout || !Array.isArray(subdivisions) || subdivisions.length === 0) return;
+
+    const logicalWidth = canvas.width / dpr;
+    const logicalHeight = canvas.height / dpr;
+
+    ctx.save();
+    subdivisions.forEach(subdivision => {
+        const rows = Math.trunc(Number(subdivision?.rows));
+        const cols = Math.trunc(Number(subdivision?.cols));
+        const bounds = getMatrixRegionBounds(
+            canvasConfig,
+            subdivision?.baseRow,
+            subdivision?.baseCol
+        );
+        if (!bounds || rows < 2 || cols < 2) return;
+
+        const x = (bounds.x / layout.width) * logicalWidth;
+        const y = (bounds.y / layout.height) * logicalHeight;
+        const width = (bounds.width / layout.width) * logicalWidth;
+        const height = (bounds.height / layout.height) * logicalHeight;
+        const isActive = getMatrixSubdivisionKey(subdivision.baseRow, subdivision.baseCol) === activeSubdivisionKey;
+
+        ctx.fillStyle = isActive ? 'rgba(34, 211, 238, 0.08)' : 'rgba(34, 211, 238, 0.035)';
+        ctx.fillRect(x, y, width, height);
+        ctx.strokeStyle = isActive ? 'rgba(103, 232, 249, 0.98)' : 'rgba(103, 232, 249, 0.72)';
+        ctx.lineWidth = isActive ? 2 : 1.25;
+        ctx.setLineDash([5, 4]);
+        ctx.strokeRect(x + 0.75, y + 0.75, Math.max(0, width - 1.5), Math.max(0, height - 1.5));
+
+        for (let col = 1; col < cols; col++) {
+            const lineX = x + (width * col) / cols;
+            ctx.beginPath();
+            ctx.moveTo(lineX, y);
+            ctx.lineTo(lineX, y + height);
+            ctx.stroke();
+        }
+        for (let row = 1; row < rows; row++) {
+            const lineY = y + (height * row) / rows;
+            ctx.beginPath();
+            ctx.moveTo(x, lineY);
+            ctx.lineTo(x + width, lineY);
+            ctx.stroke();
+        }
+
+        ctx.setLineDash([]);
+        ctx.font = '600 11px sans-serif';
+        ctx.textBaseline = 'top';
+        const label = `${rows}\u00d7${cols}`;
+        const labelWidth = ctx.measureText(label).width + 10;
+        ctx.fillStyle = 'rgba(8, 47, 73, 0.88)';
+        ctx.fillRect(x + 4, y + 4, labelWidth, 18);
+        ctx.fillStyle = 'rgba(207, 250, 254, 0.98)';
+        ctx.fillText(label, x + 9, y + 7);
+    });
+    ctx.restore();
+}
+
+export function drawMatrixDropTarget(ctx, canvas, dpr, canvasConfig, dropTargetRegion) {
+    const layout = getMatrixLayout(canvasConfig);
+    if (!ctx || !canvas || !layout || !dropTargetRegion) return;
+
+    const bounds = {
+        x: Number(dropTargetRegion.x),
+        y: Number(dropTargetRegion.y),
+        width: Number(dropTargetRegion.width),
+        height: Number(dropTargetRegion.height)
+    };
+    if (
+        !Number.isFinite(bounds.x) || !Number.isFinite(bounds.y) ||
+        !Number.isFinite(bounds.width) || !Number.isFinite(bounds.height) ||
+        bounds.width <= 0 || bounds.height <= 0
+    ) {
+        return;
+    }
+
+    const logicalWidth = canvas.width / dpr;
+    const logicalHeight = canvas.height / dpr;
+    const x = (bounds.x / layout.width) * logicalWidth;
+    const y = (bounds.y / layout.height) * logicalHeight;
+    const width = (bounds.width / layout.width) * logicalWidth;
+    const height = (bounds.height / layout.height) * logicalHeight;
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(102, 126, 234, 0.28)';
+    ctx.strokeStyle = 'rgba(139, 154, 255, 0.98)';
+    ctx.lineWidth = 2;
+    ctx.fillRect(x, y, width, height);
+    ctx.strokeRect(x + 1, y + 1, Math.max(0, width - 2), Math.max(0, height - 2));
+    ctx.restore();
+}
+
 /**
  * 获取控制点中心位置（支持旋转）
  */
@@ -818,7 +1007,8 @@ export function getHandlePositions(x, y, width, height, rotation = 0) {
 export function drawCanvas(
     canvas, ctx, dpr, layers, selectedLayer, selectedSlice, canvasConfig,
     drawLayerRect, drawLayerSlices, systemToCanvas, getLayerColor, getLayerDisplayName,
-    ALL_AVAILABLE_LAYERS, drawResizeHandles, validateConfig, selectedItems = [], snapGuides = []
+    ALL_AVAILABLE_LAYERS, drawResizeHandles, validateConfig, selectedItems = [], snapGuides = [],
+    dropTargetRegion = null, matrixSubdivisions = [], activeSubdivisionKey = ''
 ) {
     if (!canvas || !ctx) {
         return;
@@ -838,22 +1028,8 @@ export function drawCanvas(
     ctx.fillStyle = '#1a1a2e';
     ctx.fillRect(0, 0, logicalWidth, logicalHeight);
 
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
-    ctx.lineWidth = 1;
-
-    const gridSize = 50;
-    for (let x = 0; x <= logicalWidth; x += gridSize) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, logicalHeight);
-        ctx.stroke();
-    }
-    for (let y = 0; y <= logicalHeight; y += gridSize) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(logicalWidth, y);
-        ctx.stroke();
-    }
+    // 无论是否存在图层，都按后端矩阵布局绘制分割线。
+    drawMatrixLayout(ctx, canvas, dpr, canvasConfig);
 
     const selectedLayerObj = selectedLayer ? layers.find(l => l.id === selectedLayer) : null;
     const otherLayers = layers.filter(layer => layer.id !== selectedLayer);
@@ -882,6 +1058,11 @@ export function drawCanvas(
             drawLayerRect, getLayerColor, getLayerDisplayName, ALL_AVAILABLE_LAYERS, drawResizeHandles
         );
     }
+
+    drawMatrixSubdivisionGuides(
+        ctx, canvas, dpr, canvasConfig, matrixSubdivisions, activeSubdivisionKey
+    );
+    drawMatrixDropTarget(ctx, canvas, dpr, canvasConfig, dropTargetRegion);
 
     drawSelectionOverlays(
         ctx, canvas, dpr, canvasConfig, selectedItems, selectedLayer, selectedSlice,

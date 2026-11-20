@@ -49,7 +49,7 @@ class EventManager {
      * 清理所有事件监听器
      */
     clear() {
-        for (const [key, listener] of this.listeners.entries()) {
+        for (const listener of this.listeners.values()) {
             listener.element.removeEventListener(listener.event, listener.handler);
         }
         this.listeners.clear();

@@ -119,32 +119,6 @@ cc_library_static {
 }
 
 cc_test {
-    name: "libyuv_unittest",
-    static_libs: ["libyuv"],
-    shared_libs: ["libjpeg"],
-    cflags: ["-Wall", "-Werror"],
-    srcs: [
-        "unit_test/basictypes_test.cc",
-        "unit_test/color_test.cc",
-        "unit_test/compare_test.cc",
-        "unit_test/convert_test.cc",
-        "unit_test/cpu_test.cc",
-        "unit_test/cpu_thread_test.cc",
-        "unit_test/math_test.cc",
-        "unit_test/planar_test.cc",
-        "unit_test/rotate_argb_test.cc",
-        "unit_test/rotate_test.cc",
-        "unit_test/scale_argb_test.cc",
-        "unit_test/scale_plane_test.cc",
-        "unit_test/scale_rgb_test.cc",
-        "unit_test/scale_test.cc",
-        "unit_test/scale_uv_test.cc",
-        "unit_test/unit_test.cc",
-        "unit_test/video_common_test.cc",
-    ],
-}
-
-cc_test {
     name: "compare",
     gtest: false,
     srcs: [

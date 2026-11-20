@@ -13,9 +13,6 @@ package com.hsvj.engine;
 
 import android.view.Surface;
 import android.app.Activity;
-import android.content.ComponentName;
-import android.content.Intent;
-import android.provider.Settings;
 import android.util.Log;
 import androidx.annotation.Keep;
 
@@ -75,6 +72,7 @@ public class HSVJEngine {
     public void setActivity(android.app.Activity activity) {
         this.mActivity = activity;
         sActivityRef = new java.lang.ref.WeakReference<>(activity);
+        PlatformControlGateway.initialize(activity);
     }
 
     /**
@@ -116,6 +114,7 @@ public class HSVJEngine {
     public native double getLastAsyncPresentMs();
     public native double getLastAsyncAcquireMs();
     public native double getLastAsyncAcquireFenceMs();
+    public native long getSuccessfulPresentCount();
     public native long getSwapchainNoImageSkipCount();
 
     /**
@@ -124,6 +123,13 @@ public class HSVJEngine {
      * @return 若启用则返回图层 ID；未启用返回 -1
      */
     public native int getFirstMirrorLayerId();
+
+    /** 从 C++ SystemConfig 读取投屏控制配置。 */
+    public native String getMirrorControlConfigJson();
+
+    /** 仅用于将旧版 SharedPreferences 配置一次性迁移到 config.json。 */
+    public native boolean saveMirrorControlConfig(
+            String autoStartMode, boolean appSceneEnabled, String sceneName);
     
     /**
      * 通知引擎 Surface 已被系统销毁
@@ -138,6 +144,12 @@ public class HSVJEngine {
      * @param sourceType 0=HDMI/MIPI (默认值), 1=USB
      */
     public static native void setCaptureAudioSource(int sourceType);
+
+    /**
+     * Request one ordinary restart of active RK628 HDMI/MIPI capture streams.
+     * This never unbinds or rebinds the RK628 kernel driver.
+     */
+    public static native boolean restartActiveRk628CaptureForAudioRecovery();
 
     /**
      * 将外部捕获的音频数据推送到 Native 引擎进行可视化分析
@@ -165,6 +177,15 @@ public class HSVJEngine {
      * Java 只负责通过 Android UsbManager 打开并 claim ADB interface，
      * 数据链路由 C++ 接管，避免 Java 线程/队列进入音视频热路径。
      */
+    /** Starts the AirPlay H.264 RKMPP path for one mirror layer. */
+    public static native boolean startNativeAirPlayMirror(int layerId);
+
+    /** Pushes one decoded AirPlay SDK H.264 NAL packet into the native RKMPP queue. */
+    public static native boolean pushNativeAirPlayVideo(byte[] data, int nalType,
+            long ptsUs, int width, int height, int codec);
+
+    /** Stops the AirPlay RKMPP decoder thread and releases pending frames. */
+    public static native void stopNativeAirPlayMirror();
     public static native boolean startNativeUsbAdbMirror(int layerId, int usbFd,
             int bulkInEndpoint, int bulkOutEndpoint, int preferredWidth,
             int preferredHeight, String scrcpyServerPath, String keyDir,
@@ -199,6 +220,15 @@ public class HSVJEngine {
     public static native void setMirrorPin(int layerId, int pinCode);
 
     /**
+     * 同步投屏服务、连接状态和就绪提示元数据。
+     */
+    public static native void setMirrorServiceState(int layerId, String serviceName,
+            boolean started, boolean connected, String deviceName, int pinCode);
+
+    /** Runtime SUB-TV scene state; vertical crop is valid only while this is true. */
+    public static native void setMirrorTvModeActive(int layerId, boolean active);
+
+    /**
      * 更新图层尺寸（用于处理投屏手机横竖屏切换）
      * @param layerId 图层 ID
      * @param 宽度 宽度
@@ -208,96 +238,183 @@ public class HSVJEngine {
 
     /** 设备上报用：由 Java 通过系统 API 获取序列号/型号/MAC，绕过 Native 读 sysfs 的 SELinux 限制。须在 initialize 之前调用。 */
     public static native void setDeviceInfoForReport(String serial, String model, String mac);
+    /** Update targeting shares the cloud license identity and default server. */
+    public static native String getAppUpdateDeviceInfo();
+    public static native void setExternalBluetoothAudioActive(boolean active);
+    public static native void setBluetoothAudioSpectrum(float[] spectrum);
+    public static native void setBluetoothAudioMetadata(String title, String artist,
+                                                        long durationMs,
+                                                        String lyricFrame,
+                                                        long lyricPositionMs);
+    public static native void setBluetoothAudioPlayback(int state, long positionMs, float speed);
+
+    /** Native 设备上报回调：在 Wi-Fi/Ethernet Network 间逐个绑定重试。 */
+    @Keep
+    public String postDeviceReportAcrossNetworks(String url, String jsonBody, int timeoutMs) {
+        return PlatformControlGateway.postDeviceReportAcrossNetworks(url, jsonBody, timeoutMs);
+    }
     
-    /**
-     * 执行重启操作
-     * 由 Native 层调用，用于处理重启命令
-     */
+    /** Native HTTP callback with per-Network transport selection. */
     @Keep
-    public static void executeRestart() {
-        android.app.Activity activity = (sActivityRef != null) ? sActivityRef.get() : null;
-        if (activity instanceof MainActivity) {
-            MainActivity mainActivity = (MainActivity) activity;
-            mainActivity.executeRestartScript();
+    public static String requestHttpAcrossNetworks(String method, String url,
+            String body, String token, int timeoutMs) {
+        return PlatformControlGateway.requestHttpAcrossNetworks(method, url, body, token, timeoutMs);
+    }
+
+    /** Native file download callback with per-network streaming retries. */
+    @Keep
+    public static String downloadFileAcrossNetworks(String url, String filePath, int timeoutMs) {
+        return PlatformControlGateway.downloadFileAcrossNetworks(url, filePath, timeoutMs);
+    }
+
+    /** Native ZIP transfer callback; archive content never crosses JNI in memory. */
+    @Keep
+    public static String processConfigBackup(String operation, String root, String work) {
+        org.json.JSONObject result = new org.json.JSONObject();
+        try {
+            java.nio.file.Path directory = java.nio.file.Paths.get(work);
+            java.nio.file.Path archive = directory.resolve("config.zip");
+            int count;
+            if ("export".equals(operation)) {
+                count = com.hsvj.engine.util.ConfigBackupArchive.exportZip(java.nio.file.Paths.get(root), archive);
+            } else if ("import".equals(operation)) {
+                String owner = com.hsvj.engine.util.ConfigBackupArchive.processIdentity(Integer.toString(android.os.Process.myPid()));
+                if (owner.isEmpty()) throw new java.io.IOException("无法确认播放器进程，未安排还原");
+                count = com.hsvj.engine.util.ConfigBackupArchive.prepareImport(java.nio.file.Paths.get(root), archive, directory, owner);
+            } else {
+                throw new java.io.IOException("未知备份操作");
+            }
+            result.put("ok", true);
+            result.put("files", count);
+        } catch (Exception error) {
+            try {
+                result.put("ok", false);
+                String reason = error.getMessage() == null ? error.toString() : error.getMessage();
+                if (error instanceof java.util.zip.ZipException) reason = "压缩包损坏或格式不正确：" + reason;
+                else if (error instanceof java.nio.file.AccessDeniedException) reason = "没有文件访问权限：" + reason;
+                else if (error instanceof java.nio.file.NoSuchFileException) reason = "文件或目录不存在：" + reason;
+                result.put("message", reason);
+            } catch (org.json.JSONException ignored) { }
+        }
+        return result.toString();
+    }
+
+    /** Native platform callback; reports whether restart submission succeeded. */
+    @Keep
+    public static boolean executeRestart() {
+        return PlatformControlGateway.executeRestart();
+    }
+
+    @Keep
+    public static boolean scheduleWatchdogAlarm() {
+        return PlatformControlGateway.scheduleWatchdogAlarm();
+    }
+
+    @Keep
+    public static void offerGroupLeaderTime(long utcMs, long localMonoNs) {
+        PlatformControlGateway.offerGroupLeaderTime(utcMs, localMonoNs);
+    }
+
+    /** HTTPS bridge used by the native direct-Kugou client. */
+    @Keep
+    public static String httpsGetForNative(
+            String url, int connectTimeoutMs, int readTimeoutMs) {
+        org.json.JSONObject result = new org.json.JSONObject();
+        java.net.HttpURLConnection connection = null;
+        try {
+            java.net.URL endpoint = new java.net.URL(url);
+            if (!"https".equalsIgnoreCase(endpoint.getProtocol())) {
+                throw new IllegalArgumentException("only HTTPS is allowed");
+            }
+            connection = (java.net.HttpURLConnection) endpoint.openConnection();
+            connection.setRequestMethod("GET");
+            connection.setConnectTimeout(Math.max(1000, connectTimeoutMs));
+            connection.setReadTimeout(Math.max(1000, readTimeoutMs));
+            connection.setInstanceFollowRedirects(true);
+            connection.setRequestProperty("Accept", "application/json,text/plain,*/*");
+            connection.setRequestProperty("User-Agent", "HSVJEngine/1.0 Android");
+            connection.setUseCaches(false);
+            int statusCode = connection.getResponseCode();
+            java.io.InputStream stream = statusCode >= 400
+                    ? connection.getErrorStream() : connection.getInputStream();
+            String body = readHttpsResponseBody(stream, 4 * 1024 * 1024);
+            result.put("transportOk", true);
+            result.put("statusCode", statusCode);
+            result.put("body", body);
+            result.put("error", "");
+        } catch (Throwable error) {
+            Log.w(TAG, "HTTPS GET failed: " + url + " error=" + error.getMessage());
+            try {
+                result.put("transportOk", false);
+                result.put("statusCode", 0);
+                result.put("body", "");
+                result.put("error", error.getClass().getSimpleName() + ": "
+                        + String.valueOf(error.getMessage()));
+            } catch (org.json.JSONException ignored) {
+                return "";
+            }
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+        return result.toString();
+    }
+
+    private static String readHttpsResponseBody(java.io.InputStream input, int maximumBytes)
+            throws java.io.IOException {
+        if (input == null) return "";
+        try (java.io.InputStream stream = input;
+             java.io.ByteArrayOutputStream output = new java.io.ByteArrayOutputStream()) {
+            byte[] buffer = new byte[8192];
+            int total = 0;
+            int read;
+            while ((read = stream.read(buffer)) >= 0) {
+                total += read;
+                if (total > maximumBytes) {
+                    throw new java.io.IOException("HTTPS response exceeds size limit");
+                }
+                output.write(buffer, 0, read);
+            }
+            return output.toString(java.nio.charset.StandardCharsets.UTF_8.name());
         }
     }
 
     @Keep
-    public static void scheduleWatchdogAlarm() {
-        android.app.Activity activity = (sActivityRef != null) ? sActivityRef.get() : null;
-        if (activity instanceof MainActivity) {
-            ((MainActivity) activity).scheduleWatchdogRestartByAlarm();
-        }
+    public static boolean applyNetworkIpConfig(
+            String mode, String staticIp, String gateway, String dns) {
+        return PlatformControlGateway.applyNetworkIpConfig(mode, staticIp, gateway, dns);
     }
 
     @Keep
-    public static void applyNetworkIpConfig(String mode, String staticIp, String gateway, String dns) {
-        android.app.Activity activity = (sActivityRef != null) ? sActivityRef.get() : null;
-        if (activity instanceof MainActivity) {
-            ((MainActivity) activity).applyNetworkIpConfig(mode, staticIp, gateway, dns);
-        }
-    }
-
-    @Keep
-    public static void applyPowerSchedule(boolean scheduleEnabled, boolean powerOnEnabled,
+    public static boolean applyPowerSchedule(boolean scheduleEnabled, boolean powerOnEnabled,
             String powerOnDate, String powerOnTime, boolean powerOffEnabled,
             String powerOffDate, String powerOffTime) {
-        android.app.Activity activity = (sActivityRef != null) ? sActivityRef.get() : null;
-        if (activity instanceof MainActivity) {
-            ((MainActivity) activity).applyPowerSchedule(scheduleEnabled, powerOnEnabled,
-                    powerOnDate, powerOnTime, powerOffEnabled, powerOffDate, powerOffTime);
-        }
+        return PlatformControlGateway.applyPowerSchedule(scheduleEnabled, powerOnEnabled,
+                powerOnDate, powerOnTime, powerOffEnabled, powerOffDate, powerOffTime);
     }
 
     @Keep
     public static String getDeviceHsName() {
-        android.app.Activity activity = (sActivityRef != null) ? sActivityRef.get() : null;
-        if (activity == null) {
-            return "";
-        }
-        try {
-            String value = Settings.System.getString(
-                    activity.getContentResolver(), "device_hsname");
-            return value != null ? value : "";
-        } catch (Throwable t) {
-            Log.e(TAG, "getDeviceHsName failed", t);
-            return "";
-        }
+        return PlatformControlGateway.getDeviceHsName();
     }
 
     @Keep
-    public static boolean setDeviceHsName(String name) {
-        android.app.Activity activity = (sActivityRef != null) ? sActivityRef.get() : null;
-        if (activity == null) {
-            return false;
-        }
-        try {
-            return Settings.System.putString(
-                    activity.getContentResolver(), "device_hsname", name != null ? name : "");
-        } catch (Throwable t) {
-            Log.e(TAG, "setDeviceHsName failed", t);
-            return false;
-        }
+    public static boolean applyAssociatedDeviceName(String name) {
+        return PlatformControlGateway.applyAssociatedDeviceName(name);
     }
 
     @Keep
     public static boolean sendBootLogoChange(int slot) {
-        android.app.Activity activity = (sActivityRef != null) ? sActivityRef.get() : null;
-        if (activity == null || slot < 1 || slot > 5) {
-            return false;
-        }
-        try {
-            Intent intent = new Intent();
-            intent.setComponent(new ComponentName(
-                    "com.tyzc.resolutionratio",
-                    "com.tyzc.resolutionratio.TyzcBroadcastReceiver"));
-            intent.setAction("android.intent.action.logo.change" + slot);
-            activity.sendBroadcast(intent);
-            return true;
-        } catch (Throwable t) {
-            Log.e(TAG, "sendBootLogoChange failed: " + slot, t);
-            return false;
-        }
+        return PlatformControlGateway.sendBootLogoChange(slot);
+    }
+
+    @Keep
+    public static String controlDisplayResolution(String mode) {
+        return PlatformControlGateway.controlDisplayResolution(mode);
+    }
+
+    @Keep
+    public static String controlBluetooth(String action, String payload) {
+        return PlatformControlGateway.controlBluetooth(action, payload);
     }
 
     @Keep

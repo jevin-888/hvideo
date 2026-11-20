@@ -16,7 +16,8 @@ export const ApiModule = Object.freeze({
     LYRICS: 'lyrics',
     SYSTEM: 'system',
     PERIPHERALS: 'peripherals',
-    PERIPHERAL_EVENTS: 'peripheral-events'
+    PERIPHERAL_EVENTS: 'peripheral-events',
+    STAGE_CONTROL: 'stage-control'
 });
 
 const API_MODULES = new Set(Object.values(ApiModule));

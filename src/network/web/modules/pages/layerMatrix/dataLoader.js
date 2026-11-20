@@ -1,6 +1,6 @@
 // 数据加载模块
 import { apiGet } from '../../core/api.js';
-import { addToCommandLog } from '../../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { isConfigValid } from './utils.js';
 import { normalizeLayerFieldAliases } from './layerFieldModel.js';
 

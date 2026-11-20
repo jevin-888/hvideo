@@ -1,0 +1,18 @@
+.player-language { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; font-size: 13px; color: #e2e8f0; }
+.player-language select { color: #e2e8f0; background: #17223b; border: 1px solid #52607b; border-radius: 6px; padding: 6px; max-width: 135px; font: inherit; }
+.player-language select:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
+.login-container > .player-language { display: flex; justify-content: flex-end; margin-bottom: 18px; }
+.app-header.player-localized-header { display: flex; align-items: center; gap: 8px; padding: 12px; }
+.app-header > .player-language { margin-left: auto; }
+.player-language-bar { display: flex; justify-content: flex-end; padding: 8px 12px; }
+html:not([lang="zh-CN"]) .menu-text { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+    .system-header { align-items: flex-start; flex-wrap: wrap; height: auto; min-height: 54px; gap: 8px; padding-bottom: 8px; }
+    .system-header .header-left { flex: 1 1 100%; min-width: 0; }
+    .system-header .header-right { display: flex; flex: 1 1 100%; width: 100%; max-width: none; min-width: 0; flex-wrap: wrap; gap: 8px; overflow: visible; }
+    .system-header .system-status { display: flex; flex: 1 1 100%; min-width: 0; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+    .system-header .system-status .status-divider { display: none; }
+    .system-header .header-btn { min-height: 40px; }
+    .app-header .app-title { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .player-language select { max-width: 106px; }
+}

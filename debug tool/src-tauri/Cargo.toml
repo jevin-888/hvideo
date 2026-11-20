@@ -1,0 +1,29 @@
+[package]
+name = "debug-tool"
+version = "1.0.0"
+description = "HVIDEO 局域网设备调试客户端"
+authors = ["Hvideo"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.5", features = [] }
+rfd = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1", features = ["net", "time", "rt", "macros", "process", "sync"] }
+if-addrs = "0.13"
+tempfile = "3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+crc32fast = "1"
+sha2 = "0.10"
+rsa = { version = "0.9", default-features = true, features = ["sha2", "pem"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+portable-runtime = []

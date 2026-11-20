@@ -268,10 +268,10 @@ export function applyGeometryMoveLocal(regionId, op, du, dv) {
         movePoint(region, clamp(region.selected.row, 0, region.rows - 1), clamp(region.selected.col, 0, region.cols - 1), du, dv);
     } else if (op === 'row') {
         const row = clamp(region.selected.row, 0, region.rows - 1);
-        for (let col = 0; col < region.cols; col += 1) movePoint(region, row, col, du, dv);
+        for (let col = 0; col < region.cols; col += 1) movePoint(region, row, col, 0, dv);
     } else if (op === 'col') {
         const col = clamp(region.selected.col, 0, region.cols - 1);
-        for (let row = 0; row < region.rows; row += 1) movePoint(region, row, col, du, dv);
+        for (let row = 0; row < region.rows; row += 1) movePoint(region, row, col, du, 0);
     } else if (op === 'all') {
         for (let row = 0; row < region.rows; row += 1) {
             for (let col = 0; col < region.cols; col += 1) movePoint(region, row, col, du, dv);
@@ -413,6 +413,20 @@ export function applyManagerMoveLineLocal(regionId, direction, du, dv) {
     return region;
 }
 
+function resizeSelectedIndex(index, oldCount, nextCount) {
+    const selected = clamp(Math.floor(Number(index) || 0), 0, Math.max(0, oldCount - 1));
+    if (nextCount === (oldCount - 1) * 2 + 1) {
+        return clamp(selected * 2, 0, nextCount - 1);
+    }
+    if (nextCount === Math.floor((oldCount - 1) / 2) + 1) {
+        return clamp(Math.floor(selected / 2), 0, nextCount - 1);
+    }
+    if (oldCount > 1 && nextCount > 1) {
+        return clamp(Math.round((selected * (nextCount - 1)) / (oldCount - 1)), 0, nextCount - 1);
+    }
+    return 0;
+}
+
 function resizePoints(region, nextRows, nextCols) {
     const oldRows = region.rows;
     const oldCols = region.cols;
@@ -486,12 +500,16 @@ export function resizeGeometryRegionTo(regionId, rows, cols) {
     if (region.rows === nextRows && region.cols === nextCols && region.points.length === nextRows * nextCols) {
         return region;
     }
+    const oldRows = region.rows;
+    const oldCols = region.cols;
+    const selectedRow = resizeSelectedIndex(region.selected?.row ?? 0, oldRows, nextRows);
+    const selectedCol = resizeSelectedIndex(region.selected?.col ?? 0, oldCols, nextCols);
     region.points = resizePoints(region, nextRows, nextCols);
     region.rows = nextRows;
     region.cols = nextCols;
     region.selected = {
-        row: clamp(region.selected?.row ?? 0, 0, nextRows - 1),
-        col: clamp(region.selected?.col ?? 0, 0, nextCols - 1),
+        row: selectedRow,
+        col: selectedCol,
         axis: region.selected?.axis || 'col'
     };
     region.loaded = true;

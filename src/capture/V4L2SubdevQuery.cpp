@@ -5,6 +5,7 @@
 
 #include "capture/V4L2SubdevQuery.h"
 #include "utils/Logger.h"
+#include "IoctlUtils.h"
 
 #include <cerrno>
 #include <cstring>
@@ -28,22 +29,11 @@ V4L2SubdevQuery::V4L2SubdevQuery() = default;
 V4L2SubdevQuery::~V4L2SubdevQuery() { close(); }
 
 int V4L2SubdevQuery::v4l2Ioctl(int fd, unsigned long request, void *arg) {
-  int ret;
-  do {
-    ret = ioctl(fd, request, arg);
-  } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
-  return ret;
+  return captureIoctl(fd, request, arg);
 }
 
 std::string V4L2SubdevQuery::detectSubdevPath() {
 #ifdef __ANDROID__
-  // 扫描 /dev 目录以查找所有 v4l-subdev* 设备
-  DIR *dir = opendir("/dev");
-  if (!dir) {
-    LOG_DEBUG("[采集][Subdev] Cannot open /dev directory");
-    return "";
-  }
-
   std::vector<std::string> candidatePaths;
 
   // 示例/字段：先尝试常见路径（按优先级排序）
@@ -51,20 +41,6 @@ std::string V4L2SubdevQuery::detectSubdevPath() {
   candidatePaths.push_back("/dev/v4l-subdev0");
   candidatePaths.push_back("/dev/v4l-subdev1");
   candidatePaths.push_back("/dev/v4l-subdev3");
-
-  // 扫描 /dev 目录以查找所有 v4l-subdev* 设备
-  struct dirent *entry;
-  while ((entry = readdir(dir)) != nullptr) {
-    std::string name = entry->d_name;
-    if (name.find("v4l-subdev") == 0) {
-      std::string path = "/dev/" + name;
-      // 说明：如果不在候选列表中，则追加到末尾
-      if (std::find(candidatePaths.begin(), candidatePaths.end(), path) == candidatePaths.end()) {
-        candidatePaths.push_back(path);
-      }
-    }
-  }
-  closedir(dir);
 
   // 逐个尝试候选路径
   for (const std::string& path : candidatePaths) {
@@ -75,14 +51,11 @@ std::string V4L2SubdevQuery::detectSubdevPath() {
       memset(&dv_timings, 0, sizeof(dv_timings));
 
       bool supportsHDMI = false;
-      int ret;
-      do {
-        ret = ioctl(fd, VIDIOC_SUBDEV_QUERY_DV_TIMINGS, &dv_timings);
-      } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+      int ret = captureIoctl(fd, VIDIOC_SUBDEV_QUERY_DV_TIMINGS, &dv_timings);
 
       // 注意：即便 errno == ENOLINK (没接信号) 或 ENODATA (没数据)，只要不是 ENOTTY (不支持此 ioctl)，
       // 就说明这是一个支持信号探测的 subdev 节点
-      if (ret >= 0 || (errno != ENOTTY)) {
+      if (ret >= 0 || errno == ENOLINK || errno == ENODATA) {
         supportsHDMI = true;
       }
 

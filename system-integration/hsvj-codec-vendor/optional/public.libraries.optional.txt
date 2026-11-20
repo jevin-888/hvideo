@@ -1,4 +1,0 @@
-libavdevice.so
-libpostproc.so
-libdrm.so
-librockit.so

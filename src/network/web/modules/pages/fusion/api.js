@@ -1,5 +1,6 @@
 import { apiPost, apiAction } from '../../core/api.js';
-import { createFusionApi } from './apiCore.js?v=2.95';
+import { createFusionApi } from './apiCore.js?v=2.97';
+import { defaultBlendWidthForGrid } from './utils/blend.js';
 import { flattenPoints } from './utils/points.js';
 
 export function postFusionCommand(param, timeoutMs) {
@@ -64,11 +65,6 @@ export const loadBlend = fusionApi.loadBlend;
 export const autoRecalculateBlend = fusionApi.autoRecalculateBlend;
 
 const SIDES = ['left', 'right', 'top', 'bottom'];
-
-function defaultBlendWidthForGrid(gridCount) {
-    const count = Math.max(2, Number(gridCount) || 2);
-    return count > 2 ? 1 / (count - 1) : 0;
-}
 
 function normalizeBlendPayload(regionId, blend) {
     const gridRows = Math.max(2, Number(blend.gridRows) || 2);

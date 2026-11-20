@@ -1,3 +1,6 @@
+#ifdef __ANDROID__
+#include "utils/EncryptedMedia.h"
+#endif
 #include "decoder/RkmppMpeg2Probe.h"
 #include "utils/Logger.h"
 
@@ -190,7 +193,7 @@ RkmppMpeg2ProbeResult RkmppMpeg2Probe::probeFile(const std::string &path, int ma
   av_dict_set(&opts, "probesize", "8388608", 0);
   av_dict_set(&opts, "analyzeduration", "10000000", 0);
   av_dict_set(&opts, "fflags", "+genpts", 0);
-  int ret = avformat_open_input(&fmt, path.c_str(), nullptr, &opts);
+  int ret = encrypted_media::openInput(&fmt, path.c_str(), nullptr, &opts);
   av_dict_free(&opts);
   if (ret < 0 || !fmt) {
     char errbuf[128] = {0};

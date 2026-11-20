@@ -11,13 +11,18 @@
 
 #include "SystemUtils.h"
 #include "utils/Logger.h"
+#include "utils/ProcessRunner.h"
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <unistd.h>
 #include <sys/sysinfo.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -30,6 +35,35 @@ static unsigned long long prevIdleTime = 0;
 static unsigned long long prevTotalTime = 0;
 
 namespace {
+constexpr const char* USB_OTG_MODE_PATH =
+    "/sys/devices/platform/fe8a0000.usb2-phy/otg_mode";
+
+std::string normalizeInterfaceMac(std::string value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    value = value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+    if (value.size() != 17) return "";
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (i % 3 == 2) {
+            if (value[i] != ':') return "";
+        } else {
+            const auto ch = static_cast<unsigned char>(value[i]);
+            if (!std::isxdigit(ch)) return "";
+            value[i] = static_cast<char>(std::tolower(ch));
+        }
+    }
+    const unsigned long firstByte = std::strtoul(value.substr(0, 2).c_str(), nullptr, 16);
+    if ((firstByte & 1) != 0 || value == "00:00:00:00:00:00" ||
+        value == "02:00:00:00:00:00") {
+        return "";
+    }
+    return value;
+}
+
+bool isSupportedUsbOtgMode(const std::string& mode) {
+    return mode == "otg" || mode == "peripheral" || mode == "host";
+}
+
 bool isInterfaceCarrierUp(const std::string& name) {
     if (name.empty()) return false;
     std::ifstream carrier("/sys/class/net/" + name + "/carrier");
@@ -74,6 +108,46 @@ Json::Value SystemUtils::getNetworkInterfaces() {
         freeifaddrs(ifaddr);
     }
     return interfaces;
+}
+
+Json::Value SystemUtils::getNetworkReport(const std::string& localIp) {
+    if (localIp.empty()) return Json::Value();
+    for (const auto& iface : getNetworkInterfaces()) {
+        const std::string name = iface.get("name", "").asString();
+        if (iface.get("ip", "").asString() != localIp ||
+            (name != "eth0" && name != "wlan0") || !isInterfaceCarrierUp(name)) continue;
+        std::string mac;
+        if (name == "eth0") {
+            mac = getMacAddress();
+        } else {
+            // Include Wi-Fi's current MAC, including any address randomization.
+            const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (fd >= 0) {
+                struct ifreq request = {};
+                std::strncpy(request.ifr_name, name.c_str(), IFNAMSIZ - 1);
+                if (ioctl(fd, SIOCGIFHWADDR, &request) == 0) {
+                    const auto* bytes = reinterpret_cast<const unsigned char*>(request.ifr_hwaddr.sa_data);
+                    char address[18];
+                    std::snprintf(address, sizeof(address), "%02x:%02x:%02x:%02x:%02x:%02x",
+                                  bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]);
+                    mac = normalizeInterfaceMac(address);
+                }
+                close(fd);
+            }
+            if (mac.empty()) {
+                std::ifstream address("/sys/class/net/wlan0/address");
+                std::string value;
+                if (std::getline(address, value)) mac = normalizeInterfaceMac(value);
+            }
+        }
+        if (mac.empty()) return Json::Value();
+        Json::Value report;
+        report["networkType"] = name == "eth0" ? "ethernet" : "wifi";
+        report["interfaceName"] = name;
+        report["macAddress"] = mac;
+        return report;
+    }
+    return Json::Value();
 }
 
 std::string SystemUtils::getDeviceName() {
@@ -172,6 +246,58 @@ Json::Value SystemUtils::getMemoryInfo() {
     return result;
 }
 
+std::string SystemUtils::getUsbOtgMode() {
+#ifdef __ANDROID__
+    std::ifstream input(USB_OTG_MODE_PATH);
+    std::string mode;
+    if (!input.is_open() || !std::getline(input, mode)) return "";
+    while (!mode.empty() && std::isspace(static_cast<unsigned char>(mode.back()))) {
+        mode.pop_back();
+    }
+    return isSupportedUsbOtgMode(mode) ? mode : "";
+#else
+    return "";
+#endif
+}
+
+bool SystemUtils::applyUsbOtgMode(const std::string& mode) {
+    if (!isSupportedUsbOtgMode(mode)) {
+        LOG_ERROR("Unsupported USB OTG mode: %s", mode.c_str());
+        return false;
+    }
+
+#ifdef __ANDROID__
+    {
+        std::ofstream output(USB_OTG_MODE_PATH);
+        if (output.is_open()) {
+            output << mode;
+            output.flush();
+        }
+    }
+    if (getUsbOtgMode() == mode) {
+        LOG_INFO("USB OTG mode changed to %s", mode.c_str());
+        return true;
+    }
+
+    // The mode whitelist above prevents shell metacharacters in the command.
+    const std::string command =
+        "su 0 sh -c 'echo " + mode + " > " + USB_OTG_MODE_PATH + "'";
+    const auto result = runShellCommand(command, std::chrono::seconds(5));
+    const int rc = result.succeeded() ? 0 : -1;
+    const bool applied = rc == 0 && getUsbOtgMode() == mode;
+    if (applied) {
+        LOG_INFO("USB OTG mode changed to %s through su", mode.c_str());
+    } else {
+        LOG_ERROR("Failed to change USB OTG mode to %s (rc=%d)",
+                  mode.c_str(), rc);
+    }
+    return applied;
+#else
+    // Desktop builds do not expose the target Android sysfs node.
+    return true;
+#endif
+}
+
 std::string SystemUtils::getLocalIp() {
     Json::Value interfaces = getNetworkInterfaces();
     
@@ -218,7 +344,7 @@ static std::string s_override_serial, s_override_model, s_override_mac;
 void SystemUtils::setDeviceInfoFromJava(const std::string& serial, const std::string& model, const std::string& mac) {
     s_override_serial = serial;
     s_override_model = model;
-    s_override_mac = mac;
+    s_override_mac = normalizeInterfaceMac(mac);
 }
 
 std::string SystemUtils::getHardwareModel() {
@@ -246,6 +372,29 @@ std::string SystemUtils::getHardwareSerial() {
     return "";
 }
 
+std::string SystemUtils::getRegistrationSerial() {
+    std::string value = getHardwareSerial();
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    value = value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+    if (value.size() < 4 || value.size() > 128) return "";
+    bool hasIdentity = false, allZero = true, allF = true;
+    for (char& c : value) {
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+            hasIdentity = true;
+            allZero = allZero && c == '0';
+            allF = allF && c == 'F';
+        } else if (c != '.' && c != '_' && c != '-') {
+            return "";
+        }
+    }
+    if (!hasIdentity || allZero || allF || value == "UNKNOWN" || value == "NULL" ||
+        value == "NONE" || value == "DEFAULT" || value == "SERIAL" ||
+        value == "0123456789ABCDEF") return "";
+    return value;
+}
+
 std::string SystemUtils::getCpuSerial() {
     return getHardwareSerial();
 }
@@ -263,19 +412,25 @@ std::string SystemUtils::getStorageSerial() {
 }
 
 std::string SystemUtils::getMacAddress() {
+    // Java supplies only eth0. Keep identity independent of the active route,
+    // link state, Wi-Fi and hotspot interfaces.
     if (!s_override_mac.empty()) return s_override_mac;
-    for (const char* iface : { "eth0", "wlan0" }) {
-        std::string path = std::string("/sys/class/net/") + iface + "/address";
-        std::ifstream f(path);
-        if (f.is_open()) {
-            std::string line;
-            if (std::getline(f, line)) {
-                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-                if (!line.empty()) return line;
-            }
-        }
+
+    std::ifstream address("/sys/class/net/eth0/address");
+    std::string line;
+    if (std::getline(address, line)) {
+        const std::string mac = normalizeInterfaceMac(line);
+        if (!mac.empty()) return mac;
     }
-    return "00:00:00:00:00:00";
+
+    // Retry the same wired interface through the bounded shell runner where
+    // Android SELinux prevents direct sysfs access. Missing MACs are not cached.
+    const auto result = runShellCommand("cat /sys/class/net/eth0/address",
+                                        std::chrono::milliseconds(500));
+    if (result.succeeded()) {
+        return normalizeInterfaceMac(result.output);
+    }
+    return "";
 }
 
 std::string SystemUtils::generateDeviceFingerprint() {

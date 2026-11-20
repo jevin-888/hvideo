@@ -17,6 +17,7 @@ endif()
 target_include_directories(hsvj_text PUBLIC
     ${PROJECT_ROOT}/include
     ${PROJECT_ROOT}/vendor/freetype-2.8/include
+    ${PROJECT_ROOT}/vendor/libass/libass/libass
 )
 
 target_link_libraries(hsvj_text
@@ -27,3 +28,10 @@ target_link_libraries(hsvj_text
 
 # 模块说明：Layer 40/41 使用 VulkanTextOverlayBridge（FreeType+纹理），与 libass 无任何关系。
 
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_text
+    hsvj_foundation
+    hsvj_layer
+    hsvj_renderer
+    hsvj_utils
+)

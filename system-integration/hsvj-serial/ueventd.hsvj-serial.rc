@@ -1,0 +1,5 @@
+# H6 external connectors: ttyS5 RS232, ttyS7/ttyS9 RS485.
+# HSVJEngine runs as system (UID/GID 1000).
+/dev/ttyS5 0660 root system
+/dev/ttyS7 0660 root system
+/dev/ttyS9 0660 root system

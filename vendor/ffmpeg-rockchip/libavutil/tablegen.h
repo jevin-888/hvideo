@@ -30,7 +30,7 @@
 // performance and/or strict ISO C semantics as it's performed at build time
 static inline double ff_cbrt(double x)
 {
-    return x < 0 -pow(-x, 1.0 / 3.0) : pow(x, 1.0 / 3.0);
+    return x < 0 ? -pow(-x, 1.0 / 3.0) : pow(x, 1.0 / 3.0);
 }
 #define cbrt ff_cbrt
 

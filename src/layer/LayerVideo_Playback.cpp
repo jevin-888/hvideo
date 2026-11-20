@@ -10,7 +10,7 @@
 #include "capture/UsbCapture.h"
 #include "renderer/UsbCaptureRenderer.h"
 #include "core/LicenseManager.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "decoder/AudioOnlyPlayer.h"
 #include "decoder/VideoDecoder.h"
 #include "decoder/VideoDecoderPool.h"
@@ -25,6 +25,7 @@
 #include "audio/AudioPlayerManager.h"
 #include "audio/AudioPlayer.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstring>
@@ -46,6 +47,7 @@ extern "C" {
 #endif
 
 namespace hsvj {
+
 
 namespace {
 
@@ -151,32 +153,9 @@ static std::chrono::milliseconds autoCaptureRetryDelay(
   return std::chrono::seconds(120);
 }
 
-static bool queryMipiSignalPresent() {
-  V4L2SubdevQuery signalQuery;
-  if (!signalQuery.open()) {
-    return false;
-  }
-  HDMISignalInfo info = signalQuery.querySignal();
-  signalQuery.close();
-  return info.valid && info.hasSignal;
-}
-
 // 图层 1/2 全流程追踪：play()->open->start->首帧->render
 
 #ifdef __ANDROID__
-/** 切歌前触发共享音频淡出，但不阻塞等待完成，避免切歌主链路被音频线程卡住*/
-static void fadeOutSharedAudioBeforeSwitch(int layerId) {
-  if (!AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId)) {
-    return;
-  }
-  auto *ap = AudioPlayerManager::getInstance().getAudioPlayer();
-  if (!ap) {
-    return;
-  }
-  ap->fadeOut(48);
-  LOG_DEBUG("LayerVideo %d: trigger shared audio fade-out asynchronously before switch", layerId);
-}
-
 /**
  * 切换完成后：只设置 解码器 的标称音量
  * 音量在音频数据层面应用（解码器Core_Decode.cpp），不再设置 AudioPlayer 音量
@@ -191,21 +170,7 @@ static void applyVolumeSmoothAfterSwitch(int layerId, VideoDecoder *decoder,
   LOG_DEBUG("[LayerVideo] Layer %d volume set to %.2f after switch", layerId, volume);
 }
 
-/** 切换完成后触发共享音频淡入 */
-static void fadeInSharedAudioAfterSwitch(int layerId) {
-  if (!AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId)) {
-    return;
-  }
-  auto *ap = AudioPlayerManager::getInstance().getAudioPlayer();
-  if (!ap) {
-    return;
-  }
-  ap->fadeIn(48);
-  LOG_DEBUG("LayerVideo %d: trigger shared audio fade-in after switch", layerId);
-}
 #else
-static void fadeOutSharedAudioBeforeSwitch(int) {}
-static void fadeInSharedAudioAfterSwitch(int) {}
 static void applyVolumeSmoothAfterSwitch(int, VideoDecoder *decoder, float volume) {
   if (decoder) {
     decoder->setVolume(volume);
@@ -214,6 +179,70 @@ static void applyVolumeSmoothAfterSwitch(int, VideoDecoder *decoder, float volum
 #endif
 
 } // 命名空间
+
+bool LayerVideo::startAudioOnlyPlayback(const std::string& normalizedPath,
+                                        int loop) {
+  auto& audioOnly = *audioOnlyPlayer_;
+  if (!audioOnly.open(normalizedPath)) {
+    LOG_ERROR("LayerVideo %d: Failed to open pure audio: %s", layerId_, normalizedPath.c_str());
+    LOG_ERROR("[PlaybackTrace] request=0 switch=0 layer=%d stage=LAYER_AUDIO_ONLY_OPEN_FAIL path=%s",
+              layerId_, normalizedPath.c_str());
+    lastPlaybackErrorCode_ = DecodeErrorCode::OpenFileFailed;
+    lastPlaybackErrorMessage_ = "音频文件打开失败";
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    state_ = PlayState::STOPPED;
+    decoder_ = nullptr;
+    return false;
+  }
+  audioOnly.setLoop(loop);
+  audioOnly.setVolume(volume_);
+  if (!audioOnly.start(layerId_)) {
+    audioOnly.close();
+    LOG_ERROR("[PlaybackTrace] request=0 switch=0 layer=%d stage=LAYER_AUDIO_ONLY_START_FAIL path=%s",
+              layerId_, normalizedPath.c_str());
+    lastPlaybackErrorCode_ = DecodeErrorCode::DecodeFailed;
+    lastPlaybackErrorMessage_ = "音频播放失败";
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    state_ = PlayState::STOPPED;
+    decoder_ = nullptr;
+    return false;
+  }
+  {
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    currentPath_ = normalizedPath;
+    loop_ = loop;
+    state_ = PlayState::PLAYING;
+    decoder_ = nullptr;
+    isPlayingPureAudio_ = true;
+    isAudioOnlyMode_.store(true, std::memory_order_release);
+    // Keep the last video texture visible while audio-only media is playing.
+    uint32_t currentTex = textureIds_[currentTextureIndex_];
+    if (currentTex == 0) {
+      currentTex = textureIds_[(currentTextureIndex_ + 1) % 2];
+    }
+    if (currentTex != 0) {
+      const int retainW = size_.width > 0 ? size_.width : lastFallbackW_.load();
+      const int retainH = size_.height > 0 ? size_.height : lastFallbackH_.load();
+      retainedLastFrameTextureId_.store(currentTex, std::memory_order_release);
+      retainedLastFrameW_.store(retainW, std::memory_order_release);
+      retainedLastFrameH_.store(retainH, std::memory_order_release);
+      lastFallbackTextureId_.store(currentTex, std::memory_order_release);
+      lastFallbackX_.store(position_.x, std::memory_order_release);
+      lastFallbackY_.store(position_.y, std::memory_order_release);
+      lastFallbackW_.store(retainW, std::memory_order_release);
+      lastFallbackH_.store(retainH, std::memory_order_release);
+    } else {
+      retainedLastFrameTextureId_.store(0, std::memory_order_release);
+      retainedLastFrameW_.store(0, std::memory_order_release);
+      retainedLastFrameH_.store(0, std::memory_order_release);
+      lastFallbackTextureId_.store(0, std::memory_order_release);
+    }
+  }
+  LOG_INFO("LayerVideo %d: Pure audio started (audio-only pipeline): %s", layerId_, normalizedPath.c_str());
+  LOG_INFO("[PlaybackTrace] request=0 switch=0 layer=%d stage=LAYER_AUDIO_ONLY_STARTED path=%s",
+           layerId_, normalizedPath.c_str());
+  return true;
+}
 
 void LayerVideo::cleanupCompletedAsyncTasks() {
   // 移除已完成任务（解锁时偶尔调用，调用方需要先获取锁）
@@ -237,6 +266,20 @@ void LayerVideo::waitAllAsyncTasks() {
     asyncTasks_.clear();
   }
   waitDecoderReleaseTasks();
+}
+
+void LayerVideo::trackAsyncTask(std::future<void> task) {
+  if (!task.valid()) return;
+  std::lock_guard<std::mutex> lock(asyncTasksMutex_);
+  cleanupCompletedAsyncTasks();
+  asyncTasks_.push_back(std::move(task));
+}
+
+void LayerVideo::releaseDecodedFrameAsync(DecodedFrame *frame) {
+  if (!frame) {
+    return;
+  }
+  enqueueDecoderReleaseTask([frame]() { frame->release(); });
 }
 
 void LayerVideo::cleanupCompletedDecoderReleaseTasks() {
@@ -295,7 +338,8 @@ void LayerVideo::enqueueDecoderReleaseTask(Task&& task) {
     LOG_DEBUG("[PlaybackTrace] request=0 switch=0 layer=-1 stage=DECODER_RELEASE_ENQUEUE pending=%zu",
              decoderReleaseTasks_.size());
   }
-  std::thread([task = std::move(packagedTask), done]() mutable {
+  auto asyncTask = std::async(std::launch::async,
+      [task = std::move(packagedTask), done]() mutable {
     LOG_DEBUG("[PlaybackTrace] request=0 switch=0 layer=-1 stage=DECODER_RELEASE_TASK_START");
     try {
       task();
@@ -304,7 +348,12 @@ void LayerVideo::enqueueDecoderReleaseTask(Task&& task) {
     }
     done->store(true, std::memory_order_release);
     LOG_DEBUG("[PlaybackTrace] request=0 switch=0 layer=-1 stage=DECODER_RELEASE_TASK_DONE");
-  }).detach();
+  });
+  {
+    std::lock_guard<std::mutex> lock(asyncTasksMutex_);
+    cleanupCompletedAsyncTasks();
+    asyncTasks_.push_back(std::move(asyncTask));
+  }
 }
 
 void LayerVideo::asyncReleaseResources(std::unique_ptr<VideoDecoder> oldDecoder,
@@ -367,7 +416,7 @@ void LayerVideo::releasePlaybackFramesAndTexturesLocked() {
         DecodedFrame *frameToRelease = pendingFrames_[i];
         if (renderer_) {
           renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-            frameToRelease->release();
+            LayerVideo::releaseDecodedFrameAsync(frameToRelease);
           });
         } else {
           frameToRelease->release();
@@ -381,7 +430,7 @@ void LayerVideo::releasePlaybackFramesAndTexturesLocked() {
     retainedLastFrame_ = nullptr;
     if (renderer_) {
       renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-        frameToRelease->release();
+        LayerVideo::releaseDecodedFrameAsync(frameToRelease);
       });
     } else {
       frameToRelease->release();
@@ -440,12 +489,16 @@ void LayerVideo::clearDrmPrimeTextureCacheLocked(uint32_t keepTextureId0,
   drmPrimeTextureCache_.clear();
 }
 
-bool LayerVideo::play(const std::string &path, int loop, double /*同步开始时间 syncStartTime*/,
+bool LayerVideo::play(const std::string &path, int loop, double syncStartTime,
                       bool /*跳过同步 skipSync*/) {
   const auto playStart = std::chrono::steady_clock::now();
   lastPlaybackErrorCode_ = DecodeErrorCode::None;
   lastPlaybackErrorMessage_.clear();
   resetPlaybackFlowDiagnostics();
+  if (syncStartTime <= 0.0) {
+    syncPresentationDeadlineNs_.store(0, std::memory_order_release);
+    syncFirstFrameTraceEnabled_.store(false, std::memory_order_release);
+  }
   LOG_INFO("[PlaybackTrace] request=0 switch=0 layer=%d stage=LAYER_PLAY_ENTER path=%s loop=%d",
            layerId_, path.c_str(), loop);
   if (isShuttingDown_.load()) {
@@ -458,6 +511,15 @@ bool LayerVideo::play(const std::string &path, int loop, double /*同步开始�
   std::lock_guard<std::mutex> lifecycleGuard(lifecycleOpMutex_);
   // 切歌保护：同一图层同一时刻只允许一次 play() 执行，防止连续快速切歌导致双解码器泄漏。
   std::lock_guard<std::mutex> playGuard(playSwitchMutex_);
+  playbackGeneration_.fetch_add(1, std::memory_order_acq_rel);
+  // Keep the current audio layer selected while the old decoder is being
+  // replaced.  The shared PCM queue is still invalidated by the switch path;
+  // this flag only prevents a transient fallback to another visible layer.
+  audioRouteSwitching_.store(true, std::memory_order_release);
+  struct AudioRouteSwitchReset {
+    std::atomic<bool> &flag;
+    ~AudioRouteSwitchReset() { flag.store(false, std::memory_order_release); }
+  } audioRouteSwitchReset{audioRouteSwitching_};
   const int64_t lockWaitMs = elapsedMillisSince(playStart);
   logSwitchStallIfSlow(layerId_, "play_lock_wait", lockWaitMs, 50, path);
   if (isShuttingDown_.load()) {
@@ -513,68 +575,7 @@ bool LayerVideo::play(const std::string &path, int loop, double /*同步开始�
       asyncReleaseResources(std::move(oldVideoDecoder), emptyTexIds, nullptr);
     }
 
-    auto& audioOnly = *audioOnlyPlayer_;
-    if (!audioOnly.open(normalizedPath)) {
-      LOG_ERROR("LayerVideo %d: Failed to open pure audio: %s", layerId_, normalizedPath.c_str());
-      LOG_ERROR("[PlaybackTrace] request=0 switch=0 layer=%d stage=LAYER_AUDIO_ONLY_OPEN_FAIL path=%s",
-                layerId_, normalizedPath.c_str());
-      lastPlaybackErrorCode_ = DecodeErrorCode::OpenFileFailed;
-      lastPlaybackErrorMessage_ = "音频文件打开失败";
-      return false;
-    }
-    audioOnly.setLoop(loop);
-    audioOnly.setVolume(volume_);
-    if (!audioOnly.start(layerId_)) {
-      audioOnly.close();
-      LOG_ERROR("[PlaybackTrace] request=0 switch=0 layer=%d stage=LAYER_AUDIO_ONLY_START_FAIL path=%s",
-                layerId_, normalizedPath.c_str());
-      lastPlaybackErrorCode_ = DecodeErrorCode::DecodeFailed;
-      lastPlaybackErrorMessage_ = "音频播放失败";
-      return false;
-    }
-    {
-      std::lock_guard<std::timed_mutex> lock(mutex_);
-      currentPath_ = normalizedPath;
-      loop_ = loop;
-      state_ = PlayState::PLAYING;
-      isPlayingPureAudio_ = true;
-      isAudioOnlyMode_.store(true, std::memory_order_release);
-      // 把当前视频纹理保存为 retained，供切回视频时顶住黑屏。
-      // 不清空 textureIds_[]，render() 走 isAudioOnlyMode_ 分支跳过渲染。
-      uint32_t currentTex = textureIds_[currentTextureIndex_];
-      if (currentTex == 0) {
-        int other = (currentTextureIndex_ + 1) % 2;
-        currentTex = textureIds_[other];
-      }
-      if (currentTex != 0) {
-        // size_ 未配置（0x0），尝试从解码器获取实际视频尺寸。
-        int retainW = size_.width;
-        int retainH = size_.height;
-        if ((retainW <= 0 || retainH <= 0) && decoder_) {
-          retainW = decoder_->getWidth();
-          retainH = decoder_->getHeight();
-          LOG_INFO("LayerVideo %d: size_ 未配置，使用解码器尺寸 %dx%d 作为保留纹理尺寸", layerId_, retainW, retainH);
-        }
-        retainedLastFrameTextureId_.store(currentTex, std::memory_order_release);
-        retainedLastFrameW_.store(retainW, std::memory_order_release);
-        retainedLastFrameH_.store(retainH, std::memory_order_release);
-        lastFallbackTextureId_.store(currentTex, std::memory_order_release);
-        lastFallbackX_.store(position_.x, std::memory_order_release);
-        lastFallbackY_.store(position_.y, std::memory_order_release);
-        lastFallbackW_.store(retainW, std::memory_order_release);
-        lastFallbackH_.store(retainH, std::memory_order_release);
-      } else {
-        // 首次播放就是音频，没有视频纹理，清零所有引用。
-        retainedLastFrameTextureId_.store(0, std::memory_order_release);
-        retainedLastFrameW_.store(0, std::memory_order_release);
-        retainedLastFrameH_.store(0, std::memory_order_release);
-        lastFallbackTextureId_.store(0, std::memory_order_release);
-      }
-    }
-    LOG_INFO("LayerVideo %d: Pure audio started (audio-only pipeline): %s", layerId_, normalizedPath.c_str());
-    LOG_INFO("[PlaybackTrace] request=0 switch=0 layer=%d stage=LAYER_AUDIO_ONLY_STARTED path=%s",
-             layerId_, normalizedPath.c_str());
-    return true;
+    return startAudioOnlyPlayback(normalizedPath, loop);
   }
 
   // ---- 步骤0: 视频→视频 / 音频→视频切换前，若上一首是纯音频，必须先停 AudioOnlyPlayer ----
@@ -662,15 +663,8 @@ bool LayerVideo::play(const std::string &path, int loop, double /*同步开始�
   if (oldDecoder) {
     LOG_INFO("[PlaybackTrace] request=0 switch=0 layer=%d stage=OLD_DECODER_SIGNAL_START oldDecoder=%p path=%s",
              layerId_, static_cast<void *>(oldDecoder.get()), normalizedPath.c_str());
-    fadeOutSharedAudioBeforeSwitch(layerId_);
-#ifdef __ANDROID__
-    // 仅当本图层持有音频焦点时才 flush，避免清空其他图层（如 VOD 图层）正在播放的音频队列
-    if (AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId_)) {
-      if (auto *ap = AudioPlayerManager::getInstance().getAudioPlayer()) {
-        ap->flush();
-      }
-    }
-#endif
+    // setAudioOutputSuppressed(true) already faded, drained, paused and flushed
+    // the shared output. Do not repeat that barrier during decoder teardown.
     // 仅发信号，不阻塞。旧解码线程收到 shouldStop_ 后会自行退出。
     oldDecoder->signalStop();
     LOG_INFO("[PlaybackTrace] request=0 switch=0 layer=%d stage=OLD_DECODER_SIGNAL_DONE oldDecoder=%p path=%s",
@@ -795,6 +789,21 @@ bool LayerVideo::play(const std::string &path, int loop, double /*同步开始�
     state_ = PlayState::STOPPED;
     return false;
   }
+  // Some karaoke catalog entries use an .mp4 suffix while the container only
+  // carries an audio stream. Route them through AudioOnlyPlayer after probing,
+  // otherwise the render loop waits forever for a video frame and reconnects.
+  if (preOpenDecoder->getWidth() <= 0 || preOpenDecoder->getHeight() <= 0) {
+    LOG_INFO("[PlaybackTrace] request=0 switch=0 layer=%d stage=LAYER_AUDIO_ONLY_PROBED path=%s",
+             layerId_, normalizedPath.c_str());
+    VideoDecoderPool::getInstance().release(std::move(decoders_[activeDecoderIndex_]));
+    {
+      std::lock_guard<std::timed_mutex> lock(mutex_);
+      decoder_ = nullptr;
+      isPlayingPureAudio_ = false;
+      state_ = PlayState::STOPPED;
+    }
+    return startAudioOnlyPlayback(normalizedPath, loop);
+  }
   LOG_DEBUG("[PlaybackTrace] request=0 switch=0 layer=%d stage=DECODER_OPEN_OK path=%s width=%d height=%d",
            layerId_, normalizedPath.c_str(), preOpenDecoder->getWidth(), preOpenDecoder->getHeight());
   LOG_INFO("[VideoLayerDiag] open layer=%d video=%dx%d fps=%.2f duration=%.2f audioTracks=%d path=%s",
@@ -811,7 +820,7 @@ bool LayerVideo::play(const std::string &path, int loop, double /*同步开始�
   newDecoder->setLayerId(layerId_);
   if (globalPlayClockBasePtr_) newDecoder->setGlobalPlayClockBasePtr(globalPlayClockBasePtr_);
   newDecoder->setLoop(loop);
-  newDecoder->setPlaybackRate(playbackRate_);
+  newDecoder->setPlaybackRate(playbackRate_.load(std::memory_order_acquire));
   newDecoder->setNominalVolume(volume_);
   newDecoder->setAudioTrack(audioTrack_);
   newDecoder->setAudioChannel(audioChannel_);
@@ -820,7 +829,7 @@ bool LayerVideo::play(const std::string &path, int loop, double /*同步开始�
   LOG_DEBUG("[PlaybackTrace] request=0 switch=0 layer=%d stage=DECODER_START_CALL path=%s",
            layerId_, normalizedPath.c_str());
   const auto decoderStartCallStart = std::chrono::steady_clock::now();
-  const bool decoderStartOk = newDecoder->start();
+  const bool decoderStartOk = newDecoder->start(syncStartTime);
   const int64_t decoderStartCostMs =
       elapsedMillisSince(decoderStartCallStart);
   logSwitchStallIfSlow(layerId_, "decoder_start", decoderStartCostMs, 20,
@@ -896,7 +905,6 @@ bool LayerVideo::play(const std::string &path, int loop, double /*同步开始�
   }
 
   applyVolumeSmoothAfterSwitch(layerId_, decoder_, volume_);
-  fadeInSharedAudioAfterSwitch(layerId_);
   LOG_DEBUG("[LayerVideo] Layer %d play() calling applyVolumeSmoothAfterSwitch with volume_=%.2f",
            layerId_, volume_);
   LOG_DEBUG("[PlaybackTrace] request=0 switch=0 layer=%d stage=LAYER_PLAY_STARTED path=%s loop=%d",
@@ -934,7 +942,63 @@ void LayerVideo::pause() {
   }
 }
 
+void LayerVideo::setSyncPresentationDeadline(std::uint64_t deadlineNs) {
+  syncPresentationDeadlineNs_.store(deadlineNs, std::memory_order_release);
+  syncTraceDeadlineNs_.store(deadlineNs, std::memory_order_release);
+  syncFirstFrameLogged_.store(false, std::memory_order_release);
+  syncFirstFrameTraceEnabled_.store(true, std::memory_order_release);
+  LOG_INFO("[SyncPlayback] layer=%d presentation gate armed deadline=%llu",
+           layerId_, static_cast<unsigned long long>(deadlineNs));
+}
+
+void LayerVideo::clearSyncPresentationDeadline() {
+  const std::uint64_t deadline =
+      syncPresentationDeadlineNs_.exchange(0, std::memory_order_acq_rel);
+  if (deadline != 0) {
+    LOG_INFO("[SyncPlayback] layer=%d presentation gate released deadline=%llu",
+             layerId_, static_cast<unsigned long long>(deadline));
+  }
+}
+
+void LayerVideo::cancelSyncPresentation() {
+  syncPresentationDeadlineNs_.store(0, std::memory_order_release);
+  syncTraceDeadlineNs_.store(0, std::memory_order_release);
+  syncFirstFrameTraceEnabled_.store(false, std::memory_order_release);
+}
+
+bool LayerVideo::isSyncPresentationPending() const {
+  return syncPresentationDeadlineNs_.load(std::memory_order_acquire) != 0;
+}
+
+void LayerVideo::setSyncAudioSuppressed(bool suppressed) {
+  std::lock_guard<std::timed_mutex> lock(mutex_);
+  if (decoder_) {
+    decoder_->setAudioOutputSuppressed(suppressed);
+    LOG_INFO("[SyncPlayback] layer=%d audio gate %s", layerId_,
+             suppressed ? "armed" : "released");
+  }
+}
+
+bool LayerVideo::setSyncPlaybackStartTime(double startTime) {
+  std::lock_guard<std::timed_mutex> lock(mutex_);
+  return decoder_ && decoder_->setSyncStartTime(startTime);
+}
+
+bool LayerVideo::hasSyncFrameReady() {
+  std::lock_guard<std::timed_mutex> lock(mutex_);
+  if (!decoder_ || state_ == PlayState::STOPPED) return false;
+  DecodedFrame *frame = decoder_->getCurrentFrame();
+  if (!frame) return false;
+  decoder_->releaseFrame(frame);
+  return true;
+}
+
 void LayerVideo::resume() {
+  if (AudioPlayerManager::getInstance().isExternalBluetoothAudioActive()) {
+    LOG_INFO("[BluetoothAudio] Blocked direct resume while external Bluetooth audio is active: layer=%d",
+             layerId_);
+    return;
+  }
   std::lock_guard<std::timed_mutex> lock(mutex_);
   if (isPlayingPureAudio_.load() && audioOnlyPlayer_ &&
       audioOnlyPlayer_->getCurrentLayerId() == layerId_) {
@@ -961,6 +1025,14 @@ void LayerVideo::resume() {
   // 如果处于暂停状态，则恢复播放
   if (state_ == PlayState::PAUSED) {
     decoder_->resume();
+    // A paused layer may skip render submission entirely. Its last frame age
+    // therefore includes the pause and must not trigger recovery on resume.
+    noFrameStuckCount_ = 0;
+    noFrameStuckStartTime_ = 0.0;
+    lastRenderSameFrameStartMs_ = steadyNowMs();
+    lastRenderSameFrameWarnLogMs_ = 0;
+    duplicateFrameStuckStartMs_ = 0;
+    duplicateFrameStuckFrameNumber_ = -1;
     state_ = PlayState::PLAYING;
     LOG_PLAYER("LayerVideo %d resumed", layerId_);
   } else {
@@ -969,9 +1041,20 @@ void LayerVideo::resume() {
   }
 }
 
+bool LayerVideo::ensureAudioOutputStarted() {
+  std::lock_guard<std::mutex> lifecycleGuard(lifecycleOpMutex_);
+  return decoder_ && decoder_->ensureAudioOutputStarted();
+}
+
 bool LayerVideo::seek(double position, const std::string &traceId) {
   const auto seekStart = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lifecycleGuard(lifecycleOpMutex_);
+  return seekWithLifecycleLock(position, traceId, seekStart);
+}
+
+bool LayerVideo::seekWithLifecycleLock(
+    double position, const std::string &traceId,
+    std::chrono::steady_clock::time_point seekStart) {
   const auto lifecycleLockedAt = std::chrono::steady_clock::now();
   if (isPlayingPureAudio_.load()) {
     LOG_WARN("[SEEK_DIAG] trace=%s layer=%d stage=layer.reject reason=pure-audio target=%.3f wait_ms=%lld",
@@ -1010,6 +1093,7 @@ bool LayerVideo::seek(double position, const std::string &traceId) {
     return false;
   }
 
+  playbackGeneration_.fetch_add(1, std::memory_order_acq_rel);
   const bool ok = decoder->seek(position, traceId);
   const auto decoderSeekDone = std::chrono::steady_clock::now();
   if (ok) {
@@ -1023,6 +1107,13 @@ bool LayerVideo::seek(double position, const std::string &traceId) {
       return ok;
     }
     lastUploadedFrameNumber_ = -1;
+    lastRenderedFrameNumber_ = lastUploadedFrameNumber_;
+    lastRenderSameFrameStartMs_ = steadyNowMs();
+    lastRenderSameFrameWarnLogMs_ = 0;
+    noFrameStuckCount_ = 0;
+    noFrameStuckStartTime_ = 0.0;
+    duplicateFrameStuckStartMs_ = 0;
+    duplicateFrameStuckFrameNumber_ = -1;
     clearDrmPrimeTextureCacheLocked();
   }
   const auto seekDone = std::chrono::steady_clock::now();
@@ -1035,8 +1126,10 @@ bool LayerVideo::seek(double position, const std::string &traceId) {
   return ok;
 }
 
+
 void LayerVideo::stop() {
   std::lock_guard<std::mutex> lifecycleGuard(lifecycleOpMutex_);
+  playbackGeneration_.fetch_add(1, std::memory_order_acq_rel);
   // 纯音频管线：先更新状态再 stop，避免回调与 stop 争锁
   if (isPlayingPureAudio_.load() && audioOnlyPlayer_ &&
       audioOnlyPlayer_->getCurrentLayerId() == layerId_) {
@@ -1100,8 +1193,14 @@ void LayerVideo::stop() {
   }
 }
 
-bool LayerVideo::markPlaybackFinishedRetainingPath(const std::string &reason) {
+bool LayerVideo::markPlaybackFinishedRetainingPath(
+    const std::string &reason, uint64_t expectedGeneration, double endTolerance) {
+  std::unique_lock<std::mutex> lifecycleGuard(lifecycleOpMutex_, std::try_to_lock);
+  if (!lifecycleGuard.owns_lock()) return false;
   std::lock_guard<std::timed_mutex> lock(mutex_);
+  if (playbackGeneration_.load(std::memory_order_acquire) != expectedGeneration) {
+    return false;
+  }
   if (state_ == PlayState::STOPPED) {
     return true;
   }
@@ -1109,18 +1208,21 @@ bool LayerVideo::markPlaybackFinishedRetainingPath(const std::string &reason) {
     return false;
   }
 
-  if (decoder_) {
-    decoder_->setAudioOutputSuppressed(true);
-    decoder_->signalStop();
+  if (!decoder_ || !decoder_->finishPlaybackIfAtEnd(endTolerance)) {
+    return false;
   }
+  decoder_->setAudioOutputSuppressed(true);
   if (AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId_)) {
-    AudioPlayerManager::getInstance().setCurrentAudioLayerId(0);
+    // Focus selection is owned exclusively by Engine::syncAudioOutputLayer().
+    // Only discard this layer's queued tail here; the engine immediately selects
+    // the next eligible visible layer from authoritative layer state.
     if (auto *ap = AudioPlayerManager::getInstance().getAudioPlayer()) {
       ap->flush();
     }
   }
 
   state_ = PlayState::STOPPED;
+  playbackGeneration_.fetch_add(1, std::memory_order_acq_rel);
   noFrameStuckCount_ = 0;
   noFrameStuckStartTime_ = 0.0;
   duplicateFrameStuckStartMs_ = 0;
@@ -1156,380 +1258,11 @@ void waitAndReleaseDecoders(std::unique_ptr<VideoDecoder> (&oldDecoders)[2]) {
 // ----------------------------------------------------------------------------
 namespace {
 
-constexpr uint32_t kCaptureFmtNV12 = 0x3231564E; // 说明：'NV12'
 constexpr uint32_t kCaptureFmtNV16 = 0x3631564E; // 说明：'NV16'
-constexpr int kCaptureAutoUnknown = -1;
-constexpr int kCaptureAutoNormal = 0;
-constexpr int kCaptureAutoRot90VFlip = 1;
-constexpr int kCaptureAutoSampleEveryFrames = 4;
-constexpr int kCaptureAutoStableSamples = 2;
-constexpr int kCaptureAutoFastConfidence = 720;
-constexpr int kCaptureAutoNormalConfidence = 420;
-constexpr int kCaptureAutoReturnNormalStableSamples = 12;
-constexpr int kCaptureAutoHoldLogSamples = 300;
-
-struct CaptureAutoBandStats {
-  int darkPermille = 0;
-  int edgeAvg = 0;
-  int samples = 0;
-};
-
-struct CaptureAutoFrameHint {
-  int hint = kCaptureAutoUnknown;
-  int confidence = 0;
-  int horizontalBar = 0;
-  int verticalBar = 0;
-  int horizontalEdge = 0;
-  int verticalEdge = 0;
-  int centerXEdge = 0;
-  int centerYEdge = 0;
-  int leftBar = 0;
-  int rightBar = 0;
-  int activeWidth = 0;
-  bool hasSideBars = false;
-  bool fullWidth = false;
-};
-
-struct CaptureAutoDirectionalStats {
-  int xEdgeAvg = 0;
-  int yEdgeAvg = 0;
-};
-
-struct CaptureAutoSideBarScan {
-  bool hasSideBars = false;
-  bool fullWidth = false;
-  int leftBar = 0;
-  int rightBar = 0;
-  int activeWidth = 0;
-};
-
-const char *captureAutoTransformName(int transform) {
-  switch (transform) {
-  case kCaptureAutoNormal:
-    return "normal";
-  case kCaptureAutoRot90VFlip:
-    return "rot90-vflip";
-  default:
-    return "unknown";
-  }
-}
-
-int absInt(int value) {
-  return value < 0 ? -value : value;
-}
-
-bool isCaptureMostlyDarkColumn(const uint8_t *yPlane, int stride, int height,
-                               int x, int stepY, int threshold,
-                               int minPermille) {
-  if (!yPlane || stride <= 0 || height <= 0 || x < 0 || stepY <= 0) {
-    return false;
-  }
-  int samples = 0;
-  int dark = 0;
-  for (int y = 0; y < height; y += stepY) {
-    if (yPlane[static_cast<size_t>(y) * stride + x] <= threshold) {
-      ++dark;
-    }
-    ++samples;
-  }
-  return samples > 0 && (dark * 1000) / samples >= minPermille;
-}
-
-CaptureAutoSideBarScan scanCaptureSideBars(const CaptureFrame &frame,
-                                           const uint8_t *yPlane) {
-  CaptureAutoSideBarScan scan;
-  const int stepX = std::max(2, frame.width / 480);
-  const int stepY = std::max(2, frame.height / 240);
-  const int maxScan = std::max(1, frame.width / 2 - stepX);
-  const int minBarWidth = std::max(24, frame.width / 32);
-
-  int left = 0;
-  for (int x = 0; x < maxScan; x += stepX) {
-    if (!isCaptureMostlyDarkColumn(yPlane, frame.stride, frame.height, x,
-                                   stepY, 24, 930)) {
-      break;
-    }
-    left = x + stepX;
-  }
-
-  int right = frame.width;
-  for (int x = frame.width - 1; x >= frame.width - maxScan; x -= stepX) {
-    if (!isCaptureMostlyDarkColumn(yPlane, frame.stride, frame.height, x,
-                                   stepY, 24, 930)) {
-      break;
-    }
-    right = x;
-  }
-
-  left = std::max(0, std::min(left, frame.width));
-  right = std::max(0, std::min(right, frame.width));
-  const int leftBar = left;
-  const int rightBar = frame.width - right;
-  const int activeWidth = right - left;
-  scan.leftBar = leftBar;
-  scan.rightBar = rightBar;
-  scan.activeWidth = activeWidth;
-
-  const int barDiff = absInt(leftBar - rightBar);
-  const bool balancedBars = barDiff <= std::max(24, frame.width / 10);
-  scan.hasSideBars = leftBar >= minBarWidth && rightBar >= minBarWidth &&
-                     balancedBars && activeWidth >= frame.width / 4 &&
-                     activeWidth < frame.width;
-
-  // 说明：“无侧边黑边”不应被一侧深色内容边缘破坏。如果大部分
-  // the row is active and the bars are not balanced, treat it as full-宽度.
-  scan.fullWidth = !scan.hasSideBars &&
-                   ((leftBar < minBarWidth && rightBar < minBarWidth) ||
-                    activeWidth >= (frame.width * 3) / 4);
-  return scan;
-}
-
-CaptureAutoBandStats sampleCaptureYBand(const uint8_t *yPlane, int stride,
-                                        int width, int height, int x0, int y0,
-                                        int bandWidth, int bandHeight,
-                                        int step) {
-  CaptureAutoBandStats stats;
-  if (!yPlane || stride <= 0 || width <= 0 || height <= 0 ||
-      bandWidth <= 0 || bandHeight <= 0 || step <= 0) {
-    return stats;
-  }
-
-  x0 = std::max(0, std::min(x0, width));
-  y0 = std::max(0, std::min(y0, height));
-  const int x1 = std::max(x0, std::min(width, x0 + bandWidth));
-  const int y1 = std::max(y0, std::min(height, y0 + bandHeight));
-  if (x1 <= x0 || y1 <= y0) {
-    return stats;
-  }
-
-  uint64_t dark = 0;
-  uint64_t edgeSum = 0;
-  uint64_t edgeSamples = 0;
-  uint64_t samples = 0;
-
-  for (int yy = y0; yy < y1; yy += step) {
-    const uint8_t *row = yPlane + static_cast<size_t>(yy) * stride;
-    for (int xx = x0; xx < x1; xx += step) {
-      const int value = row[xx];
-      if (value < 28) {
-        ++dark;
-      }
-      ++samples;
-
-      if (xx + step < x1) {
-        edgeSum += static_cast<uint64_t>(absInt(value - row[xx + step]));
-        ++edgeSamples;
-      }
-      if (yy + step < y1) {
-        const uint8_t *nextRow =
-            yPlane + static_cast<size_t>(yy + step) * stride;
-        edgeSum += static_cast<uint64_t>(absInt(value - nextRow[xx]));
-        ++edgeSamples;
-      }
-    }
-  }
-
-  if (samples > 0) {
-    stats.darkPermille = static_cast<int>((dark * 1000) / samples);
-    stats.samples = static_cast<int>(samples);
-  }
-  if (edgeSamples > 0) {
-    stats.edgeAvg = static_cast<int>(edgeSum / edgeSamples);
-  }
-  return stats;
-}
-
-CaptureAutoDirectionalStats sampleCaptureYDirectionalEdges(
-    const uint8_t *yPlane, int stride, int width, int height, int x0, int y0,
-    int bandWidth, int bandHeight, int step) {
-  CaptureAutoDirectionalStats stats;
-  if (!yPlane || stride <= 0 || width <= 0 || height <= 0 ||
-      bandWidth <= 0 || bandHeight <= 0 || step <= 0) {
-    return stats;
-  }
-
-  x0 = std::max(0, std::min(x0, width));
-  y0 = std::max(0, std::min(y0, height));
-  const int x1 = std::max(x0, std::min(width, x0 + bandWidth));
-  const int y1 = std::max(y0, std::min(height, y0 + bandHeight));
-  if (x1 <= x0 || y1 <= y0) {
-    return stats;
-  }
-
-  uint64_t xEdgeSum = 0;
-  uint64_t xEdgeSamples = 0;
-  uint64_t yEdgeSum = 0;
-  uint64_t yEdgeSamples = 0;
-
-  for (int yy = y0; yy < y1; yy += step) {
-    const uint8_t *row = yPlane + static_cast<size_t>(yy) * stride;
-    for (int xx = x0; xx < x1; xx += step) {
-      const int value = row[xx];
-      if (xx + step < x1) {
-        xEdgeSum += static_cast<uint64_t>(absInt(value - row[xx + step]));
-        ++xEdgeSamples;
-      }
-      if (yy + step < y1) {
-        const uint8_t *nextRow =
-            yPlane + static_cast<size_t>(yy + step) * stride;
-        yEdgeSum += static_cast<uint64_t>(absInt(value - nextRow[xx]));
-        ++yEdgeSamples;
-      }
-    }
-  }
-
-  if (xEdgeSamples > 0) {
-    stats.xEdgeAvg = static_cast<int>(xEdgeSum / xEdgeSamples);
-  }
-  if (yEdgeSamples > 0) {
-    stats.yEdgeAvg = static_cast<int>(yEdgeSum / yEdgeSamples);
-  }
-  return stats;
-}
-
-CaptureAutoFrameHint detectCaptureAutoTransformHint(const CaptureFrame &frame) {
-  CaptureAutoFrameHint result;
-
-  if (frame.width == 1080 && frame.height == 1920) {
-    result.hint = kCaptureAutoRot90VFlip;
-    result.confidence = 1000;
-    return result;
-  }
-
-  if (frame.width <= frame.height || frame.width < 640 || frame.height < 360 ||
-      (frame.format != kCaptureFmtNV12 && frame.format != kCaptureFmtNV16) ||
-      !frame.data ||
-      frame.stride < frame.width) {
-    return result;
-  }
-
-  const size_t yPlaneBytes =
-      static_cast<size_t>(frame.stride) * static_cast<size_t>(frame.height);
-  if (frame.size > 0 && frame.size < yPlaneBytes) {
-    return result;
-  }
-
-  const uint8_t *yPlane = static_cast<const uint8_t *>(frame.data);
-  const int step = std::max(4, std::min(frame.width, frame.height) / 120);
-  const int bandX = std::max(48, frame.width / 10);
-  const int bandY = std::max(48, frame.height / 10);
-
-  const CaptureAutoBandStats top =
-      sampleCaptureYBand(yPlane, frame.stride, frame.width, frame.height,
-                         0, 0, frame.width, bandY, step);
-  const CaptureAutoBandStats bottom =
-      sampleCaptureYBand(yPlane, frame.stride, frame.width, frame.height,
-                         0, frame.height - bandY, frame.width, bandY, step);
-  const CaptureAutoBandStats left =
-      sampleCaptureYBand(yPlane, frame.stride, frame.width, frame.height,
-                         0, 0, bandX, frame.height, step);
-  const CaptureAutoBandStats right =
-      sampleCaptureYBand(yPlane, frame.stride, frame.width, frame.height,
-                         frame.width - bandX, 0, bandX, frame.height, step);
-  const CaptureAutoDirectionalStats centerEdges =
-      sampleCaptureYDirectionalEdges(
-          yPlane, frame.stride, frame.width, frame.height, frame.width / 4,
-          frame.height / 8, frame.width / 2, (frame.height * 3) / 4, step);
-
-  result.horizontalBar = (top.darkPermille + bottom.darkPermille) / 2;
-  result.verticalBar = (left.darkPermille + right.darkPermille) / 2;
-  result.horizontalEdge = (top.edgeAvg + bottom.edgeAvg) / 2;
-  result.verticalEdge = (left.edgeAvg + right.edgeAvg) / 2;
-  result.centerXEdge = centerEdges.xEdgeAvg;
-  result.centerYEdge = centerEdges.yEdgeAvg;
-
-  const int horizontalBoth = std::min(top.darkPermille, bottom.darkPermille);
-  const int verticalBoth = std::min(left.darkPermille, right.darkPermille);
-  const int barDiff = result.horizontalBar - result.verticalBar;
-  const CaptureAutoSideBarScan sideBars = scanCaptureSideBars(frame, yPlane);
-  result.leftBar = sideBars.leftBar;
-  result.rightBar = sideBars.rightBar;
-  result.activeWidth = sideBars.activeWidth;
-  result.hasSideBars = sideBars.hasSideBars;
-  result.fullWidth = sideBars.fullWidth;
-
-  // 全屏无左右黑边时，按异常旋转态处理。
-  if (sideBars.fullWidth) {
-    result.hint = kCaptureAutoRot90VFlip;
-    result.confidence = 900;
-    return result;
-  }
-
-  // 左右有有效黑边时，方向应回到正常；保持比例模式下渲染器会裁掉左右黑边。
-  if (sideBars.hasSideBars) {
-    result.hint = kCaptureAutoNormal;
-    result.confidence = 850;
-    return result;
-  }
-
-  // 图2异常态的真实底层特征：驱动仍是 1920x1080，但左右黑边几乎消失，
-  // 上下仍有明显黑边。此时需要把采集内容补偿为 90 度 + 垂直翻转。
-  if (result.verticalBar <= 140 && result.horizontalBar >= 160 &&
-      barDiff >= 100) {
-    result.hint = kCaptureAutoRot90VFlip;
-    result.confidence = std::min(1000, barDiff * 3 + (160 - result.verticalBar));
-    return result;
-  }
-
-  // 图1正常态的真实底层特征：左右黑边恢复，说明应回到正常方向。
-  // 但上下/左右几乎全黑多半是 App 切换或视频黑场，不能当成恢复方向的依据，
-  // 否则会在图2状态里短暂跳回 normal。
-  if (result.verticalBar >= 260 && result.horizontalBar >= 180 &&
-      result.horizontalBar <= 900 &&
-      result.verticalBar + 100 >= result.horizontalBar) {
-    result.hint = kCaptureAutoNormal;
-    result.confidence = std::min(1000, result.verticalBar + 100 - result.horizontalBar);
-    return result;
-  }
-
-  if (horizontalBoth >= 760 && barDiff >= 170 &&
-      result.verticalEdge + 2 >= result.horizontalEdge) {
-    result.hint = kCaptureAutoRot90VFlip;
-    result.confidence = std::min(1000, barDiff + horizontalBoth / 2);
-    return result;
-  }
-  if (verticalBoth >= 760 && -barDiff >= 170 &&
-      result.horizontalEdge + 2 >= result.verticalEdge) {
-    result.hint = kCaptureAutoNormal;
-    result.confidence = std::min(1000, -barDiff + verticalBoth / 2);
-    return result;
-  }
-  if (result.horizontalBar >= 880 && result.verticalBar <= 620 &&
-      result.verticalEdge + 2 >= result.horizontalEdge) {
-    result.hint = kCaptureAutoRot90VFlip;
-    result.confidence = std::min(1000, result.horizontalBar - result.verticalBar);
-    return result;
-  }
-  if (result.verticalBar >= 880 && result.horizontalBar <= 620 &&
-      result.horizontalEdge + 2 >= result.verticalEdge) {
-    result.hint = kCaptureAutoNormal;
-    result.confidence = std::min(1000, result.verticalBar - result.horizontalBar);
-    return result;
-  }
-
-  const int edgeDiff = result.verticalEdge - result.horizontalEdge;
-  const int centerDiff = result.centerXEdge - result.centerYEdge;
-  if (result.verticalEdge >= 14 && edgeDiff >= 5 &&
-      result.verticalEdge * 100 >= result.horizontalEdge * 125 &&
-      result.centerXEdge >= 14 && centerDiff >= 4) {
-    result.hint = kCaptureAutoRot90VFlip;
-    result.confidence = std::min(1000, edgeDiff * 35 + centerDiff * 20);
-    return result;
-  }
-  if (result.horizontalEdge >= 14 && -edgeDiff >= 5 &&
-      result.horizontalEdge * 100 >= result.verticalEdge * 125 &&
-      result.centerYEdge >= 14 && -centerDiff >= 4) {
-    result.hint = kCaptureAutoNormal;
-    result.confidence = std::min(1000, -edgeDiff * 35 + -centerDiff * 20);
-    return result;
-  }
-
-  return result;
-}
-
 } // 命名空间
 
-bool LayerVideo::startHdmiCapture(const std::string &devicePath, int width, int height) {
+bool LayerVideo::startHdmiCapture(const std::string &devicePath, int width, int height,
+                                  bool lockResolution) {
   std::lock_guard<std::mutex> lifecycleGuard(lifecycleOpMutex_);
   if (isShuttingDown_.load()) return false;
 
@@ -1561,6 +1294,7 @@ bool LayerVideo::startHdmiCapture(const std::string &devicePath, int width, int 
   cfg.bufferCount = 4;
   cfg.pixelFormat = 0; // 由 V4L2Capture 根据驱动支持格式自动协商
   cfg.setupMipiPipeline = false;
+  cfg.lockResolution = lockResolution && width > 0 && height > 0;
   LOG_INFO("[采集][HDMI] LayerVideo %d: init %s %dx%d%s AUTO",
            layerId_, devicePath.c_str(), width, height,
            (width <= 0 || height <= 0) ? " auto-size" : "");
@@ -1574,7 +1308,6 @@ bool LayerVideo::startHdmiCapture(const std::string &devicePath, int width, int 
     std::lock_guard<std::timed_mutex> lock(mutex_);
     v4l2Capture_ = std::move(newCapture);
     if (captureRenderer_) captureRenderer_->setV4L2Capture(v4l2Capture_.get());
-    resetCaptureAutoTransformState();
     auto cb = [this](const CaptureFrame &f) { this->onCaptureFrame(f); };
     if (!v4l2Capture_->startCapture(cb)) {
       if (captureRenderer_) captureRenderer_->setV4L2Capture(nullptr);
@@ -1589,6 +1322,7 @@ bool LayerVideo::startHdmiCapture(const std::string &devicePath, int width, int 
     captureType_ = "HDMI";
     captureWidth_ = v4l2Capture_->getWidth();
     captureHeight_ = v4l2Capture_->getHeight();
+    captureResolutionLocked_ = cfg.lockResolution;
     lastSignalCheck_ = {};
     mipiNoFrameSince_ = {};
     mipiBackpressureCount_ = 0;
@@ -1610,7 +1344,8 @@ bool LayerVideo::startHdmiCapture(const std::string &devicePath, int width, int 
   return true;
 }
 
-bool LayerVideo::startMipiCapture(const std::string &devicePath, int width, int height) {
+bool LayerVideo::startMipiCapture(const std::string &devicePath, int width, int height,
+                                  bool lockResolution) {
   std::lock_guard<std::mutex> lifecycleGuard(lifecycleOpMutex_);
   if (isShuttingDown_.load()) return false;
 
@@ -1642,12 +1377,18 @@ bool LayerVideo::startMipiCapture(const std::string &devicePath, int width, int 
   cfg.bufferCount = 10; // MIPI 1080p60: less first-import pressure than 16 while keeping driver 缓冲区 headroom
   cfg.pixelFormat = kCaptureFmtNV16; // MIPI 先试 4:2:2，失败时 V4L2Capture 自动回退 NV12
   cfg.setupMipiPipeline = true;
+  cfg.lockResolution = lockResolution && width > 0 && height > 0;
   cfg.targetFps = 30.0f; // 4K30 输出目标：采集按 30Hz 节奏投递，避免 25fps 在 30Hz 输出上抖动
-  LOG_INFO("[采集][MIPI] LayerVideo %d: init %s %dx%d%s prefer NV16",
+  LOG_INFO("[采集][MIPI] LayerVideo %d: init %s %dx%d%s%s prefer NV16",
            layerId_, devicePath.c_str(), width, height,
-           (width <= 0 || height <= 0) ? " auto-size" : "");
+           (width <= 0 || height <= 0) ? " auto-size" : "",
+           cfg.lockResolution ? " locked" : "");
 
   if (!newCapture->initialize(cfg)) {
+    if (cfg.lockResolution) {
+      captureStartError_.store(V4L2Capture::lastMipiTimingQueryError(),
+                               std::memory_order_release);
+    }
     LOG_ERROR("[采集][MIPI] LayerVideo %d: V4L2 init failed for %s", layerId_, devicePath.c_str());
     return false;
   }
@@ -1656,7 +1397,6 @@ bool LayerVideo::startMipiCapture(const std::string &devicePath, int width, int 
     std::lock_guard<std::timed_mutex> lock(mutex_);
     v4l2Capture_ = std::move(newCapture);
     if (captureRenderer_) captureRenderer_->setV4L2Capture(v4l2Capture_.get());
-    resetCaptureAutoTransformState();
     auto cb = [this](const CaptureFrame &f) { this->onCaptureFrame(f); };
     if (!v4l2Capture_->startCapture(cb)) {
       if (captureRenderer_) captureRenderer_->setV4L2Capture(nullptr);
@@ -1671,6 +1411,7 @@ bool LayerVideo::startMipiCapture(const std::string &devicePath, int width, int 
     captureType_ = "MIPI";
     captureWidth_ = v4l2Capture_->getWidth();
     captureHeight_ = v4l2Capture_->getHeight();
+    captureResolutionLocked_ = cfg.lockResolution;
     lastSignalCheck_ = {};
     mipiNoFrameSince_ = {};
     mipiBackpressureCount_ = 0;
@@ -1737,7 +1478,6 @@ bool LayerVideo::startUsbCapture(const std::string &devicePath, int width, int h
     std::lock_guard<std::timed_mutex> lock(mutex_);
     usbCapture_ = std::move(newCapture);
     if (usbRenderer_) usbRenderer_->setUsbCapture(usbCapture_.get());
-    resetCaptureAutoTransformState();
     auto cb = [this](const UsbCaptureFrame &f) { this->onUsbCaptureFrame(f); };
     if (!usbCapture_->startCapture(cb)) {
       if (usbRenderer_) usbRenderer_->setUsbCapture(nullptr);
@@ -2226,217 +1966,6 @@ void LayerVideo::stopCapture(bool keepLastFrame) {
 // ============================================================================
 // 辅助 function: 清理 capture resources (call while holding lock)
 // ============================================================================
-void LayerVideo::resetCaptureAutoTransformState() {
-  const int overrideTransform =
-      (getCaptureRotation() < 0)
-          ? captureAutoTransformOverride_.load(std::memory_order_acquire)
-          : kCaptureAutoNormal;
-  const int restoredTransform =
-      (overrideTransform == kCaptureAutoRot90VFlip) ? kCaptureAutoRot90VFlip
-                                                    : kCaptureAutoNormal;
-  captureAutoTransform_.store(restoredTransform, std::memory_order_release);
-  captureAutoDetectedTransform_.store(restoredTransform,
-                                      std::memory_order_release);
-  captureAutoSampleCounter_ = 0;
-  captureAutoCandidate_ = kCaptureAutoUnknown;
-  captureAutoCandidateFrames_ = 0;
-  captureAutoLastLoggedTransform_ = kCaptureAutoUnknown;
-}
-
-void LayerVideo::updateCaptureAutoTransform(const CaptureFrame &frame) {
-  const int captureRotation = getCaptureRotation();
-  if (captureRotation >= 0) {
-    ++captureAutoSampleCounter_;
-    if (captureAutoSampleCounter_ == 1 ||
-        (captureAutoSampleCounter_ %
-         (kCaptureAutoSampleEveryFrames * 300)) == 0) {
-      LOG_INFO("[采集自动方向] layer%d skip fixed captureRotation=%d seq=%d "
-               "frame=%dx%d fmt=0x%08x",
-               layerId_, captureRotation, frame.sequence, frame.width,
-               frame.height, frame.format);
-    }
-    return;
-  }
-
-  if ((++captureAutoSampleCounter_ % kCaptureAutoSampleEveryFrames) != 0) {
-    return;
-  }
-
-  const CaptureAutoFrameHint hint = detectCaptureAutoTransformHint(frame);
-  if (hint.hint == kCaptureAutoUnknown) {
-    if (captureAutoSampleCounter_ <= kCaptureAutoSampleEveryFrames * 5 ||
-        (captureAutoSampleCounter_ %
-         (kCaptureAutoSampleEveryFrames * 60)) == 0) {
-      LOG_INFO("[采集自动方向] layer%d unknown seq=%d frame=%dx%d stride=%d "
-               "fmt=0x%08x size=%zu bars(H=%d V=%d L=%d R=%d active=%d "
-               "side=%d full=%d) edges(H=%d V=%d) center(X=%d Y=%d)",
-               layerId_, frame.sequence, frame.width, frame.height,
-               frame.stride, frame.format, frame.size, hint.horizontalBar,
-               hint.verticalBar, hint.leftBar, hint.rightBar,
-               hint.activeWidth, hint.hasSideBars ? 1 : 0,
-               hint.fullWidth ? 1 : 0, hint.horizontalEdge,
-               hint.verticalEdge, hint.centerXEdge, hint.centerYEdge);
-    }
-    return;
-  }
-
-  if (hint.hint != captureAutoCandidate_) {
-    captureAutoCandidate_ = hint.hint;
-    captureAutoCandidateFrames_ = 1;
-  } else {
-    ++captureAutoCandidateFrames_;
-  }
-
-  const int current =
-      captureAutoDetectedTransform_.load(std::memory_order_acquire);
-  int stableNeed = kCaptureAutoStableSamples;
-  if (hint.hint == current) {
-    stableNeed = 1;
-  } else if (hint.confidence >= kCaptureAutoFastConfidence) {
-    stableNeed = 1;
-  } else if (hint.confidence >= kCaptureAutoNormalConfidence) {
-    stableNeed = 2;
-  } else {
-    stableNeed = 3;
-  }
-  if (current == kCaptureAutoRot90VFlip && hint.hint == kCaptureAutoNormal) {
-    const bool strongBalancedSideBars =
-        hint.hasSideBars && hint.confidence >= 850 &&
-        hint.leftBar >= frame.width / 5 && hint.rightBar >= frame.width / 5;
-    if (!strongBalancedSideBars) {
-      stableNeed = std::max(stableNeed, kCaptureAutoReturnNormalStableSamples);
-    }
-  }
-
-  if (captureAutoCandidateFrames_ >= stableNeed && hint.hint != current) {
-    captureAutoDetectedTransform_.store(hint.hint, std::memory_order_release);
-    captureAutoDetectedAtMs_.store(steadyNowMs(), std::memory_order_release);
-    captureAutoLastLoggedTransform_ = hint.hint;
-    LOG_INFO("[采集自动方向] layer%d apply=%s seq=%d frame=%dx%d stride=%d "
-             "confidence=%d bars(H=%d V=%d L=%d R=%d active=%d side=%d full=%d) "
-             "edges(H=%d V=%d) center(X=%d Y=%d) stable=%d need=%d current=%s",
-             layerId_, captureAutoTransformName(hint.hint), frame.sequence,
-             frame.width, frame.height, frame.stride, hint.confidence,
-             hint.horizontalBar, hint.verticalBar, hint.leftBar, hint.rightBar,
-             hint.activeWidth, hint.hasSideBars ? 1 : 0,
-             hint.fullWidth ? 1 : 0, hint.horizontalEdge, hint.verticalEdge,
-             hint.centerXEdge, hint.centerYEdge, captureAutoCandidateFrames_,
-             stableNeed, captureAutoTransformName(current));
-    return;
-  }
-
-  if (hint.hint == current && captureAutoLastLoggedTransform_ != current) {
-    captureAutoLastLoggedTransform_ = current;
-    captureAutoDetectedAtMs_.store(steadyNowMs(), std::memory_order_release);
-    LOG_INFO("[采集自动方向] layer%d confirm=%s seq=%d frame=%dx%d stride=%d "
-             "confidence=%d bars(H=%d V=%d L=%d R=%d active=%d side=%d full=%d) "
-             "edges(H=%d V=%d) center(X=%d Y=%d)",
-             layerId_, captureAutoTransformName(current), frame.sequence,
-             frame.width, frame.height, frame.stride, hint.confidence,
-             hint.horizontalBar, hint.verticalBar, hint.leftBar, hint.rightBar,
-             hint.activeWidth, hint.hasSideBars ? 1 : 0,
-             hint.fullWidth ? 1 : 0, hint.horizontalEdge, hint.verticalEdge,
-             hint.centerXEdge, hint.centerYEdge);
-  } else if (hint.hint == current &&
-             (captureAutoCandidateFrames_ % kCaptureAutoHoldLogSamples) == 0) {
-    LOG_INFO("[采集自动方向] layer%d hold=%s seq=%d frame=%dx%d stride=%d "
-             "confidence=%d bars(H=%d V=%d L=%d R=%d active=%d side=%d full=%d) "
-             "edges(H=%d V=%d) center(X=%d Y=%d) stable=%d",
-             layerId_, captureAutoTransformName(current), frame.sequence,
-             frame.width, frame.height, frame.stride, hint.confidence,
-             hint.horizontalBar, hint.verticalBar, hint.leftBar, hint.rightBar,
-             hint.activeWidth, hint.hasSideBars ? 1 : 0,
-             hint.fullWidth ? 1 : 0, hint.horizontalEdge, hint.verticalEdge,
-             hint.centerXEdge, hint.centerYEdge, captureAutoCandidateFrames_);
-  }
-}
-
-void LayerVideo::updateCaptureAutoTransformFromGeometry(int width, int height,
-                                                        uint32_t sequence) {
-  const int captureRotation = getCaptureRotation();
-  if (captureRotation >= 0) {
-    ++captureAutoSampleCounter_;
-    if (captureAutoSampleCounter_ == 1 ||
-        (captureAutoSampleCounter_ %
-         (kCaptureAutoSampleEveryFrames * 300)) == 0) {
-      LOG_INFO("[采集自动方向] layer%d geometry-skip fixed captureRotation=%d "
-               "seq=%u frame=%dx%d",
-               layerId_, captureRotation, sequence, width, height);
-    }
-    return;
-  }
-
-  if ((++captureAutoSampleCounter_ % kCaptureAutoSampleEveryFrames) != 0) {
-    return;
-  }
-
-  if (width <= 0 || height <= 0) {
-    return;
-  }
-
-  int hint = kCaptureAutoUnknown;
-  int confidence = 0;
-  if (width == 1080 && height == 1920) {
-    hint = kCaptureAutoRot90VFlip;
-    confidence = 1000;
-  } else if (width > height) {
-    hint = kCaptureAutoNormal;
-    confidence = 640;
-  }
-
-  if (hint == kCaptureAutoUnknown) {
-    if (captureAutoSampleCounter_ <= kCaptureAutoSampleEveryFrames * 5 ||
-        (captureAutoSampleCounter_ %
-         (kCaptureAutoSampleEveryFrames * 60)) == 0) {
-      LOG_INFO("[采集自动方向] layer%d geometry-unknown seq=%u frame=%dx%d",
-               layerId_, sequence, width, height);
-    }
-    return;
-  }
-
-  if (hint != captureAutoCandidate_) {
-    captureAutoCandidate_ = hint;
-    captureAutoCandidateFrames_ = 1;
-  } else {
-    ++captureAutoCandidateFrames_;
-  }
-
-  const int current =
-      captureAutoDetectedTransform_.load(std::memory_order_acquire);
-  int stableNeed =
-      (hint == current || confidence >= kCaptureAutoFastConfidence) ? 1 : 3;
-  if (hint == kCaptureAutoNormal) {
-    stableNeed = std::max(stableNeed, kCaptureAutoReturnNormalStableSamples);
-  }
-
-  if (captureAutoCandidateFrames_ >= stableNeed && hint != current) {
-    captureAutoDetectedTransform_.store(hint, std::memory_order_release);
-    captureAutoDetectedAtMs_.store(steadyNowMs(), std::memory_order_release);
-    captureAutoLastLoggedTransform_ = hint;
-    LOG_INFO("[采集自动方向] layer%d geometry-apply=%s seq=%u "
-             "frame=%dx%d confidence=%d stable=%d need=%d current=%s",
-             layerId_, captureAutoTransformName(hint), sequence, width, height,
-             confidence, captureAutoCandidateFrames_, stableNeed,
-             captureAutoTransformName(current));
-    return;
-  }
-
-  if (hint == current && captureAutoLastLoggedTransform_ != current) {
-    captureAutoLastLoggedTransform_ = current;
-    captureAutoDetectedAtMs_.store(steadyNowMs(), std::memory_order_release);
-    LOG_INFO("[采集自动方向] layer%d geometry-confirm=%s seq=%u "
-             "frame=%dx%d confidence=%d",
-             layerId_, captureAutoTransformName(current), sequence, width,
-             height, confidence);
-  } else if (hint == current &&
-             (captureAutoCandidateFrames_ % kCaptureAutoHoldLogSamples) == 0) {
-    LOG_INFO("[采集自动方向] layer%d geometry-hold=%s seq=%u frame=%dx%d "
-             "confidence=%d stable=%d",
-             layerId_, captureAutoTransformName(current), sequence, width,
-             height, confidence, captureAutoCandidateFrames_);
-  }
-}
-
 void LayerVideo::cleanupCaptureResources(bool keepLastFrame) {
 #ifdef __ANDROID__
   if (isCaptureMode_.load()) {
@@ -2477,7 +2006,6 @@ void LayerVideo::cleanupCaptureResources(bool keepLastFrame) {
   mipiBackpressureCount_ = 0;
   hiddenCaptureWarmFramesRemaining_ = 0;
   lastCaptureWarmTextureSerial_.store(0, std::memory_order_release);
-  resetCaptureAutoTransformState();
 }
 
 bool LayerVideo::isCaptureMode() const { return isCaptureMode_.load(); }
@@ -2567,8 +2095,9 @@ std::string LayerVideo::getMIPIDevicePath(int index) const {
 
 void LayerVideo::checkAndAutoCapture(const std::string &preferredCaptureType,
                                       int configuredWidth, int configuredHeight,
-                                      int configuredIndex) {
-  if (isShuttingDown_.load() || !isCaptureLayer()) {
+                                      int configuredIndex,
+                                      bool lockResolution) {
+  if (isShuttingDown_.load() || !isCaptureLayer() || isStartingCapture_.load()) {
     return;
   }
 
@@ -2605,11 +2134,13 @@ void LayerVideo::checkAndAutoCapture(const std::string &preferredCaptureType,
     std::string activeType = normalizeCaptureType(captureType_);
     bool typeChanged = isAuto ? !isConcreteCaptureType(activeType) : activeType != requestedType;
     if (typeChanged || captureIndex_ != configuredIndex ||
+        captureResolutionLocked_ != lockResolution ||
         !captureSizeMatches(captureWidth_, captureHeight_,
                             configuredWidth, configuredHeight)) {
       LOG_INFO("[采集] LayerVideo %d: config changed, restarting capture %s idx=%d %dx%d -> %s idx=%d %dx%d",
                layerId_, captureType_.c_str(), captureIndex_, captureWidth_, captureHeight_,
                requestedType.c_str(), configuredIndex, configuredWidth, configuredHeight);
+      if (v4l2Capture_ && !v4l2Capture_->stopCaptureAsync()) return;
       stopCapture(false);
       nextCaptureRetryAtMs_.store(0, std::memory_order_release);
       return;
@@ -2618,6 +2149,7 @@ void LayerVideo::checkAndAutoCapture(const std::string &preferredCaptureType,
     // 健康度监控：根据当前激活的通路使用对应的渲染器作为生存指标
     if (activeType == "MIPI") {
       if (v4l2Capture_ && v4l2Capture_->isUnhealthy()) {
+        if (!v4l2Capture_->stopCaptureAsync()) return;
         LOG_WARN("[采集][MIPI] LayerVideo %d: capture unhealthy. Forcing auto-restart.", layerId_);
         stopCapture(false);
         deferAutoCaptureRetry(std::chrono::milliseconds(500));
@@ -2632,6 +2164,7 @@ void LayerVideo::checkAndAutoCapture(const std::string &preferredCaptureType,
                    "(count=%d). Restarting if backpressure persists.",
                    layerId_, ownedBuffers, totalBuffers, mipiBackpressureCount_);
           if (mipiBackpressureCount_ >= 3) {
+            if (v4l2Capture_ && !v4l2Capture_->stopCaptureAsync()) return;
             stopCapture(false);
             deferAutoCaptureRetry(std::chrono::milliseconds(500));
             return;
@@ -2660,34 +2193,20 @@ void LayerVideo::checkAndAutoCapture(const std::string &preferredCaptureType,
                       captureRenderer_->millisecondsSinceLastFrame(),
                       sinceNoFrameStartMs)
                 : sinceNoFrameStartMs;
-        constexpr int64_t kMipiSoftNoFrameWaitMs = 2500;
+        // The capture worker already monitors RK628/source-change events.
+        // Querying subdev DV timings here can block all local video updates.
         constexpr int64_t kMipiHardNoFrameRestartMs = 3000;
-        const bool allowSignalProbe =
-            noFrameMs >= kMipiSoftNoFrameWaitMs &&
-            (lastSignalCheck_.time_since_epoch().count() == 0 ||
-             now - lastSignalCheck_ >= std::chrono::seconds(2));
-        bool subdevStillHasSignal = false;
-        if (allowSignalProbe) {
-          lastSignalCheck_ = now;
-          subdevStillHasSignal = queryMipiSignalPresent();
-        }
-        if (noFrameMs < kMipiSoftNoFrameWaitMs ||
-            (noFrameMs < kMipiHardNoFrameRestartMs && subdevStillHasSignal)) {
-          if (allowSignalProbe || (noFrameMs % 5000) < 1200) {
-            LOG_WARN("[采集][MIPI] LayerVideo %d: no frames for %lldms, keep last frame and wait for bridge/CSI relock (subdevSignal=%d)",
-                     layerId_, static_cast<long long>(noFrameMs),
-                     subdevStillHasSignal ? 1 : 0);
-          }
-          return;
-        }
+        if (noFrameMs < kMipiHardNoFrameRestartMs) return;
         LOG_WARN("[采集][MIPI] LayerVideo %d: no frames for %lldms. Restarting capture and keeping last texture.",
                  layerId_, static_cast<long long>(noFrameMs));
+        if (v4l2Capture_ && !v4l2Capture_->stopCaptureAsync()) return;
         stopCapture(true);
         deferAutoCaptureRetry(std::chrono::milliseconds(800));
         return;
       }
 
       LOG_WARN("[采集] LayerVideo %d: Capture watchdog triggered (no frames). Forcing auto-restart.", layerId_);
+      if (v4l2Capture_ && !v4l2Capture_->stopCaptureAsync()) return;
       stopCapture(false);
       deferAutoCaptureRetry(std::chrono::seconds(10));
       return;
@@ -2708,6 +2227,7 @@ void LayerVideo::checkAndAutoCapture(const std::string &preferredCaptureType,
           if (info.width > 0 && info.height > 0 && (info.width != curW || info.height != curH)) {
             LOG_INFO("LayerVideo %d: Resolution changed %dx%d -> %dx%d, restarting...",
                      layerId_, curW, curH, info.width, info.height);
+            if (v4l2Capture_ && !v4l2Capture_->stopCaptureAsync()) return;
             stopCapture(true);
             return;
           }
@@ -2729,7 +2249,7 @@ void LayerVideo::checkAndAutoCapture(const std::string &preferredCaptureType,
 
   auto task = std::async(std::launch::async,
       [this, requestedType, configuredWidth, configuredHeight,
-       configuredIndex, isAuto]() {
+       configuredIndex, isAuto, lockResolution]() {
         struct StartingGuard {
           LayerVideo *self;
           ~StartingGuard() { self->isStartingCapture_.store(false); }
@@ -2814,11 +2334,14 @@ void LayerVideo::checkAndAutoCapture(const std::string &preferredCaptureType,
           int requestWidth = defaultCaptureWidthForType(type, configuredWidth);
           int requestHeight = defaultCaptureHeightForType(type, configuredHeight);
           if (type == "USB") {
+            if (lockResolution) continue;
             ok = this->startUsbCapture(devicePath, requestWidth, requestHeight);
           } else if (type == "MIPI") {
-            ok = this->startMipiCapture(devicePath, requestWidth, requestHeight);
+            ok = this->startMipiCapture(devicePath, requestWidth, requestHeight,
+                                        lockResolution);
           } else {
-            ok = this->startHdmiCapture(devicePath, requestWidth, requestHeight);
+            ok = this->startHdmiCapture(devicePath, requestWidth, requestHeight,
+                                        lockResolution);
           }
 
           if (!ok) {
@@ -2859,52 +2382,36 @@ void LayerVideo::checkAndAutoCapture(const std::string &preferredCaptureType,
   }
 }
 
-bool LayerVideo::replay() {
-  LOG_DEBUG("LayerVideo %d replay starting", layerId_);
-
-  std::unique_lock<std::timed_mutex> lock(mutex_, std::chrono::milliseconds(100));
-  if (!lock.owns_lock()) {
-    LOG_DEBUG("LayerVideo %d replay: lock timeout, skipping", layerId_);
-    return true;
-  }
-
+bool LayerVideo::tryReplayCurrent(const std::string &expectedPath, int loop) {
+  const auto replayStart = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lifecycleGuard(lifecycleOpMutex_);
   if (licenseManager_ && licenseManager_->shouldBlockVideoPlayback()) {
-    LOG_WARN("License expired, video playback blocked");
     return false;
   }
-
-  std::string path = currentPath_;
-  int currentLoop = loop_;
-
-  if (path.empty()) {
-    LOG_ERROR("LayerVideo %d replay failed: no current path", layerId_);
+  {
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    if (isShuttingDown_.load() || isPlayingPureAudio_.load() || !decoder_ ||
+        expectedPath.empty() || currentPath_ != FileUtils::normalizePath(expectedPath) ||
+        (state_ != PlayState::PLAYING && state_ != PlayState::PAUSED) ||
+        isSyncPresentationPending()) {
+      return false;
+    }
+  }
+  // Retain the decoder, audio track, volume and network stream. The lifecycle
+  // lock spans validation, seek and resume so a concurrent switch cannot make
+  // this replay operate on another song. Seek keeps its existing frame cleanup.
+  if (!seekWithLifecycleLock(0.0, "replay", replayStart)) {
     return false;
   }
-
-  float originalVolume = volume_;
-
-  if (decoder_ && decoder_->getAudioTrackCount() > 0) {
-    fadeOutSharedAudioBeforeSwitch(layerId_);
+  {
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    loop_ = loop;
+    decoder_->setLoop(loop);
   }
-
-  lock.unlock();
-
-  bool result = play(path, currentLoop);
-
-  if (result) {
-    volume_ = originalVolume;
-    applyVolumeSmoothAfterSwitch(layerId_, decoder_, originalVolume);
-  } else {
-    volume_ = originalVolume;
-  }
-
-  if (result) {
-    LOG_PLAYER("LayerVideo %d replay successful (reopened video)", layerId_);
-  } else {
-    LOG_ERROR("LayerVideo %d replay failed", layerId_);
-  }
-
-  return result;
+  resume();
+  LOG_INFO("[ReplayTiming] layer=%d mode=seek total_ms=%lld path=%s", layerId_,
+           static_cast<long long>(elapsedMillisSince(replayStart)), expectedPath.c_str());
+  return true;
 }
 
 double LayerVideo::getCurrentPosition() const {
@@ -3027,7 +2534,8 @@ void LayerVideo::pushAudioData(const int16_t *data, int32_t numFrames, int32_t s
   // 2. 采集音频播放 (仅在 Android 平台且拥有音频焦点时)
 #ifdef __ANDROID__
   if (hasLayerFocus) {
-    if (!AudioPlayerManager::getInstance().ensureInitialized(sampleRate, 2)) {
+    if (!AudioPlayerManager::getInstance().ensureInitializedForLayer(
+            AudioFocusSource::VIDEO, layerId_, sampleRate, 2)) {
       static int warnCaptureAudioInit = 0;
       if (warnCaptureAudioInit++ % 120 == 0) {
         LOG_WARN("[Audio] Capture layer %d: AudioPlayer init failed for %dHz",
@@ -3055,10 +2563,12 @@ void LayerVideo::pushAudioData(const int16_t *data, int32_t numFrames, int32_t s
             for (int32_t i = 0; i < numFrames * 2; ++i) {
                 processedData[i] = static_cast<int16_t>(data[i] * vol);
             }
-            player->write(processedData.data(), numFrames);
+            AudioPlayerManager::getInstance().writeForLayer(
+                AudioFocusSource::VIDEO, layerId_, processedData.data(), numFrames);
         } else {
             // 音量为 1.0，直接写入
-            player->write(data, numFrames);
+            AudioPlayerManager::getInstance().writeForLayer(
+                AudioFocusSource::VIDEO, layerId_, data, numFrames);
         }
     }
   }
@@ -3134,24 +2644,12 @@ void LayerVideo::syncFramePoolSize(int activeVideoCount) {
 }
 
 void LayerVideo::onCaptureFrame(const CaptureFrame &frame) {
-  static std::atomic<int> sCaptureFrameEntryLogs{0};
-  const int entryLogCount =
-      sCaptureFrameEntryLogs.fetch_add(1, std::memory_order_relaxed);
-  if (entryLogCount < 5 || (entryLogCount % 1800) == 0) {
-    LOG_INFO("[采集自动方向] layer%d frame-entry seq=%d frame=%dx%d stride=%d "
-             "fmt=0x%08x captureRotation=%d",
-             layerId_, frame.sequence, frame.width, frame.height, frame.stride,
-             frame.format, getCaptureRotation());
-  }
-  updateCaptureAutoTransform(frame);
   if (captureRenderer_) {
     captureRenderer_->onCaptureFrame(frame);
   }
 }
 
 void LayerVideo::onUsbCaptureFrame(const UsbCaptureFrame &frame) {
-  updateCaptureAutoTransformFromGeometry(frame.width, frame.height,
-                                         frame.sequence);
   if (usbRenderer_) {
     if (!isVisible() &&
         hiddenCaptureWarmFramesRemaining_.load(std::memory_order_acquire) <= 0) {
@@ -3184,11 +2682,11 @@ void LayerVideo::cancelPreload() {
     preload_.targetPath.clear();
     preload_.triggered = false;
     // 异步释放
-    std::thread([decoder = std::move(decoder)]() mutable {
+    enqueueDecoderReleaseTask([decoder = std::move(decoder)]() mutable {
       decoder->signalStop();
       decoder->waitStoppedFor(2000);
       VideoDecoderPool::getInstance().release(std::move(decoder));
-    }).detach();
+    });
   } else {
     preload_.status = PreloadState::IDLE;
     preload_.targetPath.clear();

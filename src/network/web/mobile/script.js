@@ -3,10 +3,10 @@
  * @brief 移动端主入口文件
  */
 
-import './modules/core/interactionGuards.js';
-import * as videoControl from './modules/pages/mobileVideoControl.js?v=117';
-import * as controlPage from './modules/pages/mobileControl.js?v=117';
-import * as scenePage from './modules/pages/mobileScene.js?v=117';
+import '/shared/interactionGuards.js';
+import * as videoControl from './modules/pages/mobileVideoControl.js?v=121';
+import * as controlPage from './modules/pages/mobileControl.js?v=122';
+import * as scenePage from './modules/pages/mobileScene.js?v=118';
 
 // 当前页面
 let currentPage = 'video';
@@ -125,8 +125,6 @@ async function initializeApp() {
     // 加载系统音量
     await videoControl.loadSystemVolume();
 
-    // 默认选择defaultVideo分类
-    videoControl.selectCategory('defaultVideo');
 
     // 初始化中控页面
     controlPage.initializeControlPage();

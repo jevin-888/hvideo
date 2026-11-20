@@ -1,6 +1,6 @@
 // 配置管理模块
-import { apiPost, apiAction } from '../../core/api.js';
-import { addToCommandLog } from '../../core/commandLog.js';
+import { apiAction } from '../../core/api.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 
 /**
  * 加载系统配置

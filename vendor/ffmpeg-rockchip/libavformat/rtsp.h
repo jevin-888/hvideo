@@ -284,7 +284,7 @@ typedef struct RTSPState {
     HTTPAuthState auth_state;
 
     /** The last reply of the server to a RTSP command */
-    char last_reply[2048]; /* XXX: allocate */
+    char last_reply[2048]; /* XXX: allocate ? */
 
     /** RTSPStream->transport_priv of the last stream that we read a
      * packet from */

@@ -23,11 +23,18 @@ const LAYER_FIELDS = [
     { ui: 'invert', config: 'invert', runtime: 'invert' },
     { ui: 'capture_type', config: 'captureType', runtime: null },
     { ui: 'capture_index', config: 'captureIndex', runtime: null },
+    { ui: 'capture_width', config: 'captureWidth', runtime: null },
+    { ui: 'capture_height', config: 'captureHeight', runtime: null },
+    { ui: 'capture_resolution_locked', config: 'captureResolutionLocked', runtime: null },
     { ui: 'capture_rotation', config: 'captureRotation', runtime: 'captureRotation' },
     { ui: 'gaussian_blur', config: 'gaussianBlur', runtime: 'gaussianBlur' },
     { ui: 'fit_mode', config: 'fitMode', runtime: 'fitMode' },
     { ui: 'mirror_ready_hint_visible', config: 'mirrorReadyHintVisible', runtime: 'mirrorReadyHintVisible' },
     { ui: 'tv_vertical_crop_px', config: 'tvVerticalCropPx', runtime: 'tvVerticalCropPx' },
+    { ui: 'crop_left', config: 'cropLeft', runtime: 'cropLeft' },
+    { ui: 'crop_top', config: 'cropTop', runtime: 'cropTop' },
+    { ui: 'crop_right', config: 'cropRight', runtime: 'cropRight' },
+    { ui: 'crop_bottom', config: 'cropBottom', runtime: 'cropBottom' },
     { ui: 'shape_type', config: 'shapeType', runtime: 'shapeType' },
     { ui: 'shape_param', config: 'shapeParam', runtime: 'shapeParam' },
     { ui: 'black_to_transparent', config: 'blackToTransparent', runtime: 'blackToTransparent' },
@@ -54,7 +61,6 @@ const LAYER_FIELDS = [
     { ui: 'show_list', config: 'l41ShowList', runtime: null },
     { ui: 'qr_content', config: 'qrContent', runtime: null },
     { ui: 'qr_size', config: 'qrSize', runtime: null },
-    { ui: 'qr_logo_size', config: 'qrLogoSize', runtime: null },
     { ui: 'qr_text', config: 'qrText', runtime: null },
     { ui: 'qr_text_color', config: 'qrTextColor', runtime: null },
     { ui: 'qr_bg_color', config: 'qrBgColor', runtime: null },
@@ -69,7 +75,7 @@ function normalizeLayerFieldAliases(layer) {
     const normalizeFitMode = (value) => Number(value) > 0 ? 1 : 0;
     const normalizeCaptureRotation = (value) => {
         const rotation = Number(value) || 0;
-        return [-1, 0, 90, 180, 270].includes(rotation) ? rotation : 0;
+        return [0, 90, 180, 270].includes(rotation) ? rotation : 0;
     };
 
     if (layer.fit_mode !== undefined || layer.fitMode !== undefined) {
@@ -88,6 +94,14 @@ function normalizeLayerFieldAliases(layer) {
     }
     if (layer.captureIndex !== undefined && layer.capture_index === undefined) {
         layer.capture_index = layer.captureIndex;
+    }
+    for (const [ui, config] of [
+        ['capture_width', 'captureWidth'],
+        ['capture_height', 'captureHeight'],
+        ['capture_resolution_locked', 'captureResolutionLocked']
+    ]) {
+        if (layer[ui] === undefined && layer[config] !== undefined) layer[ui] = layer[config];
+        if (layer[config] === undefined && layer[ui] !== undefined) layer[config] = layer[ui];
     }
     if (layer.capture_rotation !== undefined || layer.captureRotation !== undefined) {
         const captureRotation = normalizeCaptureRotation(layer.capture_rotation ?? layer.captureRotation);
@@ -129,6 +143,7 @@ export function buildConfigLayerPatch(properties, layerId) {
     }
 
     LAYER_FIELDS.forEach((field) => {
+        if (Number(layerId) === 21 && field.config === 'fontFile') return;
         if (properties[field.ui] !== undefined) patch[field.config] = properties[field.ui];
     });
 

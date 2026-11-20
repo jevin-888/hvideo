@@ -1,4 +1,3 @@
-# Copy to license.properties and set the real HMAC key used by the engine
-# and license-tool. license.properties is intentionally ignored by Git.
-
-LICENSE_HMAC_KEY=change-me
+# Copy to license.properties and supply the SAME existing key used by license-tool.
+# Never generate a new key for an existing fleet. Never commit license.properties.
+LICENSE_HMAC_KEY=

@@ -8,6 +8,15 @@ import android.util.Log;
 
 import com.hsvj.engine.util.ScriptInstaller;
 
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
+
 /**
  * 开机自启动接收器
  * 监听系统启动完成广播，自动启动应用
@@ -15,7 +24,6 @@ import com.hsvj.engine.util.ScriptInstaller;
 public class BootReceiver extends BroadcastReceiver {
     private static final String TAG = "BootReceiver";
     private static final String WATCHDOG_ASSET = "hsvj_watchdog.sh";
-    private static final String WATCHDOG_PATH = "/data/local/tmp/hsvj_watchdog.sh";
     private static final String FRPC_ASSET = "frp/frpc";
     private static final String FRPC_PATH = "/data/local/tmp/frp/frpc";
     private static final String FRPC_CONFIG_ASSET = "frp/frpc.toml";
@@ -49,10 +57,10 @@ public class BootReceiver extends BroadcastReceiver {
             Log.i(TAG, "系统启动完成，准备启动应用");
 
             try {
+                PortForwardManager.start(context);
                 installFrpc(context);
                 installAndStartWatchdog(context);
-                OutputBackendController.installAndStart(context, "boot");
-                Log.i(TAG, "已按持久属性提交输出后端启动" );
+                Log.i(TAG, "DRM takeover is owned by ROM init; BootReceiver does not relaunch it");
             } catch (Exception e) {
                 Log.e(TAG, "启动应用失败: " + e.getMessage(), e);
             }
@@ -60,9 +68,6 @@ public class BootReceiver extends BroadcastReceiver {
     }
 
     private boolean isUserUnlocked(Context context) {
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.N) {
-            return true;
-        }
         UserManager userManager = (UserManager) context.getSystemService(Context.USER_SERVICE);
         return userManager == null || userManager.isUserUnlocked();
     }
@@ -72,7 +77,14 @@ public class BootReceiver extends BroadcastReceiver {
         String frpcConfigPath = ScriptInstaller.copyAssetToCache(context, FRPC_CONFIG_ASSET, "frpc.toml");
         if (frpcPath == null || frpcConfigPath == null) return;
 
-        String cmd = "su 0 sh -c '"
+        String frpToken = readSystemProperty("persist.hsvj.frp_token");
+        if (!isSafeFrpToken(frpToken)
+                || !replaceFrpToken(new File(frpcConfigPath), frpToken)) {
+            Log.w(TAG, "未配置有效的 persist.hsvj.frp_token，跳过 FRP 启动");
+            return;
+        }
+
+        String cmd = "sh -c '"
                 + "mkdir -p /data/local/tmp/frp && "
                 + "cp \"" + frpcConfigPath + "\" " + FRPC_CONFIG_PATH + " && "
                 + "chmod 644 " + FRPC_CONFIG_PATH + " && "
@@ -84,14 +96,68 @@ public class BootReceiver extends BroadcastReceiver {
         ScriptInstaller.execRootCommand(cmd, "开机 frpc 安装");
     }
 
+    private String readSystemProperty(String name) {
+        Process process = null;
+        try {
+            process = new ProcessBuilder("getprop", name).redirectErrorStream(true).start();
+            if (!process.waitFor(1500L, TimeUnit.MILLISECONDS)) {
+                process.destroyForcibly();
+                return "";
+            }
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                    process.getInputStream(), StandardCharsets.UTF_8))) {
+                String value = reader.readLine();
+                return value == null ? "" : value.trim();
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            return "";
+        } catch (Exception error) {
+            Log.w(TAG, "读取系统属性失败: " + name, error);
+            return "";
+        } finally {
+            if (process != null) process.destroyForcibly();
+        }
+    }
+
+    private boolean replaceFrpToken(File configFile, String token) {
+        try {
+            byte[] bytes;
+            try (FileInputStream input = new FileInputStream(configFile);
+                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[4096];
+                int count;
+                while ((count = input.read(buffer)) >= 0) {
+                    output.write(buffer, 0, count);
+                }
+                bytes = output.toByteArray();
+            }
+            String config = new String(bytes, StandardCharsets.UTF_8);
+            java.util.regex.Matcher tokenLine = java.util.regex.Pattern.compile("(?m)^(\\s*auth\\.token\\s*=\\s*\")[^\"\\r\\n]*(\")").matcher(config);
+            if (!tokenLine.find()) return false;
+            String updated = tokenLine.replaceFirst("$1" + token + "$2");
+            if (updated.equals(config)) return false;
+            try (FileOutputStream output = new FileOutputStream(configFile, false)) {
+                output.write(updated.getBytes(StandardCharsets.UTF_8));
+                output.flush();
+            }
+            return true;
+        } catch (Exception error) {
+            Log.w(TAG, "写入 FRP token 失败", error);
+            return false;
+        }
+    }
+
+    private boolean isSafeFrpToken(String token) {
+        return token != null && token.length() >= 16 && token.length() <= 256
+                && token.matches("[A-Za-z0-9._~-]+");
+    }
+
     private void installAndStartWatchdog(Context context) {
         String scriptPath = ScriptInstaller.copyAssetToCache(context, WATCHDOG_ASSET, WATCHDOG_ASSET);
         if (scriptPath == null) return;
 
-        String cmd = "su 0 sh -c '"
-                + "cp \"" + scriptPath + "\" " + WATCHDOG_PATH + " && "
-                + "chmod 755 " + WATCHDOG_PATH + " && "
-                + "setsid sh " + WATCHDOG_PATH + " boot-receiver >> /data/local/tmp/hsvj_watchdog_launcher.log 2>&1 < /dev/null &'";
-        ScriptInstaller.execRootCommand(cmd, "开机守护脚本");
+        String cmd = "sh \"" + scriptPath + "\" --install";
+        ScriptInstaller.execRootCommandAndWait(cmd, "开机守护脚本", 20_000L);
     }
 }

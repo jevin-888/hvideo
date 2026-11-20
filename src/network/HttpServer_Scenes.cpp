@@ -11,7 +11,7 @@
 #include "SceneTemplateManager.h"
 #include "core/CommandRouter.h"
 #include "core/Engine.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
 #include <json/json.h>

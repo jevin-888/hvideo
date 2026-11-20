@@ -2468,7 +2468,7 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
 
     if (ic->pb) {
         FFIOContext *const ctx = ffiocontext(ic->pb);
-        av_log(ic, AV_LOG_DEBUG, "Before avformat_find_stream_info() ? pos: %"PRId64" bytes read:%"PRId64" seeks:%d nb_streams:%d\n",
+        av_log(ic, AV_LOG_DEBUG, "Before avformat_find_stream_info() pos: %"PRId64" bytes read:%"PRId64" seeks:%d nb_streams:%d\n",
                avio_tell(ic->pb), ctx->bytes_read, ctx->seek_count, ic->nb_streams);
     }
 
@@ -3025,7 +3025,7 @@ find_stream_info_err:
     }
     if (ic->pb) {
         FFIOContext *const ctx = ffiocontext(ic->pb);
-        av_log(ic, AV_LOG_DEBUG, "After avformat_find_stream_info() ? pos: %"PRId64" bytes read:%"PRId64" seeks:%d frames:%d\n",
+        av_log(ic, AV_LOG_DEBUG, "After avformat_find_stream_info() pos: %"PRId64" bytes read:%"PRId64" seeks:%d frames:%d\n",
                avio_tell(ic->pb), ctx->bytes_read, ctx->seek_count, count);
     }
     return ret;

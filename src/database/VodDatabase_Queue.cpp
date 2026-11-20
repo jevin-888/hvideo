@@ -1,6 +1,6 @@
 #include "database/VodDatabase.h"
 
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 
 #include "utils/JsonUtils.h"
 
@@ -536,15 +536,11 @@ bool VodDatabase::patchOnlineVodStatePartial(const std::string& roomId,
 
 
 
-    // 名称：roomName / name
+    // 名称只接受网络 VOD 协议规定的 roomName。
 
     if (patchJson.isMember("roomName") && patchJson["roomName"].isString()) {
 
         bindNullableText(4, patchJson["roomName"].asString(), true);
-
-    } else if (patchJson.isMember("name") && patchJson["name"].isString()) {
-
-        bindNullableText(4, patchJson["name"].asString(), true);
 
     } else {
 

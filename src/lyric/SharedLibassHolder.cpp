@@ -4,11 +4,13 @@
  */
 
 #include "lyric/SharedLibassHolder.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "utils/FileUtils.h"
 #include "utils/Logger.h"
 #include <cstring>
 #include <string>
+#include <algorithm>
+#include <cctype>
 
 extern "C" {
 #include "ass.h"
@@ -79,10 +81,23 @@ bool SharedLibassHolder::ensureAppFontsLoaded(const std::string &fontDir,
     baseDir.pop_back();
   }
 
-  std::vector<std::string> paths;
-  paths.push_back(baseDir.empty() ? (FONT_DIR + "lyric.ttf") : (baseDir + "/lyric.ttf"));
-  paths.push_back(baseDir.empty() ? (FONT_DIR + "lyric-Pinyin.ttf")
-                                  : (baseDir + "/lyric-Pinyin.ttf"));
+  std::vector<std::string> paths = FileUtils::listFiles(baseDir);
+  paths.erase(std::remove_if(paths.begin(), paths.end(), [](const std::string &path) {
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos) return true;
+    std::string ext = path.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext != ".ttf" && ext != ".otf" && ext != ".ttc";
+  }), paths.end());
+  std::sort(paths.begin(), paths.end(), [&baseDir](const std::string &a, const std::string &b) {
+    auto rank = [&baseDir](const std::string &p) {
+      if (p == baseDir + "/默认字体.ttf") return 0;
+      if (p == baseDir + "/lyric.ttf") return 1;
+      return 2;
+    };
+    return rank(a) == rank(b) ? a < b : rank(a) < rank(b);
+  });
 
   std::string firstLoadedPath;
   for (const std::string &path : paths) {
@@ -96,19 +111,15 @@ bool SharedLibassHolder::ensureAppFontsLoaded(const std::string &fontDir,
     }
     appFontDataBuffers_.push_back(std::move(data));
     char *ptr = appFontDataBuffers_.back().data();
-    ass_add_font(library_, "lyric", ptr, static_cast<int>(size));
-    ass_add_font(library_, "Lyric", ptr, static_cast<int>(size));
-    ass_add_font(library_, "Default", ptr, static_cast<int>(size));
-    if (path.find("lyric-Pinyin") != std::string::npos) {
-      ass_add_font(library_, "lyric-Pinyin", ptr, static_cast<int>(size));
-      ass_add_font(library_, "Lyric-Pinyin", ptr, static_cast<int>(size));
-    }
+    const std::string name = path.substr(path.find_last_of('/') + 1);
+    ass_add_font(library_, name.c_str(), ptr, static_cast<int>(size));
     if (firstLoadedPath.empty()) {
       firstLoadedPath = path;
     }
   }
 
   if (!firstLoadedPath.empty()) {
+    defaultFontPath_ = firstLoadedPath;
     ass_set_fonts(renderer_, firstLoadedPath.c_str(), "lyric",
                   ASS_FONTPROVIDER_NONE, nullptr, 1);
     fontsLoaded_ = true;

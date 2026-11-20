@@ -136,7 +136,7 @@ static void convolve_horiz_mmi(const uint8_t *src, int32_t src_stride,
           [ftmp13]"=&f"(ftmp[14])
         : [filter]"r"(filter_x),
           [src_stride]"r"((mips_reg)src_stride),
-          [dst_stride]"r"((mips_reg)? dst_stride)
+          [dst_stride]"r"((mips_reg)dst_stride)
         : "memory"
     );
 }
@@ -223,7 +223,7 @@ static void convolve_vert_mmi(const uint8_t *src, int32_t src_stride,
         : [filter]"r"(filter_y),
           [src_stride]"r"((mips_reg)src_stride),
           [dst_stride]"r"((mips_reg)dst_stride),
-          [addr]"r"((mips_reg)? addr)
+          [addr]"r"((mips_reg)addr)
         : "memory"
     );
 }
@@ -305,7 +305,7 @@ static void convolve_avg_horiz_mmi(const uint8_t *src, int32_t src_stride,
           [ftmp13]"=&f"(ftmp[14])
         : [filter]"r"(filter_x),
           [src_stride]"r"((mips_reg)src_stride),
-          [dst_stride]"r"((mips_reg)? dst_stride)
+          [dst_stride]"r"((mips_reg)dst_stride)
         : "memory"
     );
 }
@@ -402,7 +402,7 @@ static void convolve_avg_vert_mmi(const uint8_t *src, int32_t src_stride,
         : [filter]"r"(filter_y),
           [src_stride]"r"((mips_reg)src_stride),
           [dst_stride]"r"((mips_reg)dst_stride),
-          [addr]"r"((mips_reg)? addr)
+          [addr]"r"((mips_reg)addr)
         : "memory"
     );
 }
@@ -449,7 +449,7 @@ static void convolve_avg_mmi(const uint8_t *src, int32_t src_stride,
           [src]"+&r"(src),        [dst]"+&r"(dst),
           [width]"+&r"(w),        [height]"+&r"(h)
         : [src_stride]"r"((mips_reg)src_stride),
-          [dst_stride]"r"((mips_reg)? dst_stride)
+          [dst_stride]"r"((mips_reg)dst_stride)
         : "memory"
     );
 }

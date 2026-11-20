@@ -76,7 +76,8 @@ void LayerInitializerFactory::sortInitializers() {
               initializers_.size());
 }
 
-int LayerInitializerFactory::initializeAllLayers(const LayerInitContext& context) {
+int LayerInitializerFactory::initializeAllLayers(
+    const LayerInitContext& context, const std::vector<int>& preservedLayerIds) {
     if (!context.mubu || !context.systemConfig) {
         LOG_ERROR("[LayerInitializerFactory] Invalid context: mubu or systemConfig is null");
         return 0;
@@ -110,6 +111,11 @@ int LayerInitializerFactory::initializeAllLayers(const LayerInitContext& context
              initOrder.size());
 
     for (int layerId : initOrder) {
+        if (std::find(preservedLayerIds.begin(), preservedLayerIds.end(), layerId) !=
+            preservedLayerIds.end()) {
+            skippedCount++;
+            continue;
+        }
         auto it = configLayers.find(layerId);
         if (it == configLayers.end()) continue;
 

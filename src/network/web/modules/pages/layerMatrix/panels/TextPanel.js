@@ -89,51 +89,11 @@ export function generateTextLayer41Html(prefix, config) {
                     ${playlistOptions}
                 </select>
             </div>
-            <div class="setting-item" style="grid-column: span 2;">
-                <label for="${idPrefix}text-font-size">字体大小:</label>
-                <div class="number-input-wrapper horizontal layer-param-input">
-                    <button type="button" class="number-btn minus" data-target="${idPrefix}text-font-size">-</button>
-                    <input type="number" id="${idPrefix}text-font-size" min="1" step="1" value="${fontSize}" data-default="${fontSize}" class="form-control number-input">
-                    <button type="button" class="number-btn plus" data-target="${idPrefix}text-font-size">+</button>
-                    <button type="button" class="number-btn number-reset" data-target="${idPrefix}text-font-size" title="恢复默认">↻</button>
-                </div>
-            </div>
-            <div class="setting-item" style="grid-column: span 2;">
-                <label for="${idPrefix}show-count">显示数量:</label>
-                <div class="number-input-wrapper horizontal layer-param-input">
-                    <button type="button" class="number-btn minus" data-target="${idPrefix}show-count">-</button>
-                    <input type="number" id="${idPrefix}show-count" min="1" max="20" step="1" value="${showCount}" data-default="${showCount}" class="form-control number-input">
-                    <button type="button" class="number-btn plus" data-target="${idPrefix}show-count">+</button>
-                    <button type="button" class="number-btn number-reset" data-target="${idPrefix}show-count" title="恢复默认">↻</button>
-                </div>
-            </div>
-            <div class="setting-item" style="grid-column: span 2;">
-                <label for="${idPrefix}display-duration">显示时长 (秒):</label>
-                <div class="number-input-wrapper horizontal layer-param-input">
-                    <button type="button" class="number-btn minus" data-target="${idPrefix}display-duration">-</button>
-                    <input type="number" id="${idPrefix}display-duration" min="0" step="0.5" value="${displayDuration}" data-default="${displayDuration}" class="form-control number-input">
-                    <button type="button" class="number-btn plus" data-target="${idPrefix}display-duration">+</button>
-                    <button type="button" class="number-btn number-reset" data-target="${idPrefix}display-duration" title="恢复默认">↻</button>
-                </div>
-            </div>
-            <div class="setting-item" style="grid-column: span 3;">
-                <label for="${idPrefix}start-hint-time">起始提示时间 (秒):</label>
-                <div class="number-input-wrapper horizontal layer-param-input">
-                    <button type="button" class="number-btn minus" data-target="${idPrefix}start-hint-time">-</button>
-                    <input type="number" id="${idPrefix}start-hint-time" min="0" step="1" value="${startHintTime}" data-default="${startHintTime}" class="form-control number-input">
-                    <button type="button" class="number-btn plus" data-target="${idPrefix}start-hint-time">+</button>
-                    <button type="button" class="number-btn number-reset" data-target="${idPrefix}start-hint-time" title="恢复默认">↻</button>
-                </div>
-            </div>
-            <div class="setting-item" style="grid-column: span 3;">
-                <label for="${idPrefix}end-hint-time">结束提示时间 (秒):</label>
-                <div class="number-input-wrapper horizontal layer-param-input">
-                    <button type="button" class="number-btn minus" data-target="${idPrefix}end-hint-time">-</button>
-                    <input type="number" id="${idPrefix}end-hint-time" min="0" step="1" value="${endHintTime}" data-default="${endHintTime}" class="form-control number-input">
-                    <button type="button" class="number-btn plus" data-target="${idPrefix}end-hint-time">+</button>
-                    <button type="button" class="number-btn number-reset" data-target="${idPrefix}end-hint-time" title="恢复默认">↻</button>
-                </div>
-            </div>
+            ${createNumInput(idPrefix + 'text-font-size', '字体大小', fontSize, '1', null, '1', 2)}
+            ${createNumInput(idPrefix + 'show-count', '显示数量', showCount, '1', '20', '1', 2)}
+            ${createNumInput(idPrefix + 'display-duration', '显示时长 (秒)', displayDuration, '0', null, '0.5', 2)}
+            ${createNumInput(idPrefix + 'start-hint-time', '起始提示时间 (秒)', startHintTime, '0', null, '1', 3)}
+            ${createNumInput(idPrefix + 'end-hint-time', '结束提示时间 (秒)', endHintTime, '0', null, '1', 3)}
         </div>
     `;
 }
@@ -178,9 +138,7 @@ export function generateNormalTextHtml(prefix, config) {
                 </div>
             </div>
 
-            <div class="setting-item" style="grid-column: span 2;">
-                ${createNumInput(idPrefix + 'text-font-size', '字体大小', fontSize, 1.0, null, 1.0, 2)}
-            </div>
+            ${createNumInput(idPrefix + 'text-font-size', '字体大小', fontSize, 1.0, null, 1.0, 2)}
 
             <div class="setting-item" style="grid-column: span 2;">
                 <label for="${idPrefix}text-alignment">对齐方式:</label>

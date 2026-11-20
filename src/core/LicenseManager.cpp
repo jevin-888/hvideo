@@ -12,7 +12,7 @@
 #include "core/LicenseManager.h"
 #include "core/LayerDefinitions.h"
 #include "core/LicenseVerify.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "network/CloudLicenseClient.h"
 #include "utils/FileUtils.h"
 #include "utils/JsonUtils.h"
@@ -29,8 +29,9 @@
 
 namespace {
 #ifndef HVIDEO_LICENSE_HMAC_KEY
-#define HVIDEO_LICENSE_HMAC_KEY ""
+#error "HVIDEO_LICENSE_HMAC_KEY must be configured by the build"
 #endif
+static_assert(sizeof(HVIDEO_LICENSE_HMAC_KEY) > 1, "License HMAC key must not be empty");
 const char* const kLicenseHmacKey = HVIDEO_LICENSE_HMAC_KEY;
 
 static std::string simpleStableHash(const std::string& content) {
@@ -52,16 +53,6 @@ static int displayDays(double days) {
 
 namespace hsvj {
 static std::string formatExpiryDate(int64_t expiryTime);
-
-static std::string normalizeLicenseModuleName(const std::string& module) {
-    if (module == "TV") {
-        return "TV";
-    }
-    if (module == "effects") {
-        return module;
-    }
-    return module;
-}
 
 // Constants are now defined as constexpr in License管理器.h
 
@@ -87,6 +78,7 @@ LicenseManager::LicenseManager()
     , deviceTimeValid_(false)
     , lastSaveTime_(0)
     , useCloudPriority_(true)
+    , transientOnlineLicense_(false)
     , cloudClient_(nullptr)
 {
     LOG_DEBUG("LicenseManager initialized");
@@ -144,18 +136,103 @@ void LicenseManager::clearLicenseState() {
     warningStage_ = WarningStage::UNLICENSED;
     showWarning_ = true;
     warningText_ = "VJEngine";
+    transientOnlineLicense_ = false;
+    cloudManagedLicense_ = false;
+    serverLicensePermanent_ = false;
+    remainingDays_ = 0.0;
 }
 
-bool LicenseManager::checkLicense() {
+bool LicenseManager::checkLicense(bool allowCloudSync) {
+    // A network-mode fallback must not leave a previous cloud worker running.
+    // Stop it before taking mutex_ because its callback also uses mutex_.
+    if (cloudClient_) {
+        cloudClient_->stop();
+    }
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    // 1. 加载本地主授权文件
-    bool localOk = loadLicense();
-
-    if (!localOk) {
-        LOG_WARN("[License] 未找到有效授权文件，系统保持未授权状态");
+    useCloudPriority_ = allowCloudSync;
+    if (!allowCloudSync) {
+        startupLocalSyncRequired_ = false;
+        clearLicenseState();
+        LOG_INFO("[License] 网络 VOD 模式，仅等待 VOD 服务器授权");
         return false;
     }
-    
+
+    migrateLegacyCloudLicense();
+    // Both import and cloud renewal use license.dat. Only a manually imported
+    // grant waits for startup reporting before allowing cloud replacement.
+    const std::string localContent = getLocalLicenseContent();
+    LicenseManager localCandidate;
+    const int64_t now = std::max<int64_t>(std::time(nullptr), lastValidTime_);
+    if (!localContent.empty() && localCandidate.validateLicenseFile(localContent) &&
+        localCandidate.startTime_ > 0 && localCandidate.startTime_ <= now + 300 &&
+        localCandidate.expiryTime_ > now) {
+        const bool loadedLocal = validateLicenseFile(localContent);
+        if (loadedLocal) {
+            cloudManagedLicense_ = localCandidate.licenseHash_ == persistedCloudLicenseHash_;
+            refreshLoadedLicense();
+            if (!cloudManagedLicense_ && (startupLocalSyncRequired_ || localLicenseSyncPending_)) {
+                LOG_INFO("[License] 已优先加载有效本地授权，等待启动上报确认后再启动云端同步");
+                return licensed_;
+            }
+            LOG_INFO("[License] 已加载有效本地授权，启动云端同步");
+            startCloudSync();
+            return licensed_;
+        }
+    }
+
+    applyLocalFallback("等待有效云端授权", 0);
+    startCloudSync();
+    return licensed_;
+}
+
+void LicenseManager::migrateLegacyCloudLicense() {
+    if (licensePath_.empty()) return;
+    const std::string legacyPath = FileUtils::getDirectory(licensePath_) + "/license-cloud.dat";
+    if (!FileUtils::exists(legacyPath) || FileUtils::isDirectory(legacyPath)) return;
+
+    const auto localContent = getLocalLicenseContent();
+    const auto legacyContent = FileUtils::readTextFile(legacyPath);
+    LicenseManager localCandidate;
+    LicenseManager legacyCandidate;
+    const int64_t now = std::max<int64_t>(std::time(nullptr), lastValidTime_);
+    const bool localValid = localCandidate.validateLicenseFile(localContent);
+    const bool legacyValid = legacyCandidate.validateLicenseFile(legacyContent) &&
+        legacyCandidate.startTime_ > 0 && legacyCandidate.startTime_ <= now + 300 &&
+        legacyCandidate.expiryTime_ > now;
+    const bool localCurrent = localValid && localCandidate.startTime_ > 0 &&
+        localCandidate.startTime_ <= now + 300 && localCandidate.expiryTime_ > now;
+    // Preserve the existing startup priority: a current license.dat wins.
+    if (legacyValid && !localLicenseSyncPending_ && !localCurrent) {
+        if (!FileUtils::writeTextFile(licensePath_, legacyContent)) {
+            LOG_WARN("[License] 旧云端授权迁移失败，保留原文件等待重试");
+            return;
+        }
+        persistedCloudLicenseHash_ = legacyCandidate.licenseHash_;
+        validateLicenseFile(legacyContent);
+        cloudManagedLicense_ = true;
+        refreshLoadedLicense();
+        LOG_INFO("[License] 旧云端授权已迁移至 license.dat");
+    } else if (!localValid) {
+        // Never discard the only historical file when neither grant is usable.
+        return;
+    }
+    if (!FileUtils::removeFile(legacyPath)) {
+        LOG_WARN("[License] 旧云端授权文件清理失败，后续启动重试");
+    }
+}
+
+void LicenseManager::startCloudSync() {
+    if (!cloudClient_) return;
+    cloudClient_->start(DEFAULT_CLOUD_HOST, DEFAULT_CLOUD_PORT,
+        SystemUtils::generateDeviceFingerprint(), 8080,
+        [this](const CloudLicenseClient::LicenseState& state) {
+            onCloudLicenseReceived(state.success, state.server_time, state.content);
+        }, CLOUD_SYNC_INTERVAL);
+}
+
+void LicenseManager::refreshLoadedLicense() {
+    transientOnlineLicense_ = false;
+    serverLicensePermanent_ = false;
     // 2. 根据可信时间源刷新剩余天数
     int64_t now = std::time(nullptr);
     double licenseDurationDays = (startTime_ > 0 && expiryTime_ > startTime_)
@@ -229,32 +306,197 @@ bool LicenseManager::checkLicense() {
     // 4. [BUG_FIX] 立即刷新一次状态，防止 reloadLicense 后仍然维持旧状态导致黑屏
     updateWarningState(0.0f);
     
-    // 5. 启动云端同步（后台运行，每小时校准一次时间与授权）
-    if (useCloudPriority_ && cloudClient_) {
-        std::string fp = SystemUtils::generateDeviceFingerprint();
-        cloudClient_->start(DEFAULT_CLOUD_HOST, DEFAULT_CLOUD_PORT, fp, 8080,
-            [this](const CloudLicenseClient::LicenseState& state) {
-                this->onCloudLicenseReceived(state.success, state.license_expiry, state.server_time);
-            }, CLOUD_SYNC_INTERVAL);
+}
+
+bool LicenseManager::isServerLicenseMode() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return !useCloudPriority_;
+}
+
+std::string LicenseManager::getLicenseSource() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return !licensed_ ? "none" : transientOnlineLicense_ ? "server" : cloudManagedLicense_ ? "cloud" : "local";
+}
+
+std::string LicenseManager::getLocalLicenseContent() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (licensePath_.empty() || !FileUtils::exists(licensePath_) ||
+        FileUtils::isDirectory(licensePath_)) return {};
+    return FileUtils::readTextFile(licensePath_);
+}
+
+void LicenseManager::setCloudLicenseAppliedCallback(std::function<void()> callback) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    cloudLicenseAppliedCallback_ = std::move(callback);
+}
+
+void LicenseManager::setLocalLicenseSyncCallback(std::function<void(const std::string&)> callback) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    localLicenseSyncCallback_ = std::move(callback);
+}
+
+void LicenseManager::stopCloudSync() {
+    if (cloudClient_) cloudClient_->stop();
+}
+
+void LicenseManager::completeLocalLicenseSync(bool synced) {
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        lastImportCloudSyncStatus_ = synced ? 1 : 0;
+        if (synced) {
+            localLicenseSyncPending_ = false;
+            startupLocalSyncRequired_ = false;
+        }
     }
-    
+    if (synced) reloadLicense(true);
+}
+
+void LicenseManager::setLastImportCloudSyncStatus(int status) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    lastImportCloudSyncStatus_ = status;
+}
+
+int LicenseManager::getLastImportCloudSyncStatus() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return lastImportCloudSyncStatus_;
+}
+
+bool LicenseManager::importLicense(const std::string& content, bool allowCloudSync) {
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        lastImportCloudSyncStatus_ = -1;
+    }
+    // Validate on a separate instance before touching the current local/server grant.
+    LicenseManager candidate;
+    if (!candidate.validateLicenseFile(content)) {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        setLastError(candidate.getLastError());
+        return false;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        if (!FileUtils::writeTextFile(licensePath_, content)) {
+            setLastError("写入本地授权文件失败");
+            return false;
+        }
+        persistedCloudLicenseHash_.clear();
+        // Block an already running cloud callback before releasing the file lock.
+        localLicenseSyncPending_ = allowCloudSync;
+        saveState();
+        const std::string legacyPath = FileUtils::getDirectory(licensePath_) + "/license-cloud.dat";
+        if (FileUtils::exists(legacyPath) && !FileUtils::isDirectory(legacyPath) &&
+            !FileUtils::removeFile(legacyPath)) {
+            LOG_WARN("[License] 本地授权已导入，旧云端文件清理失败");
+        }
+    }
+    if (allowCloudSync) syncLocalLicenseToCloud(content);
+
     return true;
 }
 
-bool LicenseManager::reloadLicense() {
-    return checkLicense();
+bool LicenseManager::hasValidLocalLicense() const {
+    const std::string content = getLocalLicenseContent();
+    LicenseManager candidate;
+    if (!candidate.validateLicenseFile(content)) return false;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    const int64_t now = std::max<int64_t>(std::time(nullptr), lastValidTime_);
+    return candidate.licenseHash_ != persistedCloudLicenseHash_ &&
+           candidate.startTime_ > 0 && candidate.startTime_ <= now + 300 &&
+           candidate.expiryTime_ > now;
+}
+
+void LicenseManager::syncLocalLicenseToCloud(const std::string& content) {
+    std::function<void(const std::string&)> syncCallback;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        localLicenseSyncPending_ = true;
+        lastImportCloudSyncStatus_ = 2;
+        applyLocalFallback("本地授权已导入，等待云端同步", 0);
+        syncCallback = localLicenseSyncCallback_;
+    }
+    if (syncCallback) syncCallback(content);
+    else {
+        stopCloudSync();
+        completeLocalLicenseSync(false);
+    }
+}
+
+void LicenseManager::revokeServerLicense(const std::string& reason) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (useCloudPriority_) return;
+    clearLicenseState();
+    setLastError(reason);
+}
+
+bool LicenseManager::authorizeServerLicense(const Json::Value& admission) {
+    // Server grants may only affect an explicitly enabled network VOD session.
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!admission.isObject() || !admission["contractVersion"].isInt() ||
+        admission["contractVersion"].asInt() != 2 ||
+        !admission["authorized"].isBool() || !admission["authorized"].asBool() ||
+        !admission["issuedAt"].isInt64() || !admission["expiresAt"].isInt64() ||
+        !admission["serverTime"].isInt64() || !admission["permanent"].isBool() ||
+        !admission["customerName"].isString()) {
+        setLastError("服务器授权响应格式无效，请升级服务器并重新签发授权");
+        return false;
+    }
+    const int64_t serverTime = admission["serverTime"].asInt64();
+    const int64_t issuedAt = admission["issuedAt"].asInt64();
+    const int64_t expiry = admission["expiresAt"].asInt64();
+    const bool permanent = admission["permanent"].asBool();
+    if (serverTime <= 0 || issuedAt <= 0 || issuedAt > serverTime + 300 ||
+        expiry <= issuedAt || (!permanent && expiry <= serverTime)) {
+        setLastError("服务器授权未生效或已过期");
+        return false;
+    }
+    // Validate all rights before replacing an existing running grant.
+    LicenseManager candidate;
+    if (!candidate.loadEntitlements(admission["license"])) {
+        setLastError(candidate.getLastError());
+        return false;
+    }
+    clearLicenseState();
+    loadEntitlements(admission["license"]);
+    licensed_ = true;
+    transientOnlineLicense_ = true;
+    serverLicensePermanent_ = permanent;
+    customerName_ = admission["customerName"].asString();
+    supplierName_ = "HVideo";
+    licenseInfo_ = customerName_;
+    expiryTime_ = expiry;
+    startTime_ = issuedAt;
+    expiryDateFormatted_ = permanent ? "永久" : formatExpiryDate(expiryTime_);
+    totalLicenseDays_ = static_cast<double>(expiry - issuedAt) / 86400.0;
+    remainingDays_ = static_cast<double>(expiry - serverTime) / 86400.0;
+    daysSource_ = "server";
+    initializedFromLicense_ = true;
+    deviceTimeValid_ = true;
+    cloudServerTime_ = serverTime;
+    cloudSyncLocalTime_ = std::time(nullptr);
+    serverLicenseReceivedAt_ = std::chrono::steady_clock::now();
+    useCloudPriority_ = false;
+    warningStage_ = WarningStage::NONE;
+    warningTimer_ = 0.0f;
+    setLastError("");
+    updateWarningState(0.0f);
+    return true;
+}
+
+bool LicenseManager::reloadLicense(bool allowCloudSync) {
+    return checkLicense(allowCloudSync);
 }
 
 bool LicenseManager::isModuleEnabled(const std::string& module) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!licensed_) return false;
-    const std::string normalizedModule = normalizeLicenseModuleName(module);
     for (const auto& m : modules_) {
-        if (normalizeLicenseModuleName(m) == normalizedModule) return true;
+        if (m == module) return true;
     }
     return false;
 }
 
 bool LicenseManager::isLayerEnabled(int layerId) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!licensed_) return false;
     for (int id : enabledLayerIds_) {
         if (id == layerId) return true;
@@ -264,13 +506,17 @@ bool LicenseManager::isLayerEnabled(int layerId) const {
 
 void LicenseManager::update(float deltaTime) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (remainingDays_ > 0) {
+    if (transientOnlineLicense_ && !serverLicensePermanent_) {
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - serverLicenseReceivedAt_).count();
+        remainingDays_ = (static_cast<double>(expiryTime_ - cloudServerTime_) - elapsed) / 86400.0;
+    } else if (licensed_ && !serverLicensePermanent_) {
         remainingDays_ -= (static_cast<double>(deltaTime) / 86400.0);
         if (daysSource_ == "cloud") {
             daysSource_ = "offline_state";
         }
-        if (remainingDays_ <= 0) {
-            LOG_WARN("[License] 授权刚刚耗尽，进入过期状态");
+        if (cloudManagedLicense_ && remainingDays_ <= 0) {
+            applyLocalFallback("云端授权已过期", 0);
         }
     }
 
@@ -315,6 +561,7 @@ void LicenseManager::loadState() {
         cloudServerTime_ = root.get("cloudServerTime", 0).asInt64();
         cloudSyncLocalTime_ = root.get("cloudSyncLocalTime", 0).asInt64();
         stateLicenseHash_ = root.get("licenseHash", "").asString();
+        persistedCloudLicenseHash_ = root.get("cloudLicenseHash", "").asString();
         daysSource_ = root.get("daysSource", "offline_state").asString();
         initializedFromLicense_ = root.get("initializedFromLicense", false).asBool();
         deviceTimeValid_ = root.get("deviceTimeValid", false).asBool();
@@ -324,7 +571,7 @@ void LicenseManager::loadState() {
 
 void LicenseManager::saveState() {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (statePath_.empty()) return;
+    if (statePath_.empty() || transientOnlineLicense_) return;
 
     Json::Value root;
     root["remainingDays"] = remainingDays_;
@@ -335,6 +582,7 @@ void LicenseManager::saveState() {
     root["cloudServerTime"] = static_cast<Json::Int64>(cloudServerTime_);
     root["cloudSyncLocalTime"] = static_cast<Json::Int64>(cloudSyncLocalTime_);
     root["licenseHash"] = licenseHash_;
+    root["cloudLicenseHash"] = persistedCloudLicenseHash_;
     root["daysSource"] = daysSource_;
     root["initializedFromLicense"] = initializedFromLicense_;
     root["deviceTimeValid"] = deviceTimeValid_;
@@ -344,44 +592,100 @@ void LicenseManager::saveState() {
     FileUtils::writeTextFile(statePath_, content);
 }
 
-void LicenseManager::onCloudLicenseReceived(bool success, int64_t expiry, int64_t serverTime) {
-    if (!success) return;
-
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    LOG_INFO("[License] 云端同步成功: Expiry=%lld ServerTime=%lld",
-             static_cast<long long>(expiry), static_cast<long long>(serverTime));
-    
-    // 如果云端返回了活跃状态
-    if (expiry > 0 && serverTime > 0) {
-        double cloudDaysRemaining = static_cast<double>(expiry - serverTime) / 86400.0;
-        
-        // 云端同步是最高优先级，直接覆盖本地扣点数的结果
-        // 但为了防止恶意跳变，我们只在云端比本地更具体的时候更新
-        remainingDays_ = cloudDaysRemaining;
-        expiryTime_ = expiry;
-        if (startTime_ > 0 && expiryTime_ > startTime_) {
-            totalLicenseDays_ = static_cast<double>(expiryTime_ - startTime_) / 86400.0;
-        }
-        expiryDateFormatted_ = formatExpiryDate(expiryTime_);
-        lastStateStartTime_ = startTime_;
-        lastStateExpiryTime_ = expiryTime_;
-        cloudServerTime_ = serverTime;
-        cloudSyncLocalTime_ = std::time(nullptr);
-        stateLicenseHash_ = licenseHash_;
-        daysSource_ = "cloud";
-        initializedFromLicense_ = true;
-        deviceTimeValid_ = true;
-        
-        LOG_INFO("[License] 授权有效期已通过云端校准，剩余 %.2f 天", remainingDays_);
-        
-        // --- [BUG_FIX] 关键修复：云端校准后重置状态 ---
-        if (remainingDays_ > 0) {
-            licensed_ = true;
-            // 立即刷新告警状态，确保 0.08 天这类临界值能实时生效
+void LicenseManager::applyLocalFallback(const std::string& reason, int64_t serverTime) {
+    const auto previousHash = licenseHash_;
+    const bool previousCloud = cloudManagedLicense_;
+    const bool previousLicensed = licensed_;
+    cloudManagedLicense_ = false;
+    // A cloud rejection must not reload that same cloud grant as a local backup.
+    if (loadLicense() && licenseHash_ != persistedCloudLicenseHash_) {
+        refreshLoadedLicense();
+        if (serverTime > 0) {
+            remainingDays_ = static_cast<double>(expiryTime_ - serverTime) / 86400.0;
+            cloudServerTime_ = serverTime;
+            cloudSyncLocalTime_ = std::time(nullptr);
+            daysSource_ = "cloud";
+            deviceTimeValid_ = true;
             updateWarningState(0.0f);
+            saveState();
         }
-        
-        saveState();
+    } else {
+        clearLicenseState();
+        setLastError(reason + "；本地授权不可用");
+    }
+    if (previousCloud || previousLicensed != licensed_ || previousHash != licenseHash_) {
+        LOG_INFO("[License] %s，已回退本地授权（%s）", reason.c_str(), licensed_ ? "有效" : "不可用");
+        if (cloudLicenseAppliedCallback_) cloudLicenseAppliedCallback_();
+    }
+}
+
+void LicenseManager::onCloudLicenseReceived(bool success, int64_t serverTime, const std::string& content) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!useCloudPriority_ || localLicenseSyncPending_) return;
+    if (!success) {
+        // A transport/response failure is not a revocation. Keep the already
+        // verified cloud grant, including after loading it from disk at boot.
+        const int64_t now = std::max<int64_t>(std::time(nullptr), lastValidTime_);
+        if (licensed_ && cloudManagedLicense_ && remainingDays_ > 0.0 && expiryTime_ > now) {
+            remainingDays_ = std::min(remainingDays_,
+                static_cast<double>(expiryTime_ - now) / 86400.0);
+            daysSource_ = "offline_state";
+            updateWarningState(0.0f);
+            saveState();
+            LOG_WARN("[License] 云端连接或响应失败，继续使用已验签的本地云端授权缓存");
+            return;
+        }
+        applyLocalFallback("云端连接或响应失败", 0);
+        return;
+    }
+    if (serverTime <= 0 || content.empty()) {
+        applyLocalFallback("云端未签发有效授权", serverTime);
+        return;
+    }
+    LicenseManager candidate;
+    if (!candidate.validateLicenseFile(content)) {
+        LOG_WARN("[License] 云端授权校验失败: %s", candidate.getLastError().c_str());
+        applyLocalFallback("云端授权校验失败", serverTime);
+        return;
+    }
+    if (candidate.startTime_ <= 0 || candidate.startTime_ > serverTime + 300 || candidate.expiryTime_ <= serverTime) {
+        applyLocalFallback("云端授权未生效或已过期", serverTime);
+        return;
+    }
+    const bool changed = !licensed_ || !cloudManagedLicense_ || candidate.licenseHash_ != licenseHash_;
+    if (changed) {
+        // Signature, device and validity checks above precede the atomic replace.
+        if (licensePath_.empty() || !FileUtils::writeTextFile(licensePath_, content)) {
+            setLastError("云端授权写入 license.dat 失败，保留当前授权");
+            return;
+        }
+        if (!validateLicenseFile(content)) {
+            applyLocalFallback("云端授权加载失败", serverTime);
+            return;
+        }
+        cloudManagedLicense_ = true;
+        persistedCloudLicenseHash_ = licenseHash_;
+        transientOnlineLicense_ = false;
+        serverLicensePermanent_ = false;
+        licensed_ = true;
+        warningTimer_ = 0.0f;
+        setLastError("");
+    }
+    remainingDays_ = static_cast<double>(expiryTime_ - serverTime) / 86400.0;
+    totalLicenseDays_ = static_cast<double>(expiryTime_ - startTime_) / 86400.0;
+    lastStateStartTime_ = startTime_;
+    lastStateExpiryTime_ = expiryTime_;
+    stateLicenseHash_ = licenseHash_;
+    daysSource_ = "cloud";
+    initializedFromLicense_ = true;
+    deviceTimeValid_ = true;
+    cloudServerTime_ = serverTime;
+    cloudSyncLocalTime_ = std::time(nullptr);
+    updateWarningState(0.0f);
+    saveState();
+    if (changed) {
+        LOG_INFO("[License] 云端优先授权已下发并生效");
+        if (cloudLicenseAppliedCallback_) cloudLicenseAppliedCallback_();
     }
 }
 
@@ -393,7 +697,7 @@ void LicenseManager::triggerCloudSync() {
 
 void LicenseManager::applyBrowserTimeHint(int64_t browserTime) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (!licensed_ || expiryTime_ <= 0 || browserTime <= 0) return;
+    if (!licensed_ || transientOnlineLicense_ || expiryTime_ <= 0 || browserTime <= 0) return;
     if (startTime_ > 0 && browserTime < startTime_ - 86400) return;
 
     double browserDays = static_cast<double>(expiryTime_ - browserTime) / 86400.0;
@@ -414,7 +718,7 @@ void LicenseManager::applyBrowserTimeHint(int64_t browserTime) {
 }
 
 bool LicenseManager::loadLicense() {
-    if (!FileUtils::exists(licensePath_)) {
+    if (!FileUtils::exists(licensePath_) || FileUtils::isDirectory(licensePath_)) {
         setLastError("授权文件不存在");
         LOG_ERROR("[License] 授权文件不存在");
         return false;
@@ -426,7 +730,14 @@ bool LicenseManager::loadLicense() {
         LOG_WARN("[License] 文件为空或读取失败");
         return false;
     }
-    std::string raw(rawBytes.begin(), rawBytes.end());
+    return validateLicenseFile(std::string(rawBytes.begin(), rawBytes.end()));
+}
+
+bool LicenseManager::validateLicenseFile(std::string raw) {
+    if (raw.empty()) {
+        setLastError("授权文件为空");
+        return false;
+    }
     LOG_WARN("[License] 初始化授权 raw_len=%zu first=0x%02x printable=%c",
              raw.size(), static_cast<unsigned char>(raw[0]),
              (raw[0] >= 32 && raw[0] < 127) ? raw[0] : '.');
@@ -476,14 +787,24 @@ bool LicenseManager::loadLicense() {
         }
     }
 
-    return validateLicense(licenseData);
+    try {
+        return validateLicense(licenseData);
+    } catch (const std::exception& error) {
+        setLastError(std::string("授权字段格式无效: ") + error.what());
+        return false;
+    }
 }
 
 static std::string formatExpiryDate(int64_t expiryTime) {
     if (expiryTime <= 0) return "";
     std::time_t t = static_cast<std::time_t>(expiryTime);
-    std::tm* utc = std::gmtime(&t);
-    if (!utc) return "";
+    std::tm value{};
+#ifdef _WIN32
+    if (gmtime_s(&value, &t) != 0) return "";
+#else
+    if (!gmtime_r(&t, &value)) return "";
+#endif
+    const std::tm* utc = &value;
     std::ostringstream oss;
     oss << (utc->tm_year + 1900) << "-"
         << std::setfill('0') << std::setw(2) << (utc->tm_mon + 1) << "-"
@@ -552,19 +873,25 @@ bool LicenseManager::validateLicense(const std::string& licenseData) {
         LOG_WARN("[License] 签名校验失败（文件可能被篡改或非 license-tool 签发）");
         return false;
     }
-    // 设备指纹校验：授权若带 device.fingerprint 则必须与本机一致
-    if (root.isMember("device") && root["device"].isObject()
-        && root["device"].isMember("fingerprint") && root["device"]["fingerprint"].isString()) {
-        std::string boundFp = root["device"]["fingerprint"].asString();
-        while (!boundFp.empty() && (boundFp.back() == ' ' || boundFp.back() == '\t')) boundFp.pop_back();
-        if (!boundFp.empty()) {
-            std::string currentFp = SystemUtils::generateDeviceFingerprint();
-            if (currentFp != boundFp) {
-                setLastError("设备指纹不匹配，授权文件不属于本机");
-                LOG_WARN("[License] 设备指纹不匹配，授权与本机绑定不一致");
-                return false;
-            }
-        }
+    // Device binding is mandatory. An omitted fingerprint would make a
+    // signed license portable across every H66_POR device.
+    if (!root.isMember("device") || !root["device"].isObject()
+        || !root["device"].isMember("fingerprint")
+        || !root["device"]["fingerprint"].isString()) {
+        setLastError("授权缺少设备指纹，不能用于本机");
+        LOG_WARN("[License] 授权缺少 device.fingerprint，拒绝通用授权文件");
+        return false;
+    }
+    std::string boundFp = root["device"]["fingerprint"].asString();
+    while (!boundFp.empty() && (boundFp.back() == ' ' || boundFp.back() == '\t' ||
+                                boundFp.back() == '\r' || boundFp.back() == '\n')) {
+        boundFp.pop_back();
+    }
+    const std::string currentFp = SystemUtils::generateDeviceFingerprint();
+    if (boundFp.empty() || currentFp.empty() || currentFp != boundFp) {
+        setLastError("设备指纹不匹配，授权文件不属于本机");
+        LOG_WARN("[License] 设备指纹缺失或不匹配，授权与本机绑定不一致");
+        return false;
     }
     const Json::Value& customer = root["customer"];
     const Json::Value& license = root["license"];
@@ -601,6 +928,45 @@ bool LicenseManager::validateLicense(const std::string& licenseData) {
         licenseInfo_ = "HSVJEngine Licensed";
     }
 
+    if (!loadEntitlements(license)) return false;
+
+    int daysUntilExpiry = calculateDaysUntilExpiry();
+    if (daysSource_ == "time_invalid" || daysSource_ == "license_duration") {
+        warningStage_ = WarningStage::NONE;
+        showWarning_ = false;
+        warningTimer_ = 0.0f;
+        warningText_.clear();
+    } else if (daysUntilExpiry <= DAYS_BEFORE_WARNING) {
+        warningStage_ = WarningStage::BEFORE_EXPIRY;
+        warningTimer_ = WARNING_DURATION;
+        showWarning_ = true;
+        warningText_ = generateWarningText(daysUntilExpiry);
+    } else {
+        warningStage_ = WarningStage::NONE;
+        showWarning_ = false;
+        warningTimer_ = 0.0f;
+    }
+    setLastError("");
+    return true;
+}
+
+bool LicenseManager::loadEntitlements(const Json::Value& license) {
+    if (!license.isObject() || !license["usage_mode"].isString() ||
+        !license["modules"].isArray() ||
+        (license.isMember("input_channel_count") && !license["input_channel_count"].isInt())) {
+        setLastError("授权模块、商业模式或输入通道数字段无效");
+        return false;
+    }
+    static const std::vector<std::string> supportedModules = {"TV", "投屏", "霸屏", "fusion", "effects", "scene", "cave", "stage", "vod"};
+    for (const auto& module : license["modules"]) {
+        if (!module.isString() || std::find(supportedModules.begin(), supportedModules.end(), module.asString()) == supportedModules.end()) {
+            setLastError("授权包含不支持的功能模块");
+            return false;
+        }
+    }
+    modules_.clear();
+    enabledLayerIds_.clear();
+    inputChannelCount_ = 0;
     if (license.isMember("usage_mode")) {
         usageMode_ = license["usage_mode"].asString();
     }
@@ -628,7 +994,7 @@ bool LicenseManager::validateLicense(const std::string& licenseData) {
     if (mods.isArray()) {
         for (Json::ArrayIndex i = 0; i < mods.size(); ++i) {
             if (mods[i].isString()) {
-                modules_.push_back(normalizeLicenseModuleName(mods[i].asString()));
+                modules_.push_back(mods[i].asString());
             }
         }
     }
@@ -655,23 +1021,6 @@ bool LicenseManager::validateLicense(const std::string& licenseData) {
         }
     }
 
-    int daysUntilExpiry = calculateDaysUntilExpiry();
-    if (daysSource_ == "time_invalid" || daysSource_ == "license_duration") {
-        warningStage_ = WarningStage::NONE;
-        showWarning_ = false;
-        warningTimer_ = 0.0f;
-        warningText_.clear();
-    } else if (daysUntilExpiry <= DAYS_BEFORE_WARNING) {
-        warningStage_ = WarningStage::BEFORE_EXPIRY;
-        warningTimer_ = WARNING_DURATION;
-        showWarning_ = true;
-        warningText_ = generateWarningText(daysUntilExpiry);
-    } else {
-        warningStage_ = WarningStage::NONE;
-        showWarning_ = false;
-        warningTimer_ = 0.0f;
-    }
-    setLastError("");
     return true;
 }
 
@@ -681,7 +1030,9 @@ int LicenseManager::getDaysUntilExpiry() const {
 
 int LicenseManager::calculateDaysUntilExpiry() const {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (daysSource_ == "offline_state" || daysSource_ == "cloud" || daysSource_ == "browser_time") {
+    if (serverLicensePermanent_) return 36500;
+    if (daysSource_ == "offline_state" || daysSource_ == "cloud" ||
+        daysSource_ == "browser_time" || daysSource_ == "server") {
         return displayDays(remainingDays_);
     }
     if (daysSource_ == "license_duration") {
@@ -701,6 +1052,14 @@ int LicenseManager::calculateDaysUntilExpiry() const {
 
 void LicenseManager::updateWarningState(float deltaTime) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    if (transientOnlineLicense_) {
+        warningStage_ = (!serverLicensePermanent_ && remainingDays_ <= 0.0)
+            ? WarningStage::EXPIRED_15_PLUS : WarningStage::NONE;
+        showWarning_ = warningStage_ != WarningStage::NONE;
+        warningText_ = showWarning_ ? "服务器授权已过期" : "";
+        return;
+    }
 
     if (daysSource_ == "time_invalid" || daysSource_ == "license_duration") {
         warningStage_ = WarningStage::NONE;
@@ -785,6 +1144,7 @@ std::string LicenseManager::generateWarningText(int daysUntilExpiry) const {
 }
 
 bool LicenseManager::shouldBlockVideoPlayback() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return warningStage_ == WarningStage::EXPIRED_15_PLUS || warningStage_ == WarningStage::UNLICENSED;
 }
 

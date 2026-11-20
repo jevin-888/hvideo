@@ -86,13 +86,13 @@ public:
    * @brief 启动 HDMI RX 采集（V4L2 + dmabuf 直采，NV12/NV16）
    */
   bool startHdmiCapture(const std::string &devicePath, int width = 0,
-                        int height = 0);
+                        int height = 0, bool lockResolution = false);
 
   /**
    * @brief 启动 MIPI CSI 采集（V4L2 + dmabuf 直采，NV12）
    */
   bool startMipiCapture(const std::string &devicePath, int width = 0,
-                        int height = 0);
+                        int height = 0, bool lockResolution = false);
 
   /**
    * @brief 启动 USB 摄像头/采集卡（UsbCapture + MJPEG RKMPP 硬解 + DMA-BUF 直采）
@@ -125,6 +125,7 @@ public:
    * @return 如果当前是采集模式返回 true
    */
   bool isCaptureMode() const;
+  int takeCaptureStartError() { return captureStartError_.exchange(0); }
 
   /**
    * @brief 检查采集通路是否有近期有效帧
@@ -159,33 +160,6 @@ public:
   }
 
   /**
-   * @brief 获取自动方向补偿状态（0=正常，1=旋转90+垂直翻转）。
-   */
-  int getCaptureAutoTransform() const {
-    return captureAutoTransform_.load(std::memory_order_acquire);
-  }
-
-  /**
-   * @brief 获取自动方向检测目标（0=正常，1=旋转90+垂直翻转）。
-   */
-  int getCaptureAutoDetectedTransform() const {
-    return captureAutoDetectedTransform_.load(std::memory_order_acquire);
-  }
-
-  int64_t getCaptureAutoDetectedAtMs() const {
-    return captureAutoDetectedAtMs_.load(std::memory_order_acquire);
-  }
-
-  /**
-   * @brief 场景已切到目标布局后，提交自动方向补偿给渲染使用。
-   */
-  void commitCaptureAutoTransform(int transform) {
-    const int normalized = (transform == 1) ? 1 : 0;
-    captureAutoTransformOverride_.store(normalized, std::memory_order_release);
-    captureAutoTransform_.store(normalized, std::memory_order_release);
-  }
-
-  /**
    * @brief 自动信号检测和采集控制
    *
    * preferredCaptureType 为 "AUTO" 时依次尝试 HDMI/MIPI/USB，哪个先收到真实帧就使用哪个；
@@ -195,7 +169,8 @@ public:
    */
   void checkAndAutoCapture(const std::string &preferredCaptureType = "AUTO",
                            int configuredWidth = 0, int configuredHeight = 0,
-                           int configuredIndex = 0);
+                           int configuredIndex = 0,
+                           bool lockResolution = false);
 
   /**
    * @brief 切片独立采集控制。preferredCaptureType 为空时切片继续复用主图层采集。
@@ -220,6 +195,24 @@ public:
   void resume();
 
   /**
+   * @brief 设置/解除同步播放的呈现截止时间。
+   *
+   * 预热解码器时允许后台填充首帧，但在目标时间之前继续显示旧画面；
+   * 同步调度器到点后清除此门控再恢复解码。
+   */
+  void setSyncPresentationDeadline(std::uint64_t deadlineNs);
+  void clearSyncPresentationDeadline();
+  void cancelSyncPresentation();
+  /** Returns true while the prepared sync presentation gate is still armed. */
+  bool isSyncPresentationPending() const;
+  void setSyncAudioSuppressed(bool suppressed);
+  bool setSyncPlaybackStartTime(double startTime);
+  bool hasSyncFrameReady();
+
+  /** Start audio only for the selected video route; image layers have no such path. */
+  bool ensureAudioOutputStarted();
+
+  /**
    * @brief 停止播放
    */
   void stop();
@@ -230,7 +223,14 @@ public:
    * 用于播放列表续播：自然 EOF 的正常路径也是 state=STOPPED 且保留路径，
    * Engine 依赖这个路径校验当前项后再按播放列表配置切下一项。
    */
-  bool markPlaybackFinishedRetainingPath(const std::string &reason);
+  bool markPlaybackFinishedRetainingPath(const std::string &reason,
+                                         uint64_t expectedGeneration,
+                                         double endTolerance);
+
+  /** Identifies the current decoder/timeline epoch for asynchronous EOF checks. */
+  uint64_t getPlaybackGeneration() const {
+    return playbackGeneration_.load(std::memory_order_acquire);
+  }
 
   /**
    * @brief 跳转到指定位置
@@ -240,10 +240,10 @@ public:
   bool seek(double position, const std::string &traceId = std::string());
 
   /**
-   * @brief 重播：从头开始播放
-   * @return 是否重播成功
+   * @brief Reuse the current decoder for replay; false requests the normal open fallback.
+   * The expected path prevents a queued replay from seeking a different song.
    */
-  bool replay();
+  bool tryReplayCurrent(const std::string &expectedPath, int loop);
 
   /**
    * @brief 设置授权管理器（用于检查是否允许播放）
@@ -300,10 +300,17 @@ public:
    */
   PlayState getState() const;
 
+  /** True while this layer is replacing its decoder during a track switch. */
+  bool isAudioRouteSwitching() const {
+    return audioRouteSwitching_.load(std::memory_order_acquire);
+  }
+
   /**
    * @brief 当前视频解码是否已自然到达 EOF。
    */
   bool isPlaybackFinished() const;
+  // A terminal decoder error is distinct from natural EOF and an explicit stop.
+  bool isPlaybackFailed() const;
 
   /**
    * @brief 当前是否在播纯音频（音频单独管线）
@@ -349,7 +356,7 @@ public:
    * @brief 获取播放速率
    * @return 播放速率
    */
-  float getPlaybackRate() const { return playbackRate_; }
+  float getPlaybackRate() const { return playbackRate_.load(std::memory_order_acquire); }
 
   /**
    * @brief 设置音量
@@ -601,7 +608,7 @@ public:
                           int height, float rotation, float scale, float alpha,
                           int shapeType, float shapeParam,
                           bool blackToTransparent, int invert,
-                          int fitMode = 0);
+                          float gaussianBlur = 0.0f, int fitMode = 0);
 
   /**
    * @brief 更新闪黑/闪白状态（每图层每帧只应调用一次，保证多图层、多切片同步）
@@ -639,6 +646,9 @@ public:
 
 private:
   void resetPlaybackFlowDiagnostics();
+  // Start the dedicated audio pipeline after media probing confirms that the
+  // container has no video stream (including audio-only MP4 files).
+  bool startAudioOnlyPlayback(const std::string& normalizedPath, int loop);
 
   // ========== 双解码器交替机制 ==========
   // 使用两个解码器交替播放，切换时无需等待解码器关闭/打开
@@ -675,9 +685,11 @@ private:
   std::unique_ptr<UsbCapture> usbCapture_;
   std::unique_ptr<UsbCaptureRenderer> usbRenderer_;
   std::atomic<bool> isCaptureMode_{false};           // 是否处于采集模式
+  std::atomic<int> captureStartError_{0};
   bool configuredCaptureLayer_{false};               // 是否为当前 config 中配置的采集图层
   int captureWidth_ = 0;                            // 采集宽度（实际检测到的）
   int captureHeight_ = 0;                           // 采集高度（实际检测到的）
+  bool captureResolutionLocked_ = false;
   int captureIndex_ = 0;                            // 采集设备索引（来自配置）
   std::atomic<bool> isStartingCapture_{false};        // 是否正在异步启动中 (防止并发开启硬件)
   std::atomic<bool> isShuttingDown_{false}; // 是否正在关闭（防止关闭后访问）
@@ -766,17 +778,26 @@ private:
 
   /** 生命周期操作串行化：play/stop/startCapture/shutdown 互斥执行，避免并发资源竞争 */
   mutable std::mutex lifecycleOpMutex_;
+  // Caller holds lifecycleOpMutex_; shared by ordinary seek and atomic replay.
+  bool seekWithLifecycleLock(double position, const std::string &traceId,
+                             std::chrono::steady_clock::time_point seekStart);
 
   /** 切歌保护：串行化 play()，防止连续快速切歌时多个 play() 并发导致双解码器/资源竞争 */
   mutable std::mutex playSwitchMutex_;
 
   std::string currentPath_;  // 当前播放路径
+  std::atomic<uint64_t> playbackGeneration_{0};
   DecodeErrorCode lastPlaybackErrorCode_ = DecodeErrorCode::None;
   std::string lastPlaybackErrorMessage_;
   PlayState state_;          // 播放状态
   std::atomic<bool> isPlayingPureAudio_{false};  // 当前是否由纯音频管线播放
+  std::atomic<bool> audioRouteSwitching_{false}; // 播放切换期间保持当前音频焦点
+  std::atomic<std::uint64_t> syncPresentationDeadlineNs_{0};
+  std::atomic<std::uint64_t> syncTraceDeadlineNs_{0};
+  std::atomic<bool> syncFirstFrameLogged_{false};
+  std::atomic<bool> syncFirstFrameTraceEnabled_{false};
   int loop_;                 // 循环模式
-  float playbackRate_;       // 播放速率
+  std::atomic<float> playbackRate_{1.0f};       // 播放速率
   float volume_;             // 音量
   float systemVolumeForEffect_ = 1.0f;  // 用于效果门控的系统音量（每帧由 Engine 设置）
   int audioTrack_;          // 当前音轨
@@ -930,12 +951,18 @@ protected:
   template <typename Task>
   static void enqueueDecoderReleaseTask(Task&& task);
 
+  // Called only after the GPU fence retires. RKMPP/DRM frame destruction can
+  // still block in the driver, so finish the release off the render thread.
+  static void releaseDecodedFrameAsync(DecodedFrame *frame);
+
 public:
   /**
    * @brief 等待所有异步资源释放任务完成（程序关闭时调用）
    */
   static void waitAllAsyncTasks();
   static size_t getPendingDecoderReleaseTaskCount();
+  // Track work scheduled after a GPU fence so shutdown can wait for it.
+  static void trackAsyncTask(std::future<void> task);
 
   /**
    * @brief 从视频路径获取基础文件名（不含扩展名）
@@ -982,7 +1009,7 @@ public:
 
   static int normalizeCaptureRotation(int degrees) {
     if (degrees < 0) {
-      return -1; // 自动：按运行时采集真实尺寸决定
+      return 0;
     }
     int normalized = degrees % 360;
     if (normalized < 0) {
@@ -1000,19 +1027,12 @@ public:
   }
 
   static int resolveCaptureRotation(int degrees) {
-    int normalized = normalizeCaptureRotation(degrees);
-    return normalized < 0 ? 0 : normalized;
+    return normalizeCaptureRotation(degrees);
   }
 
   void setCaptureRotation(int degrees) {
-    const int normalized = normalizeCaptureRotation(degrees);
-    const int previous = captureRotation_.load(std::memory_order_acquire);
-    captureRotation_.store(normalized, std::memory_order_release);
-    if (previous != normalized) {
-      captureAutoTransformOverride_.store(0, std::memory_order_release);
-      captureAutoTransform_.store(0, std::memory_order_release);
-      captureAutoDetectedTransform_.store(0, std::memory_order_release);
-    }
+    captureRotation_.store(normalizeCaptureRotation(degrees),
+                           std::memory_order_release);
   }
 
   int getCaptureRotation() const {
@@ -1035,20 +1055,7 @@ public:
 private:
   std::string captureType_ = "AUTO";                  // 当前真实活跃采集类型
   std::string configuredCaptureType_ = "AUTO";        // 配置期望类型，可为 AUTO
-  std::atomic<int> captureRotation_{0};               // 输入采集画面旋转角度（-1=自动，0/90/180/270）
-  std::atomic<int> captureAutoTransformOverride_{0};   // 用户/场景指定的自动方向补偿，采集重启后继续生效
-  std::atomic<int> captureAutoTransform_{0};          // 自动方向补偿：0=正常，1=旋转90+垂直翻转
-  std::atomic<int> captureAutoDetectedTransform_{0};   // 自动方向检测目标，待场景切换后提交到渲染
-  std::atomic<int64_t> captureAutoDetectedAtMs_{0};     // 最近一次自动方向检测/提交时间
-  uint32_t captureAutoSampleCounter_ = 0;
-  int captureAutoCandidate_ = -1;
-  int captureAutoCandidateFrames_ = 0;
-  int captureAutoLastLoggedTransform_ = -1;
-
-  void resetCaptureAutoTransformState();
-  void updateCaptureAutoTransform(const CaptureFrame &frame);
-  void updateCaptureAutoTransformFromGeometry(int width, int height,
-                                              uint32_t sequence);
+  std::atomic<int> captureRotation_{0};               // 输入采集画面旋转角度（0/90/180/270）
 
   bool ensureCapturePlaceholderRenderer();
   bool hasSliceCapture(const std::string &sliceKey) const;

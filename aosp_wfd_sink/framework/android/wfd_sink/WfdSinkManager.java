@@ -10,6 +10,8 @@ import android.view.Surface;
 /**
  * WFD Sink 系统服务客户端 管理器。
  *
+ * @hide
+ *
  * 引擎 app 通过 Context.getSystemService(Context.WFD_SINK_SERVICE) 获取实例：
  *
  *   WfdSink管理器 mgr = (WfdSink管理器) context.getSystemService(Context.WFD_SINK_SERVICE);

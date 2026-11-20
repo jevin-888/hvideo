@@ -19,9 +19,10 @@ namespace hsvj {
 /** 音源类型：谁在向 AudioPlayer 写数据 */
 enum class AudioFocusSource {
   NONE = -1,
-  VIDEO = 0,     /** 视频解码器（任意图层） */
-  AUDIO_ONLY = 1, /** 纯音频管线（.wav/.mp3 等） */
-  MIRROR = 2     /** USB/scrcpy 投屏音频 */
+  VIDEO = 0,     /** Video decoder audio */
+  AUDIO_ONLY = 1, /** Audio-only pipeline */
+  MIRROR = 2,    /** USB/scrcpy mirror audio */
+  EXTERNAL_BLUETOOTH = 3 /** System Bluetooth A2DP Sink audio */
 };
 
 /**
@@ -58,6 +59,17 @@ public:
                           int32_t channelCount = 2,
                           int32_t format = AAUDIO_FORMAT_PCM_I16,
                           int32_t deviceId = AAUDIO_UNSPECIFIED);
+    /**
+     * Initialize/reinitialize only when the given source and layer currently own
+     * the selected audio route. This prevents background layers from replacing
+     * the shared stream with a different sample rate.
+     */
+    bool ensureInitializedForLayer(AudioFocusSource source,
+                                   int layerId,
+                                   int32_t sampleRate,
+                                   int32_t channelCount = 2,
+                                   int32_t format = AAUDIO_FORMAT_PCM_I16,
+                                   int32_t deviceId = AAUDIO_UNSPECIFIED);
     
     /**
      * @brief 关闭全局 AudioPlayer
@@ -67,11 +79,16 @@ public:
     /** 规则 A：请求音频焦点，后请求者获得焦点，前一音源失去焦点 */
     void requestFocus(AudioFocusSource source);
     /** 恢复焦点（reinit 后使用，不增加引用计数，因本解码器从未 release） */
-    void restoreFocus(AudioFocusSource source);
+    bool restoreFocus(AudioFocusSource source);
     /** 释放当前音源的焦点（仅当当前持有者是自己时清除） */
     void releaseFocus(AudioFocusSource source);
     /** 当前是否由该音源持有焦点 */
     bool hasFocus(AudioFocusSource source) const;
+
+    /** Idempotently blocks or releases local audio output for system Bluetooth A2DP Sink. */
+    void setExternalBluetoothAudioActive(bool active);
+    /** Single source of truth for blocking local playback while A2DP Sink owns audio. */
+    bool isExternalBluetoothAudioActive() const;
 
     /**
      * @brief 设置当前 MIRROR 音源绑定的图层 ID
@@ -88,6 +105,13 @@ public:
     int getCurrentAudioLayerId() const;
     /** @brief 该图层是否允许向全局 AudioPlayer 写入（用于多图层时只播一个声音，避免卡顿） */
     bool hasAudioFocusForLayer(int layerId) const;
+    /** Shared PCM timeline identity; changes on route or stream replacement. */
+    uint64_t getAudioClockGeneration() const;
+
+    /** 写入指定图层的 PCM，并返回本次写入对应的音频时钟代次。 */
+    int32_t writeForLayer(AudioFocusSource source, int layerId,
+                          const void* data, int32_t numFrames,
+                          uint64_t* acceptedGeneration = nullptr);
 
     // 禁止拷贝和赋值
     AudioPlayerManager(const AudioPlayerManager&) = delete;
@@ -98,7 +122,14 @@ private:
     ~AudioPlayerManager() = default;
 
     int& refCountForSourceLocked(AudioFocusSource source);
+    AudioFocusSource chooseFallbackFocusLocked(AudioFocusSource releasedSource) const;
     void applyQueuePolicyLocked(AudioFocusSource source);
+    void invalidatePcmRouteLocked();
+    void setFocusOwnerLocked(AudioFocusSource source);
+    bool ensureInitializedLocked(int32_t sampleRate,
+                                 int32_t channelCount,
+                                 int32_t format,
+                                 int32_t deviceId);
     
     std::unique_ptr<AudioPlayer> audioPlayer_;
     mutable std::mutex mutex_; // 保护 audioPlayer_ 的创建/销毁和音源引用计数
@@ -111,10 +142,14 @@ private:
     int audioOnlyRefCount_ = 0;
     /** MIRROR 音源引用数：USB/scrcpy 投屏 raw PCM */
     int mirrorRefCount_ = 0;
+    std::atomic<bool> externalBluetoothAudioActive_{false};
+    int externalBluetoothRefCount_ = 0;
     /** 当前 USB/scrcpy 音频绑定的 MIRROR 图层 ID；由启动投屏时注册，避免写死 layer31 */
     std::atomic<int> mirrorAudioLayerId_{0};
     /** 当前允许输出音频的图层 ID；0=未指定；多图层同时播放时仅该图层写入，避免双路混写卡顿 */
     std::atomic<int> currentAudioLayerId_{0}; // 原子变量，热路径无锁读取
+    /** Decoder audio clocks are valid only for this shared-player generation. */
+    std::atomic<uint64_t> audioClockGeneration_{1};
 };
 
 } // 命名空间 hsvj

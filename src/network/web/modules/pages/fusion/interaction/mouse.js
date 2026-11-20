@@ -5,7 +5,6 @@ import {
     drawGridScene,
     getCanvasRegionPreviewLayouts,
     hitTestTransformedMaskPoint,
-    outputScreenToRegionLocal,
     outputScreenToGeometryPoint,
     regionPointToOutputScreen,
     screenToTransformedMaskCanvasPoint

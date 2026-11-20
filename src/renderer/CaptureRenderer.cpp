@@ -11,7 +11,6 @@
 #include "utils/Logger.h"
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <limits>
 #include <vector>
 
@@ -27,197 +26,6 @@ constexpr uint32_t kFmtBGR3 = 0x33524742;
 constexpr int kRecoveryDropFrames = 30;
 constexpr int64_t kSignalLossMs = 12000;
 
-struct ContentCropHint {
-  bool enabled = false;
-  int left = 0;
-  int right = 0;
-  int darkLeft = 0;
-  int darkRight = 0;
-};
-
-struct ActiveLumaStats {
-  bool valid = false;
-  int minY = 0;
-  int maxY = 0;
-  int avgY = 0;
-  int high220Permille = 0;
-  int high235Permille = 0;
-  int clipped252Permille = 0;
-  int edgeAvg = 0;
-  int samples = 0;
-};
-
-void alignCropToChromaPairs(ContentCropHint &hint, int frameWidth) {
-  if (!hint.enabled || frameWidth <= 0) {
-    return;
-  }
-  hint.left = std::clamp(hint.left & ~1, 0, frameWidth);
-  hint.right = std::clamp((hint.right + 1) & ~1, 0, frameWidth);
-  if (hint.right <= hint.left + 2) {
-    hint.enabled = false;
-    hint.left = 0;
-    hint.right = frameWidth;
-  }
-}
-
-bool isMostlyDarkColumn(const uint8_t *yPlane, int stride, int height,
-                        int x, int stepY, int threshold, int minPermille,
-                        int *outDarkPermille = nullptr) {
-  if (!yPlane || stride <= 0 || height <= 0 || x < 0 || stepY <= 0) {
-    return false;
-  }
-  int samples = 0;
-  int dark = 0;
-  for (int y = 0; y < height; y += stepY) {
-    if (yPlane[static_cast<size_t>(y) * stride + x] <= threshold) {
-      ++dark;
-    }
-    ++samples;
-  }
-  if (samples <= 0) {
-    return false;
-  }
-  const int darkPermille = (dark * 1000) / samples;
-  if (outDarkPermille) {
-    *outDarkPermille = darkPermille;
-  }
-  return darkPermille >= minPermille;
-}
-
-ContentCropHint detectNv12SideBars(const CaptureFrame &frame) {
-  ContentCropHint hint;
-  if ((frame.format != kFmtNV12 && frame.format != kFmtNV16) || !frame.data ||
-      frame.width < 640 || frame.height < 360 ||
-      frame.stride < frame.width) {
-    return hint;
-  }
-
-  const size_t yPlaneBytes =
-      static_cast<size_t>(frame.stride) * static_cast<size_t>(frame.height);
-  if (frame.size > 0 && frame.size < yPlaneBytes) {
-    return hint;
-  }
-
-  const uint8_t *yPlane = static_cast<const uint8_t *>(frame.data);
-  const int stepX = std::max(2, frame.width / 480);
-  const int stepY = std::max(2, frame.height / 240);
-  const int maxScan = std::max(1, frame.width / 2 - stepX);
-  constexpr int kDarkThreshold = 24;
-  constexpr int kDarkColumnPermille = 930;
-  const int minBarWidth = std::max(24, frame.width / 32);
-
-  int left = 0;
-  int lastLeftDark = 0;
-  for (int x = 0; x < maxScan; x += stepX) {
-    int dark = 0;
-    if (!isMostlyDarkColumn(yPlane, frame.stride, frame.height, x, stepY,
-                            kDarkThreshold, kDarkColumnPermille, &dark)) {
-      break;
-    }
-    lastLeftDark = dark;
-    left = x + stepX;
-  }
-
-  int right = frame.width;
-  int lastRightDark = 0;
-  for (int x = frame.width - 1; x >= frame.width - maxScan; x -= stepX) {
-    int dark = 0;
-    if (!isMostlyDarkColumn(yPlane, frame.stride, frame.height, x, stepY,
-                            kDarkThreshold, kDarkColumnPermille, &dark)) {
-      break;
-    }
-    lastRightDark = dark;
-    right = x;
-  }
-
-  left = std::max(0, std::min(left, frame.width));
-  right = std::max(0, std::min(right, frame.width));
-  const int activeWidth = right - left;
-  if (left >= minBarWidth && frame.width - right >= minBarWidth &&
-      activeWidth >= frame.width / 4 && activeWidth < frame.width) {
-    hint.enabled = true;
-    hint.left = left;
-    hint.right = right;
-    hint.darkLeft = lastLeftDark;
-    hint.darkRight = lastRightDark;
-    alignCropToChromaPairs(hint, frame.width);
-  }
-  return hint;
-}
-
-ActiveLumaStats sampleActiveNv12LumaStats(const CaptureFrame &frame, int left,
-                                          int right) {
-  ActiveLumaStats stats;
-  if ((frame.format != kFmtNV12 && frame.format != kFmtNV16) || !frame.data ||
-      frame.width <= 0 || frame.height <= 0 ||
-      frame.stride < frame.width) {
-    return stats;
-  }
-
-  const size_t yPlaneBytes =
-      static_cast<size_t>(frame.stride) * static_cast<size_t>(frame.height);
-  if (frame.size > 0 && frame.size < yPlaneBytes) {
-    return stats;
-  }
-
-  left = std::clamp(left, 0, frame.width - 1);
-  right = std::clamp(right, left + 1, frame.width);
-  const int activeWidth = right - left;
-  const int stepX = std::max(1, activeWidth / 240);
-  const int stepY = std::max(1, frame.height / 240);
-  const uint8_t *yPlane = static_cast<const uint8_t *>(frame.data);
-
-  uint64_t sum = 0;
-  uint64_t high220 = 0;
-  uint64_t high235 = 0;
-  uint64_t clipped252 = 0;
-  uint64_t edgeSum = 0;
-  uint64_t edgeSamples = 0;
-  uint64_t samples = 0;
-  int minY = 255;
-  int maxY = 0;
-
-  for (int yy = 0; yy < frame.height; yy += stepY) {
-    const uint8_t *row = yPlane + static_cast<size_t>(yy) * frame.stride;
-    for (int xx = left; xx < right; xx += stepX) {
-      const int value = row[xx];
-      minY = std::min(minY, value);
-      maxY = std::max(maxY, value);
-      sum += static_cast<uint64_t>(value);
-      high220 += value >= 220 ? 1u : 0u;
-      high235 += value >= 235 ? 1u : 0u;
-      clipped252 += value >= 252 ? 1u : 0u;
-      ++samples;
-
-      const int nextX = xx + stepX;
-      if (nextX < right) {
-        edgeSum += static_cast<uint64_t>(std::abs(value - row[nextX]));
-        ++edgeSamples;
-      }
-      const int nextY = yy + stepY;
-      if (nextY < frame.height) {
-        const uint8_t *nextRow =
-            yPlane + static_cast<size_t>(nextY) * frame.stride;
-        edgeSum += static_cast<uint64_t>(std::abs(value - nextRow[xx]));
-        ++edgeSamples;
-      }
-    }
-  }
-
-  if (samples == 0) {
-    return stats;
-  }
-  stats.valid = true;
-  stats.minY = minY;
-  stats.maxY = maxY;
-  stats.avgY = static_cast<int>(sum / samples);
-  stats.high220Permille = static_cast<int>((high220 * 1000) / samples);
-  stats.high235Permille = static_cast<int>((high235 * 1000) / samples);
-  stats.clipped252Permille = static_cast<int>((clipped252 * 1000) / samples);
-  stats.edgeAvg = edgeSamples > 0 ? static_cast<int>(edgeSum / edgeSamples) : 0;
-  stats.samples = static_cast<int>(samples);
-  return stats;
-}
 }
 
 CaptureRenderer::CaptureRenderer() {}
@@ -236,8 +44,16 @@ bool CaptureRenderer::initialize(VulkanRenderer *renderer,
 }
 
 void CaptureRenderer::setV4L2Capture(V4L2Capture *capture) {
-  if (renderer_) {
-    renderer_->flushDeferredFrameFenceCallbacks();
+  bool hadPreviousCapture = false;
+  {
+    std::lock_guard<std::mutex> lock(frameMutex_);
+    if (v4l2Capture_ == capture) {
+      return;
+    }
+    hadPreviousCapture = v4l2Capture_ != nullptr;
+  }
+  if (renderer_ && hadPreviousCapture) {
+    renderer_->flushDeferredFrameFenceCallbacks("V4L2 capture switch");
   }
   std::lock_guard<std::mutex> lock(frameMutex_);
   if (v4l2Capture_) {
@@ -266,7 +82,6 @@ void CaptureRenderer::setV4L2Capture(V4L2Capture *capture) {
     hasLastSequence_ = false;
     recoveringFromSignalLoss_ = false;
     recoveryDropFramesRemaining_ = 0;
-    resetContentCropStateLocked();
   }
   v4l2Capture_ = capture;
 }
@@ -325,9 +140,6 @@ void CaptureRenderer::drainDeferredReleases(bool force) {
 }
 
 void CaptureRenderer::shutdown() {
-  if (renderer_) {
-    renderer_->flushDeferredFrameFenceCallbacks();
-  }
   setV4L2Capture(nullptr);
   if (!renderer_) return;
   {
@@ -348,8 +160,6 @@ void CaptureRenderer::shutdown() {
 }
 
 void CaptureRenderer::onCaptureFrame(const CaptureFrame &frame) {
-  updateContentCropFromFrame(frame);
-
   std::lock_guard<std::mutex> lock(frameMutex_);
 
   // [Buffer-Ownership Fix] 收到新帧 → 标记为本类持有。
@@ -379,173 +189,6 @@ void CaptureRenderer::onCaptureFrame(const CaptureFrame &frame) {
   hasSignal_ = true;
 }
 
-void CaptureRenderer::updateContentCropFromFrame(const CaptureFrame &frame) {
-  const ContentCropHint hint = detectNv12SideBars(frame);
-  const bool candidateEnabled = hint.enabled;
-  const int candidateLeft = candidateEnabled ? hint.left : 0;
-  const int candidateRight = candidateEnabled ? hint.right : frame.width;
-  const int frameWidth = std::max(1, frame.width);
-
-  bool changed = false;
-  bool committedEnabled = false;
-  int committedLeft = 0;
-  int committedRight = frameWidth;
-  int stableFrames = 0;
-  {
-    std::lock_guard<std::mutex> lock(frameMutex_);
-    const int leftDiff = contentCropCandidateLeft_ > candidateLeft
-                             ? contentCropCandidateLeft_ - candidateLeft
-                             : candidateLeft - contentCropCandidateLeft_;
-    const int rightDiff = contentCropCandidateRight_ > candidateRight
-                              ? contentCropCandidateRight_ - candidateRight
-                              : candidateRight - contentCropCandidateRight_;
-    const bool sameCandidate =
-        contentCropCandidateEnabled_ == candidateEnabled &&
-        contentCropCandidateFrameWidth_ == frameWidth && leftDiff <= 8 &&
-        rightDiff <= 8;
-
-    if (sameCandidate) {
-      ++contentCropCandidateStableFrames_;
-      if (candidateEnabled) {
-        // 说明：固定第一条稳定边缘，避免与文字边缘求平均。
-        contentCropCandidateLeft_ =
-            (contentCropCandidateLeft_ * 3 + candidateLeft) / 4;
-        contentCropCandidateRight_ =
-            (contentCropCandidateRight_ * 3 + candidateRight) / 4;
-      }
-    } else {
-      contentCropCandidateEnabled_ = candidateEnabled;
-      contentCropCandidateLeft_ = candidateLeft;
-      contentCropCandidateRight_ = candidateRight;
-      contentCropCandidateFrameWidth_ = frameWidth;
-      contentCropCandidateStableFrames_ = 1;
-    }
-
-    stableFrames = contentCropCandidateStableFrames_;
-    const bool haveCommitted =
-        hasContentCrop_ == candidateEnabled &&
-        contentCropCommittedFrameWidth_ == frameWidth;
-    const int committedLeftDiff = contentCropCommittedLeft_ > contentCropCandidateLeft_
-                                      ? contentCropCommittedLeft_ - contentCropCandidateLeft_
-                                      : contentCropCandidateLeft_ - contentCropCommittedLeft_;
-    const int committedRightDiff = contentCropCommittedRight_ > contentCropCandidateRight_
-                                       ? contentCropCommittedRight_ - contentCropCandidateRight_
-                                       : contentCropCandidateRight_ - contentCropCommittedRight_;
-    const bool materiallyDifferent =
-        !haveCommitted || committedLeftDiff > 16 || committedRightDiff > 16;
-    const int requiredStableFrames = hasContentCrop_ ? 60 : 30;
-
-    if (stableFrames >= requiredStableFrames && materiallyDifferent) {
-      const bool enabled = contentCropCandidateEnabled_;
-      const int left = enabled ? contentCropCandidateLeft_ : 0;
-      const int right = enabled ? contentCropCandidateRight_ : frameWidth;
-      const float x = enabled ? static_cast<float>(left) /
-                                    static_cast<float>(frameWidth)
-                              : 0.0f;
-      const float w = enabled ? static_cast<float>(right - left) /
-                                    static_cast<float>(frameWidth)
-                              : 1.0f;
-      changed = hasContentCrop_ != enabled ||
-                std::fabs(contentCropX_ - x) > 0.002f ||
-                std::fabs(contentCropW_ - w) > 0.002f;
-      hasContentCrop_ = enabled;
-      contentCropX_ = x;
-      contentCropY_ = 0.0f;
-      contentCropW_ = w;
-      contentCropH_ = 1.0f;
-      contentCropCommittedLeft_ = left;
-      contentCropCommittedRight_ = right;
-      contentCropCommittedFrameWidth_ = frameWidth;
-    }
-
-    committedEnabled = hasContentCrop_;
-    committedLeft = contentCropCommittedLeft_;
-    committedRight = contentCropCommittedRight_;
-  }
-
-  const bool logDue = changed || (++contentCropLogCounter_ % 3600) == 0;
-  if (logDue) {
-    const int sampleLeft =
-        committedEnabled ? committedLeft : (candidateEnabled ? candidateLeft : 0);
-    const int sampleRight = committedEnabled
-                                ? committedRight
-                                : (candidateEnabled ? candidateRight : frameWidth);
-    const ActiveLumaStats yStats =
-        sampleActiveNv12LumaStats(frame, sampleLeft, sampleRight);
-    if (committedEnabled) {
-      LOG_INFO("[采集][有效区域] side-bars crop stable seq=%d frame=%dx%d "
-               "left=%d right=%d active=%d candStable=%d dark(L=%d R=%d) "
-               "activeY[min=%d max=%d avg=%d hi220=%d hi235=%d clip252=%d edge=%d samples=%d]",
-               frame.sequence, frame.width, frame.height, committedLeft,
-               frame.width - committedRight, committedRight - committedLeft,
-               stableFrames, hint.darkLeft, hint.darkRight,
-               yStats.valid ? yStats.minY : -1,
-               yStats.valid ? yStats.maxY : -1,
-               yStats.valid ? yStats.avgY : -1,
-               yStats.valid ? yStats.high220Permille : -1,
-               yStats.valid ? yStats.high235Permille : -1,
-               yStats.valid ? yStats.clipped252Permille : -1,
-               yStats.valid ? yStats.edgeAvg : -1,
-               yStats.valid ? yStats.samples : 0);
-    } else if (changed) {
-      LOG_INFO("[采集][有效区域] side-bars crop disabled seq=%d frame=%dx%d stable=%d",
-               frame.sequence, frame.width, frame.height, stableFrames);
-    } else {
-      LOG_DEBUG("[采集][有效区域] no side-bars crop seq=%d frame=%dx%d "
-                "candStable=%d activeY[min=%d max=%d avg=%d hi220=%d "
-                "hi235=%d clip252=%d edge=%d samples=%d]",
-                frame.sequence, frame.width, frame.height, stableFrames,
-                yStats.valid ? yStats.minY : -1,
-                yStats.valid ? yStats.maxY : -1,
-                yStats.valid ? yStats.avgY : -1,
-                yStats.valid ? yStats.high220Permille : -1,
-                yStats.valid ? yStats.high235Permille : -1,
-                yStats.valid ? yStats.clipped252Permille : -1,
-                yStats.valid ? yStats.edgeAvg : -1,
-                yStats.valid ? yStats.samples : 0);
-    }
-  }
-}
-
-void CaptureRenderer::resetContentCropStateLocked() {
-  hasContentCrop_ = false;
-  contentCropX_ = 0.0f;
-  contentCropY_ = 0.0f;
-  contentCropW_ = 1.0f;
-  contentCropH_ = 1.0f;
-  contentCropCandidateEnabled_ = false;
-  contentCropCandidateLeft_ = 0;
-  contentCropCandidateRight_ = 0;
-  contentCropCandidateFrameWidth_ = 0;
-  contentCropCandidateStableFrames_ = 0;
-  contentCropCommittedLeft_ = 0;
-  contentCropCommittedRight_ = 0;
-  contentCropCommittedFrameWidth_ = 0;
-}
-
-void CaptureRenderer::applyContentCropToTexture(uint32_t textureId) {
-#ifdef __ANDROID__
-  if (!renderer_ || textureId == 0) {
-    return;
-  }
-  bool enabled = false;
-  float x = 0.0f;
-  float y = 0.0f;
-  float w = 1.0f;
-  float h = 1.0f;
-  {
-    std::lock_guard<std::mutex> lock(frameMutex_);
-    enabled = hasContentCrop_;
-    x = contentCropX_;
-    y = contentCropY_;
-    w = contentCropW_;
-    h = contentCropH_;
-  }
-  renderer_->setTextureContentCrop(textureId, enabled, x, y, w, h);
-#else
-  (void)textureId;
-#endif
-}
 
 bool CaptureRenderer::updateTexture() {
   if (!renderer_ || !v4l2Capture_) return false;
@@ -641,6 +284,7 @@ bool CaptureRenderer::updateTexture() {
   }
 
   if (textureUpdated_ && updatedTextureId_ != 0) {
+    renderer_->setTextureContentCrop(updatedTextureId_, cropEnabled_, cropX_, cropY_, cropW_, cropH_, true);
     if (++busyReuseCount_ <= 3 || (busyReuseCount_ % 300) == 0) {
       LOG_WARN("[采集][Renderer] DMA-BUF update skipped/failed, keep previous texture (count=%u)",
                busyReuseCount_);
@@ -742,7 +386,6 @@ void CaptureRenderer::enterRecoveryModeLocked(const char *reason) {
   }
   recoveringFromSignalLoss_ = true;
   recoveryDropFramesRemaining_ = kRecoveryDropFrames;
-  resetContentCropStateLocked();
 }
 
 bool CaptureRenderer::takeNextFrame(FrameCache &frameCache) {
@@ -788,7 +431,6 @@ bool CaptureRenderer::updateTextureFromDmaBuf(const FrameCache &frameCache, uint
                                          frameCache.width, frameCache.height,
                                          frameCache.format, frameCache.stride,
                                          frameCache.vStride, true)) {
-    applyContentCropToTexture(textureId);
     markTextureUpdated(textureId);
     return true;
   }
@@ -806,20 +448,20 @@ bool CaptureRenderer::render(float x, float y, float width, float height,
                              float rotation, float scale, float alpha,
                              int shapeType, float shapeParam,
                              bool blackToTransparent, int invert,
-                             int fitMode) {
+                             float gaussianBlur, int fitMode) {
   if (!renderer_) return false;
 
   if (textureUpdated_ && updatedTextureId_ != 0) {
     renderer_->renderLayer(updatedTextureId_, static_cast<int>(x), static_cast<int>(y),
                            static_cast<int>(width), static_cast<int>(height),
                            rotation, scale, alpha, nullptr, shapeType, shapeParam,
-                           blackToTransparent, invert, 0.0f, fitMode);
+                           blackToTransparent, invert, gaussianBlur, fitMode);
     return true;
   }
 
   // 无信号渲染黑色占位
   renderBlackTexture(x, y, width, height, rotation, scale, alpha, shapeType, shapeParam,
-                     blackToTransparent, invert, fitMode);
+                     blackToTransparent, invert, gaussianBlur, fitMode);
   return false;
 }
 
@@ -865,17 +507,12 @@ bool CaptureRenderer::hasNewFrame() const {
 
 void CaptureRenderer::clearFrameCache(bool clearTextureState) {
   std::lock_guard<std::mutex> lock(frameMutex_);
-  if (v4l2Capture_) {
-    drainDeferredReleases(true);
-    if (frameCache_.hasNewFrame && frameCache_.bufferIndex >= 0) {
-      safeReleaseFrame(frameCache_.bufferIndex);
-    }
-    // 兜底：归还所有 ownership 表里的残留
-    for (int i = 0; i < kMaxV4L2Buffers; ++i) {
-      if (bufferOwned_[i]) {
-        safeReleaseFrame(i);
-      }
-    }
+
+  // Only a frame still waiting in frameCache_ is safe to return here. A frame
+  // already submitted to Vulkan remains owned until its frame-fence callback;
+  // returning every buffer during a scene hide races V4L2 against the GPU.
+  if (v4l2Capture_ && frameCache_.hasNewFrame && frameCache_.bufferIndex >= 0) {
+    safeReleaseFrame(frameCache_.bufferIndex);
   }
   frameCache_.hasNewFrame = false;
   frameCache_.bufferIndex = -1;
@@ -884,7 +521,6 @@ void CaptureRenderer::clearFrameCache(bool clearTextureState) {
     updatedTextureId_ = 0;
     textureUpdateSerial_.store(0, std::memory_order_release);
     hasSignal_ = false;
-    resetContentCropStateLocked();
   }
 }
 
@@ -915,18 +551,23 @@ void CaptureRenderer::renderBlackTexture(float x, float y, float width, float he
                                          float rotation, float scale, float alpha,
                                          int shapeType, float shapeParam,
                                          bool blackToTransparent, int invert,
-                                         int fitMode) {
+                                         float gaussianBlur, int fitMode) {
   if (!renderer_ || !blackTextureCreated_ || blackTextureId_ == 0) return;
+  renderer_->setTextureContentCrop(blackTextureId_, cropEnabled_, cropX_, cropY_, cropW_, cropH_, true);
   renderer_->renderLayer(blackTextureId_, static_cast<int>(x), static_cast<int>(y),
                          static_cast<int>(width), static_cast<int>(height),
                          rotation, scale, alpha, nullptr, shapeType, shapeParam,
-                         blackToTransparent, invert, 0.0f, fitMode);
+                         blackToTransparent, invert, gaussianBlur, fitMode);
 }
 
 void CaptureRenderer::dropStaleGpuTextureHandles() {
+  std::lock_guard<std::mutex> lock(frameMutex_);
   for (int i = 0; i < kMaxV4L2Buffers; i++) textureIds_[i] = 0;
   blackTextureId_ = 0;
   blackTextureCreated_ = false;
+  textureUpdated_ = false;
+  updatedTextureId_ = 0;
+  textureUpdateSerial_.store(0, std::memory_order_release);
 }
 
 } // 命名空间 hsvj

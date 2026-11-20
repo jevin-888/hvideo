@@ -8,7 +8,6 @@
 package com.hsvj.engine.resource;
 
 import com.hsvj.engine.HuoshanStorageRepair;
-import com.hsvj.engine.StartupConfig;
 
 import android.content.Context;
 import android.content.res.AssetManager;
@@ -38,9 +37,6 @@ import java.util.Set;
  */
 public class IncrementalUpdater {
     private static final String TAG = "IncrementalUpdater";
-    private static final String[] REQUIRED_EXTRACTED_ASSETS = {
-            "web/index.html"
-    };
 
     // 磁盘容量保护：目标分区至少保留 100MB 才允许资源同步
     private static final long DISK_RESERVE_BYTES = 100L * 1024 * 1024;
@@ -160,6 +156,13 @@ public class IncrementalUpdater {
                 // 比较并更新资源
                 Log.i(TAG, "[增量更新] 步骤3/4: 比较清单并更新变更文件");
                 result = compareAndUpdate(existingManifest, newManifest, classifier);
+
+                // Never mark a partial classifier scan as a complete Web installation.
+                if (result.success && hasDamagedWebResources("web")) {
+                    result.success = false;
+                    result.failedFiles++;
+                    result.errorMessage = "Web 资源修复后完整性校验失败";
+                }
                 
                 // 保存新清单
                 if (result.success) {
@@ -234,25 +237,28 @@ public class IncrementalUpdater {
                 // 否则源码改动后无法自动同步到设备。
                 
                 for (ResourceClassifier.ResourceInfo resource : classifier.getResourcesByPriority(priority)) {
-                    if (!resource.isDirectory) {
+                    if (!resource.isDirectory && !resource.assetPath.startsWith("web/")) {
                         // 检查线程中断标志，支持超时退出
-                        if (Thread.interrupted()) {
-                            Log.w(TAG, "[增量更新] 扫描被中断（可能已超时），停止处理");
-                            return manifest;
+                        if (Thread.currentThread().isInterrupted()) {
+                            throw new IOException("资源扫描被中断，禁止保存或使用不完整清单");
                         }
                         
                         String hash = calculateAssetHash(resource.assetPath);
                         if (hash != null) {
                             manifest.fileHashes.put(resource.assetPath, hash);
+                        } else {
+                            throw new IOException("无法校验 APK 资源: " + resource.assetPath);
                         }
                     }
                 }
             }
             
+            // Web inventory comes directly from the APK, even if classification was partial.
+            collectWebHashes("web", manifest.fileHashes);
             Log.i(TAG, String.format("新清单创建完成: %d 个文件", manifest.fileHashes.size()));
             
         } catch (Exception e) {
-            Log.e(TAG, "创建新清单失败", e);
+            throw new IllegalStateException("创建新清单失败，停止同步", e);
         }
         
         return manifest;
@@ -275,7 +281,29 @@ public class IncrementalUpdater {
                 continue;
             }
             
-            if (existingHash == null) {
+            if (assetPath.startsWith("web/")) {
+                File targetFile = new File(getTargetPath(assetPath, classifier));
+                try {
+                    if (WebResourceFile.matches(targetFile, newHash)) {
+                        unchangedCount++;
+                    } else {
+                        boolean missing = !targetFile.exists();
+                        Log.w(TAG, "Web 资源缺失或损坏，自动修复: " + assetPath);
+                        if (copyAssetFile(assetPath, classifier)) {
+                            if (missing) result.addedFiles++;
+                            else result.updatedFiles++;
+                        } else {
+                            result.failedFiles++;
+                        }
+                    }
+                    processedFiles.add(assetPath);
+                } catch (IOException e) {
+                    result.success = false;
+                    result.failedFiles++;
+                    result.errorMessage = e.getMessage();
+                    return result;
+                }
+            } else if (existingHash == null) {
                 if (copyAssetFile(assetPath, classifier)) {
                     result.addedFiles++;
                     processedFiles.add(assetPath);
@@ -384,6 +412,16 @@ public class IncrementalUpdater {
     }
 
     private void writeAssetToFile(String assetPath, File targetFile) throws IOException {
+        if (assetPath.startsWith("web/")) {
+            String expectedHash = calculateAssetHash(assetPath);
+            if (expectedHash == null) {
+                throw new IOException("无法校验 APK Web 资源: " + assetPath);
+            }
+            try (InputStream input = assetManager.open(assetPath)) {
+                WebResourceFile.install(input, targetFile, expectedHash);
+            }
+            return;
+        }
         try (InputStream inputStream = assetManager.open(assetPath);
              FileOutputStream outputStream = new FileOutputStream(targetFile)) {
             byte[] buffer = new byte[8192];
@@ -457,12 +495,15 @@ public class IncrementalUpdater {
     
     /**
      * 计算Asset文件的哈希值
-     * 优化：对于大文件（>1MB），只计算前512KB的哈希以加速处理
+     * Web 使用完整 SHA-256；其他资源沿用前 512KB 的 MD5。
      */
     private String calculateAssetHash(String assetPath) {
         InputStream inputStream = null;
         try {
             inputStream = assetManager.open(assetPath);
+            if (assetPath.startsWith("web/")) {
+                return WebResourceFile.hash(inputStream);
+            }
             MessageDigest md = MessageDigest.getInstance("MD5");
             
             byte[] buffer = new byte[8192];
@@ -561,7 +602,7 @@ public class IncrementalUpdater {
     
     /**
      * 检查是否需要增量更新。
-     * [HSVJ_Optimization] 只有当 APK 最后更新时间变了，才发起 MD5 深度比对，否则快速通过。
+     * APK 未更新时仍逐文件校验 Web，不能把清单一致视为磁盘内容完整。
      */
     public boolean needsIncrementalUpdate() {
         try {
@@ -583,7 +624,7 @@ public class IncrementalUpdater {
                 Log.i(TAG, "应用版本变化，需要重新同步: old=" + existing.appVersion + ", new=" + currentAppVersion);
                 return true;
             }
-            if (hasMissingRequiredExtractedAssets()) {
+            if (hasDamagedWebResources("web")) {
                 return true;
             }
             // 获取 APK 的最后安装/更新时间
@@ -595,7 +636,7 @@ public class IncrementalUpdater {
                 return true;
             }
             
-            Log.i(TAG, "APK 版本未变且关键延后资源完整，使用现有资产缓存");
+            Log.i(TAG, "APK 版本未变且全部 Web 资源 SHA-256 校验通过，使用现有资产缓存");
             return false;
             
         } catch (Exception e) {
@@ -638,23 +679,27 @@ public class IncrementalUpdater {
                 .versionName;
     }
 
-    private boolean hasMissingRequiredExtractedAssets() {
-        String normalizedRoot = normalizeRootPath(targetRootPath);
-        for (String assetPath : REQUIRED_EXTRACTED_ASSETS) {
-            File targetFile = new File(normalizedRoot + assetPath);
-            if (!targetFile.exists() || targetFile.length() <= 0) {
-                Log.i(TAG, "检测到必需资源缺失，需要重新同步: " + targetFile.getAbsolutePath());
-                return true;
+    private void collectWebHashes(String assetPath, Map<String, String> hashes) throws IOException {
+        String[] children = assetManager.list(assetPath);
+        if (children != null && children.length > 0) {
+            for (String child : children) {
+                collectWebHashes(assetPath + "/" + child, hashes);
             }
+            return;
         }
+        // Read the APK itself rather than trusting a possibly stale/partial manifest.
+        try (InputStream source = assetManager.open(assetPath)) {
+            hashes.put(assetPath, WebResourceFile.hash(source));
+        }
+    }
 
-        for (String[] pair : StartupConfig.DEFERRED_ASSET_DIRS) {
-            if (!"web".equals(pair[0])) {
-                continue;
-            }
-            File targetDir = new File(normalizedRoot + pair[1]);
-            if (!targetDir.exists() || !targetDir.isDirectory()) {
-                Log.i(TAG, "检测到延后资源目录缺失，需要重新同步: " + targetDir.getAbsolutePath());
+    private boolean hasDamagedWebResources(String assetPath) throws IOException {
+        Map<String, String> hashes = new HashMap<>();
+        collectWebHashes(assetPath, hashes);
+        for (Map.Entry<String, String> entry : hashes.entrySet()) {
+            File target = new File(normalizeRootPath(targetRootPath) + entry.getKey());
+            if (!WebResourceFile.matches(target, entry.getValue())) {
+                Log.w(TAG, "启动校验发现 Web 资源缺失或损坏: " + target);
                 return true;
             }
         }

@@ -10,39 +10,12 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "[HSVJ-SAFE] Ultra safe optimizer started."
-HOTSPOT_SSID="HVIDEO"
-HOTSPOT_PASSWORD="88888888"
-HOTSPOT_STATUS_FILE="/data/local/tmp/hsvj_hotspot_status"
-HOTSPOT_HOSTAPD_CONF="/data/vendor/wifi/hostapd/hostapd_wlan0.conf"
-HOTSPOT_SSID_HEX="48564944454f"
 
 # ==============================================
 # SELinux 规则配置（不影响启动）
 # ==============================================
 configure_selinux_rules() {
-    echo "[HSVJ-SAFE] Configuring SELinux rules..."
-
-    if command -v supolicy >/dev/null 2>&1; then
-        supolicy --live \
-            "allow system_app video_device chr_file ioctl" \
-            "allow system_app video_device chr_file { read write open getattr }" \
-            "allow system_app mpp_device chr_file ioctl" \
-            "allow system_app mpp_device chr_file { read write open getattr }" \
-            "allow system_app gpu_device chr_file ioctl" \
-            "allow system_app gpu_device chr_file { read write open getattr }" \
-            2>/dev/null
-    fi
-
-    if [ "$(getenforce)" = "Enforcing" ]; then
-        setenforce 0
-    fi
-
-    for dev in /dev/mpp_service /dev/mpp-service /dev/rkvdec /dev/rkvenc /dev/vepu /dev/vpu_service /dev/dri/renderD128; do
-        if [ -e "$dev" ]; then
-            chmod 666 "$dev" 2>/dev/null
-            chown system:system "$dev" 2>/dev/null
-        fi
-    done
+    echo "[HSVJ-SAFE] SELinux and device access are managed by the H66_POR ROM policy."
 }
 
 # ==============================================
@@ -53,108 +26,6 @@ set_node_value() {
     local value="$2"
     [ -e "$node" ] || return 1
     echo "$value" > "$node" 2>/dev/null
-}
-
-get_debug_hotspot_ip() {
-    local ip_addr=""
-    for iface in wlan0 softap0 ap0; do
-        ip_addr="$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)"
-        [ -n "$ip_addr" ] && break
-    done
-    if [ -z "$ip_addr" ]; then
-        ip_addr="$(ip -4 -o addr show 2>/dev/null | awk '/wlan|softap|ap/ {print $4; exit}' | cut -d/ -f1)"
-    fi
-    echo "$ip_addr"
-}
-
-get_debug_hotspot_ssid() {
-    dumpsys wifi 2>/dev/null | awk -F'"' '/mApConfig\.SoftApConfiguration\.SSID/ {print $2; exit}'
-}
-
-sanitize_debug_hotspot_ssid() {
-    echo "$1" | tr -d '"'
-}
-
-is_debug_hotspot_quoted_in_hostapd() {
-    local ssid2
-    [ -f "$HOTSPOT_HOSTAPD_CONF" ] || return 1
-    ssid2="$(awk -F= '/^ssid2=/ {print $2; exit}' "$HOTSPOT_HOSTAPD_CONF" 2>/dev/null)"
-    [ "$ssid2" = "22${HOTSPOT_SSID_HEX}22" ]
-}
-
-is_debug_hotspot_unquoted_in_hostapd() {
-    local ssid2 ssid
-    [ -f "$HOTSPOT_HOSTAPD_CONF" ] || return 1
-    ssid2="$(awk -F= '/^ssid2=/ {print $2; exit}' "$HOTSPOT_HOSTAPD_CONF" 2>/dev/null)"
-    ssid="$(awk -F= '/^ssid=/ {print $2; exit}' "$HOTSPOT_HOSTAPD_CONF" 2>/dev/null)"
-    [ "$ssid2" = "$HOTSPOT_SSID_HEX" ] || [ "$ssid" = "$HOTSPOT_SSID" ]
-}
-
-write_debug_hotspot_status() {
-    local state="$1"
-    local ip_addr="$2"
-    local message="$3"
-    local ssid
-    ssid="$(sanitize_debug_hotspot_ssid "$HOTSPOT_SSID")"
-    {
-        echo "ssid=$ssid"
-        echo "ip=$ip_addr"
-        echo "state=$state"
-        echo "message=$message"
-        echo "updated_at=$(date '+%F %T' 2>/dev/null)"
-    } > "$HOTSPOT_STATUS_FILE" 2>/dev/null
-    chmod 666 "$HOTSPOT_STATUS_FILE" 2>/dev/null
-}
-
-configure_debug_hotspot() {
-    echo "[HSVJ-SAFE] Starting debug hotspot: ssid=$HOTSPOT_SSID"
-
-    if ! command -v cmd >/dev/null 2>&1; then
-        echo "[HSVJ-SAFE] Hotspot skipped: cmd command unavailable"
-        write_debug_hotspot_status "unavailable" "" "cmd command unavailable"
-        return 0
-    fi
-
-    if ! cmd wifi help 2>/dev/null | grep -q "start-softap"; then
-        echo "[HSVJ-SAFE] Hotspot skipped: wifi start-softap unsupported"
-        write_debug_hotspot_status "unsupported" "" "wifi start-softap unsupported"
-        return 0
-    fi
-
-    CURRENT_HOTSPOT_SSID="$(sanitize_debug_hotspot_ssid "$(get_debug_hotspot_ssid)")"
-    CURRENT_HOTSPOT_IP="$(get_debug_hotspot_ip)"
-    for wait_round in 1 2 3 4 5; do
-        if [ -n "$CURRENT_HOTSPOT_IP" ] && is_debug_hotspot_unquoted_in_hostapd; then
-            echo "[HSVJ-SAFE] Debug hotspot ready via Java manager: ssid=$HOTSPOT_SSID ip=$CURRENT_HOTSPOT_IP"
-            write_debug_hotspot_status "ready" "$CURRENT_HOTSPOT_IP" "Java SoftAP manager ready"
-            return 0
-        fi
-        [ "$wait_round" = "5" ] && break
-        sleep 2
-        CURRENT_HOTSPOT_SSID="$(sanitize_debug_hotspot_ssid "$(get_debug_hotspot_ssid)")"
-        CURRENT_HOTSPOT_IP="$(get_debug_hotspot_ip)"
-    done
-
-    if [ "$CURRENT_HOTSPOT_SSID" = "$HOTSPOT_SSID" ] && [ -n "$CURRENT_HOTSPOT_IP" ]; then
-        if is_debug_hotspot_quoted_in_hostapd; then
-            echo "[HSVJ-SAFE] Existing hotspot is quoted in hostapd config, stopping bad SSID"
-            cmd wifi stop-softap >/dev/null 2>&1
-            write_debug_hotspot_status "stopped_quoted" "" "quoted ssid stopped, Java SoftAP manager will restart"
-            return 0
-        fi
-        echo "[HSVJ-SAFE] Debug hotspot already ready: ssid=$HOTSPOT_SSID ip=$CURRENT_HOTSPOT_IP"
-        write_debug_hotspot_status "ready" "$CURRENT_HOTSPOT_IP" "already running"
-        return 0
-    fi
-    if [ -n "$CURRENT_HOTSPOT_SSID" ] && [ "$CURRENT_HOTSPOT_SSID" != "$HOTSPOT_SSID" ]; then
-        echo "[HSVJ-SAFE] Existing hotspot ssid=$CURRENT_HOTSPOT_SSID, restarting as $HOTSPOT_SSID"
-        cmd wifi stop-softap >/dev/null 2>&1
-        sleep 1
-    fi
-
-    echo "[HSVJ-SAFE] Hotspot start skipped in shell to avoid quoted SSID ROM bug"
-    write_debug_hotspot_status "pending_java" "" "Java SoftAP manager handles hotspot startup"
-    return 0
 }
 
 # ==============================================
@@ -184,7 +55,7 @@ lock_cpu_performance() {
         [ -d "$policy" ] || continue
         set_node_value "$policy/scaling_governor" performance
         MAX_FREQ="$(cat "$policy/cpuinfo_max_freq" 2>/dev/null)"
-        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$policy/scaling_available_frequencies" 2>/dev/null | awk '{print $NF}')"
+        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(tr ' ' '\n' < "$policy/scaling_available_frequencies" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $1 > max { max=$1 } END { if (max) print max }')"
         if [ -n "$MAX_FREQ" ]; then
             set_node_value "$policy/scaling_max_freq" "$MAX_FREQ"
             set_node_value "$policy/scaling_min_freq" "$MAX_FREQ"
@@ -206,8 +77,10 @@ lock_devfreq_performance() {
         esac
 
         set_node_value "$dev/governor" performance
-        MAX_FREQ="$(cat "$dev/max_freq" 2>/dev/null)"
-        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$dev/available_frequencies" 2>/dev/null | awk '{print $NF}')"
+        # available_frequencies is the hardware table. max_freq may already be
+        # temporarily reduced by thermal cooling when this script starts.
+        MAX_FREQ="$(tr ' ' '\n' < "$dev/available_frequencies" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $1 > max { max=$1 } END { if (max) print max }')"
+        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$dev/max_freq" 2>/dev/null)"
         if [ -n "$MAX_FREQ" ]; then
             set_node_value "$dev/max_freq" "$MAX_FREQ"
             set_node_value "$dev/min_freq" "$MAX_FREQ"
@@ -361,9 +234,9 @@ optimize_for_video() {
     setprop debug.hsvj.async_acquire_wait_fence off
     setprop debug.hsvj.surface_frame_rate on
 
-    # HSVJ Vulkan DRM_PRIME texture cache: cover RKMPP DMA-BUF ring without
-    # raising the global texture destruction threshold. Set to 0 to disable.
-    setprop debug.hsvj.drm_prime_cache 12
+    # Verified 4K DMA-BUF cache limit: keep one reusable DRM_PRIME texture.
+    # Larger values retain extra 4K buffers without improving presentation.
+    setprop debug.hsvj.drm_prime_cache 1
 
     # 日志降噪
     setprop log.tag.CompositionEngine WARN
@@ -411,21 +284,6 @@ optimize_io() {
         fi
     done
 
-    # 端口转发 80 -> 8080（绑定当前有效 IPv4，手机/微信访问不需要带 8080）
-    echo "[HSVJ-SAFE] Setting up port forwarding 80 -> 8080..."
-    while true; do
-        line="$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | awk '/tcp dpt:80 redir ports 8080/ {print $1; exit}')"
-        [ -n "$line" ] || break
-        iptables -t nat -D PREROUTING "$line" 2>/dev/null || break
-    done
-    configured=0
-    for ip in $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do
-        [ -n "$ip" ] || continue
-        iptables -t nat -I PREROUTING 1 -d "$ip"/32 -p tcp --dport 80 -j REDIRECT --to-port 8080
-        echo "[HSVJ-SAFE] Port forwarding configured for $ip"
-        configured=$((configured + 1))
-    done
-    [ "$configured" -gt 0 ] || echo "[HSVJ-SAFE] Port forwarding skipped: no global IPv4"
 }
 
 # ==============================================
@@ -472,7 +330,6 @@ echo "[HSVJ-SAFE] Starting ultra safe optimization..."
 
 configure_hwc_release_fence_timeline
 configure_selinux_rules
-configure_debug_hotspot
 lock_cpu_performance
 lock_devfreq_performance
 disable_ultra_safe_packages
@@ -493,7 +350,6 @@ echo "[HSVJ-SAFE]   ✓ Telephony/Radio services disabled"
 echo "[HSVJ-SAFE]   ✓ Video playback optimized"
 echo "[HSVJ-SAFE]   ✓ RK HWC display pipeline timeline requested"
 echo "[HSVJ-SAFE]   ✓ Memory/IO optimized"
-echo "[HSVJ-SAFE]   ✓ Port forwarding 80->8080 configured"
 echo "[HSVJ-SAFE]   ✓ RKNN/traced/statsd disabled"
 echo "[HSVJ-SAFE]   ✓ Studio screen sharing agent stopped"
 echo "[HSVJ-SAFE]   ✓ DRM_PRIME texture cache set to 12"

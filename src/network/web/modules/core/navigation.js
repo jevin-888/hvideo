@@ -10,15 +10,17 @@
 
 // 导入页面模块更新函数
 import { initializeStatusUpdate, cleanupStatusUpdate } from '../pages/systemStatus.js';
-import { initializeLayerMatrix, updateLayerMatrix } from '../pages/layerMatrix.js';
-import { updateSceneTemplates } from '../pages/sceneTemplates.js';
-import { initializeEffects, isEffectsLicenseDenied, stopAudioReactiveRefresh, syncEffectLicenseVisibility } from '../pages/effectControl.js?v=2.99';
-import { updateSettings } from '../pages/systemSettings.js?v=2.66';
+import { initializeLayerMatrix, updateLayerMatrix } from '../pages/layerMatrix.js?v=qr_address_2';
+import { initializeSceneTemplates, updateSceneTemplates } from '../pages/sceneTemplates.js?v=license_1';
+import { initializeEffects, isEffectsLicenseDenied, stopAudioReactiveRefresh, syncEffectLicenseVisibility } from '../pages/effectControl.js?v=3.00';
+import { updateSettings } from '../pages/systemSettings.js?v=2.95';
 import { initializeVideoControl, updateVideoControl } from '../pages/videoControl.js?v=2.98';
 import { updateMaterials } from '../features/materials.js';
 import { updatePlaylistList } from '../features/playlist.js';
-import { initializeFusionControl, refreshFusionControl } from '../pages/fusionControl.js?v=2.100';
-import { initializeProjectionCorrection, refreshProjectionCorrection } from '../pages/projectionCorrection.js?v=1.5';
+import { initializeFusionControl, refreshFusionControl } from '../pages/fusionControl.js?v=2.104';
+import { initializeProjectionCorrection, refreshProjectionCorrection } from '../pages/projectionCorrection.js?v=1.6';
+import { initializeStageControl, refreshStageControl } from '../pages/stageControl.js?v=1.0';
+import { isPageLicensed, refreshModuleLicense } from './moduleLicense.js';
 
 /** 当前活动页面标识 */
 let currentPage = 'system-status';
@@ -26,6 +28,7 @@ let layerMatrixInitialized = false;
 let videoControlInitialized = false;
 let fusionControlInitialized = false;
 let projectionCorrectionInitialized = false;
+let stageControlInitialized = false;
 
 /**
  * @brief 初始化页面导航
@@ -33,6 +36,9 @@ let projectionCorrectionInitialized = false;
  * 为所有菜单项添加点击事件监听器
  */
 export function initializeNavigation() {
+    window.addEventListener('moduleLicenseChanged', () => {
+        if (!isPageLicensed(currentPage)) showPage('system-status');
+    });
     const menuItems = document.querySelectorAll('.menu-item');
     menuItems.forEach(item => {
         item.addEventListener('click', function () {
@@ -47,6 +53,10 @@ export function initializeNavigation() {
  * @param {string} page 页面标识符
  */
 export async function showPage(page) {
+    if (!isPageLicensed(page)) {
+        await refreshModuleLicense();
+        if (!isPageLicensed(page)) page = 'system-status';
+    }
     if (page === 'effect-control') {
         const effectsEnabled = await syncEffectLicenseVisibility();
         if (!effectsEnabled || isEffectsLicenseDenied()) {
@@ -99,6 +109,7 @@ export async function showPage(page) {
             }
             break;
         case 'scene-template':
+            initializeSceneTemplates();
             updateSceneTemplates();
             break;
         case 'effect-control':
@@ -126,6 +137,15 @@ export async function showPage(page) {
             document.querySelector(`[data-page="${page}"]`)?.classList.add('active');
             document.getElementById(`${page}-page`)?.classList.add('active');
             break;
+        case 'stage-control':
+            if (!stageControlInitialized) {
+                await initializeStageControl();
+                stageControlInitialized = true;
+            } else {
+                await refreshStageControl();
+            }
+            break;
+
         case 'system-settings':
             updateSettings();
             break;

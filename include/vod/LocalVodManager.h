@@ -50,6 +50,9 @@ public:
      */
     std::vector<LocalVodDatabase::QueueItem> getSelectedQueue(int offset = 0, int limit = 200);
     bool getQueueItemById(int id, LocalVodDatabase::QueueItem& out);
+    bool getSongInfo(const std::string& songNo, LocalSongDatabase::SongInfo& out) {
+        return songDb_ && songDb_->getSongByNo(songNo, out);
+    }
     
     /**
      * @brief 获取已唱列表

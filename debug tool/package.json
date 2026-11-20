@@ -1,0 +1,17 @@
+{
+  "name": "debug-tool",
+  "version": "1.0.0",
+  "description": "HVIDEO 局域网设备调试客户端",
+  "private": true,
+  "scripts": {
+    "dev": "tauri dev",
+    "tauri": "tauri",
+    "build": "tauri build",
+    "build:nsis": "tauri build --bundles nsis",
+    "build:exe": "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/build-exe.ps1",
+    "test": "node --check public/js/app.js && node --check src-tauri/src/debug_navigation.js && node --check public/js/app-update.js && node --check public/js/system-update.js && node scripts/test-device-view.js && node scripts/test-app-update.js && node scripts/test-system-update.js && cargo test --manifest-path src-tauri/Cargo.toml"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^1.5.9"
+  }
+}

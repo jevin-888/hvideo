@@ -164,3 +164,37 @@ vendor/WifiDisplay_backup/libs/
 # Keep required wrapper and placeholders
 !gradle/wrapper/gradle-wrapper.jar
 !**/.gitkeep
+
+# Device-specific signing and remote-access configuration
+*.pk8
+*.p8
+*.p7b
+*.p7s
+/signing-runtime-staging*/
+/debug tool/signing-runtime-staging*/
+/debug tool/src-tauri/resources/signing-runtime.inputs.json
+/app/src/main/assets/frp/frpc.toml
+
+# Generated files and local audit history
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.unslop-audit*/
+.artifacts/
+/app/app/
+/app/src/main/AndroidManifest.xml.pre_fg_*
+/artifacts/
+/baseline/
+/bootchain_reference/
+/build_logs/
+/builds/
+/old-hsvj-unpack-*/
+/outputs/
+/perf_records/
+/rom-change-records/
+/rom_build_records/
+/rom_reference/
+/records/*
+!/records/20261120-full-project-audit.md
+!/records/20261120-git-restore.md
+/debug tool/records/

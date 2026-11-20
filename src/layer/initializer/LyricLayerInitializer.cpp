@@ -57,9 +57,11 @@ LayerInitResult LyricLayerInitializer::applyLyricProperties(
         textLayer->setLyricRenderSize(lyricSize.width, lyricSize.height);
     }
 
-    // 设置字体路径
-    if (!config.fontPath.empty()) {
-        std::string fullFontPath = context.fontDir + config.fontPath;
+    // Layer21 uses the shared root-level lyricFont setting.
+    const std::string configuredFont =
+        context.systemConfig ? context.systemConfig->getLyricFont() : std::string();
+    if (!configuredFont.empty()) {
+        std::string fullFontPath = context.fontDir + configuredFont;
         std::string normalizedFontPath = FileUtils::normalizePath(fullFontPath);
 
         if (FileUtils::exists(normalizedFontPath)) {
@@ -67,6 +69,8 @@ LayerInitResult LyricLayerInitializer::applyLyricProperties(
         } else {
             textLayer->setFontPath(fullFontPath);
         }
+    } else {
+        textLayer->setFontPath("");
     }
 
     // 设置字体大小

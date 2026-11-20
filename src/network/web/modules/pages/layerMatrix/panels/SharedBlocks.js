@@ -70,3 +70,20 @@ export function fitModeBlockHtml(layer) {
             </select>
         </div>`;
 }
+
+// 所有图层统一的源内容裁剪，百分比输入，API 传 0..1 比例。
+export function contentCropBlockHtml(layer = {}, prefix = 'layer') {
+    const value = (key) => {
+        const snake = key.replace(/^crop([A-Z])/, (_, first) => `crop_${first.toLowerCase()}`);
+        const raw = layer[key] ?? layer[snake];
+        const n = Number(raw);
+        return Number.isFinite(n) ? Math.round(Math.max(0, Math.min(1, n)) * 1000) / 10 : 0;
+    };
+    return `
+        <div class="setting-section layer-content-crop" style="grid-column: 1 / -1;">
+            ${createNumInput(`${prefix}-crop-left`, '裁剪左 (%)', value('cropLeft'), 0, 100, 0.1)}
+            ${createNumInput(`${prefix}-crop-top`, '裁剪上 (%)', value('cropTop'), 0, 100, 0.1)}
+            ${createNumInput(`${prefix}-crop-right`, '裁剪右 (%)', value('cropRight'), 0, 100, 0.1)}
+            ${createNumInput(`${prefix}-crop-bottom`, '裁剪下 (%)', value('cropBottom'), 0, 100, 0.1)}
+        </div>`;
+}

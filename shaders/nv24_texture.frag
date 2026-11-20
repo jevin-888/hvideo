@@ -116,8 +116,12 @@ float fetchNv24LumaClamped(int x, int y, int width, int height, int stride) {
     return fetchByte(sy * stride + sx, stride);
 }
 
-float antialiasCaptureLuma(vec2 uv, float yVal, int width, int height,
-                           int stride) {
+float sharpenCaptureLuma(vec2 uv, float yVal, int width, int height,
+                          int stride) {
+    if (width <= 1 || height <= 1) {
+        return yVal;
+    }
+
     vec2 clampedUv = clamp(uv, vec2(0.0), vec2(1.0));
     ivec2 p = ivec2(floor(clampedUv * vec2(float(width), float(height))));
     p.x = clamp(p.x, 0, width - 1);
@@ -128,92 +132,42 @@ float antialiasCaptureLuma(vec2 uv, float yVal, int width, int height,
     float up = fetchNv24LumaClamped(p.x, p.y - 1, width, height, stride);
     float down = fetchNv24LumaClamped(p.x, p.y + 1, width, height, stride);
     float neighborAvg = (left + right + up + down) * 0.25;
+    float localMin = min(min(left, right), min(up, down));
+    float localMax = max(max(left, right), max(up, down));
+    float localContrast = localMax - localMin;
 
     vec2 srcPx = fwidth(uv) * vec2(float(width), float(height));
     float maxSrcPx = max(srcPx.x, srcPx.y);
-    float upscaleGate = clamp(1.20 - maxSrcPx, 0.0, 1.0);
-    float localContrast = max(max(abs(yVal - left), abs(yVal - right)),
-                              max(abs(yVal - up), abs(yVal - down)));
-    float detail = yVal - neighborAvg;
-    float detailGate = smoothstep(0.012, 0.120, localContrast);
-    float hardEdgeGate = smoothstep(0.070, 0.220, localContrast);
-    float highlightGuard = 1.0 - smoothstep(0.64, 0.88, yVal);
+    float upscaleGate = 1.0 - smoothstep(0.95, 1.35, maxSrcPx);
+    float minifyFade = 1.0 - smoothstep(1.15, 1.85, maxSrcPx);
+    float detailGate = smoothstep(0.008, 0.100, localContrast);
+    float hardEdgeGuard = 1.0 - 0.45 * smoothstep(0.18, 0.42, localContrast);
 
-    float darkTextMask = smoothstep(0.54, 0.84, neighborAvg) *
-                         smoothstep(0.010, 0.115, -detail);
-    float textPreserved = yVal - (-detail) * 0.30 * darkTextMask;
-    float smoothLuma = yVal * 0.42 + neighborAvg * 0.58;
-    float aaStrength = 0.16 * upscaleGate * hardEdgeGate *
-                       (1.0 - darkTextMask);
-    float refined = mix(yVal, smoothLuma, aaStrength);
-    refined = mix(refined, textPreserved, darkTextMask);
-
-    float sharpenStrength = (0.045 + 0.080 * upscaleGate) *
-                            detailGate * highlightGuard * (1.0 - aaStrength);
-    return clamp(refined + (refined - neighborAvg) * sharpenStrength, 0.0, 1.0);
+    float strength = (0.075 + 0.115 * upscaleGate) * minifyFade *
+                     detailGate * hardEdgeGuard;
+    float sharpened = yVal + (yVal - neighborAvg) * strength;
+    float ringGuard = 0.010 + 0.012 * upscaleGate;
+    return clamp(sharpened,
+                 max(0.0, localMin - ringGuard),
+                 min(1.0, localMax + ringGuard));
 }
 
-vec3 yuvToRgbBt709Full(float yVal, float uVal, float vVal) {
-    float y = yVal;
-    float u = uVal - 0.5;
-    float v = vVal - 0.5;
+vec3 yuvToRgbBt601Limited(float yVal, float uVal, float vVal) {
+    float y = (yVal - 16.0 / 255.0) * (255.0 / 219.0);
+    float u = (uVal - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (vVal - 128.0 / 255.0) * (255.0 / 224.0);
+    return vec3(y + 1.402 * v,
+                y - 0.344136 * u - 0.714136 * v,
+                y + 1.772 * u);
+}
+
+vec3 yuvToRgbBt709Limited(float yVal, float uVal, float vVal) {
+    float y = (yVal - 16.0 / 255.0) * (255.0 / 219.0);
+    float u = (uVal - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (vVal - 128.0 / 255.0) * (255.0 / 224.0);
     return vec3(y + 1.5748 * v,
                 y - 0.187324 * u - 0.468124 * v,
                 y + 1.8556 * u);
-}
-
-float rollOffCaptureLuma(float yVal) {
-    float knee = smoothstep(0.50, 0.88, yVal);
-    float over = max(yVal - 0.50, 0.0);
-    float compressed = 0.50 + (1.0 - exp(-over * 2.25)) * 0.34;
-    return clamp(mix(yVal, compressed, knee * 0.88), 0.0, 1.0);
-}
-
-float captureSkinMask(float uVal, float vVal) {
-    float cbMask = smoothstep(0.30, 0.37, uVal) *
-                   (1.0 - smoothstep(0.56, 0.64, uVal));
-    float crMask = smoothstep(0.49, 0.56, vVal) *
-                   (1.0 - smoothstep(0.78, 0.86, vVal));
-    return clamp(cbMask * crMask, 0.0, 1.0);
-}
-
-float rollOffCaptureSkinLuma(float yVal, float skinMask) {
-    float knee = smoothstep(0.48, 0.82, yVal) * skinMask;
-    float over = max(yVal - 0.48, 0.0);
-    float compressed = 0.48 + (1.0 - exp(-over * 2.05)) * 0.27;
-    return clamp(mix(yVal, compressed, knee * 0.62), 0.0, 1.0);
-}
-
-vec3 enhanceCaptureLook(vec3 rgb) {
-    const vec3 lumaWeights = vec3(0.2126, 0.7152, 0.0722);
-    float luma = dot(rgb, lumaWeights);
-
-    float highlightProtect = 1.0 - smoothstep(0.46, 0.78, luma);
-    float shadowProtect = smoothstep(0.03, 0.16, luma);
-    float midAmount = highlightProtect * shadowProtect;
-
-    vec3 enhanced = mix(vec3(luma), rgb, 1.04 + 0.03 * midAmount);
-    enhanced = (enhanced - vec3(0.5)) * (1.0 + 0.025 * midAmount) + vec3(0.5);
-
-    float hi = smoothstep(0.58, 0.92, luma);
-    enhanced = mix(enhanced, vec3(luma) + (enhanced - vec3(luma)) * 0.92, hi);
-    enhanced = min(enhanced, rgb + vec3(0.035));
-    enhanced = mix(enhanced, rgb * 0.965, smoothstep(0.72, 1.0, luma));
-
-    float amount = 0.48 * shadowProtect;
-    return clamp(mix(rgb, enhanced, amount), 0.0, 1.0);
-}
-
-vec3 rollOffCaptureHighlights(vec3 rgb) {
-    const vec3 lumaWeights = vec3(0.2126, 0.7152, 0.0722);
-    float luma = dot(rgb, lumaWeights);
-    float peak = max(max(rgb.r, rgb.g), rgb.b);
-    float pressure = max(luma, peak * 0.92);
-    float knee = smoothstep(0.55, 0.90, pressure);
-    vec3 soft = vec3(1.0) - exp(-rgb * 1.60);
-    soft *= 0.86;
-    vec3 compressed = mix(rgb, soft, knee);
-    return clamp(mix(rgb, compressed, 0.82), 0.0, 1.0);
 }
 
 void main() {
@@ -278,7 +232,16 @@ void main() {
     if (pc.userCrop.z <= 0.0 || pc.userCrop.w <= 0.0) {
         texCoord = fragTexCoord;
     }
-    int mode = int(invertMode + 0.5);
+    int rawMode = int(invertMode + 0.5);
+    int rotateMode = rawMode & 0xF0;
+    int mode = rawMode & 0x0F;
+    if (rotateMode == 0x10) {
+        texCoord = vec2(1.0 - texCoord.x, 1.0 - texCoord.y);
+    } else if (rotateMode == 0x20) {
+        texCoord = vec2(texCoord.y, 1.0 - texCoord.x);
+    } else if (rotateMode == 0x30) {
+        texCoord = vec2(1.0 - texCoord.y, texCoord.x);
+    }
     if (mode == 1) {
         texCoord.x = 1.0 - texCoord.x;
     } else if (mode == 2) {
@@ -293,14 +256,14 @@ void main() {
     vec2 chroma = sampleNv24ChromaLinear(texCoord, visibleWidth, visibleHeight,
                                          stride, uvOffset);
 
-    yVal = antialiasCaptureLuma(texCoord, yVal, visibleWidth, visibleHeight,
-                                stride);
-    yVal = rollOffCaptureSkinLuma(yVal, captureSkinMask(chroma.x, chroma.y));
-    yVal = rollOffCaptureLuma(yVal);
+    yVal = sharpenCaptureLuma(texCoord, yVal, visibleWidth, visibleHeight,
+                               stride);
 
-    vec3 rgb = yuvToRgbBt709Full(yVal, chroma.x, chroma.y);
-    rgb = rollOffCaptureHighlights(clamp(rgb, 0.0, 1.0));
-    rgb = enhanceCaptureLook(rgb);
+    bool hdCapture = visibleWidth >= 1280 || visibleHeight >= 720;
+    vec3 rgbRaw = hdCapture
+                    ? yuvToRgbBt709Limited(yVal, chroma.x, chroma.y)
+                    : yuvToRgbBt601Limited(yVal, chroma.x, chroma.y);
+    vec3 rgb = clamp(rgbRaw, 0.0, 1.0);
 
     vec4 finalColor = vec4(rgb, 1.0) * pc.color;
 

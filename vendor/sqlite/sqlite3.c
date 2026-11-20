@@ -34439,7 +34439,7 @@ do_atof_calc:
 
   if( s==0 ) {
     /* In the IEEE 754 standard, zero is signed. */
-    result = sign<0 ? -(double)? 0 : (double)0;
+    result = sign<0 ? -(double)0 : (double)0;
   } else {
     /* Attempt to reduce exponent.
     **

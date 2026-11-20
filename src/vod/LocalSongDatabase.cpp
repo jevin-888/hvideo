@@ -1,5 +1,6 @@
 #include "vod/LocalSongDatabase.h"
 #include "utils/Logger.h"
+#include <filesystem>
 #include <utility>
 
 namespace hsvj {
@@ -34,19 +35,65 @@ LocalSongDatabase::~LocalSongDatabase() {
 
 bool LocalSongDatabase::initialize(const std::string& dbPath) {
     std::lock_guard<std::mutex> lock(dbMutex_);
-    if (db_) {
+    if (db_ && !temporary_) {
         return true;
     }
-    if (sqlite3_open_v2(dbPath.c_str(), &db_, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
-        LOG_WARN("[VOD] LocalSongDatabase: failed to open %s: %s", dbPath.c_str(), db_ ? sqlite3_errmsg(db_) : "?");
-        shutdown();
-        return false;
+    std::error_code pathError;
+    const bool databaseFileExists = std::filesystem::exists(dbPath, pathError);
+    if (db_ && temporary_ && !databaseFileExists && !pathError) {
+        return true;
     }
-    sqlite3_busy_timeout(db_, 5000);
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA temp_store=MEMORY;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, R"(
+    bool temporary = false;
+    sqlite3* database = nullptr;
+    if (sqlite3_open_v2(dbPath.c_str(), &database, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) {
+        const std::string error = database ? sqlite3_errmsg(database) : "?";
+        LOG_WARN("[VOD] LocalSongDatabase: failed to open %s: %s", dbPath.c_str(), error.c_str());
+        // dbMutex_ is already held; shutdown() would lock it again and deadlock.
+        if (database) sqlite3_close(database);
+        if (databaseFileExists || pathError) {
+            return false;
+        }
+        if (sqlite3_open_v2(":memory:", &database,
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
+            LOG_WARN("[VOD] LocalSongDatabase: temporary in-memory database failed: %s",
+                     database ? sqlite3_errmsg(database) : "?");
+            if (database) sqlite3_close(database);
+            return false;
+        }
+        temporary = true;
+        LOG_WARN("[VOD] LocalSongDatabase: %s is missing; using an empty in-memory database",
+                 dbPath.c_str());
+    }
+    sqlite3_busy_timeout(database, 5000);
+    if (!temporary) {
+        sqlite3_stmt* schema = nullptr;
+        const int schemaResult = sqlite3_prepare_v2(database, "SELECT songNo FROM songs LIMIT 0;", -1, &schema, nullptr);
+        sqlite3_finalize(schema);
+        if (schemaResult != SQLITE_OK) {
+            LOG_WARN("[VOD] LocalSongDatabase: invalid song database %s: %s", dbPath.c_str(), sqlite3_errmsg(database));
+            sqlite3_close(database);
+            return false;
+        }
+    }
+    sqlite3_exec(database, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+    sqlite3_exec(database, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
+    sqlite3_exec(database, "PRAGMA temp_store=MEMORY;", nullptr, nullptr, nullptr);
+    const int createResult = sqlite3_exec(database, R"(
+        CREATE TABLE IF NOT EXISTS songs (
+            songNo TEXT PRIMARY KEY,
+            songName TEXT DEFAULT '',
+            singerNames TEXT DEFAULT '',
+            primarySingerNo TEXT DEFAULT '',
+            primarySingerName TEXT DEFAULT '',
+            initialKey TEXT DEFAULT '',
+            languageCode TEXT DEFAULT '',
+            categoryCode TEXT DEFAULT '',
+            relativePath TEXT DEFAULT '',
+            fileName TEXT DEFAULT '',
+            durationMs INTEGER DEFAULT 0,
+            track INTEGER DEFAULT 0,
+            lightCode TEXT DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS local_available_songs (
             songNo TEXT PRIMARY KEY,
             absolutePath TEXT NOT NULL,
@@ -56,7 +103,16 @@ bool LocalSongDatabase::initialize(const std::string& dbPath) {
             updatedAt INTEGER DEFAULT 0
         );
     )", nullptr, nullptr, nullptr);
-    LOG_INFO("[VOD] LocalSongDatabase initialized: %s", dbPath.c_str());
+    if (createResult != SQLITE_OK) {
+        LOG_WARN("[VOD] LocalSongDatabase: failed to initialize local song index %s: %s", dbPath.c_str(), sqlite3_errmsg(database));
+        sqlite3_close(database);
+        return false;
+    }
+    if (db_) sqlite3_close(db_);
+    db_ = database;
+    temporary_ = temporary;
+    LOG_INFO("[VOD] LocalSongDatabase initialized: %s%s", dbPath.c_str(),
+             temporary_ ? " (temporary in-memory)" : "");
     return true;
 }
 
@@ -66,6 +122,7 @@ void LocalSongDatabase::shutdown() {
         sqlite3_close(db_);
         db_ = nullptr;
     }
+    temporary_ = false;
 }
 
 bool LocalSongDatabase::getSongByNo(const std::string& songNo, SongInfo& out) {
@@ -100,6 +157,12 @@ bool LocalSongDatabase::getSongByNo(const std::string& songNo, SongInfo& out) {
     fillSongInfo(stmt, out);
 
     sqlite3_finalize(stmt);
+    sqlite3_stmt* light = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT lightCode FROM songs WHERE songNo=? LIMIT 1", -1, &light, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(light, 1, songNo.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(light) == SQLITE_ROW) out.lightCode = columnText(light, 0);
+    }
+    sqlite3_finalize(light);
     return true;
 }
 

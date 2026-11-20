@@ -1,10 +1,19 @@
 #include "core/Engine.h"
+#include "core/LicenseManager.h"
+#include "platform/JavaHttpsBridge.h"
+#include "platform/NetworkHttpBridge.h"
+#include "platform/ConfigBackupBridge.h"
+#include "platform/AssociatedDeviceName.h"
+#include "platform/GroupClockBridge.h"
+#include "audio/AudioPlayerManager.h"
 #include "NativeUsbAdbMirrorClient.h"
+#include "AirPlayRkmppSession.h"
 #include "decoder/frame/DecodedFrame.h"
 #include "layer/LayerVideo.h"
 #include "layer/LayerMirror.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "utils/Logger.h"
+#include "utils/JsonUtils.h"
 #include "utils/SystemUtils.h"
 #include <android/hardware_buffer_jni.h>
 #include <android/native_window.h>
@@ -26,18 +35,19 @@ static jclass g_dspControlClass = nullptr;
 static jmethodID g_setAudioDSPTypeMethod = nullptr;
 static jmethodID g_setDSPVolumeMethod = nullptr;
 
-// 应用版本号（由 Java 层在 initialize 时传入 BuildConfig.VERSION_NAME）
 std::string g_appVersion = "1.0.0";
 
-// 保存 HSVJEngine 类的引用，用于调用 executeRestart 方法
 static jclass g_hsvjEngineClass = nullptr;
 static jmethodID g_executeRestartMethod = nullptr;
 static jmethodID g_scheduleWatchdogAlarmMethod = nullptr;
+static jmethodID g_offerGroupLeaderTimeMethod = nullptr;
+static jmethodID g_httpsGetForNativeMethod = nullptr;
 static jmethodID g_applyNetworkIpConfigMethod = nullptr;
 static jmethodID g_applyPowerScheduleMethod = nullptr;
 static jmethodID g_getDeviceHsNameMethod = nullptr;
-static jmethodID g_setDeviceHsNameMethod = nullptr;
+static jmethodID g_applyAssociatedDeviceNameMethod = nullptr;
 static jmethodID g_sendBootLogoChangeMethod = nullptr;
+static jmethodID g_controlBluetoothMethod = nullptr;
 static jmethodID g_controlMirrorServiceMethod = nullptr;
 static jmethodID g_controlMirrorServiceWithPayloadMethod = nullptr;
 
@@ -45,35 +55,72 @@ static bool isEngineReady() {
   return g_engine && g_engine->isInitialized();
 }
 
+static std::string jstringToUtf8(JNIEnv* env, jstring value) {
+  std::string result;
+  if (!env || !value) {
+    return result;
+  }
+  const char* chars = env->GetStringUTFChars(value, nullptr);
+  if (chars) {
+    result = chars;
+    env->ReleaseStringUTFChars(value, chars);
+  } else if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+  }
+  return result;
+}
+
 static std::mutex g_nativeUsbMirrorMutex;
 static std::unique_ptr<hsvj::NativeUsbAdbMirrorClient> g_nativeUsbMirrorClient;
+static std::mutex g_nativeAirPlayMirrorMutex;
+static std::unique_ptr<hsvj::AirPlayRkmppSession> g_nativeAirPlayMirrorSession;
 
-static hsvj::LayerMirror* getMirrorLayerForUsbMirror(int layerId) {
+static hsvj::LayerMirror* getMirrorLayer(int layerId) {
   if (!isEngineReady()) return nullptr;
   hsvj::Layer* layer = g_engine->getMubu().getLayer(layerId);
   if (!layer || layer->getType() != hsvj::LayerType::MIRROR) return nullptr;
   return static_cast<hsvj::LayerMirror*>(layer);
 }
 
-static void deliverUsbMirrorFrame(int layerId,
-                                  hsvj::UsbH264RkmppFrame decodedFrame) {
-  if (!decodedFrame.frame) return;
-  hsvj::LayerMirror* mirrorLayer = getMirrorLayerForUsbMirror(layerId);
+static void deliverMirrorDecodedFrame(int layerId,
+                                      hsvj::H264RkmppFrame& decodedFrame) {
+  hsvj::DecodedFrame* frame = decodedFrame.frame;
+  decodedFrame.frame = nullptr;
+  if (!frame) return;
+
+  hsvj::LayerMirror* mirrorLayer = getMirrorLayer(layerId);
   if (!mirrorLayer) {
-    decodedFrame.frame->release();
+    frame->release();
     return;
   }
-  mirrorLayer->updateDecodedFrame(decodedFrame.frame,
+  mirrorLayer->updateDecodedFrame(frame,
                                   decodedFrame.originalWidth,
                                   decodedFrame.originalHeight,
                                   decodedFrame.cropOffsetY);
 }
 
+static void stopNativeAirPlayMirrorSession() {
+  std::unique_ptr<hsvj::AirPlayRkmppSession> session;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeAirPlayMirrorMutex);
+    session = std::move(g_nativeAirPlayMirrorSession);
+  }
+  if (session) session->stop();
+}
+
+static void stopNativeUsbMirrorClient() {
+  std::unique_ptr<hsvj::NativeUsbAdbMirrorClient> client;
+  {
+    std::lock_guard<std::mutex> lock(g_nativeUsbMirrorMutex);
+    client = std::move(g_nativeUsbMirrorClient);
+  }
+  if (client) client->stop();
+}
+
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-  (void)reserved; // JNI标准接口参数，暂时未使用
+  (void)reserved;
   g_jvm = vm;
 
-  // 初始化DSP控制相关JNI引用
   JNIEnv *env = nullptr;
   if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) == JNI_OK) {
     g_dspControlClass =
@@ -99,22 +146,18 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 }
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
-  (void)vm;       // JNI标准接口参数，暂时未使用
-  (void)reserved; // JNI标准接口参数，暂时未使用
+  (void)vm;
+  (void)reserved;
+  // Decoder callbacks access LayerMirror through g_engine. Stop every native
+  // producer before destroying the engine and its layers.
+  stopNativeAirPlayMirrorSession();
+  stopNativeUsbMirrorClient();
   if (g_engine) {
     g_engine->shutdown();
     delete g_engine;
     g_engine = nullptr;
   }
-  {
-    std::lock_guard<std::mutex> lock(g_nativeUsbMirrorMutex);
-    if (g_nativeUsbMirrorClient) {
-      g_nativeUsbMirrorClient->stop();
-      g_nativeUsbMirrorClient.reset();
-    }
-  }
 
-  // 清理 DSP 控制相关JNI引用
   if (g_jvm) {
     JNIEnv *env = nullptr;
     if (g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) ==
@@ -133,11 +176,14 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
   g_setDSPVolumeMethod = nullptr;
   g_executeRestartMethod = nullptr;
   g_scheduleWatchdogAlarmMethod = nullptr;
+  g_offerGroupLeaderTimeMethod = nullptr;
+  g_httpsGetForNativeMethod = nullptr;
   g_applyNetworkIpConfigMethod = nullptr;
   g_applyPowerScheduleMethod = nullptr;
   g_getDeviceHsNameMethod = nullptr;
-  g_setDeviceHsNameMethod = nullptr;
+  g_applyAssociatedDeviceNameMethod = nullptr;
   g_sendBootLogoChangeMethod = nullptr;
+  g_controlBluetoothMethod = nullptr;
   g_controlMirrorServiceMethod = nullptr;
   g_controlMirrorServiceWithPayloadMethod = nullptr;
   g_jvm = nullptr;
@@ -252,6 +298,68 @@ std::string controlJavaMirrorService(const std::string& action, int layerId) {
   return controlJavaMirrorService(action, layerId, "");
 }
 
+namespace hsvj {
+
+std::string callJavaControlBluetooth(
+    const std::string& action, const std::string& payload) {
+  if (!g_jvm || !g_hsvjEngineClass) {
+    LOG_WARN("Java bluetooth control not available");
+    return "{\"ok\":false,\"message\":\"Java bluetooth control not available\"}";
+  }
+
+  JNIEnv *env = nullptr;
+  bool attached = false;
+  jint result = g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+  if (result == JNI_EDETACHED) {
+    if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+      attached = true;
+    } else {
+      LOG_ERROR("Failed to attach thread for controlBluetooth");
+      return "{\"ok\":false,\"message\":\"AttachCurrentThread failed\"}";
+    }
+  } else if (result != JNI_OK || !env) {
+    LOG_ERROR("Failed to get JNIEnv for controlBluetooth");
+    return "{\"ok\":false,\"message\":\"GetEnv failed\"}";
+  }
+
+  if (!g_controlBluetoothMethod) {
+    g_controlBluetoothMethod = env->GetStaticMethodID(
+        g_hsvjEngineClass, "controlBluetooth",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      g_controlBluetoothMethod = nullptr;
+    }
+  }
+  if (!g_controlBluetoothMethod) {
+    if (attached) g_jvm->DetachCurrentThread();
+    return "{\"ok\":false,\"message\":\"controlBluetooth method not found\"}";
+  }
+
+  jstring jAction = env->NewStringUTF(action.c_str());
+  jstring jPayload = env->NewStringUTF(payload.c_str());
+  jstring jResult = static_cast<jstring>(env->CallStaticObjectMethod(
+      g_hsvjEngineClass, g_controlBluetoothMethod, jAction, jPayload));
+  std::string value = "{\"ok\":false,\"message\":\"empty bluetooth result\"}";
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    value = "{\"ok\":false,\"message\":\"controlBluetooth threw exception\"}";
+  } else if (jResult) {
+    const char *chars = env->GetStringUTFChars(jResult, nullptr);
+    if (chars) {
+      value = chars;
+      env->ReleaseStringUTFChars(jResult, chars);
+    }
+    env->DeleteLocalRef(jResult);
+  }
+  if (jAction) env->DeleteLocalRef(jAction);
+  if (jPayload) env->DeleteLocalRef(jPayload);
+  if (attached) g_jvm->DetachCurrentThread();
+  return value;
+}
+
+} // namespace hsvj
+
 std::string getJavaDeviceHsName() {
   if (!g_jvm || !g_hsvjEngineClass) {
     LOG_WARN("Java device_hsname getter not available");
@@ -305,9 +413,9 @@ std::string getJavaDeviceHsName() {
   return value;
 }
 
-bool setJavaDeviceHsName(const std::string& name, std::string& error) {
+bool applyJavaAssociatedDeviceName(const std::string& name, std::string& error) {
   if (!g_jvm || !g_hsvjEngineClass) {
-    error = "Java device_hsname setter not available";
+    error = "Java associated-name setter not available";
     LOG_WARN("%s", error.c_str());
     return false;
   }
@@ -320,27 +428,27 @@ bool setJavaDeviceHsName(const std::string& name, std::string& error) {
       attached = true;
     } else {
       error = "AttachCurrentThread failed";
-      LOG_ERROR("Failed to attach thread for setDeviceHsName");
+      LOG_ERROR("Failed to attach thread for applyAssociatedDeviceName");
       return false;
     }
   } else if (result != JNI_OK || !env) {
     error = "GetEnv failed";
-    LOG_ERROR("Failed to get JNIEnv for setDeviceHsName");
+    LOG_ERROR("Failed to get JNIEnv for applyAssociatedDeviceName");
     return false;
   }
 
-  if (!g_setDeviceHsNameMethod) {
-    g_setDeviceHsNameMethod = env->GetStaticMethodID(
-        g_hsvjEngineClass, "setDeviceHsName", "(Ljava/lang/String;)Z");
+  if (!g_applyAssociatedDeviceNameMethod) {
+    g_applyAssociatedDeviceNameMethod = env->GetStaticMethodID(
+        g_hsvjEngineClass, "applyAssociatedDeviceName", "(Ljava/lang/String;)Z");
     if (env->ExceptionCheck()) {
       env->ExceptionClear();
-      g_setDeviceHsNameMethod = nullptr;
+      g_applyAssociatedDeviceNameMethod = nullptr;
     }
   }
 
   bool ok = false;
-  if (!g_setDeviceHsNameMethod) {
-    error = "setDeviceHsName method not found";
+  if (!g_applyAssociatedDeviceNameMethod) {
+    error = "applyAssociatedDeviceName method not found";
   } else {
     jstring jName = env->NewStringUTF(name.c_str());
     if (!jName) {
@@ -350,13 +458,13 @@ bool setJavaDeviceHsName(const std::string& name, std::string& error) {
       error = "Failed to create device_hsname string";
     } else {
       ok = env->CallStaticBooleanMethod(
-          g_hsvjEngineClass, g_setDeviceHsNameMethod, jName) == JNI_TRUE;
+          g_hsvjEngineClass, g_applyAssociatedDeviceNameMethod, jName) == JNI_TRUE;
       if (env->ExceptionCheck()) {
         env->ExceptionClear();
         ok = false;
-        error = "setDeviceHsName threw an exception";
+        error = "applyAssociatedDeviceName threw an exception";
       } else if (!ok) {
-        error = "Settings.System.putString returned false";
+        error = "associated-name target update returned false";
       }
       env->DeleteLocalRef(jName);
     }
@@ -426,20 +534,16 @@ bool sendJavaBootLogoChange(int slot, std::string& error) {
   return ok;
 }
 
-// C++ 全局函数：设置 DSP 音频类型（供 Video解码器 调用）
+// Forward DSP type changes to the Java DSP controller.
 extern "C" void setDSPAudioType(int dspType) {
   if (!g_jvm || !g_dspControlClass || !g_setAudioDSPTypeMethod) {
     LOG_WARN("DSP control not available");
     return;
   }
-
   JNIEnv *env = nullptr;
   bool attached = false;
-
-  // 获取 JNIEnv（可能在不同线程中调用）
   jint result = g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
   if (result == JNI_EDETACHED) {
-    // 当前线程未附加到 JVM，需要附件
     if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
       attached = true;
     } else {
@@ -450,33 +554,26 @@ extern "C" void setDSPAudioType(int dspType) {
     LOG_ERROR("Failed to get JNIEnv");
     return;
   }
-
-  // 调用 Java 方法
-  env->CallStaticVoidMethod(g_dspControlClass, g_setAudioDSPTypeMethod,
-                            dspType);
-
-  // 如果附加了线程，需要分离
+  env->CallStaticVoidMethod(g_dspControlClass, g_setAudioDSPTypeMethod, dspType);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    LOG_ERROR("Java DSP type callback threw an exception");
+  }
   if (attached) {
     g_jvm->DetachCurrentThread();
   }
+}
 
-  }
-
-// C++ 全局函数：设置 DSP 音量（供 LayerVideo/AudioPlayer 调用）
-// V04设备使用12级音量控制
+// Forward DSP volume changes to the Java DSP controller.
 extern "C" void setDSPVolume(float volume, int isHdmin) {
   if (!g_jvm || !g_dspControlClass || !g_setDSPVolumeMethod) {
     LOG_WARN("DSP volume control not available");
     return;
   }
-
   JNIEnv *env = nullptr;
   bool attached = false;
-
-  // 获取 JNIEnv（可能在不同线程中调用）
   jint result = g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
   if (result == JNI_EDETACHED) {
-    // 当前线程未附加到 JVM，需要附件
     if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
       attached = true;
     } else {
@@ -487,18 +584,15 @@ extern "C" void setDSPVolume(float volume, int isHdmin) {
     LOG_ERROR("Failed to get JNIEnv");
     return;
   }
-
-  // 调用 Java 方法
-  env->CallStaticVoidMethod(g_dspControlClass, g_setDSPVolumeMethod, volume,
-                            isHdmin);
-
-  // 如果附加了线程，需要分离
+  env->CallStaticVoidMethod(g_dspControlClass, g_setDSPVolumeMethod, volume, isHdmin);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    LOG_ERROR("Java DSP volume callback threw an exception");
+  }
   if (attached) {
     g_jvm->DetachCurrentThread();
   }
-
-  }
-
+}
 extern "C" JNIEXPORT void JNICALL
 Java_com_hsvj_engine_HSVJEngine_setDeviceInfoForReport(JNIEnv *env, jclass clazz,
                                                        jstring serial, jstring model, jstring mac) {
@@ -519,6 +613,17 @@ Java_com_hsvj_engine_HSVJEngine_setDeviceInfoForReport(JNIEnv *env, jclass clazz
   hsvj::SystemUtils::setDeviceInfoFromJava(s, m, a);
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hsvj_engine_HSVJEngine_getAppUpdateDeviceInfo(JNIEnv *env, jclass) {
+  Json::Value device;
+  device["device_serial"] = hsvj::SystemUtils::getHardwareSerial();
+  device["device_model"] = hsvj::SystemUtils::getHardwareModel();
+  device["device_fingerprint"] = hsvj::SystemUtils::generateDeviceFingerprint();
+  device["cloud_url"] = "http://" + std::string(hsvj::LicenseManager::DEFAULT_CLOUD_HOST)
+      + ":" + std::to_string(hsvj::LicenseManager::DEFAULT_CLOUD_PORT);
+  return env->NewStringUTF(hsvj::JsonUtils::toString(device).c_str());
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
                                            jobject surface,
@@ -527,11 +632,11 @@ Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
                                            jstring rootPath,
                                            jboolean lowMemoryMode,
                                            jstring appVersion) {
-  (void)thiz; // JNI标准接口参数，暂时未使用
-  (void)assetManager; // 资源同步由 Java 启动流程完成，JNI 不复制 assets
-  (void)appDataDir; // 保留 JNI 签名兼容，路径根目录以 rootPath 为唯一来源
+  (void)thiz;
+  (void)assetManager;
+  (void)appDataDir;
 
-  // 存储版本号供 status 接口使用
+  // Cache app version from Java before engine initialization.
   if (appVersion) {
     const char* ver = env->GetStringUTFChars(appVersion, nullptr);
     if (ver) {
@@ -539,18 +644,13 @@ Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
       env->ReleaseStringUTFChars(appVersion, ver);
     }
   }
-
-  // 记录低内存模式状态
   if (lowMemoryMode) {
-    LOG_INFO("[内存优化] 启用低内存模式 ");
+    LOG_INFO("[Engine] Low memory mode enabled");
   }
 
-  // 如果 Engine 已经存在，先清理旧的实例（处理重启场景）
   if (g_engine) {
     LOG_WARN("Engine already initialized, cleaning up old instance before reinitializing");
-
-    // Engine::shutdown() 内部同步等待所有解码器线程 join、异步任务完成、
-    // 音频回调停止，返回后可安全 delete，无需额外 sleep。
+    // Stop all engine workers before replacing the instance.
     g_engine->shutdown();
     extern void setEngineJavaObject(jobject obj);
     setEngineJavaObject(nullptr);
@@ -577,9 +677,9 @@ Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
     LOG_INFO("Headless DRM/KMS engine initialization requested");
   }
 
-  // ========== 步骤0: Java 已选根路径并复制资源，此处仅设置同一个根路径 ==========
+  // Java has already synchronized resources; native only adopts rootPath.
   if (rootPath) {
-    const char* root = env->GetStringUTFChars(rootPath, nullptr);
+    const char *root = env->GetStringUTFChars(rootPath, nullptr);
     if (root) {
       if (root[0]) {
         hsvj::setRootPath(root);
@@ -588,19 +688,15 @@ Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
     }
   }
   hsvj::initializePathConfig();
-  // 资源目录和文件已由 Java 同步到 rootPath；Native 只使用当前根目录，不在 JNI 初始化阶段复制 APK assets。
 
-  // 创建引擎实例
   g_engine = new hsvj::Engine();
 
-  // 保存 Java 对象的全局引用，用于进度回调
+  // Keep a global reference to the Java engine object for callbacks.
   {
-    // setEngineJavaObject 内部会创建/替换 GlobalRef，这里传局部引用即可。
     extern void setEngineJavaObject(jobject obj);
     setEngineJavaObject(thiz);
   }
 
-  // 保存 HSVJEngine 类的引用，用于调用 executeRestart 方法
   if (!g_hsvjEngineClass) {
     jclass localClass = env->FindClass("com/hsvj/engine/HSVJEngine");
     if (env->ExceptionCheck()) {
@@ -615,7 +711,7 @@ Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
   }
 
   if (g_hsvjEngineClass && !g_executeRestartMethod) {
-    g_executeRestartMethod = env->GetStaticMethodID(g_hsvjEngineClass, "executeRestart", "()V");
+    g_executeRestartMethod = env->GetStaticMethodID(g_hsvjEngineClass, "executeRestart", "()Z");
     if (env->ExceptionCheck()) {
       env->ExceptionClear();
       LOG_ERROR("Failed to find executeRestart method due to JNI exception");
@@ -627,7 +723,7 @@ Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
 
   if (g_hsvjEngineClass && !g_scheduleWatchdogAlarmMethod) {
     g_scheduleWatchdogAlarmMethod = env->GetStaticMethodID(
-        g_hsvjEngineClass, "scheduleWatchdogAlarm", "()V");
+        g_hsvjEngineClass, "scheduleWatchdogAlarm", "()Z");
     if (env->ExceptionCheck()) {
       env->ExceptionClear();
       LOG_ERROR("Failed to find scheduleWatchdogAlarm method due to JNI exception");
@@ -637,10 +733,33 @@ Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
     }
   }
 
+  if (g_hsvjEngineClass && !g_offerGroupLeaderTimeMethod) {
+    g_offerGroupLeaderTimeMethod = env->GetStaticMethodID(
+        g_hsvjEngineClass, "offerGroupLeaderTime", "(JJ)V");
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      g_offerGroupLeaderTimeMethod = nullptr;
+      LOG_ERROR("Failed to find offerGroupLeaderTime JNI callback");
+    }
+  }
+
+  if (g_hsvjEngineClass && !g_httpsGetForNativeMethod) {
+    g_httpsGetForNativeMethod = env->GetStaticMethodID(
+        g_hsvjEngineClass, "httpsGetForNative",
+        "(Ljava/lang/String;II)Ljava/lang/String;");
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      LOG_ERROR("Failed to find httpsGetForNative method due to JNI exception");
+      g_httpsGetForNativeMethod = nullptr;
+    } else if (!g_httpsGetForNativeMethod) {
+      LOG_WARN("Failed to find httpsGetForNative method - GetStaticMethodID returned NULL");
+    }
+  }
+
   if (g_hsvjEngineClass && !g_applyNetworkIpConfigMethod) {
     g_applyNetworkIpConfigMethod = env->GetStaticMethodID(
         g_hsvjEngineClass, "applyNetworkIpConfig",
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z");
     if (env->ExceptionCheck()) {
       env->ExceptionClear();
       LOG_ERROR("Failed to find applyNetworkIpConfig method due to JNI exception");
@@ -653,13 +772,26 @@ Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
   if (g_hsvjEngineClass && !g_applyPowerScheduleMethod) {
     g_applyPowerScheduleMethod = env->GetStaticMethodID(
         g_hsvjEngineClass, "applyPowerSchedule",
-        "(ZZLjava/lang/String;Ljava/lang/String;ZLjava/lang/String;Ljava/lang/String;)V");
+        "(ZZLjava/lang/String;Ljava/lang/String;ZLjava/lang/String;Ljava/lang/String;)Z");
     if (env->ExceptionCheck()) {
       env->ExceptionClear();
       LOG_ERROR("Failed to find applyPowerSchedule method due to JNI exception");
       g_applyPowerScheduleMethod = nullptr;
     } else if (!g_applyPowerScheduleMethod) {
       LOG_WARN("Failed to find applyPowerSchedule method - GetStaticMethodID returned NULL");
+    }
+  }
+
+  if (g_hsvjEngineClass && !g_controlBluetoothMethod) {
+    g_controlBluetoothMethod = env->GetStaticMethodID(
+        g_hsvjEngineClass, "controlBluetooth",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      LOG_ERROR("Failed to find controlBluetooth method due to JNI exception");
+      g_controlBluetoothMethod = nullptr;
+    } else if (!g_controlBluetoothMethod) {
+      LOG_WARN("Failed to find controlBluetooth method - GetStaticMethodID returned NULL");
     }
   }
 
@@ -698,7 +830,7 @@ Java_com_hsvj_engine_HSVJEngine_initialize(JNIEnv *env, jobject thiz,
     initResult = g_engine->initialize();
   }
 
-  LOG_INFO("返回: %s", initResult ? "true" : "false");
+  LOG_INFO("Engine initialize result: %s", initResult ? "true" : "false");
 
   if (!initResult) {
     LOG_ERROR("Failed to initialize engine");
@@ -727,8 +859,12 @@ Java_com_hsvj_engine_HSVJEngine_initializeHeadless(
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_hsvj_engine_HSVJEngine_shutdown(JNIEnv *env, jobject thiz) {
-  (void)env;  // JNI标准接口参数，暂时未使用
-  (void)thiz; // JNI标准接口参数，暂时未使用
+  (void)env;
+  (void)thiz;
+  // The library may remain loaded after shutdown(), so stop producer threads
+  // here as well as in JNI_OnUnload().
+  stopNativeAirPlayMirrorSession();
+  stopNativeUsbMirrorClient();
   if (g_engine) {
     g_engine->shutdown();
     extern void setEngineJavaObject(jobject obj);
@@ -745,8 +881,8 @@ Java_com_hsvj_engine_HSVJEngine_shutdown(JNIEnv *env, jobject thiz) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_hsvj_engine_HSVJEngine_notifySurfaceDestroyed(JNIEnv *env, jobject thiz) {
-  (void)env;  // JNI标准接口参数，暂时未使用
-  (void)thiz; // JNI标准接口参数，暂时未使用
+  (void)env;
+  (void)thiz;
   if (isEngineReady()) {
     g_engine->notifySurfaceDestroyed();
   } else {
@@ -756,8 +892,8 @@ Java_com_hsvj_engine_HSVJEngine_notifySurfaceDestroyed(JNIEnv *env, jobject thiz
 
 extern "C" JNIEXPORT void JNICALL Java_com_hsvj_engine_HSVJEngine_update(
     JNIEnv *env, jobject thiz, jfloat deltaTime) {
-  (void)env;  // JNI标准接口参数，暂时未使用
-  (void)thiz; // JNI标准接口参数，暂时未使用
+  (void)env;
+  (void)thiz;
 
   static int updateLogCount = 0;
   updateLogCount++;
@@ -791,7 +927,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_hsvj_engine_HSVJEngine_update(
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_hsvj_engine_HSVJEngine_processCommand(JNIEnv *env, jobject thiz,
                                                jstring jsonCommand) {
-  (void)thiz; // JNI标准接口参数，暂时未使用
+  (void)thiz;
   if (!isEngineReady()) {
     return env->NewStringUTF(
         "{\"ok\":false,\"error\":\"Engine not initialized\"}");
@@ -819,7 +955,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_hsvj_engine_HSVJEngine_setCaptureAudioSource(JNIEnv *env, jclass clazz,
                                                        jint sourceType) {
   (void)clazz;
-  // 通过反射调用 DSPControl.setCaptureAudioSource
+  // Bridge capture-audio source changes to DSPControl.setCaptureAudioSource.
   jclass dspControlClass = env->FindClass("com/hsvj/engine/DSPControl");
   if (!dspControlClass) {
     LOG_ERROR("Failed to find DSPControl class for setCaptureAudioSource");
@@ -838,7 +974,44 @@ Java_com_hsvj_engine_HSVJEngine_setCaptureAudioSource(JNIEnv *env, jclass clazz,
   env->DeleteLocalRef(dspControlClass);
 }
 
-// 通知 Java 层采集源类型
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_hsvj_engine_HSVJEngine_restartActiveRk628CaptureForAudioRecovery(
+    JNIEnv *env, jclass clazz) {
+  (void)env;
+  (void)clazz;
+  if (!isEngineReady()) {
+    LOG_WARN("RK628 audio recovery restart requested before engine ready");
+    return JNI_FALSE;
+  }
+
+  bool accepted = false;
+  for (const auto &layer : g_engine->getMubu().getAllLayers()) {
+    if (!layer || layer->getType() != hsvj::LayerType::VIDEO) {
+      continue;
+    }
+    auto *videoLayer = static_cast<hsvj::LayerVideo *>(layer.get());
+    if (!videoLayer->isCaptureMode() || videoLayer->getCaptureType() == "USB") {
+      continue;
+    }
+
+    Json::Value command(Json::objectValue);
+    Json::Value param(Json::objectValue);
+    command["type"] = 0;
+    command["code"] = 2;
+    param["action"] = "restartCapture";
+    param["layerId"] = layer->getLayerId();
+    command["param"] = param;
+
+    const hsvj::CommandResponse response =
+        g_engine->getCommandRouter().processCommand(
+            hsvj::JsonUtils::toString(command));
+    LOG_WARN("RK628 audio recovery ordinary capture restart layer=%d accepted=%d error=0x%04X",
+             layer->getLayerId(), response.ok ? 1 : 0, response.error);
+    accepted = response.ok || accepted;
+  }
+  return accepted ? JNI_TRUE : JNI_FALSE;
+}
+// Notify Java when the native capture source changes.
 extern "C" void notifyJavaCaptureSource(int sourceType) {
     if (!g_jvm) return;
 
@@ -868,47 +1041,212 @@ extern "C" void notifyJavaCaptureSource(int sourceType) {
     }
 }
 
-// 调用 Java 层的重启方法
-extern "C" void callJavaRestartMethod() {
+// Invoke HSVJEngine.executeRestart() from a native thread.
+extern "C" bool callJavaRestartMethod() {
   if (!g_jvm || !g_hsvjEngineClass || !g_executeRestartMethod) {
     LOG_WARN("Java restart method not available");
-    return;
+    return false;
   }
-
   JNIEnv *env = nullptr;
   bool attached = false;
-
-  // 获取 JNIEnv（可能在不同线程中调用）
   jint result = g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
   if (result == JNI_EDETACHED) {
-    // 当前线程未附加到 JVM，需要附件
     if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
       attached = true;
     } else {
       LOG_ERROR("Failed to attach thread to JVM");
-      return;
+      return false;
     }
   } else if (result != JNI_OK) {
     LOG_ERROR("Failed to get JNIEnv");
-    return;
+    return false;
   }
-
-  // 调用 Java 方法
   LOG_DEBUG("Calling Java HSVJEngine.executeRestart()");
-  env->CallStaticVoidMethod(g_hsvjEngineClass, g_executeRestartMethod);
-
-  // 如果附加了线程，需要分离
+  bool ok = env->CallStaticBooleanMethod(g_hsvjEngineClass, g_executeRestartMethod) == JNI_TRUE;
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    LOG_ERROR("Java restart callback threw an exception");
+    ok = false;
+  }
   if (attached) {
     g_jvm->DetachCurrentThread();
   }
-
-  LOG_DEBUG("Java restart method called");
+  LOG_DEBUG("Java restart method returned %s", ok ? "true" : "false");
+  return ok;
 }
 
-extern "C" void callJavaScheduleWatchdogAlarm() {
+std::string callJavaHttpsGet(const std::string& url,
+                                          int connectTimeoutMs,
+                                          int readTimeoutMs) {
+  if (!g_jvm || !g_hsvjEngineClass || !g_httpsGetForNativeMethod) {
+    LOG_WARN("Java HTTPS bridge is not available");
+    return {};
+  }
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  const jint result =
+      g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  if (result == JNI_EDETACHED) {
+    if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+      LOG_ERROR("Failed to attach thread for HTTPS bridge");
+      return {};
+    }
+    attached = true;
+  } else if (result != JNI_OK || !env) {
+    LOG_ERROR("Failed to get JNIEnv for HTTPS bridge");
+    return {};
+  }
+
+  std::string response;
+  jstring jUrl = env->NewStringUTF(url.c_str());
+  if (jUrl) {
+    auto jResponse = static_cast<jstring>(env->CallStaticObjectMethod(
+        g_hsvjEngineClass, g_httpsGetForNativeMethod, jUrl,
+        static_cast<jint>(connectTimeoutMs), static_cast<jint>(readTimeoutMs)));
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      LOG_ERROR("Java HTTPS bridge threw an exception");
+    } else {
+      response = jstringToUtf8(env, jResponse);
+    }
+    if (jResponse) env->DeleteLocalRef(jResponse);
+    env->DeleteLocalRef(jUrl);
+  }
+  if (attached) g_jvm->DetachCurrentThread();
+  return response;
+}
+
+std::string callJavaHttpRequestAcrossNetworks(const std::string& method, const std::string& url,
+                                             const std::string& body, const std::string& token,
+                                             int timeoutMs) {
+  if (!g_jvm || !g_hsvjEngineClass) return {};
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  const jint result = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  if (result == JNI_EDETACHED) {
+    if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return {};
+    attached = true;
+  } else if (result != JNI_OK || !env) return {};
+  std::string response;
+  if (env->PushLocalFrame(8) == JNI_OK) {
+    const auto callback = env->GetStaticMethodID(g_hsvjEngineClass,
+        "requestHttpAcrossNetworks",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;");
+    if (callback && !env->ExceptionCheck()) {
+      jstring args[4] = {};
+      const std::string* values[] = {&method, &url, &body, &token};
+      bool valid = true;
+      for (int i = 0; i < 4; ++i) {
+        args[i] = env->NewStringUTF(values[i]->c_str());
+        if (!args[i]) { valid = false; break; }
+      }
+      if (valid) {
+        auto reply = static_cast<jstring>(env->CallStaticObjectMethod(
+            g_hsvjEngineClass, callback, args[0], args[1], args[2], args[3], timeoutMs));
+        if (!env->ExceptionCheck()) response = jstringToUtf8(env, reply);
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->PopLocalFrame(nullptr);
+  } else if (env->ExceptionCheck()) env->ExceptionClear();
+  if (attached) g_jvm->DetachCurrentThread();
+  return response;
+}
+
+std::string callJavaFileDownloadAcrossNetworks(const std::string& url, const std::string& filePath,
+                                               int timeoutMs) {
+  if (!g_jvm || !g_hsvjEngineClass) return {};
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  const jint result = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  if (result == JNI_EDETACHED) {
+    if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return {};
+    attached = true;
+  } else if (result != JNI_OK || !env) return {};
+
+  std::string response;
+  if (env->PushLocalFrame(8) == JNI_OK) {
+    const auto callback = env->GetStaticMethodID(g_hsvjEngineClass,
+        "downloadFileAcrossNetworks",
+        "(Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;");
+    if (callback && !env->ExceptionCheck()) {
+      auto jUrl = env->NewStringUTF(url.c_str());
+      auto jPath = env->NewStringUTF(filePath.c_str());
+      if (jUrl && jPath) {
+        auto reply = static_cast<jstring>(env->CallStaticObjectMethod(
+            g_hsvjEngineClass, callback, jUrl, jPath, timeoutMs));
+        if (!env->ExceptionCheck()) response = jstringToUtf8(env, reply);
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->PopLocalFrame(nullptr);
+  } else if (env->ExceptionCheck()) env->ExceptionClear();
+  if (attached) g_jvm->DetachCurrentThread();
+  return response;
+}
+
+std::string callJavaDisplayResolution(const std::string& mode) {
+  if (!g_jvm || !g_hsvjEngineClass) return {};
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  const jint result = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  if (result == JNI_EDETACHED) {
+    if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return {};
+    attached = true;
+  } else if (result != JNI_OK || !env) return {};
+  std::string response;
+  if (env->PushLocalFrame(4) == JNI_OK) {
+    const auto callback = env->GetStaticMethodID(g_hsvjEngineClass, "controlDisplayResolution",
+        "(Ljava/lang/String;)Ljava/lang/String;");
+    if (callback && !env->ExceptionCheck()) {
+      auto arg = env->NewStringUTF(mode.c_str());
+      if (arg) {
+        auto reply = static_cast<jstring>(env->CallStaticObjectMethod(g_hsvjEngineClass, callback, arg));
+        if (!env->ExceptionCheck()) response = jstringToUtf8(env, reply);
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->PopLocalFrame(nullptr);
+  } else if (env->ExceptionCheck()) env->ExceptionClear();
+  if (attached) g_jvm->DetachCurrentThread();
+  return response;
+}
+
+std::string callJavaConfigBackup(const std::string& operation,
+                                const std::string& root, const std::string& work) {
+  if (!g_jvm || !g_hsvjEngineClass) return {};
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  const jint result = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  if (result == JNI_EDETACHED) {
+    if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return {};
+    attached = true;
+  } else if (result != JNI_OK || !env) return {};
+  std::string response;
+  if (env->PushLocalFrame(8) == JNI_OK) {
+    const auto callback = env->GetStaticMethodID(g_hsvjEngineClass, "processConfigBackup",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    if (callback && !env->ExceptionCheck()) {
+      auto op = env->NewStringUTF(operation.c_str());
+      auto rootArg = env->NewStringUTF(root.c_str());
+      auto workArg = env->NewStringUTF(work.c_str());
+      if (op && rootArg && workArg) {
+        auto reply = static_cast<jstring>(env->CallStaticObjectMethod(
+            g_hsvjEngineClass, callback, op, rootArg, workArg));
+        if (!env->ExceptionCheck()) response = jstringToUtf8(env, reply);
+      }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->PopLocalFrame(nullptr);
+  } else if (env->ExceptionCheck()) env->ExceptionClear();
+  if (attached) g_jvm->DetachCurrentThread();
+  return response;
+}
+
+extern "C" bool callJavaScheduleWatchdogAlarm() {
   if (!g_jvm || !g_hsvjEngineClass || !g_scheduleWatchdogAlarmMethod) {
     LOG_WARN("Java watchdog alarm method not available");
-    return;
+    return false;
   }
 
   JNIEnv *env = nullptr;
@@ -919,30 +1257,53 @@ extern "C" void callJavaScheduleWatchdogAlarm() {
       attached = true;
     } else {
       LOG_ERROR("Failed to attach thread to JVM for watchdog alarm");
-      return;
+      return false;
     }
   } else if (result != JNI_OK) {
     LOG_ERROR("Failed to get JNIEnv for watchdog alarm");
-    return;
+    return false;
   }
 
   LOG_DEBUG("Calling Java HSVJEngine.scheduleWatchdogAlarm()");
-  env->CallStaticVoidMethod(g_hsvjEngineClass, g_scheduleWatchdogAlarmMethod);
+  bool ok = env->CallStaticBooleanMethod(g_hsvjEngineClass, g_scheduleWatchdogAlarmMethod) == JNI_TRUE;
   if (env->ExceptionCheck()) {
     env->ExceptionClear();
     LOG_ERROR("Java scheduleWatchdogAlarm threw an exception");
+    ok = false;
   }
 
   if (attached) {
     g_jvm->DetachCurrentThread();
   }
+  return ok;
 }
 
-extern "C" void callJavaApplyNetworkIpConfig(const std::string& mode, const std::string& staticIp,
+extern "C" void callJavaOfferGroupLeaderTime(std::int64_t utcMs,
+                                            std::int64_t localMonoNs) {
+  if (!g_jvm || !g_hsvjEngineClass || !g_offerGroupLeaderTimeMethod) return;
+  JNIEnv *env = nullptr;
+  bool attached = false;
+  const jint result = g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+  if (result == JNI_EDETACHED) {
+    if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+    attached = true;
+  } else if (result != JNI_OK) {
+    return;
+  }
+  env->CallStaticVoidMethod(g_hsvjEngineClass, g_offerGroupLeaderTimeMethod,
+                           static_cast<jlong>(utcMs), static_cast<jlong>(localMonoNs));
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    LOG_ERROR("Group leader time JNI callback failed");
+  }
+  if (attached) g_jvm->DetachCurrentThread();
+}
+
+extern "C" bool callJavaApplyNetworkIpConfig(const std::string& mode, const std::string& staticIp,
                                              const std::string& gateway, const std::string& dns) {
   if (!g_jvm || !g_hsvjEngineClass || !g_applyNetworkIpConfigMethod) {
     LOG_WARN("Java applyNetworkIpConfig method not available");
-    return;
+    return false;
   }
 
   JNIEnv *env = nullptr;
@@ -953,18 +1314,18 @@ extern "C" void callJavaApplyNetworkIpConfig(const std::string& mode, const std:
       attached = true;
     } else {
       LOG_ERROR("Failed to attach thread to JVM for applyNetworkIpConfig");
-      return;
+      return false;
     }
   } else if (result != JNI_OK) {
     LOG_ERROR("Failed to get JNIEnv for applyNetworkIpConfig");
-    return;
+    return false;
   }
 
   jstring jMode = env->NewStringUTF(mode.c_str());
   jstring jStaticIp = env->NewStringUTF(staticIp.c_str());
   jstring jGateway = env->NewStringUTF(gateway.c_str());
   jstring jDns = env->NewStringUTF(dns.c_str());
-  env->CallStaticVoidMethod(g_hsvjEngineClass, g_applyNetworkIpConfigMethod, jMode, jStaticIp, jGateway, jDns);
+  bool ok = env->CallStaticBooleanMethod(g_hsvjEngineClass, g_applyNetworkIpConfigMethod, jMode, jStaticIp, jGateway, jDns) == JNI_TRUE;
   env->DeleteLocalRef(jMode);
   env->DeleteLocalRef(jStaticIp);
   env->DeleteLocalRef(jGateway);
@@ -973,15 +1334,16 @@ extern "C" void callJavaApplyNetworkIpConfig(const std::string& mode, const std:
   if (attached) {
     g_jvm->DetachCurrentThread();
   }
+  return ok;
 }
 
-extern "C" void callJavaApplyPowerSchedule(bool scheduleEnabled, bool powerOnEnabled,
+extern "C" bool callJavaApplyPowerSchedule(bool scheduleEnabled, bool powerOnEnabled,
                                            const std::string& powerOnDate, const std::string& powerOnTime,
                                            bool powerOffEnabled, const std::string& powerOffDate,
                                            const std::string& powerOffTime) {
   if (!g_jvm || !g_hsvjEngineClass || !g_applyPowerScheduleMethod) {
     LOG_WARN("Java applyPowerSchedule method not available");
-    return;
+    return false;
   }
 
   JNIEnv *env = nullptr;
@@ -992,23 +1354,23 @@ extern "C" void callJavaApplyPowerSchedule(bool scheduleEnabled, bool powerOnEna
       attached = true;
     } else {
       LOG_ERROR("Failed to attach thread to JVM for applyPowerSchedule");
-      return;
+      return false;
     }
   } else if (result != JNI_OK) {
     LOG_ERROR("Failed to get JNIEnv for applyPowerSchedule");
-    return;
+    return false;
   }
 
   jstring jPowerOnDate = env->NewStringUTF(powerOnDate.c_str());
   jstring jPowerOnTime = env->NewStringUTF(powerOnTime.c_str());
   jstring jPowerOffDate = env->NewStringUTF(powerOffDate.c_str());
   jstring jPowerOffTime = env->NewStringUTF(powerOffTime.c_str());
-  env->CallStaticVoidMethod(g_hsvjEngineClass, g_applyPowerScheduleMethod,
+  bool ok = env->CallStaticBooleanMethod(g_hsvjEngineClass, g_applyPowerScheduleMethod,
                             static_cast<jboolean>(scheduleEnabled),
                             static_cast<jboolean>(powerOnEnabled),
                             jPowerOnDate, jPowerOnTime,
                             static_cast<jboolean>(powerOffEnabled),
-                            jPowerOffDate, jPowerOffTime);
+                            jPowerOffDate, jPowerOffTime) == JNI_TRUE;
   env->DeleteLocalRef(jPowerOnDate);
   env->DeleteLocalRef(jPowerOnTime);
   env->DeleteLocalRef(jPowerOffDate);
@@ -1017,34 +1379,32 @@ extern "C" void callJavaApplyPowerSchedule(bool scheduleEnabled, bool powerOnEna
   if (attached) {
     g_jvm->DetachCurrentThread();
   }
+  return ok;
 }
 
-// JNI 推送音频数据接口
+// Push PCM data to active capture-backed video layers.
 extern "C" JNIEXPORT void JNICALL
 Java_com_hsvj_engine_HSVJEngine_pushAudioData(JNIEnv *env, jclass clazz,
                                                jshortArray data, jint numFrames,
                                                jint sampleRate) {
   (void)clazz;
-  if (!isEngineReady() || !data || numFrames <= 0) return;
-
-  // 获取 PCM 数据指针（jshortArray 对应 int16_t）
-  jshort *pcm = env->GetShortArrayElements(data, nullptr);
-  if (pcm) {
-    // 这里的 data 假定是立体声交错的，样本总数是 numFrames * 2
-    // 我们将其分发给当前处于采集模式的图层（图层 10 或 11）
-    // 也可以遍历所有图层，但通常只有 10/11 需要来自外部（HDMI/MIPI）的推送
-    for (int layerId : {10, 11}) {
-        hsvj::Layer* layer = g_engine->getMubu().getLayer(layerId);
-        if (layer && layer->getType() == hsvj::LayerType::VIDEO) {
-            hsvj::LayerVideo* vl = static_cast<hsvj::LayerVideo*>(layer);
-            if (vl->isCaptureMode()) {
-                vl->pushAudioData(reinterpret_cast<const int16_t*>(pcm), numFrames, sampleRate);
-            }
-        }
-    }
-    // 释放资源，JNI_ABORT 表示不写回 Java 数组（因为我们只是读取）
-    env->ReleaseShortArrayElements(data, pcm, JNI_ABORT);
+  if (!isEngineReady() || !data || numFrames <= 0) {
+    return;
   }
+  jshort *pcm = env->GetShortArrayElements(data, nullptr);
+  if (!pcm) {
+    return;
+  }
+  for (int layerId : {10, 11}) {
+    hsvj::Layer *layer = g_engine->getMubu().getLayer(layerId);
+    if (layer && layer->getType() == hsvj::LayerType::VIDEO) {
+      auto *videoLayer = static_cast<hsvj::LayerVideo *>(layer);
+      if (videoLayer->isCaptureMode()) {
+        videoLayer->pushAudioData(reinterpret_cast<const int16_t *>(pcm), numFrames, sampleRate);
+      }
+    }
+  }
+  env->ReleaseShortArrayElements(data, pcm, JNI_ABORT);
 }
 
 extern "C"
@@ -1072,13 +1432,82 @@ Java_com_hsvj_engine_HSVJEngine_pushMirrorFrame(JNIEnv *env, jclass clazz, jint 
 
 extern "C"
 JNIEXPORT jboolean JNICALL
+Java_com_hsvj_engine_HSVJEngine_startNativeAirPlayMirror(
+        JNIEnv *env, jclass clazz, jint layerId) {
+    (void)env;
+    (void)clazz;
+    if (!getMirrorLayer(layerId)) {
+        LOG_ERROR("[AirPlayRkmppJNI] mirror layer %d unavailable", layerId);
+        return JNI_FALSE;
+    }
+
+    std::lock_guard<std::mutex> lock(g_nativeAirPlayMirrorMutex);
+    if (g_nativeAirPlayMirrorSession) {
+        g_nativeAirPlayMirrorSession->stop();
+        g_nativeAirPlayMirrorSession.reset();
+    }
+
+    auto session = std::make_unique<hsvj::AirPlayRkmppSession>();
+    if (!session->start(layerId, [](int callbackLayerId,
+                                    hsvj::H264RkmppFrame& frame) {
+          deliverMirrorDecodedFrame(callbackLayerId, frame);
+        })) {
+        LOG_ERROR("[AirPlayRkmppJNI] failed to start native session layer=%d",
+                  layerId);
+        return JNI_FALSE;
+    }
+    g_nativeAirPlayMirrorSession = std::move(session);
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_hsvj_engine_HSVJEngine_pushNativeAirPlayVideo(
+        JNIEnv *env, jclass clazz, jbyteArray data, jint nalType, jlong ptsUs,
+        jint width, jint height, jint codec) {
+    (void)clazz;
+    if (!data) return JNI_FALSE;
+
+    const jsize size = env->GetArrayLength(data);
+    if (size <= 0) return JNI_FALSE;
+
+    std::vector<uint8_t> payload(static_cast<size_t>(size));
+    env->GetByteArrayRegion(data, 0, size,
+                            reinterpret_cast<jbyte*>(payload.data()));
+    if (env->ExceptionCheck()) {
+        LOG_ERROR("[AirPlayRkmppJNI] failed to copy AirPlay NAL bytes=%d", size);
+        return JNI_FALSE;
+    }
+
+    std::lock_guard<std::mutex> lock(g_nativeAirPlayMirrorMutex);
+    if (!g_nativeAirPlayMirrorSession ||
+        !g_nativeAirPlayMirrorSession->isRunning()) {
+        return JNI_FALSE;
+    }
+    return g_nativeAirPlayMirrorSession->enqueue(
+               std::move(payload), nalType, static_cast<int64_t>(ptsUs),
+               width, height, codec)
+        ? JNI_TRUE
+        : JNI_FALSE;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_hsvj_engine_HSVJEngine_stopNativeAirPlayMirror(
+        JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    stopNativeAirPlayMirrorSession();
+}
+extern "C"
+JNIEXPORT jboolean JNICALL
 Java_com_hsvj_engine_HSVJEngine_startNativeUsbAdbMirror(
         JNIEnv *env, jclass clazz, jint layerId, jint usbFd,
         jint bulkInEndpoint, jint bulkOutEndpoint, jint preferredWidth,
         jint preferredHeight, jstring scrcpyServerPath, jstring keyDir,
         jboolean adbAlreadyConnected, jboolean foregroundMonitorEnabled) {
     (void)clazz;
-    if (!getMirrorLayerForUsbMirror(layerId)) {
+    if (!getMirrorLayer(layerId)) {
         LOG_ERROR("[NativeUsbAdbJNI] mirror layer %d unavailable", layerId);
         return JNI_FALSE;
     }
@@ -1111,8 +1540,8 @@ Java_com_hsvj_engine_HSVJEngine_startNativeUsbAdbMirror(
     config.adbAlreadyConnected = adbAlreadyConnected == JNI_TRUE;
     config.foregroundMonitorEnabled = foregroundMonitorEnabled == JNI_TRUE;
     config.videoFrameCallback = [](int callbackLayerId,
-                                   hsvj::UsbH264RkmppFrame& frame) {
-        deliverUsbMirrorFrame(callbackLayerId, frame);
+                                   hsvj::H264RkmppFrame& frame) {
+        deliverMirrorDecodedFrame(callbackLayerId, frame);
     };
 
     std::lock_guard<std::mutex> lock(g_nativeUsbMirrorMutex);
@@ -1137,11 +1566,7 @@ JNIEXPORT void JNICALL
 Java_com_hsvj_engine_HSVJEngine_stopNativeUsbAdbMirror(JNIEnv *env, jclass clazz) {
     (void)env;
     (void)clazz;
-    std::lock_guard<std::mutex> lock(g_nativeUsbMirrorMutex);
-    if (g_nativeUsbMirrorClient) {
-        g_nativeUsbMirrorClient->stop();
-        g_nativeUsbMirrorClient.reset();
-    }
+    stopNativeUsbMirrorClient();
 }
 
 extern "C"
@@ -1261,6 +1686,71 @@ Java_com_hsvj_engine_HSVJEngine_setMirroringState(JNIEnv *env, jclass clazz, jbo
 
 extern "C"
 JNIEXPORT void JNICALL
+Java_com_hsvj_engine_HSVJEngine_setExternalBluetoothAudioActive(
+        JNIEnv *env, jclass clazz, jboolean active) {
+    (void)env;
+    (void)clazz;
+    if (isEngineReady()) {
+        g_engine->setBluetoothAudioMode(active == JNI_TRUE);
+    } else {
+        hsvj::AudioPlayerManager::getInstance().setExternalBluetoothAudioActive(active == JNI_TRUE);
+    }
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_hsvj_engine_HSVJEngine_setBluetoothAudioSpectrum(
+        JNIEnv *env, jclass clazz, jfloatArray spectrum) {
+    (void)clazz;
+    if (!isEngineReady() || spectrum == nullptr) {
+        return;
+    }
+    const jsize size = env->GetArrayLength(spectrum);
+    if (size <= 0) {
+        return;
+    }
+    std::vector<float> values(static_cast<size_t>(size));
+    env->GetFloatArrayRegion(spectrum, 0, size, values.data());
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return;
+    }
+    g_engine->setBluetoothAudioSpectrum(values);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_hsvj_engine_HSVJEngine_setBluetoothAudioMetadata(
+        JNIEnv *env, jclass clazz, jstring title, jstring artist,
+        jlong durationMs, jstring lyricFrame, jlong lyricPositionMs) {
+    (void)clazz;
+    if (!isEngineReady()) {
+        return;
+    }
+
+    g_engine->setBluetoothAudioMetadata(jstringToUtf8(env, title),
+                                        jstringToUtf8(env, artist),
+                                        static_cast<int64_t>(durationMs),
+                                        jstringToUtf8(env, lyricFrame),
+                                        static_cast<int64_t>(lyricPositionMs));
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_hsvj_engine_HSVJEngine_setBluetoothAudioPlayback(
+        JNIEnv *env, jclass clazz, jint state, jlong positionMs, jfloat speed) {
+    (void)env;
+    (void)clazz;
+    if (!isEngineReady()) {
+        return;
+    }
+    g_engine->setBluetoothAudioPlayback(static_cast<int>(state),
+                                        static_cast<int64_t>(positionMs),
+                                        static_cast<float>(speed));
+}
+
+extern "C"
+JNIEXPORT void JNICALL
 Java_com_hsvj_engine_HSVJEngine_setMirrorPin(JNIEnv *env, jclass clazz, jint layerId, jint pinCode) {
     (void)env;
     (void)clazz;
@@ -1272,6 +1762,56 @@ Java_com_hsvj_engine_HSVJEngine_setMirrorPin(JNIEnv *env, jclass clazz, jint lay
         }
     }
 }
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_hsvj_engine_HSVJEngine_setMirrorServiceState(
+        JNIEnv *env, jclass clazz, jint layerId, jstring serviceName,
+        jboolean started, jboolean connected, jstring deviceName, jint pinCode) {
+    (void)clazz;
+    if (!isEngineReady()) return;
+
+    std::string serviceNameValue;
+    if (serviceName) {
+        const char* value = env->GetStringUTFChars(serviceName, nullptr);
+        if (value) {
+            serviceNameValue = value;
+            env->ReleaseStringUTFChars(serviceName, value);
+        }
+    }
+
+    std::string deviceNameValue;
+    if (deviceName) {
+        const char* value = env->GetStringUTFChars(deviceName, nullptr);
+        if (value) {
+            deviceNameValue = value;
+            env->ReleaseStringUTFChars(deviceName, value);
+        }
+    }
+
+    hsvj::Layer* layer = g_engine->getMubu().getLayer(layerId);
+    if (layer && layer->getType() == hsvj::LayerType::MIRROR) {
+        auto* mirrorLayer = static_cast<hsvj::LayerMirror*>(layer);
+        mirrorLayer->setServiceState(started == JNI_TRUE, serviceNameValue,
+                                     connected == JNI_TRUE, deviceNameValue,
+                                     pinCode);
+    }
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_hsvj_engine_HSVJEngine_setMirrorTvModeActive(
+        JNIEnv *env, jclass clazz, jint layerId, jboolean active) {
+    (void)env;
+    (void)clazz;
+    if (!isEngineReady()) return;
+
+    hsvj::Layer* layer = g_engine->getMubu().getLayer(layerId);
+    if (layer && layer->getType() == hsvj::LayerType::MIRROR) {
+        auto* mirrorLayer = static_cast<hsvj::LayerMirror*>(layer);
+        mirrorLayer->setTvModeActive(active == JNI_TRUE);
+    }
+}
+
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_hsvj_engine_HSVJEngine_updateLayerSize(JNIEnv *env, jclass clazz, jint layerId, jint width, jint height) {
@@ -1291,8 +1831,7 @@ Java_com_hsvj_engine_HSVJEngine_updateLayerSize(JNIEnv *env, jclass clazz, jint 
     }
 }
 
-// [AdaptiveFPS] 诊断接口：返回当前 PLAYING 视频图层的最大 fps（不含采集层）。
-// 渲染循环应优先使用 getRenderDemandFps()。
+// [AdaptiveFPS] Render pacing JNI bridge.
 extern "C"
 JNIEXPORT jdouble JNICALL
 Java_com_hsvj_engine_HSVJEngine_getActiveVideoFps(JNIEnv *env, jobject thiz) {
@@ -1302,7 +1841,7 @@ Java_com_hsvj_engine_HSVJEngine_getActiveVideoFps(JNIEnv *env, jobject thiz) {
     return g_engine->getActiveVideoFps();
 }
 
-// [AdaptiveFPS] 返回当前画面更新需求帧率：有动态画面时 60，静态场景时 30。
+// [AdaptiveFPS] Render pacing JNI bridge.
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_hsvj_engine_HSVJEngine_getRenderDemandFps(JNIEnv *env, jobject thiz) {
@@ -1388,6 +1927,15 @@ Java_com_hsvj_engine_HSVJEngine_getLastAsyncAcquireFenceMs(JNIEnv *env, jobject 
 
 extern "C"
 JNIEXPORT jlong JNICALL
+Java_com_hsvj_engine_HSVJEngine_getSuccessfulPresentCount(JNIEnv *env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+    if (!isEngineReady()) return 0;
+    return static_cast<jlong>(g_engine->getSuccessfulPresentCount());
+}
+
+extern "C"
+JNIEXPORT jlong JNICALL
 Java_com_hsvj_engine_HSVJEngine_getSwapchainNoImageSkipCount(JNIEnv *env, jobject thiz) {
     (void)env;
     (void)thiz;
@@ -1395,9 +1943,7 @@ Java_com_hsvj_engine_HSVJEngine_getSwapchainNoImageSkipCount(JNIEnv *env, jobjec
     return static_cast<jlong>(g_engine->getSwapchainNoImageSkipCount());
 }
 
-// [MirrorGate] 返回 config.json 中启用的第一个 MIRROR 图层 ID；若未启用任何
-// MIRROR 图层则返回 -1。Java 侧 Mirror管理器 据此决定是否启动 Lymp 服务，
-// 避免硬编码 Layer 31 白白消耗 HardwareBuffer pool + TCP/HTTP 监听线程。
+// [MirrorGate] Mirror layer lookup JNI bridge.
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_hsvj_engine_HSVJEngine_getFirstMirrorLayerId(JNIEnv *env, jobject thiz) {
@@ -1405,4 +1951,68 @@ Java_com_hsvj_engine_HSVJEngine_getFirstMirrorLayerId(JNIEnv *env, jobject thiz)
     (void)thiz;
     if (!isEngineReady()) return -1;
     return g_engine->getFirstMirrorLayerId();
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_hsvj_engine_HSVJEngine_getMirrorControlConfigJson(JNIEnv *env, jobject thiz) {
+    (void)thiz;
+    Json::Value result(Json::objectValue);
+    if (!isEngineReady()) {
+        result["configured"] = false;
+        result["mode"] = "none";
+        result["enabled"] = false;
+        result["sceneName"] = "";
+        return env->NewStringUTF(hsvj::JsonUtils::toString(result).c_str());
+    }
+
+    const hsvj::SystemConfig& config = g_engine->getSystemConfig();
+    result["configured"] = config.hasMirrorControlConfig();
+    result["mode"] = config.getMirrorAutoStartMode();
+    result["enabled"] = config.isUsbAppSceneEnabled();
+    result["sceneName"] = config.getUsbAppSceneName();
+    return env->NewStringUTF(hsvj::JsonUtils::toString(result).c_str());
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_hsvj_engine_HSVJEngine_saveMirrorControlConfig(
+        JNIEnv *env, jobject thiz, jstring autoStartMode, jboolean appSceneEnabled,
+        jstring sceneName) {
+    (void)thiz;
+    if (!isEngineReady() || autoStartMode == nullptr || sceneName == nullptr) {
+        return JNI_FALSE;
+    }
+
+    const char *modeChars = env->GetStringUTFChars(autoStartMode, nullptr);
+    const char *sceneChars = env->GetStringUTFChars(sceneName, nullptr);
+    if (modeChars == nullptr || sceneChars == nullptr) {
+        if (modeChars != nullptr) {
+            env->ReleaseStringUTFChars(autoStartMode, modeChars);
+        }
+        if (sceneChars != nullptr) {
+            env->ReleaseStringUTFChars(sceneName, sceneChars);
+        }
+        return JNI_FALSE;
+    }
+    const std::string mode(modeChars);
+    const std::string scene(sceneChars);
+    env->ReleaseStringUTFChars(autoStartMode, modeChars);
+    env->ReleaseStringUTFChars(sceneName, sceneChars);
+
+    if (mode != "none" && mode != "usb" && mode != "android" && mode != "apple") {
+        return JNI_FALSE;
+    }
+
+    hsvj::SystemConfig& config = g_engine->getSystemConfig();
+    const bool oldConfigured = config.hasMirrorControlConfig();
+    const std::string oldMode = config.getMirrorAutoStartMode();
+    const bool oldEnabled = config.isUsbAppSceneEnabled();
+    const std::string oldSceneName = config.getUsbAppSceneName();
+    config.setMirrorControlConfig(true, mode, appSceneEnabled == JNI_TRUE, scene);
+    if (config.save(hsvj::CONFIG_PATH)) {
+        return JNI_TRUE;
+    }
+    config.setMirrorControlConfig(oldConfigured, oldMode, oldEnabled, oldSceneName);
+    return JNI_FALSE;
 }

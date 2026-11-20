@@ -102,7 +102,7 @@ static av_cold int libspeex_decode_init(AVCodecContext *avctx)
         channels = 2;
     }
     av_channel_layout_uninit(&avctx->ch_layout);
-    avctx->ch_layout = channels == 2 ? (AVChannelLayout)? AV_CHANNEL_LAYOUT_STEREO :
+    avctx->ch_layout = channels == 2 ? (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO :
                                        (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
     speex_bits_init(&s->bits);

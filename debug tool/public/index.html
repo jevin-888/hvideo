@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HVIDEO · 连接设备</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/main.css">
+  <script src="js/app-update.js" defer></script>
+  <script src="js/system-update.js" defer></script>
+  <script src="js/app.js" defer></script>
+</head>
+<body>
+  <div id="app" class="app">
+    <header class="header">
+      <div class="brand"><button id="brand-logo" class="logo-button" type="button" aria-label="HVIDEO Logo"><img class="logo" src="favicon.svg" alt="" draggable="false"></button><strong>HVIDEO <span>设备调试</span></strong></div>
+      <nav class="steps" aria-label="连接步骤"><span aria-current="step"><b>01</b> 选择设备</span><i aria-hidden="true"></i><span><b>02</b> 进入调试</span></nav>
+      <div class="header-actions"><button id="serial-button" class="quiet" type="button" hidden>写序列号</button><button id="app-update-button" class="quiet" type="button">APP 升级</button><button id="system-update-button" class="quiet" type="button">系统升级</button><button id="manual-button" class="quiet" type="button">手动连接 <span aria-hidden="true">↗</span></button></div>
+    </header>
+    <main class="workspace">
+      <section class="discovery" aria-labelledby="devices-heading">
+        <div class="section-heading"><div><p class="eyebrow">DEVICE DISCOVERY</p><h1 id="devices-heading">连接你的设备<span id="device-count" class="count">0</span></h1><p class="subtitle">选择局域网中的设备，开始本次调试。</p></div></div>
+        <div class="network-controls">
+          <label for="network-interface">选择网卡</label>
+          <select id="network-interface" title="选择网卡后点击重新扫描"><option value="">全部网卡</option></select>
+          <button id="scan-button" class="primary" type="button"><span aria-hidden="true">↻</span> 重新扫描</button>
+        </div>
+        <div class="filters">
+          <label class="search"><span aria-hidden="true">⌕</span><input id="device-filter" type="search" aria-label="搜索设备" placeholder="搜索设备名称、IP、序列号…" autocomplete="off"></label>
+          <label class="sr-only" for="model-filter">设备型号</label><select id="model-filter"><option value="">全部型号</option></select>
+          <label class="sr-only" for="device-sort">排序方式</label><select id="device-sort"><option value="ip">按 IP 排序</option><option value="name">按名称排序</option></select>
+        </div>
+        
+        <div class="scan-feedback"><div id="status" class="status" role="status" aria-live="polite">正在准备网络接口…</div><span id="scan-time">尚未扫描</span></div>
+        <details id="scan-warnings" class="warnings" hidden><summary>部分网卡扫描异常</summary><p id="warning-detail"></p></details>
+        <div id="device-table" class="table-scroll" aria-busy="false">
+          <table aria-label="局域网设备列表"><colgroup><col class="name-col"><col class="ip-col"><col class="model-col"><col class="choice-col"></colgroup><thead><tr><th scope="col">设备名称</th><th scope="col">IP 地址</th><th scope="col">型号</th><th scope="col"><span class="sr-only">选择状态</span></th></tr></thead><tbody id="device-list"></tbody></table>
+          <div id="empty-state" class="empty"><div class="empty-icon" aria-hidden="true">⌕</div><h2>正在发现设备</h2><p>发现后立即显示，请保持电脑与设备处于同一网络。</p></div>
+        </div>
+        <div class="pagination"><span id="result-count">共 0 台设备</span><div><label for="page-size" class="sr-only">每页设备数</label><select id="page-size"><option value="20">20 台 / 页</option><option value="50">50 台 / 页</option><option value="100">100 台 / 页</option></select><button id="previous-page" class="page-button" type="button" aria-label="上一页" disabled>‹</button><span id="page-indicator">1 / 1</span><button id="next-page" class="page-button" type="button" aria-label="下一页" disabled>›</button></div></div>
+      </section>
+      <aside class="connection-panel" aria-labelledby="selection-heading">
+        <div class="panel-top"><span class="eyebrow">READY TO CONNECT</span><span class="panel-dot" aria-hidden="true"></span></div>
+        <div class="device-illustration" aria-hidden="true"><div class="device-box"><span>HVIDEO</span><i></i><i></i><i></i></div><div class="device-shadow"></div></div>
+        <div id="no-selection"><h2 id="selection-heading">从左侧选择一台设备</h2><p>设备信息将在这里显示，<br>确认后即可进入调试。</p></div>
+        <div id="selection-details" hidden><p class="selection-label">已选择设备</p><h2 id="selected-name"></h2><p id="selected-address" class="selected-address"></p><dl><div><dt>型号</dt><dd id="selected-model"></dd></div><div><dt>序列号</dt><dd id="selected-serial"></dd></div><div><dt>MAC 地址</dt><dd id="selected-mac"></dd></div></dl></div>
+        <div class="login-action"><p id="selection-hint">先选择设备，再进入调试</p><button id="login-button" type="button" disabled>进入调试 <span aria-hidden="true">→</span></button><p id="connect-status" role="status" aria-live="polite"></p></div>
+        <div class="panel-footer"><span aria-hidden="true">◇</span><p>自动连接已选设备<br>连接成功后进入完整调试界面</p></div>
+      </aside>
+    </main>
+    <footer class="footer"><span>HVIDEO · 局域网设备连接中心</span><span>未发现设备？检查网络连接，或使用右上角「手动连接」。</span></footer>
+  </div>
+  <section id="device-view" class="device-view" hidden aria-label="设备调试页面">
+    <div class="device-view-toolbar">
+      <button id="device-view-back" class="device-home-button" type="button" aria-label="退出调试，返回设备列表" title="退出调试，返回设备列表"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg></button>
+    </div>
+    <iframe id="device-frame" title="设备调试页面" referrerpolicy="no-referrer"></iframe>
+  </section>
+  <dialog id="manual-dialog" aria-labelledby="manual-heading"><form id="connect-form"><div class="dialog-header"><h2 id="manual-heading">手动连接设备</h2><button id="close-manual" class="icon-button" type="button" aria-label="关闭手动连接">×</button></div><p>填写设备地址，确认后选择此设备。</p><label>设备 IPv4 地址<input id="device-ip" placeholder="192.168.1.100" required maxlength="15" autocomplete="off" spellcheck="false"></label><p id="manual-error" class="error" role="alert"></p><button class="primary" type="submit">选择此设备</button></form></dialog>
+  <dialog id="serial-unlock-dialog" aria-labelledby="serial-unlock-heading"><form id="serial-unlock-form"><div class="dialog-header"><h2 id="serial-unlock-heading">解锁写号</h2><button id="close-serial-unlock" class="icon-button" type="button" aria-label="取消写号解锁">×</button></div><p>请输入写号密码。</p><label for="serial-unlock-password">密码<input id="serial-unlock-password" type="password" inputmode="numeric" maxlength="6" autocomplete="off" required></label><p id="serial-unlock-error" class="error" role="alert"></p><div class="dialog-actions"><button id="cancel-serial-unlock" class="quiet" type="button">取消</button><button class="primary" type="submit">确定</button></div></form></dialog>
+  <dialog id="app-update-dialog" aria-labelledby="app-update-heading">
+    <div class="dialog-header"><h2 id="app-update-heading">APP 升级</h2><button id="app-update-close" class="icon-button" type="button" aria-label="关闭 APP 升级">×</button></div>
+    <p>选择 APK 和目标设备，覆盖安装并保留应用数据，安装成功后自动启动该应用。安装前自动重启本机 ADB 服务。USB 安装请使用数据线连接设备，并开启 USB 调试；网络安装需开启网络调试。</p>
+    <fieldset id="app-update-fields">
+      <div class="update-connection"><label for="app-update-connection">连接方式 <select id="app-update-connection"><option value="network">局域网连接</option><option value="usb">USB 连接</option></select></label><button id="app-update-usb-refresh" class="quiet" type="button" hidden>刷新 USB 设备</button></div>
+      <div class="apk-picker"><button id="app-update-choose" class="primary" type="button">选择 APK</button><span id="app-update-file-info">尚未选择安装包（最大 300 MB）</span></div>
+      <label class="update-signing">安装签名<select id="app-update-signing"><option value="none">保持原 APK 签名</option><option value="hw81">重签名为 hw81</option><option value="hw82">重签名为 hw82</option></select></label>
+      <div class="update-selection"><label><input id="app-update-all" type="checkbox">全选列表设备</label><span id="app-update-count">已选 0 台</span></div>
+      <div id="app-update-devices" class="update-devices" aria-label="升级目标设备"></div>
+      <label class="update-checkbox"><input id="app-update-downgrade" type="checkbox">允许降级安装（保留应用数据）</label>
+      <p class="update-hint">已内置 hw81/hw82 签名资源，可直接选择重签名，无需安装 Java 或配置密钥。原 APK 不会被修改；覆盖安装需与设备已有应用签名一致。</p>
+    </fieldset>
+    <p id="app-update-status" role="status" aria-live="polite"></p>
+    <progress id="app-update-progress" aria-label="安装任务进度" max="1" value="0" hidden></progress>
+    <div id="app-update-results" aria-label="逐台安装结果"></div>
+    <div class="update-actions"><button id="app-update-refresh" class="quiet" type="button">重新获取状态</button><button id="app-update-start" class="primary" type="button" disabled>开始安装</button></div>
+  </dialog>
+  <dialog id="system-update-dialog" aria-labelledby="system-update-heading">
+    <div class="dialog-header"><h2 id="system-update-heading">系统升级</h2><button id="system-update-close" class="icon-button" type="button" aria-label="关闭系统升级">×</button></div>
+    <p>选择本地 ROM 包后，工具会通过网络 ADB 将文件交给播放器现有的原生控制器校验并启动 Recovery 升级。调试工具不直接写分区；升级期间请保持供电和网络连接。</p>
+    <div class="apk-picker rom-picker"><button id="system-update-choose" class="primary" type="button">选择 update.img</button><span id="system-update-file-info">尚未选择 ROM（请选择 update.img，自动匹配配套清单和签名）</span></div>
+    <fieldset id="system-update-fields"><div class="update-selection"><label><input id="system-update-all" type="checkbox">全选列表设备</label><span id="system-update-count">已选 0 台</span></div><div id="system-update-devices" class="update-devices" aria-label="系统升级目标设备"></div>
+      <label class="update-checkbox"><input id="system-update-downgrade" type="checkbox">允许降级刷机</label>
+      <label class="update-signing">硬件标识<select id="system-update-hardware"><option value="hw82" selected>hw82</option><option value="hw81">hw81</option></select></label>
+      <p class="update-hint">默认使用 hw82；需要旧设备时可切换为 hw81。请复制完整 ROM 文件夹，工具自动选用对应标识文件。新 ROM 不再按 hw81/hw82 限制；刷回旧 ROM 后恢复旧规则。升级前请备份数据。</p>
+    </fieldset>
+    <p id="system-update-status" role="status" aria-live="polite"></p>
+    <div id="system-update-results" aria-label="系统升级结果"></div>
+    <div class="update-actions"><button id="system-update-refresh" class="quiet" type="button">重新获取状态</button><button id="system-update-start" class="primary" type="button" disabled>检查并启动</button></div>
+  </dialog>
+</body>
+</html>

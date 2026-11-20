@@ -430,7 +430,7 @@ static void h263p_encode_umotion(PutBitContext *pb, int val)
         put_bits(pb, 3, 2);
     else {
 
-        sval = ((val < 0) ? (short)? (-val):(short)val);
+        sval = ((val < 0) ? (short)(-val):(short)val);
         temp_val = sval;
 
         while (temp_val != 0) {

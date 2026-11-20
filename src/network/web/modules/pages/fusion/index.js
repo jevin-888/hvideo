@@ -14,17 +14,17 @@ import {
     initializeGeometryRegion,
     snapManagerCornerSelection
 } from './geometry/actions.js?v=2.95';
-import { initializeMask } from './mask/actions.js?v=2.95';
+import { initializeMask, setMaskEnabled } from './mask/actions.js?v=2.95';
 import { setActiveBlendCorner, setActiveBlendSide, setBlendAutoEdges, setBlendMasterEnabled } from './blend/actions.js?v=2.95';
 import { patchColor } from './color/actions.js?v=2.95';
-import { persistFusionConfig, getBlendAutoEdges, getFusionMaster, getManagerMode } from './api.js?v=2.95';
-import { bindUi } from './ui/bindings.js?v=2.100';
-import { renderFusionUi } from './ui/panel.js?v=2.100';
+import { persistFusionConfig, getBlendAutoEdges, getFusionMaster, getManagerMode } from './api.js?v=2.97';
+import { bindUi } from './ui/bindings.js?v=2.104';
+import { renderFusionUi } from './ui/panel.js?v=2.103';
 import { loadGeometryLayout, loadGeometryRegion, persistGeometryRegion, syncActiveGeometrySelection, flushPendingGeometryOps } from './sync/syncGeometry.js?v=2.95';
 import { loadMask, persistMask } from './sync/syncMask.js?v=2.95';
-import { loadBlendRegion, syncBlendRegion } from './sync/syncBlend.js?v=2.95';
+import { loadBlendRegion, syncBlendRegion } from './sync/syncBlend.js?v=2.96';
 import { syncColorRegion } from './sync/syncColor.js?v=2.95';
-import { switchFusionTab } from './modeSwitch.js?v=2.100';
+import { switchFusionTab } from './modeSwitch.js?v=2.104';
 import { applyGridVisualStyle } from './canvas/visualStyle.js?v=2.81';
 
 function ensureRegionState(regionId) {
@@ -268,4 +268,3 @@ export async function initializeFusion() {
 }
 
 window.hsFusion = createFusionFacade();
-

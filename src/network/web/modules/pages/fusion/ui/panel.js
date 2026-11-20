@@ -2,6 +2,7 @@ import { getState, patchPage } from '../actions.js?v=2.95';
 import { getActiveBlend, getActiveColor, getActiveGeometry, getActiveMask } from '../selectors.js?v=2.95';
 import { drawBlendScene, drawGridScene, getInputCanvasLayoutMetrics, resizeCanvasToDisplaySize } from '../canvas/renderer.js?v=2.101';
 import { BLEND_SIDE_LABELS, TABS } from '../types.js';
+import { renderHorizontalDragFill } from './horizontalDrag.js?v=1.2';
 
 export function switchTab(tab) {
     patchPage({ activeTab: tab });
@@ -102,9 +103,7 @@ function syncControls() {
     const state = getState();
     const regionId = state.page.activeRegionId;
     const blend = state.blend.byRegionId[regionId];
-    const geometry = state.geometry.byRegionId[regionId];
     const color = getActiveColor();
-    const geometryEnabled = !!(geometry && geometry.showGrid);
     const blendControlsEnabled = !!state.blend.masterEnabled;
     const fusionTitle = document.getElementById('fusionBlendSectionTitle');
     if (fusionTitle) {
@@ -175,10 +174,19 @@ function syncControls() {
         if (slopeInput) slopeInput.value = String(sideState.slope);
         if (gainInput) gainInput.value = String(sideState.anchor ?? 0.5);
     }
+    renderHorizontalDragFill(gainInput, gainInput?.value ?? 0.5, {
+        min: 0,
+        max: 1,
+        color: '245, 158, 11'
+    });
     [gammaInput, slopeInput, gainInput].forEach((input) => {
         if (!input) return;
         input.disabled = !blendControlsEnabled;
-        input.title = blendControlsEnabled ? '' : '请先打开融合带';
+        input.title = blendControlsEnabled
+            ? (input === gainInput ? '按住或左右拖动调整' : '')
+            : '请先打开融合带';
+        const dragHost = input.closest('.horizontal-drag-field');
+        if (dragHost) dragHost.setAttribute('aria-disabled', String(input.disabled));
     });
 
     // 同步 fusion band brightness inputs
@@ -241,14 +249,13 @@ function updateKeyboardShortcutsColors() {
 }
 
 function updateBrightnessDragFill(input, value, color) {
-    const host = input?.closest?.('.brightness-drag-field');
-    if (!host) return;
     const next = Math.max(0, Math.min(255, Number(value) || 0));
-    host.style.setProperty('--brightness-color', color);
-    host.style.setProperty('--brightness-level', `${(next / 255) * 100}%`);
+    renderHorizontalDragFill(input, next, { min: 0, max: 255, color });
 }
 
-const MOBILE_DEBUG_FALLBACK_URL = 'http://192.168.1.100:8080/fusion-mobile/';
+// Port 80 is forwarded to the engine's internal HTTP service. Keep the QR
+// payload in the user-facing form: http://热点IP/fusion-mobile/.
+const MOBILE_DEBUG_FALLBACK_URL = 'http://192.168.1.100/fusion-mobile/';
 let lastMobileDebugUrl = '';
 
 function getMobileDebugUrl() {
@@ -257,7 +264,12 @@ function getMobileDebugUrl() {
     const host = location.hostname;
     const unusableHost = !host || host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0';
     if (!location.protocol.startsWith('http') || unusableHost) return fallback;
-    return `${location.protocol}//${location.host}/fusion-mobile/`;
+    // location.hostname intentionally excludes the browser's port (for
+    // example, 192.168.182.192:8080 becomes 192.168.182.192).
+    const normalizedHost = host.includes(':') && !host.startsWith('[')
+        ? `[${host}]`
+        : host;
+    return `http://${normalizedHost}/fusion-mobile/`;
 }
 
 function renderMobileDebugQr() {
@@ -284,6 +296,10 @@ function renderMobileDebugQr() {
         if (fallback) fallback.style.display = '';
         return;
     }
+
+    // 设置 canvas 的实际分辨率以匹配显示尺寸，避免模糊
+    canvas.width = qrSize;
+    canvas.height = qrSize;
 
     window.QRCode.toCanvas(canvas, url, {
         width: qrSize,
@@ -326,3 +342,7 @@ export function renderFusionUi() {
     renderMobileDebugQr();
 }
 
+// Redraw canvas labels when the presentation language changes.
+document.addEventListener('player-language-changed', () => {
+    if (document.getElementById('fusionCanvas')) renderFusionUi();
+});

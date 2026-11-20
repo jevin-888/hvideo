@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 namespace hsvj {
 
@@ -29,6 +30,10 @@ enum class LayerPlaybackState {
 class LayerPlaybackController {
 public:
   explicit LayerPlaybackController(int layerId);
+  ~LayerPlaybackController();
+
+  LayerPlaybackController(const LayerPlaybackController &) = delete;
+  LayerPlaybackController &operator=(const LayerPlaybackController &) = delete;
 
   PlaybackResult requestPlay(const PlaybackRequest &request, LayerVideo *layer);
   PlaybackResult stop(LayerVideo *layer);
@@ -50,6 +55,10 @@ private:
   LayerVideo *activeLayer_ = nullptr;
   LayerVideo *pendingLayer_ = nullptr;
   bool workerRunning_ = false;
+  bool stopRequested_ = false;
+  // Processes the latest queued switch and is joined before the controller is
+  // destroyed, so a pending request cannot outlive its LayerVideo/controller.
+  std::thread pendingWorker_;
 };
 
 const char *toString(LayerPlaybackState state);

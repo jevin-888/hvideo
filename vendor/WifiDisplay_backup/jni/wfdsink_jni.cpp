@@ -187,7 +187,7 @@ int startWFDSink(const char *devaddr, bool isgo, const sp<Surface> &surface = NU
     return 0;
 }
 
-static jint android_p2p_startWFDSink(JNIEnv *env, jobject *thiz, jstring peerinfo, jboolean go) {
+static jint android_p2p_startWFDSink(JNIEnv *env, jobject thiz, jstring peerinfo, jboolean go) {
    UNUSED(thiz);
    const char *peerinfoStr = env->GetStringUTFChars(peerinfo, NULL);
    if (peerinfoStr == NULL) {  // Out of memory
@@ -198,7 +198,7 @@ static jint android_p2p_startWFDSink(JNIEnv *env, jobject *thiz, jstring peerinf
    return ret;
 }
 
-static jint android_p2p_startWFDSinkWithSurface(JNIEnv *env, jobject *thiz,
+static jint android_p2p_startWFDSinkWithSurface(JNIEnv *env, jobject thiz,
         jstring peerinfo, jboolean go, jobject surfaceObj) {
    UNUSED(thiz);
    const char *peerinfoStr = env->GetStringUTFChars(peerinfo, NULL);
@@ -216,7 +216,7 @@ static jint android_p2p_startWFDSinkWithSurface(JNIEnv *env, jobject *thiz,
    return ret;
 }
 
-static void android_p2p_stopWFDSink(JNIEnv *env, jobject *thiz) {
+static void android_p2p_stopWFDSink(JNIEnv *env, jobject thiz) {
     UNUSED(env);
     UNUSED(thiz);
     sp<WifiDisplaySink> sink;

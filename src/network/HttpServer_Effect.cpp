@@ -15,17 +15,6 @@
 #include "utils/Logger.h"
 #include <json/json.h>
 
-void HttpServer::initializeEffectServices() {
-  // 之前在此处会做 RK3588 RKNN 消原唱模型预热；RKNN 子系统已整体下线，
-  // 当前阶段无需任何启动期资源准备。保留函数符号以维持调用链兼容。
-  bool effectsLicensed = false;
-  if (engine_) {
-    const hsvj::LicenseManager *lm = engine_->getLicenseManager();
-    effectsLicensed = lm && lm->isLicensed() && lm->isModuleEnabled("effects");
-    LOG_INFO("[Effect] license check: licensed=%d", effectsLicensed ? 1 : 0);
-  }
-}
-
 void HttpServer::registerEffectRoutes() {
   auto rejectIfEffectsUnlicensed = [this](HttpResponse &response) -> bool {
     bool licensed = false;

@@ -51,7 +51,10 @@ public:
               float rotation, float scale, float alpha,
               int shapeType = 0, float shapeParam = 0.0f,
               bool blackToTransparent = false, int invert = 0,
-              int fitMode = 0);
+              float gaussianBlur = 0.0f, int fitMode = 0);
+  void setContentCrop(bool enabled, float x, float y, float width, float height) {
+    cropEnabled_ = enabled; cropX_ = x; cropY_ = y; cropW_ = width; cropH_ = height;
+  }
 
   void prepareTextures();
   /** 渲染线程：拿最新 MppFrame，import 到 Vulkan（updateTextureFromDmaBuf）。 */
@@ -78,10 +81,12 @@ private:
                           float rotation, float scale, float alpha,
                           int shapeType, float shapeParam,
                           bool blackToTransparent, int invert,
-                          int fitMode);
+                          float gaussianBlur, int fitMode);
 
   // 解码 worker：MJPEG bytes → MppFrame(NV12, dma_fd) → readyFrame_
   void decoderThreadFunc();
+  void recordCaptureHeartbeat(const UsbCaptureFrame &frame);
+  void logPipelineProgress(int64_t nowMs);
 
   VulkanRenderer *renderer_ = nullptr;
   UsbCapture *usbCapture_ = nullptr;
@@ -105,8 +110,6 @@ private:
   std::condition_variable mjpegCv_;
   std::vector<uint8_t> pendingMjpeg_;
   uint32_t pendingSeq_ = 0;
-  int pendingWidth_ = 0;
-  int pendingHeight_ = 0;
   bool hasPendingMjpeg_ = false;
 
   // ========== 解码完成的 MppFrame 单槽（解码器 → render）==========
@@ -121,9 +124,18 @@ private:
 
   // ========== 状态/诊断 ==========
   std::atomic<bool> hasSignal_{false};
-  mutable std::chrono::steady_clock::time_point lastFrameTime_;
+  std::atomic<int64_t> lastFrameTimeMs_{0};
+  std::atomic<int64_t> lastDecodedTimeMs_{0};
+  std::atomic<uint64_t> captureCount_{0}, pendingReplacedCount_{0};
+  std::atomic<uint64_t> decodedCount_{0}, decodeFailedCount_{0}, readyReplacedCount_{0};
+  std::atomic<int64_t> maxCaptureGapMs_{0}, maxDecodeTimeUs_{0};
+  uint64_t publishedCount_ = 0, importFailedCount_ = 0;
+  int64_t lastPublishedTimeMs_ = 0, maxPublishGapMs_ = 0, maxImportTimeUs_ = 0;
+  int64_t lastProgressLogMs_ = 0;
   std::atomic<int> currentWidth_{0};
   std::atomic<int> currentHeight_{0};
+  bool cropEnabled_ = false;
+  float cropX_ = 0.0f, cropY_ = 0.0f, cropW_ = 1.0f, cropH_ = 1.0f;
 };
 
 } // 命名空间 hsvj

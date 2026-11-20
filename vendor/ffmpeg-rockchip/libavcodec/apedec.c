@@ -322,7 +322,7 @@ static av_cold int ape_decode_init(AVCodecContext *avctx)
     ff_bswapdsp_init(&s->bdsp);
     ff_llauddsp_init(&s->adsp);
     av_channel_layout_uninit(&avctx->ch_layout);
-    avctx->ch_layout = (channels == 2) ? (AVChannelLayout)? AV_CHANNEL_LAYOUT_STEREO
+    avctx->ch_layout = (channels == 2) ? (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO
                                        : (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
     return 0;

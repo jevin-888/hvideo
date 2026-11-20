@@ -1,19 +1,22 @@
 // UI渲染模块
-import { apiPost, apiPut, sendLayerCommand, apiAction } from '../../core/api.js';
-import { sendSceneCommand } from '../../core/commandHelper.js';
+import { apiPost, apiPut, apiAction } from '../../core/api.js';
 import { clearContainer } from '../../utils/domHelpers.js';
 import { escapeHtml, showConfirm } from '../../components/toast.js';
-import { addToCommandLog } from '../../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { getLayerDisplayName, getLayerTemplateDisplayName } from './utils.js';
 import { handleApiOperation } from '../../utils/apiHelpers.js';
 import { generateTextLayer40Html, generateTextLayer41Html, generateNormalTextHtml, setupTextLayerEvents } from './panels/TextPanel.js';
 import { buildCommonPositionSection, createRotationForRoamRow } from './panels/PositionPanel.js';
+import { LAYER_MATRIX_DRAG_TYPE } from './matrixLayout.js';
 import { generateShapeTypeOptions, updateShapeParamUI, generateShapeParamHTML } from './panels/ShapePanel.js';
-import { createNumInput, setupNumberInputButtons } from './panels/CommonControls.js';
+import { createNumInput, createNumControl, setupNumberInputButtons } from './panels/CommonControls.js';
 import { generateVideoHtml } from './panels/VideoPanel.js';
-import { generateCaptureHtml } from './panels/CapturePanel.js';
+import { generateCaptureHtml, setupCaptureEdidEvents, saveCaptureResolutionConfig } from './panels/CapturePanel.js';
 import { generateImageHtml } from './panels/ImagePanel.js';
+import { contentCropBlockHtml } from './panels/SharedBlocks.js';
 import { generateEffectHtml } from './panels/EffectPanel.js';
+import { getSliceData, isSliceVisible } from './sliceModel.js';
+import { normalizeQrAddressValue } from '../../../shared/qrAddressOptions.js?v=1';
 // 图层类型展示标签（与顶部卡片、左侧已应用列表共用）
 const TYPE_NAME_MAP = {
     'video': '视频', 'image': '图片', 'text': '文本', 'qrcode': '二维码',
@@ -24,11 +27,26 @@ const LAYER_ID_TO_TYPE_LABEL = {
     40: '欢迎词', 41: '提示消息', 70: 'logo', 71: '二维码'
 };
 const DEFAULT_ROAM_CONFIG = { enabled: true, mode: 0, speed: 100, loop: true };
+const LAYER41_VOD_PLAYLISTS = [
+    { id: 'v1:selected', name: '网络VOD已选列表' },
+    { id: 'local-vod:selected', name: '本地VOD已选列表' }
+];
 
-function normalizeCaptureRotationValue(value, fallback = 0) {
-    const rotation = Number(value);
-    return [-1, 0, 90, 180, 270].includes(rotation) ? rotation : fallback;
+function buildLayer41PlaylistOptions(playlists, selectedPlaylistId) {
+    const selectedId = String(selectedPlaylistId || '');
+    const buildOption = ({ id, name }, preserveName = false) => {
+        const value = String(id ?? '');
+        const selected = value === selectedId ? ' selected' : '';
+        return `<option${preserveName ? ' translate="no"' : ''} value="${escapeHtml(value)}"${selected}>${escapeHtml(name || value)}</option>`;
+    };
+    const vodOptions = LAYER41_VOD_PLAYLISTS.map(item => buildOption(item)).join('');
+    const regularOptions = (Array.isArray(playlists) ? playlists : []).map(item => buildOption(item, true)).join('');
+    return `<option value=""${selectedId ? '' : ' selected'}>未关联</option>`
+        + `<optgroup label="VOD已选列表">${vodOptions}</optgroup>`
+        + (regularOptions ? `<optgroup label="普通播放列表">${regularOptions}</optgroup>` : '');
 }
+let propertyRenderRevision = 0;
+
 
 function normalizeRoamConfigValue(value, fallback = DEFAULT_ROAM_CONFIG) {
     let parsed = value;
@@ -119,13 +137,12 @@ function generateMirrorHtml(layer = {}) {
                     <div class="mirror-method-title">USB线镜像</div>
                     <button type="button" id="mirror-usb-toggle-btn" class="btn small primary mirror-toggle-btn" aria-pressed="false">启动</button>
                     <button type="button" id="mirror-usb-refresh-status-btn" class="btn small">刷新</button>
-                    <div class="mirror-autostart-control mirror-side-control" title="应用启动后自动开启USB镜像">
-                        <span class="mirror-autostart-label">启动时开启</span>
-                        <label class="preview-switch margin-none">
-                            <input type="checkbox" id="mirror-usb-autostart-switch">
-                            <span class="switch-slider"></span>
-                        </label>
-                    </div>
+                    <select id="mirror-autostart-mode" class="form-control mirror-autostart-select mirror-side-control" title="选择应用启动后自动开启的投屏服务">
+                        <option value="none">不自动启动</option>
+                        <option value="usb">USB</option>
+                        <option value="android">安卓</option>
+                        <option value="apple">苹果</option>
+                    </select>
 
                     <div class="mirror-method-title">电视投屏场景</div>
                     <div class="mirror-app-scene-grid">
@@ -143,7 +160,7 @@ function generateMirrorHtml(layer = {}) {
                     </div>
                     <div class="mirror-number-control mirror-side-control" title="上下各裁剪指定像素后拉伸铺满">
                         <span class="mirror-autostart-label">TV画面</span>
-                        <input type="number" id="mirror-tv-vertical-crop-px" min="0" max="4000" step="1" value="${tvVerticalCropPx}" class="form-control mirror-number-input">
+                        ${createNumControl('mirror-tv-vertical-crop-px', tvVerticalCropPx, 0, 4000, 1, { wrapperClass: 'mirror-number-wrapper', inputClass: 'mirror-number-input' })}
                     </div>
                 </div>
             </div>
@@ -202,12 +219,12 @@ async function populateMirrorAppSceneSelect(select, apiGet, selectedScene = '') 
             if (!name || name === '默认配置' || name === 'default') return;
             if (seen.has(name)) return;
             seen.add(name);
-            html += `<option value="${escapeHtml(name)}" ${name === selected ? 'selected' : ''}>${escapeHtml(name)}</option>`;
+            html += `<option translate="no" value="${escapeHtml(name)}" ${name === selected ? 'selected' : ''}>${escapeHtml(name)}</option>`;
         });
         select.innerHTML = html;
         if (selected && !seen.has(selected)) {
             select.insertAdjacentHTML('beforeend',
-                `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)}</option>`);
+                `<option translate="no" value="${escapeHtml(selected)}" selected>${escapeHtml(selected)}</option>`);
         }
     };
     render([]);
@@ -219,326 +236,6 @@ async function populateMirrorAppSceneSelect(select, apiGet, selectedScene = '') 
         console.warn('populateMirrorAppSceneSelect failed:', error);
     }
 }
-
-// 强制注入关键布局样式 (解决浏览器缓存导致的样式不更新问题)
-const criticalStyle = document.createElement('style');
-criticalStyle.textContent = `
-    /* 核心修复：让 setting-section 参与 Grid 布局，解决竖向堆叠和无间距问题 */
-    .setting-section { display: contents !important; }
-    
-    /* 核心修复：完全禁止内部滚动，高度自适应 */
-    #layer-properties-form {
-        overflow: visible !important;
-        height: auto !important;
-        max-height: none !important;
-        min-height: 0 !important;
-    }
-    #layer-matrix-page {
-        --layer-param-panel-height: 320px;
-        --layer-param-content-min-height: 248px;
-        --layer-param-control-height: 32px;
-        --layer-param-control-width: 130px;
-        --layer-param-compact-min-width: 96px;
-    }
-    #layer-matrix-page .control-params {
-        flex: 0 0 var(--layer-param-panel-height) !important;
-        height: var(--layer-param-panel-height) !important;
-        min-height: var(--layer-param-panel-height) !important;
-        max-height: var(--layer-param-panel-height) !important;
-        overflow: hidden !important;
-        padding: 8px !important;
-    }
-    #layer-properties-form .property-group {
-        display: flex !important;
-        flex-direction: column !important;
-        margin-bottom: 0 !important;
-        height: calc(var(--layer-param-panel-height) - 16px) !important;
-        min-height: calc(var(--layer-param-panel-height) - 16px) !important;
-        max-height: calc(var(--layer-param-panel-height) - 16px) !important;
-    }
-    /* 隐藏所有潜在的滚动条 */
-    ::-webkit-scrollbar { display: none !important; }
-    
-    /* 解除旧有 CSS 限制：修复 table-layout: fixed 及 max-宽度 给 Logo尺寸输入框造成的强制溢出 */
-    .qr-params-table { table-layout: auto !important; }
-    #layer-properties-form .property-group .property-content .qr-params-center .qr-params-table td:last-child {
-        width: auto !important; min-width: 0 !important; max-width: none !important;
-    }
-    
-    /* 第一行：左侧设置 | 二维码预览 | 右侧设置，第二行：底部参数 */
-    .qr-params-layout { display: flex !important; flex-direction: column !important; gap: 8px !important; overflow-x: auto !important; padding-bottom: 4px !important; width: 100% !important; }
-    .qr-params-row1 { display: grid !important; grid-template-columns: minmax(290px, 1.2fr) minmax(min-content, 1.5fr) 140px !important; gap: 12px !important; align-items: stretch !important; width: 100% !important; min-width: 840px !important; margin-bottom: 8px !important; }
-    .qr-params-row1 .qr-params-left { grid-column: 1 !important; min-width: 0 !important; overflow: visible !important; }
-    .qr-params-row1 .qr-params-center { grid-column: 2 !important; min-width: 0 !important; overflow: visible !important; }
-    .qr-params-row1 .qr-params-right { grid-column: 3 !important; min-width: 140px !important; display: flex !important; justify-content: flex-end !important; position: relative !important; z-index: 1 !important; }
-    .qr-params-bottom { margin-top: 4px !important; }
-    
-    /* 核心修复：6列网格 + 展平嵌套结构 */
-    .property-content { display: grid !important; grid-template-columns: repeat(6, minmax(0, 1fr)) !important; gap: 8px !important; min-height: var(--layer-param-content-min-height) !important; flex: 1 1 auto !important; overflow-y: auto !important; scrollbar-width: none !important; }
-    
-    /* 仅作用于图层属性表单内的 .setting-item，避免影响矩阵配置等页面的单行输入 */
-    #layer-properties-form .setting-item { display: flex !important; flex-direction: column !important; min-width: 0 !important; margin-bottom: 0 !important; }
-    #layer-properties-form .setting-item { grid-column: span 1 !important; }
-    #layer-properties-form .setting-item[style*="1 / -1"], #layer-properties-form .property-separator { grid-column: 1 / -1 !important; }
-    #layer-properties-form .setting-item[style*="span 4"] { grid-column: span 4 !important; }
-    #layer-properties-form .setting-item[style*="display: none"] { display: none !important; }
-    #layer-properties-form .setting-item label { margin-bottom: 2px !important; font-size: 12px !important; white-space: nowrap !important; overflow: hidden; text-overflow: ellipsis; }
-
-    #layer-properties-form .property-content.property-content--compact-advanced { grid-template-columns: repeat(9, minmax(var(--layer-param-compact-min-width), 1fr)) !important; gap: 6px 8px !important; }
-    #layer-properties-form .property-content.property-content--compact-advanced .property-separator { display: none !important; }
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item { min-height: 46px !important; gap: 3px !important; padding: 0 6px !important; }
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item label { margin-bottom: 2px !important; font-size: 12px !important; line-height: 1.2 !important; }
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item .form-control,
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item select.form-control,
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item select.layer-select { height: var(--layer-param-control-height) !important; font-size: 12px !important; padding-top: 2px !important; padding-bottom: 2px !important; }
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item select.form-control,
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item select.layer-select { width: 100% !important; min-width: 0 !important; max-width: 100% !important; padding-left: 10px !important; padding-right: 32px !important; }
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item .number-input-wrapper,
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item .number-input-wrapper.layer-param-input { width: 100% !important; min-width: 0 !important; max-width: 100% !important; height: var(--layer-param-control-height) !important; }
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item .number-input-wrapper input.number-input,
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item .number-input-wrapper .number-input { height: var(--layer-param-control-height) !important; font-size: 13px !important; }
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item .number-input-wrapper .number-btn { width: 26px !important; height: 26px !important; min-height: 26px !important; font-size: 16px !important; }
-    #layer-properties-form .property-content:has(.compact-advanced-params) .setting-item .number-input-wrapper .number-btn.number-reset { width: 26px !important; font-size: 12px !important; }
-    #layer-properties-form .mirror-setting-section {
-        display: grid !important;
-        grid-column: 1 / -1 !important;
-        grid-template-columns: minmax(720px, 1.08fr) minmax(430px, 0.92fr) !important;
-        gap: 14px 20px !important;
-        align-items: start !important;
-        padding: 0 6px !important;
-    }
-    #layer-properties-form .mirror-operations,
-    #layer-properties-form .mirror-status-panel {
-        min-width: 0 !important;
-    }
-    #layer-properties-form .mirror-operations {
-        display: grid !important;
-        grid-template-columns: minmax(0, 1fr) !important;
-        gap: 8px !important;
-    }
-    #layer-properties-form .mirror-action-grid {
-        display: grid !important;
-        grid-template-columns: 128px minmax(112px, 1fr) minmax(112px, 1fr) minmax(172px, 1.05fr) !important;
-        align-items: center !important;
-        gap: 8px 10px !important;
-        min-width: 0 !important;
-    }
-    #layer-properties-form .mirror-method {
-        display: grid !important;
-        grid-template-columns: 128px minmax(0, 1fr) !important;
-        align-items: center !important;
-        gap: 10px !important;
-        min-height: 40px !important;
-        min-width: 0 !important;
-    }
-    #layer-properties-form .mirror-method-title,
-    #layer-properties-form .mirror-status-label {
-        color: var(--text-secondary) !important;
-        font-size: 12px !important;
-        font-weight: 700 !important;
-        line-height: 1.2 !important;
-        white-space: nowrap !important;
-    }
-    #layer-properties-form .mirror-control-row {
-        display: grid !important;
-        grid-template-columns: repeat(4, minmax(112px, 1fr)) !important;
-        align-items: center !important;
-        gap: 8px !important;
-        min-width: 0 !important;
-    }
-    #layer-properties-form .mirror-control-row-single {
-        grid-template-columns: minmax(150px, 260px) !important;
-    }
-    #layer-properties-form .mirror-control-row-actions {
-        grid-template-columns: minmax(112px, 1fr) minmax(112px, 1fr) minmax(112px, 1fr) minmax(150px, 0.95fr) !important;
-    }
-    #layer-properties-form .mirror-control-placeholder {
-        display: block !important;
-        min-height: 36px !important;
-        visibility: hidden !important;
-    }
-    #layer-properties-form .mirror-app-scene-method {
-        align-items: start !important;
-    }
-    #layer-properties-form .mirror-app-scene-grid {
-        display: grid !important;
-        grid-template-columns: minmax(140px, 1fr) minmax(160px, 1.35fr) minmax(104px, 0.85fr) minmax(112px, 0.95fr) !important;
-        align-items: center !important;
-        gap: 8px !important;
-        min-width: 0 !important;
-    }
-    #layer-properties-form .mirror-action-grid > .mirror-app-scene-grid {
-        grid-column: 2 / 4 !important;
-        grid-template-columns: minmax(112px, 0.9fr) minmax(120px, 1.25fr) minmax(82px, 0.75fr) !important;
-    }
-    #layer-properties-form .mirror-app-scene-grid .form-control,
-    #layer-properties-form .mirror-app-scene-grid .btn.small {
-        width: 100% !important;
-        min-width: 0 !important;
-        min-height: 40px !important;
-        height: 40px !important;
-        font-size: 13px !important;
-    }
-    #layer-properties-form .mirror-action-grid > .btn.small {
-        width: 100% !important;
-        min-width: 0 !important;
-        min-height: 40px !important;
-        padding: 0 8px !important;
-        font-size: 13px !important;
-        white-space: nowrap !important;
-    }
-    #layer-properties-form .mirror-side-control {
-        width: 100% !important;
-        min-width: 0 !important;
-        min-height: 40px !important;
-        height: 40px !important;
-        box-sizing: border-box !important;
-        font-size: 13px !important;
-        font-weight: 700 !important;
-        line-height: 1.2 !important;
-    }
-    #layer-properties-form .mirror-side-control.btn.small {
-        display: flex !important;
-        align-items: center !important;
-        justify-content: flex-start !important;
-        padding: 0 14px !important;
-        text-align: left !important;
-    }
-    #layer-properties-form .mirror-app-scene-grid .btn.small {
-        grid-column: 3 / 4 !important;
-    }
-    #layer-properties-form .mirror-app-scene-package {
-        padding-left: 10px !important;
-        padding-right: 10px !important;
-    }
-    #layer-properties-form .mirror-control-row .btn.small {
-        width: 100% !important;
-        min-width: 0 !important;
-        min-height: 36px !important;
-        padding: 0 8px !important;
-        font-size: 13px !important;
-        white-space: nowrap !important;
-    }
-    #layer-properties-form .mirror-toggle-btn {
-        font-weight: 800 !important;
-    }
-    #layer-properties-form .mirror-autostart-control {
-        display: flex !important;
-        align-items: center !important;
-        justify-content: space-between !important;
-        gap: 8px !important;
-        min-width: 0 !important;
-        min-height: 40px !important;
-        padding: 0 12px 0 14px !important;
-        border-radius: 8px !important;
-        border: 1px solid var(--glass-border) !important;
-        background: rgba(255, 255, 255, 0.04) !important;
-    }
-    #layer-properties-form .mirror-autostart-label {
-        min-width: 0 !important;
-        color: var(--text-secondary) !important;
-        font-size: 13px !important;
-        font-weight: 700 !important;
-        line-height: 1.2 !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        white-space: nowrap !important;
-    }
-    #layer-properties-form .mirror-autostart-control .switch-slider {
-        width: 36px !important;
-        height: 18px !important;
-    }
-    #layer-properties-form .mirror-autostart-control .switch-slider::before {
-        width: 14px !important;
-        height: 14px !important;
-    }
-    #layer-properties-form .mirror-autostart-control input[type="checkbox"]:checked + .switch-slider::before {
-        transform: translateX(18px) !important;
-    }
-    #layer-properties-form .mirror-number-control {
-        display: grid !important;
-        grid-template-columns: minmax(84px, 1fr) minmax(64px, 96px) !important;
-        align-items: center !important;
-        gap: 8px !important;
-        min-width: 0 !important;
-        min-height: 40px !important;
-        padding: 0 12px 0 14px !important;
-        border-radius: 8px !important;
-        border: 1px solid var(--glass-border) !important;
-        background: rgba(255, 255, 255, 0.04) !important;
-    }
-    #layer-properties-form .mirror-number-input {
-        width: 100% !important;
-        min-width: 0 !important;
-        height: 30px !important;
-        padding: 2px 8px !important;
-        font-size: 12px !important;
-        text-align: right !important;
-    }
-    #layer-properties-form .mirror-status-panel {
-        display: grid !important;
-        grid-template-columns: 1fr !important;
-        gap: 7px !important;
-    }
-    #layer-properties-form .mirror-status-row {
-        display: grid !important;
-        grid-template-columns: 52px minmax(0, 1fr) !important;
-        align-items: center !important;
-        gap: 10px !important;
-        min-width: 0 !important;
-    }
-    #layer-properties-form .mirror-status-value {
-        display: block !important;
-        min-width: 0 !important;
-        min-height: 34px !important;
-        padding: 8px 12px !important;
-        border-radius: 8px !important;
-        background: rgba(0, 0, 0, 0.2) !important;
-        border: 1px solid var(--glass-border) !important;
-        color: var(--text-primary) !important;
-        font-size: 13px !important;
-        font-weight: 650 !important;
-        line-height: 1.25 !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        white-space: nowrap !important;
-    }
-    @media (max-width: 1280px) {
-        #layer-properties-form .mirror-setting-section {
-            grid-template-columns: 1fr !important;
-        }
-    }
-    @media (max-width: 760px) {
-        #layer-properties-form .mirror-method {
-            grid-template-columns: 1fr !important;
-        }
-        #layer-properties-form .mirror-action-grid {
-            grid-template-columns: minmax(88px, 0.9fr) minmax(0, 1fr) minmax(0, 1fr) !important;
-        }
-        #layer-properties-form .mirror-action-grid > .mirror-app-scene-grid,
-        #layer-properties-form .mirror-action-grid > .mirror-number-control {
-            grid-column: 1 / -1 !important;
-        }
-        #layer-properties-form .mirror-control-row,
-        #layer-properties-form .mirror-control-row-actions {
-            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
-        }
-        #layer-properties-form .mirror-control-placeholder {
-            display: none !important;
-        }
-        #layer-properties-form .mirror-app-scene-grid {
-            grid-template-columns: 1fr 1fr !important;
-        }
-        #layer-properties-form .mirror-app-scene-grid .btn.small {
-            grid-column: auto !important;
-        }
-        #layer-properties-form .mirror-app-scene-package {
-            grid-column: 1 / -1 !important;
-        }
-    }
-`;
-document.head.appendChild(criticalStyle);
-
 
 /**
  * 渲染图层矩阵
@@ -611,6 +308,23 @@ export function renderLayerMatrix(
         }
         layerItem.dataset.layerId = layerTemplate.id;
         layerItem.dataset.layerType = layerTemplate.type;
+        const displayName = getLayerTemplateDisplayName(layerTemplate);
+        layerItem.draggable = true;
+        layerItem.title = isCreated ? '拖动到画布分区重新放置' : '拖动到画布分区创建图层';
+        layerItem.addEventListener('dragstart', (event) => {
+            if (!event.dataTransfer) return;
+            const payload = {
+                layerId: layerTemplate.id,
+                layerType: layerTemplate.type
+            };
+            event.dataTransfer.effectAllowed = isCreated ? 'move' : 'copy';
+            event.dataTransfer.setData(LAYER_MATRIX_DRAG_TYPE, JSON.stringify(payload));
+            event.dataTransfer.setData('text/plain', displayName);
+            layerItem.classList.add('dragging');
+        });
+        layerItem.addEventListener('dragend', () => {
+            layerItem.classList.remove('dragging');
+        });
 
         const typeName = getLayerTypeLabel(layerTemplate);
         const visibilitySvg = '<svg class="layer-status-svg icon-visible" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="layer-status-svg icon-hidden hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
@@ -625,17 +339,12 @@ export function renderLayerMatrix(
             iconBlock = `<span class="layer-add-btn" title="点击添加到图层列表">${addSvg}</span>`;
         }
 
-        const displayName = getLayerTemplateDisplayName(layerTemplate);
         const escapedLayerName = escapeHtml(displayName);
         const idActiveClass = isCreated ? 'active' : '';
         layerItem.innerHTML = `
             <div class="layer-item-header">
+                ${iconBlock}
                 <span class="layer-name">${escapedLayerName}</span>
-            </div>
-            <div class="layer-item-icon">
-                <span class="status-icon-wrapper">
-                    ${iconBlock}
-                </span>
             </div>
             <div class="layer-status">
                 <span class="layer-type">${typeName}</span>
@@ -672,7 +381,7 @@ function initializeLayerMatrixDragScroll(container) {
     let scrollLeft;
 
     container.addEventListener('mousedown', (e) => {
-        if (e.target.classList.contains('layer-add-btn')) return;
+        if (e.target.closest('.layer-item[draggable="true"]') || e.target.classList.contains('layer-add-btn')) return;
         isDown = true;
         container.dataset.dragging = 'false';
         startX = e.pageX - container.offsetLeft;
@@ -802,16 +511,15 @@ export function updateSelectionUI(selectedLayer, selectedSlice) {
  * 渲染二维码控制面板HTML
  */
 export function renderQRCodeDashboard(layer, idPrefix, coords, parseColor, rgbaStringToCssColor) {
-    const qrBgColor = parseColor(layer.qr_bg_color, "0 0.2 1 1"); // 默认 #0051FF
+    const qrBgColor = parseColor(layer.qr_bg_color, "0 0.2 1 1"); // 默认 #0033FF
     const qrBgColorCss = rgbaStringToCssColor(qrBgColor);
     const qrSize = layer.qr_size || 256;
-    const layerId = layer.id;
     const defaultQrContent = (() => {
-        if (typeof window === 'undefined' || !window.location) return 'http://127.0.0.1:8081';
-        const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+        if (typeof window === 'undefined' || !window.location) return 'http://127.0.0.1:8081/';
         const host = window.location.hostname || '127.0.0.1';
-        return `${protocol}//${host}:8081`;
+        return 'http://' + host + ':8081/';
     })();
+    const configuredQrContent = normalizeQrAddressValue(layer.qr_content);
 
     return `
         <div class="setting-section">
@@ -826,9 +534,12 @@ export function renderQRCodeDashboard(layer, idPrefix, coords, parseColor, rgbaS
                                         <td class="qr-params-value">
                                             <input type="text" id="qr-text" class="form-control" value="${layer.qr_text || '微信扫码关注'}" placeholder="">
                                         </td>
-                                        <td class="qr-params-label">Logo图</td>
+                                        <td class="qr-params-label">融合调试</td>
                                         <td class="qr-params-value">
-                                            <button id="load-qr-logo-btn" class="btn primary qr-upload-btn" style="width: 100%;">上传logo</button>
+                                            <label class="preview-switch" title="启动时显示融合调试二维码，同时受启动 IP 提示开关控制">
+                                                <input type="checkbox" id="fusion-debug-enabled" checked>
+                                                <span class="switch-slider"></span>
+                                            </label>
                                         </td>
                                     </tr>
                                     <tr>
@@ -836,7 +547,7 @@ export function renderQRCodeDashboard(layer, idPrefix, coords, parseColor, rgbaS
                                         <td class="qr-params-value" colspan="3">
                                             <div class="color-input-container" style="display: flex; gap: 8px; align-items: center;">
                                                  <div id="qr-bg-color-swatch" class="color-swatch-btn" style="background-color: ${qrBgColorCss}; width: 32px; height: 32px; border-radius: 4px; border: 1px solid #444; cursor: pointer;"></div>
-                                                 <input type="color" id="qr-bg-color-picker" value="${qrBgColorCss.startsWith('#') ? qrBgColorCss : '#0051FF'}" style="opacity: 0; position: absolute; pointer-events: none; width: 0; height: 0;">
+                                                 <input type="color" id="qr-bg-color-picker" value="${qrBgColorCss.startsWith('#') ? qrBgColorCss : '#0033FF'}" style="opacity: 0; position: absolute; pointer-events: none; width: 0; height: 0;">
                                                  <input type="text" id="qr-bg-color-hex" class="form-control" value="${qrBgColorCss}" style="width: 80px; text-transform: uppercase;" placeholder="#RRGGBB">
                                                  <input type="hidden" id="qr-bg-color" value="${qrBgColor}">
                                                  <input type="text" id="qr-bg-color-rgba" class="form-control" value="${qrBgColor}" style="display: none;">
@@ -852,27 +563,19 @@ export function renderQRCodeDashboard(layer, idPrefix, coords, parseColor, rgbaS
                                     <tr>
                                         <td class="qr-params-label">尺寸</td>
                                         <td class="qr-params-value">
-                                            <div class="number-input-wrapper horizontal layer-param-input">
-                                                <button type="button" class="number-btn minus" data-target="qr-size">-</button>
-                                                <input type="number" id="qr-size" min="64" max="2048" value="${qrSize}" data-default="${qrSize}" class="form-control number-input">
-                                                <button type="button" class="number-btn plus" data-target="qr-size">+</button>
-                                                <button type="button" class="number-btn number-reset" data-target="qr-size" title="恢复默认">↻</button>
-                                            </div>
+                                                ${createNumControl('qr-size', qrSize, 64, 2048)}
                                         </td>
-                                        <td class="qr-params-label">Logo尺寸</td>
-                                        <td class="qr-params-value">
-                                            <div class="number-input-wrapper horizontal layer-param-input">
-                                                <button type="button" class="number-btn minus" data-target="qr-logo-size">-</button>
-                                                <input type="number" id="qr-logo-size" min="0" max="30" value="${layer.qr_logo_size || 0}" data-default="${layer.qr_logo_size || 0}" class="form-control number-input">
-                                                <button type="button" class="number-btn plus" data-target="qr-logo-size">+</button>
-                                                <button type="button" class="number-btn number-reset" data-target="qr-logo-size" title="恢复默认">↻</button>
-                                            </div>
-                                        </td>
+                                        <td class="qr-params-label"> </td>
+                                        <td class="qr-params-value"></td>
                                     </tr>
                                     <tr>
                                         <td class="qr-params-label">地址内容</td>
                                         <td class="qr-params-value qr-params-value-address" colspan="2">
-                                            <input type="text" id="qr-content" class="form-control" value="${layer.qr_content || defaultQrContent}" placeholder="${defaultQrContent}" style="width: 100%; min-width: 50px;">
+                                            <div class="qr-address-picker" data-qr-address-picker>
+                                                <input type="text" id="qr-content" class="form-control" aria-label="二维码地址" value="${escapeHtml(configuredQrContent || defaultQrContent)}" data-initial-value="${escapeHtml(configuredQrContent)}" autocomplete="off">
+                                                <button type="button" class="qr-address-toggle" data-qr-address-toggle aria-label="选择二维码地址" aria-expanded="false">▾</button>
+                                                <div class="qr-address-menu" data-qr-address-menu role="listbox" hidden></div>
+                                            </div>
                                         </td>
                                         <td class="qr-params-value">
                                             <button id="generate-qrcode-btn" class="btn primary gen-btn" style="width: 100%;">生成二维码</button>
@@ -887,7 +590,6 @@ export function renderQRCodeDashboard(layer, idPrefix, coords, parseColor, rgbaS
                                     <div id="qr-preview" class="qr-preview">
                                         <div class="qr-placeholder" style="color: #666;">生成中...</div>
                                     </div>
-                                    <div class="qr-preview-label">${layer.qr_text || '微信扫码关注'}</div>
                                 </div>
                             </div>
                         </div>
@@ -895,48 +597,23 @@ export function renderQRCodeDashboard(layer, idPrefix, coords, parseColor, rgbaS
                     <div class="qr-params-bottom">
                         <div class="bottom-param-item">
                             <label>优先级:</label>
-                            <div class="number-input-wrapper horizontal layer-param-input">
-                                <button type="button" class="number-btn minus" data-target="${idPrefix}-priority">-</button>
-                                <input type="number" id="${idPrefix}-priority" min="0" max="100" value="${coords.priority}" data-default="${coords.priority}" class="form-control number-input">
-                                <button type="button" class="number-btn plus" data-target="${idPrefix}-priority">+</button>
-                                <button type="button" class="number-btn number-reset" data-target="${idPrefix}-priority" title="恢复默认">↻</button>
-                            </div>
+                            ${createNumControl(`${idPrefix}-priority`, coords.priority, 0, 100)}
                         </div>
                         <div class="bottom-param-item">
                             <label>X:</label>
-                            <div class="number-input-wrapper horizontal layer-param-input">
-                                <button type="button" class="number-btn minus" data-target="${idPrefix}-x">-</button>
-                                <input type="number" id="${idPrefix}-x" min="-4000" max="4000" value="${coords.x}" data-default="${coords.x}" class="form-control number-input">
-                                <button type="button" class="number-btn plus" data-target="${idPrefix}-x">+</button>
-                                <button type="button" class="number-btn number-reset" data-target="${idPrefix}-x" title="恢复默认">↻</button>
-                            </div>
+                            ${createNumControl(`${idPrefix}-x`, coords.x, -4000, 4000)}
                         </div>
                         <div class="bottom-param-item">
                             <label>Y:</label>
-                            <div class="number-input-wrapper horizontal layer-param-input">
-                                <button type="button" class="number-btn minus" data-target="${idPrefix}-y">-</button>
-                                <input type="number" id="${idPrefix}-y" min="-4000" max="4000" value="${coords.y}" data-default="${coords.y}" class="form-control number-input">
-                                <button type="button" class="number-btn plus" data-target="${idPrefix}-y">+</button>
-                                <button type="button" class="number-btn number-reset" data-target="${idPrefix}-y" title="恢复默认">↻</button>
-                            </div>
+                            ${createNumControl(`${idPrefix}-y`, coords.y, -4000, 4000)}
                         </div>
                         <div class="bottom-param-item">
                             <label>宽度:</label>
-                            <div class="number-input-wrapper horizontal layer-param-input">
-                                <button type="button" class="number-btn minus" data-target="${idPrefix}-width">-</button>
-                                <input type="number" id="${idPrefix}-width" min="0" max="4000" value="${coords.width}" data-default="${coords.width}" class="form-control number-input">
-                                <button type="button" class="number-btn plus" data-target="${idPrefix}-width">+</button>
-                                <button type="button" class="number-btn number-reset" data-target="${idPrefix}-width" title="恢复默认">↻</button>
-                            </div>
+                            ${createNumControl(`${idPrefix}-width`, coords.width, 0, 4000)}
                         </div>
                         <div class="bottom-param-item">
                             <label>高度:</label>
-                            <div class="number-input-wrapper horizontal layer-param-input">
-                                <button type="button" class="number-btn minus" data-target="${idPrefix}-height">-</button>
-                                <input type="number" id="${idPrefix}-height" min="0" max="4000" value="${coords.height}" data-default="${coords.height}" class="form-control number-input">
-                                <button type="button" class="number-btn plus" data-target="${idPrefix}-height">+</button>
-                                <button type="button" class="number-btn number-reset" data-target="${idPrefix}-height" title="恢复默认">↻</button>
-                            </div>
+                            ${createNumControl(`${idPrefix}-height`, coords.height, 0, 4000)}
                         </div>
                     </div>
                 </div>
@@ -1001,6 +678,10 @@ export async function showLayerProperties(
     const formContainer = document.getElementById('layer-properties-form');
     if (!formContainer) return;
 
+    const renderRevision = ++propertyRenderRevision;
+    const isCurrentRender = () =>
+        renderRevision === propertyRenderRevision && formContainer.isConnected;
+
     formContainer.style.display = 'block';
     delete formContainer.dataset.layerId;
     delete formContainer.dataset.sliceKey;
@@ -1025,6 +706,8 @@ export async function showLayerProperties(
     }
 
     // 如果之前没有获取到漫游配置（且是需要的图层）
+    if (!isCurrentRender()) return;
+
     if (layer && !layer.roam_config && ((layerId >= 1 && layerId <= 4) || layerId === 10 || layerId === 11 || layerId === 60)) {
         try {
             const roamConfig = await apiGet(`/layers/${layerId}/roam`);
@@ -1036,6 +719,8 @@ export async function showLayerProperties(
             layer.roam_config = DEFAULT_ROAM_CONFIG;
         }
     }
+
+    if (!isCurrentRender()) return;
 
     if (!layer) {
         formContainer.innerHTML = '<div class="no-layer-selected">未找到图层信息</div>';
@@ -1055,7 +740,7 @@ export async function showLayerProperties(
 
     // 采集图层参数 (Layer10, Layer11)
     if (isCaptureLayer) {
-        specialFields += generateCaptureHtml(layer, layerId);
+        specialFields += generateCaptureHtml(layer);
     }
 
     // 视频图层参数 (Layer1-Layer4)
@@ -1123,17 +808,15 @@ export async function showLayerProperties(
             const showList = layer.show_list !== undefined ? layer.show_list : true;
 
             // 异步获取播放列表以填充下拉框
-            let playlistOptions = '<option value="">未关联</option>';
+            let playlists = [];
             try {
-                const playlists = await apiGet('/playlists');
-                if (playlists && Array.isArray(playlists)) {
-                    playlistOptions += playlists.map(pl =>
-                        `<option value="${pl.id}" ${pl.id === boundPlaylistId ? 'selected' : ''}>${escapeHtml(pl.name)}</option>`
-                    ).join('');
-                }
+                const response = await apiGet('/playlists');
+                if (Array.isArray(response)) playlists = response;
             } catch (e) {
                 console.error('Failed to fetch playlists for Layer 41', e);
             }
+            const playlistOptions = buildLayer41PlaylistOptions(playlists, boundPlaylistId);
+            if (!isCurrentRender()) return;
 
             specialFields += generateTextLayer41Html('layer', {
                 alphaVal: Math.round((layer.alpha !== undefined ? layer.alpha : 1.0) * 255),
@@ -1172,10 +855,9 @@ export async function showLayerProperties(
     if (isEffectLayer) {
         specialFields += generateEffectHtml(layer);
     }
-    // [Bug fix] 原后置 shape section 对采集图层会与 CapturePanel 内的同 id 控件
-    // (layer-shape-type / layer-invert / layer-black-to-transparent) 冲突，导致 DOM 重复 id。
-    // 现在 Capture/Video/Image panel 内部已自行包含对应控件，Layer 60 形状仍由漫游区处理；
-    // 故移除此后置 shape section。
+    specialFields += contentCropBlockHtml(layer);
+    // Capture/Video/Image 的专用面板自行决定需要显示的高级参数，
+    // Layer 60 形状仍由漫游区处理；不再追加一套重复控件。
 
     // 图层21：歌词参数（特殊处理，使用独立的歌词控制接口，与文本参数分开显示）
     if (isLyricLayer) {
@@ -1221,15 +903,8 @@ export async function showLayerProperties(
             }
         }).catch(() => { });
 
-        const configuredFont = layer.font_file || '';
         specialFields += `
-            <div class="setting-section lyric-three-selects">
-                <div class="setting-item" style="grid-column: span 1;">
-                    <label for="text-font-file">选择字体:</label>
-                    <select id="text-font-file" class="form-control select-font-lyric" aria-label="选择歌词字体" title="${configuredFont ? configuredFont : '请选择字体'}">
-                        <option value="">${configuredFont || '请选择字体'}</option>
-                    </select>
-                </div>
+            <div class="setting-section">
                 <div class="setting-item" style="grid-column: span 1;">
                     <label for="lyric-bind-layer">关联视频层:</label>
                     <select id="lyric-bind-layer" class="form-control">
@@ -1257,6 +932,8 @@ export async function showLayerProperties(
         `;
     }
 
+    if (!isCurrentRender()) return;
+
     formContainer.innerHTML = `
         <div class="property-group">
             <div class="property-header">
@@ -1271,7 +948,7 @@ export async function showLayerProperties(
                 </div>
             </div>
 
-            <div class="property-content tab-common ${((isVideoLayer && !isCaptureLayer && !isQRCodeLayer) || isCaptureLayer) ? 'property-content--compact-advanced' : ''}">
+            <div class="property-content layer-properties-content tab-common ${((isVideoLayer && !isCaptureLayer && !isQRCodeLayer) || isCaptureLayer) ? 'property-content--compact-advanced' : ''}">
                 ${specialFields}
                 ${!isQRCodeLayer ? `
                 <div class="property-separator" style="grid-column: 1 / -1; height: 1px; background: rgba(255,255,255,0.1); margin: 5px 0;"></div>
@@ -1313,42 +990,22 @@ export async function showLayerProperties(
                     ` : ''}
                     <div class="setting-item" style="grid-column: span 1;">
                         <label for="layer-roam-speed">移动速度(像素/秒):</label>
-                        <div class="number-input-wrapper horizontal layer-param-input">
-                            <button type="button" class="number-btn minus" data-target="layer-roam-speed">-</button>
-                            <input type="number" id="layer-roam-speed" min="1" max="1000" step="1" value="${layer.roam_config?.speed || 100}" data-default="${layer.roam_config?.speed || 100}" class="form-control number-input">
-                            <button type="button" class="number-btn plus" data-target="layer-roam-speed">+</button>
-                            <button type="button" class="number-btn number-reset" data-target="layer-roam-speed" title="恢复默认">↻</button>
-                        </div>
+                        ${createNumControl('layer-roam-speed', layer.roam_config?.speed || 100, 1, 1000)}
                     </div>
                     <!-- 左右移动参数 -->
                     <div id="roam-horizontal-params" class="setting-item" style="grid-column: span 1; display: ${layer.roam_config?.mode === 1 ? 'block' : 'none'};">
                         <label for="layer-roam-range-x">移动范围(像素):</label>
-                        <div class="number-input-wrapper horizontal layer-param-input">
-                            <button type="button" class="number-btn minus" data-target="layer-roam-range-x">-</button>
-                            <input type="number" id="layer-roam-range-x" min="0" max="4000" step="10" value="${layer.roam_config?.rangeX || 500}" data-default="${layer.roam_config?.rangeX || 500}" class="form-control number-input">
-                            <button type="button" class="number-btn plus" data-target="layer-roam-range-x">+</button>
-                            <button type="button" class="number-btn number-reset" data-target="layer-roam-range-x" title="恢复默认">↻</button>
-                        </div>
+                        ${createNumControl('layer-roam-range-x', layer.roam_config?.rangeX || 500, 0, 4000, 10)}
                     </div>
                     <!-- 上下移动参数 -->
                     <div id="roam-vertical-params" class="setting-item" style="grid-column: span 1; display: ${layer.roam_config?.mode === 2 ? 'block' : 'none'};">
                         <label for="layer-roam-range-y">移动范围(像素):</label>
-                        <div class="number-input-wrapper horizontal layer-param-input">
-                            <button type="button" class="number-btn minus" data-target="layer-roam-range-y">-</button>
-                            <input type="number" id="layer-roam-range-y" min="0" max="4000" step="10" value="${layer.roam_config?.rangeY || 500}" data-default="${layer.roam_config?.rangeY || 500}" class="form-control number-input">
-                            <button type="button" class="number-btn plus" data-target="layer-roam-range-y">+</button>
-                            <button type="button" class="number-btn number-reset" data-target="layer-roam-range-y" title="恢复默认">↻</button>
-                        </div>
+                        ${createNumControl('layer-roam-range-y', layer.roam_config?.rangeY || 500, 0, 4000, 10)}
                     </div>
                     <!-- 圆形路径参数 -->
                     <div id="roam-circular-params" class="setting-item" style="grid-column: span 1; display: ${layer.roam_config?.mode === 3 ? 'block' : 'none'};">
                         <label for="layer-roam-radius">圆形半径(像素):</label>
-                        <div class="number-input-wrapper horizontal layer-param-input">
-                            <button type="button" class="number-btn minus" data-target="layer-roam-radius">-</button>
-                            <input type="number" id="layer-roam-radius" min="0" max="2000" step="10" value="${layer.roam_config?.radius || 200}" data-default="${layer.roam_config?.radius || 200}" class="form-control number-input">
-                            <button type="button" class="number-btn plus" data-target="layer-roam-radius">+</button>
-                            <button type="button" class="number-btn number-reset" data-target="layer-roam-radius" title="恢复默认">↻</button>
-                        </div>
+                        ${createNumControl('layer-roam-radius', layer.roam_config?.radius || 200, 0, 2000, 10)}
                     </div>
                     <div class="setting-item" style="grid-column: span 1;">
                         <label>循环播放:</label>
@@ -1372,6 +1029,16 @@ export async function showLayerProperties(
             </div>
         </div>
     `;
+    formContainer.dataset.layerId = String(layerId);
+
+    if (isCaptureLayer) setupCaptureEdidEvents(formContainer, isCurrentRender, async capture => {
+        const config = await saveCaptureResolutionConfig(layerId, capture);
+        if (!config) return false;
+        layer.capture_width = config.captureWidth;
+        layer.capture_height = config.captureHeight;
+        layer.capture_resolution_locked = config.captureResolutionLocked;
+        return true;
+    });
 
     applyParamTabs(formContainer);
 
@@ -1391,13 +1058,13 @@ export async function showLayerProperties(
                 console.error('图层音量提示同步失败:', error);
             });
         }
-    });
+    }, { excludeSelector: '[id$="-roam-config-section"]' });
 
     // 透明度滑块监听已移除，转为普通数字输入框监听
 
     // 图层属性输入框变化时，实时更新幕布显示并同步到服务器
     registerLivePreviewHandlers(
-        ['layer-x', 'layer-y', 'layer-width', 'layer-height', 'layer-priority', 'layer-rotation', 'layer-alpha', 'qr-x', 'qr-y', 'qr-width', 'qr-height', 'qr-priority'],
+        ['layer-x', 'layer-y', 'layer-width', 'layer-height', 'layer-priority', 'layer-rotation', 'layer-alpha', 'layer-crop-left', 'layer-crop-top', 'layer-crop-right', 'layer-crop-bottom', 'qr-x', 'qr-y', 'qr-width', 'qr-height', 'qr-priority'],
         () => applyLayerProperties(layerId),
         () => updateLayerFromInputs(layerId)
     );
@@ -1451,7 +1118,7 @@ export async function showLayerProperties(
 
         const statusEl = document.getElementById('mirror-status-text');
         const toggleBtn = document.getElementById('mirror-toggle-btn');
-        const updateMirrorStatus = async (action = 'status') => {
+        const updateMirrorStatus = async (action = 'status', writeLog = true) => {
             const result = await apiPost(`/mirror/actions/${action}`, { layerId });
             if (!result) {
                 setMirrorStatusText(statusEl, '状态读取失败');
@@ -1462,7 +1129,9 @@ export async function showLayerProperties(
             const detail = `${summary}${ip ? ` · IP ${ip}` : ''}`;
             setMirrorStatusText(statusEl, summary, detail);
             setMirrorToggleButton(toggleBtn, !!result.started);
-            addToCommandLog('投屏', result.started ? 'success' : 'info', `投屏服务状态：${result.started ? '已启动' : '未启动'}，${result.connected ? '已连接' : '未连接'}`);
+            if (writeLog) {
+                addToCommandLog('投屏', result.started ? 'success' : 'info', `投屏服务状态：${result.started ? '已启动' : '未启动'}，${result.connected ? '已连接' : '未连接'}`);
+            }
         };
         toggleBtn?.addEventListener('click', () => updateMirrorStatus(toggleBtn.dataset.running === '1' ? 'stop' : 'start'));
         document.getElementById('mirror-reset-pin-btn')?.addEventListener('click', () => updateMirrorStatus('reset_pin'));
@@ -1471,7 +1140,7 @@ export async function showLayerProperties(
 
         const androidStatusEl = document.getElementById('mirror-android-status-text');
         const androidToggleBtn = document.getElementById('mirror-android-toggle-btn');
-        const updateAndroidMirrorStatus = async (action = 'status') => {
+        const updateAndroidMirrorStatus = async (action = 'status', writeLog = true) => {
             const result = await apiPost(`/mirror/actions/android_${action}`, { layerId });
             if (!result) {
                 setMirrorStatusText(androidStatusEl, '安卓状态读取失败');
@@ -1481,7 +1150,9 @@ export async function showLayerProperties(
             const detail = `${summary} · ${result.wfdEnabled ? 'WFD已启' : 'WFD未启'}${result.message ? ` · ${result.message}` : ''}`;
             setMirrorStatusText(androidStatusEl, summary, detail);
             setMirrorToggleButton(androidToggleBtn, !!result.serviceStarted);
-            addToCommandLog('安卓投屏', result.serviceStarted ? 'success' : 'info', result.message || 'Miracast状态已更新');
+            if (writeLog) {
+                addToCommandLog('安卓投屏', result.serviceStarted ? 'success' : 'info', result.message || 'Miracast状态已更新');
+            }
         };
         androidToggleBtn?.addEventListener('click', () => updateAndroidMirrorStatus(androidToggleBtn.dataset.running === '1' ? 'stop' : 'start'));
         document.getElementById('mirror-android-refresh-status-btn')?.addEventListener('click', () => updateAndroidMirrorStatus('status'));
@@ -1489,14 +1160,62 @@ export async function showLayerProperties(
 
         const usbStatusEl = document.getElementById('mirror-usb-status-text');
         const usbToggleBtn = document.getElementById('mirror-usb-toggle-btn');
-        const usbAutostartSwitch = document.getElementById('mirror-usb-autostart-switch');
+        const mirrorAutostartSelect = document.getElementById('mirror-autostart-mode');
         const usbAppSceneEnabled = document.getElementById('mirror-usb-app-scene-enabled');
         const usbAppSceneSelect = document.getElementById('mirror-usb-app-scene-name');
         const usbSaveAppSceneBtn = document.getElementById('mirror-usb-save-app-scene-btn');
-        if (usbAutostartSwitch) {
-            usbAutostartSwitch.checked = false;
+        let usbAppSceneEditRevision = 0;
+        let usbAppSceneFormDirty = false;
+        let usbAppSceneSaving = false;
+        const markUsbAppSceneFormDirty = () => {
+            usbAppSceneEditRevision += 1;
+            usbAppSceneFormDirty = true;
+        };
+        const syncUsbAppSceneControls = (result, requestRevision, force = false) => {
+            if (!result || (!force && (usbAppSceneFormDirty
+                || usbAppSceneSaving
+                || requestRevision !== usbAppSceneEditRevision))) {
+                return;
+            }
+            if (usbAppSceneEnabled) {
+                usbAppSceneEnabled.checked = !!result.appSceneDetectEnabled;
+            }
+            if (usbAppSceneSelect && result.appSceneName) {
+                usbAppSceneSelect.value = result.appSceneName;
+            }
+        };
+        if (mirrorAutostartSelect) {
+            mirrorAutostartSelect.value = 'none';
         }
-        const updateUsbMirrorStatus = async (action = 'status') => {
+        const updateMirrorAutostartStatus = async (mode = null) => {
+            const isUpdate = mode !== null;
+            const payload = isUpdate ? { mode } : {};
+            let result = null;
+            try {
+                const endpoint = isUpdate
+                    ? '/mirror/actions/autostart_set'
+                    : '/mirror/actions/autostart_status';
+                result = await apiPost(endpoint, payload);
+            } catch (error) {
+                console.warn('updateMirrorAutostartStatus failed:', error);
+            }
+            if (!result) {
+                addToCommandLog('投屏自启动', 'error', '配置读取或保存失败');
+                return null;
+            }
+            if (mirrorAutostartSelect
+                && (!isUpdate || document.activeElement !== mirrorAutostartSelect)) {
+                mirrorAutostartSelect.value = result.mode || 'none';
+            }
+            if (isUpdate) {
+                const modeLabels = { none: '不自动启动', usb: 'USB', android: '安卓', apple: '苹果' };
+                addToCommandLog('投屏自启动', 'success',
+                    '启动时开启：' + (modeLabels[result.mode] || result.mode));
+            }
+            return result;
+        };
+        const updateUsbMirrorStatus = async (action = 'status', writeLog = true) => {
+            const requestRevision = usbAppSceneEditRevision;
             let result = null;
             try {
                 result = await apiPost(`/mirror/actions/usb_${action}`, { layerId });
@@ -1505,59 +1224,75 @@ export async function showLayerProperties(
             }
             if (!result) {
                 setMirrorStatusText(usbStatusEl, 'USB状态读取失败');
-                if (usbAutostartSwitch) {
-                    usbAutostartSwitch.checked = false;
-                }
                 return;
             }
             const size = result.width && result.height ? ` · ${result.width}x${result.height}` : '';
             const auth = result.awaitingAuthorization ? ' · 等待授权' : '';
-            const autoStart = result.autoStart ? ' · 启动自启' : '';
             const visibleAppPackage = result.foregroundLaunchPackage || result.suggestedAppPackage || result.foregroundPackage || '';
             const currentApp = visibleAppPackage ? ` · ${visibleAppPackage}` : '';
             const appScene = result.appSceneDetectEnabled
                 ? ` · TV场景${result.appSceneMatched ? '命中' : '待命'}`
                 : '';
-            const summary = `${result.started ? '镜像中' : '未启动'} · ${result.connected ? 'ADB已连' : 'ADB未连'}${autoStart}${appScene}${size}${auth}${currentApp}`;
+            const summary = `${result.started ? '镜像中' : '未启动'} · ${result.connected ? 'ADB已连' : 'ADB未连'}${appScene}${size}${auth}${currentApp}`;
             const detail = `${summary}${result.deviceName ? ` · ${result.deviceName}` : ''}${result.message ? ` · ${result.message}` : ''}${result.foregroundRawFocus ? ` · ${result.foregroundRawFocus}` : ''}${result.runningPackages ? ` · running=${result.runningPackages}` : ''}`;
             setMirrorStatusText(usbStatusEl, summary, detail);
             setMirrorToggleButton(usbToggleBtn, !!result.started);
-            if (usbAutostartSwitch) {
-                usbAutostartSwitch.checked = result.autoStart === true;
+            syncUsbAppSceneControls(result, requestRevision);
+            if (writeLog) {
+                addToCommandLog('USB投屏', result.started ? 'success' : 'info', result.message || 'USB镜像状态已更新');
             }
-            if (usbAppSceneEnabled) {
-                usbAppSceneEnabled.checked = !!result.appSceneDetectEnabled;
-            }
-            if (usbAppSceneSelect && document.activeElement !== usbAppSceneSelect) {
-                if (result.appSceneName) {
-                    usbAppSceneSelect.value = result.appSceneName;
-                }
-            }
-            addToCommandLog('USB投屏', result.started ? 'success' : 'info', result.message || 'USB镜像状态已更新');
             return result;
         };
         const saveUsbAppSceneConfig = async () => {
             const payload = {
                 layerId,
                 enabled: !!usbAppSceneEnabled?.checked,
-                packageName: '',
                 sceneName: usbAppSceneSelect?.value || ''
             };
-            const result = await apiPost('/mirror/actions/usb_app_scene_config', payload);
-            if (!result) {
-                addToCommandLog('USB TV场景', 'error', '保存失败');
+            if (payload.enabled && !payload.sceneName) {
+                addToCommandLog('USB TV场景', 'error', '请先选择电视投屏对应场景');
                 return;
             }
-            addToCommandLog('USB TV场景', 'success',
-                payload.enabled
-                    ? `已保存：电视投屏检测 -> ${payload.sceneName}`
-                    : '已关闭自动场景切换');
-            await updateUsbMirrorStatus('status');
+
+            usbAppSceneSaving = true;
+            if (usbAppSceneEnabled) usbAppSceneEnabled.disabled = true;
+            if (usbAppSceneSelect) usbAppSceneSelect.disabled = true;
+            if (usbSaveAppSceneBtn) usbSaveAppSceneBtn.disabled = true;
+            try {
+                const result = await apiPost('/mirror/actions/usb_app_scene_config', payload);
+                if (!result) {
+                    addToCommandLog('USB TV场景', 'error', '保存失败');
+                    return;
+                }
+                usbAppSceneEditRevision += 1;
+                usbAppSceneFormDirty = false;
+                syncUsbAppSceneControls(result, usbAppSceneEditRevision, true);
+                addToCommandLog('USB TV场景', 'success',
+                    result.appSceneDetectEnabled
+                        ? `已保存：电视投屏检测 -> ${result.appSceneName || payload.sceneName}`
+                        : '已关闭自动场景切换');
+            } finally {
+                usbAppSceneSaving = false;
+                if (usbAppSceneEnabled) usbAppSceneEnabled.disabled = false;
+                if (usbAppSceneSelect) usbAppSceneSelect.disabled = false;
+                if (usbSaveAppSceneBtn) usbSaveAppSceneBtn.disabled = false;
+            }
         };
         usbToggleBtn?.addEventListener('click', () => updateUsbMirrorStatus(usbToggleBtn.dataset.running === '1' ? 'stop' : 'start'));
-        usbAutostartSwitch?.addEventListener('change', () => updateUsbMirrorStatus(usbAutostartSwitch.checked ? 'autostart_on' : 'autostart_off'));
+        usbAppSceneEnabled?.addEventListener('change', markUsbAppSceneFormDirty);
+        usbAppSceneSelect?.addEventListener('change', markUsbAppSceneFormDirty);
+        mirrorAutostartSelect?.addEventListener('change', async () => {
+            const selectedMode = mirrorAutostartSelect.value;
+            mirrorAutostartSelect.disabled = true;
+            const result = await updateMirrorAutostartStatus(selectedMode);
+            mirrorAutostartSelect.disabled = false;
+            if (!result) {
+                await updateMirrorAutostartStatus();
+            }
+        });
         usbSaveAppSceneBtn?.addEventListener('click', saveUsbAppSceneConfig);
         document.getElementById('mirror-usb-refresh-status-btn')?.addEventListener('click', () => updateUsbMirrorStatus('status'));
+        updateMirrorAutostartStatus();
         updateUsbMirrorStatus('status').then(result => {
             if (result?.appSceneName) {
                 populateMirrorAppSceneSelect(usbAppSceneSelect, apiGet, result.appSceneName);
@@ -1565,6 +1300,31 @@ export async function showLayerProperties(
                 populateMirrorAppSceneSelect(usbAppSceneSelect, apiGet);
             }
         });
+
+        let mirrorStatusPollInFlight = false;
+        const pollMirrorStatuses = async () => {
+            if (!statusEl?.isConnected && !androidStatusEl?.isConnected && !usbStatusEl?.isConnected) {
+                return;
+            }
+            if (!mirrorStatusPollInFlight) {
+                mirrorStatusPollInFlight = true;
+                try {
+                    await Promise.all([
+                        updateMirrorStatus('status', false),
+                        updateAndroidMirrorStatus('status', false),
+                        updateUsbMirrorStatus('status', false)
+                    ]);
+                } catch (error) {
+                    console.warn('pollMirrorStatuses failed:', error);
+                } finally {
+                    mirrorStatusPollInFlight = false;
+                }
+            }
+            if (statusEl?.isConnected || androidStatusEl?.isConnected || usbStatusEl?.isConnected) {
+                setTimeout(pollMirrorStatuses, 1000);
+            }
+        };
+        setTimeout(pollMirrorStatuses, 1000);
     }
 
     // 视频图层及采集图层参数事件监听
@@ -1613,125 +1373,8 @@ export async function showLayerProperties(
 
     // 采集图层参数事件监听
     if (isCaptureLayer) {
-        // 采集音量等
-        ['capture-volume'].forEach(id => {
-            const input = document.getElementById(id);
-            if (input) {
-                let timer = null;
-                input.addEventListener('change', () => { updateLayerFromInputs(layerId); applyLayerProperties(layerId); });
-                input.addEventListener('input', () => {
-                    updateLayerFromInputs(layerId);
-                    clearTimeout(timer);
-                    timer = setTimeout(() => { applyLayerProperties(layerId); timer = null; }, 300);
-                });
-            }
-        });
 
-        const captureTransformPreset = document.getElementById('capture-transform-preset');
-        if (captureTransformPreset) {
-            captureTransformPreset.addEventListener('change', () => {
-                const rotationSelect = document.getElementById('capture-rotation');
-                const invertSelect = document.getElementById('layer-invert');
-                const fitModeSelect = document.getElementById('video-fit-mode');
-                if (captureTransformPreset.value === 'normal') {
-                    if (rotationSelect) rotationSelect.value = '0';
-                    if (invertSelect) invertSelect.value = '0';
-                    if (fitModeSelect) fitModeSelect.value = '1';
-                } else if (captureTransformPreset.value === 'auto') {
-                    if (rotationSelect) rotationSelect.value = '-1';
-                    if (invertSelect) invertSelect.value = '0';
-                    if (fitModeSelect) fitModeSelect.value = '0';
-                }
-                updateLayerFromInputs(layerId);
-                applyLayerProperties(layerId);
-            });
-        }
-
-        const restartCaptureWithCurrentInputs = async (captureAutoTransform = null) => {
-            const captureType = document.getElementById('capture-type')?.value || 'MIPI';
-            const captureIndex = Number(document.getElementById('capture-index')?.value || 0) || 0;
-            const captureRotation = normalizeCaptureRotationValue(document.getElementById('capture-rotation')?.value, 0);
-            const invert = Number(document.getElementById('layer-invert')?.value || 0) || 0;
-            const fitMode = Number(document.getElementById('video-fit-mode')?.value || 0) > 0 ? 1 : 0;
-            const payload = {
-                captureType,
-                captureIndex,
-                captureRotation,
-                invert,
-                fitMode
-            };
-            if (captureAutoTransform === 0 || captureAutoTransform === 1) {
-                payload.captureAutoTransform = captureAutoTransform;
-            }
-            return await sendLayerCommand(layerId, 'restartRk628Capture', payload);
-        };
-
-        const setCaptureSceneModeInputs = (mode) => {
-            const isTvMode = mode === 'tv';
-            const presetSelect = document.getElementById('capture-transform-preset');
-            const rotationSelect = document.getElementById('capture-rotation');
-            const invertSelect = document.getElementById('layer-invert');
-            const fitModeSelect = document.getElementById('video-fit-mode');
-
-            if (presetSelect) presetSelect.value = 'auto';
-            if (rotationSelect) rotationSelect.value = '-1';
-            if (invertSelect) invertSelect.value = '0';
-            if (fitModeSelect) fitModeSelect.value = isTvMode ? '0' : '1';
-        };
-
-        const applyCaptureSceneMode = async (mode, button) => {
-            const isTvMode = mode === 'tv';
-            const originalText = button?.textContent || '';
-            try {
-                if (button) {
-                    button.disabled = true;
-                    button.textContent = '应用中...';
-                }
-
-                const sceneName = isTvMode ? 'TVMirror' : '默认配置';
-                let sceneWarning = '';
-                try {
-                    const sceneResult = await sendSceneCommand('switch_scene', { scene_name: sceneName });
-                    if (sceneResult == null) {
-                        sceneWarning = `切换${sceneName}失败`;
-                    }
-                } catch (sceneError) {
-                    sceneWarning = sceneError.message || `切换${sceneName}失败`;
-                }
-
-                setCaptureSceneModeInputs(mode);
-                updateLayerFromInputs(layerId);
-                await applyLayerProperties(layerId);
-
-                const restartResult = await restartCaptureWithCurrentInputs(isTvMode ? 1 : 0);
-                if (restartResult == null) {
-                    throw new Error('重启采集失败');
-                }
-
-                if (sceneWarning) {
-                    addToCommandLog('采集场景', 'warning', `${sceneWarning}，已继续应用采集画面参数`);
-                }
-                addToCommandLog('采集场景', 'success',
-                    isTvMode ? '已应用无黑边旋转+TV' : '已应用有黑边不旋转+普通');
-            } catch (error) {
-                addToCommandLog('采集场景', 'error', error.message || '采集场景应用失败');
-            } finally {
-                if (button) {
-                    button.disabled = false;
-                    button.textContent = originalText;
-                }
-            }
-        };
-
-        document.getElementById('capture-tv-mode-btn')?.addEventListener('click', (event) => {
-            applyCaptureSceneMode('tv', event.currentTarget);
-        });
-        document.getElementById('capture-normal-mode-btn')?.addEventListener('click', (event) => {
-            applyCaptureSceneMode('normal', event.currentTarget);
-        });
-
-        // 输入选择/输入旋转下拉框变化事件
-        ['capture-type', 'capture-rotation'].forEach(id => {
+        ['capture-type', 'capture-index'].forEach(id => {
             const input = document.getElementById(id);
             if (input) {
                 input.addEventListener('change', () => {
@@ -1740,31 +1383,6 @@ export async function showLayerProperties(
                 });
             }
         });
-
-        const restartRk628Btn = document.getElementById('capture-restart-rk628-btn');
-        if (restartRk628Btn) {
-            restartRk628Btn.addEventListener('click', async () => {
-                restartRk628Btn.disabled = true;
-                const originalText = restartRk628Btn.textContent;
-                restartRk628Btn.textContent = '重启中...';
-                addToCommandLog('重启采集', 'info', `正在重启图层 ${layerId} 采集链路`);
-                try {
-                    updateLayerFromInputs(layerId);
-                    await applyLayerProperties(layerId);
-                    const result = await restartCaptureWithCurrentInputs();
-                    if (result == null) {
-                        addToCommandLog('重启采集', 'error', '重启失败');
-                    } else {
-                        addToCommandLog('重启采集', 'success', result?.message || '重启完成');
-                    }
-                } catch (error) {
-                    addToCommandLog('重启采集', 'error', error.message || '重启失败');
-                } finally {
-                    restartRk628Btn.disabled = false;
-                    restartRk628Btn.textContent = originalText;
-                }
-            });
-        }
     }
 
     // 图像图层参数事件监听（图层不管文件操作，无加载图像）
@@ -1892,9 +1510,6 @@ export async function showLayerProperties(
     // 文本图层参数事件监听
     if (isTextLayer) {
         if (isLyricLayer) {
-            // 优先用当前 layer.font_file，否则用列表中同图层的 font_file（保证 config 有配置时能显示）
-            const fontFile = layer.font_file || (layers && layers.find(l => l.id === layerId) || {}).font_file || '';
-            loadFontList(layerId, fontFile, apiGet, applyLayerProperties);
             const bindLayerSelect = document.getElementById('lyric-bind-layer');
             if (bindLayerSelect) {
                 bindLayerSelect.addEventListener('change', () => {
@@ -2077,6 +1692,7 @@ async function loadFontList(layerId, currentFontFile, apiGet, applyLayerProperti
             if (displayName.length > 14) {
                 displayName = displayName.substring(0, 11) + '...';
             }
+            option.setAttribute('translate', 'no');
             option.textContent = displayName;
             option.title = font.name;
             fontSelect.appendChild(option);
@@ -2224,6 +1840,10 @@ export async function showSliceProperties(
     const formContainer = document.getElementById('layer-properties-form');
     if (!formContainer) return;
 
+    const renderRevision = ++propertyRenderRevision;
+    const isCurrentRender = () =>
+        renderRevision === propertyRenderRevision && formContainer.isConnected;
+
     formContainer.style.display = 'block';
     delete formContainer.dataset.layerId;
     delete formContainer.dataset.sliceKey;
@@ -2244,29 +1864,28 @@ export async function showSliceProperties(
     const fallbackSize = { width: layer?.size?.width || 0, height: layer?.size?.height || 0 };
     const coord = parseSliceCoordinate(sliceData, fallbackSize);
 
-    const { isVideoLayer, isCaptureLayer, isQRCodeLayer, isImageLayer, isTextLayer, isLyricLayer, isLayer40, isLayer41, isEffectLayer } = getLayerTypeFlags(layer, layerId);
+    const { isVideoLayer, isCaptureLayer, isQRCodeLayer, isImageLayer, isTextLayer, isLyricLayer, isLayer40, isLayer41 } = getLayerTypeFlags(layer, layerId);
 
     // 非文本图层切片使用自己的漫游配置，避免写到主图层漫游。
     const showRoamForSlice = (layerId !== 21 && layerId !== 30 && layerId !== 40 && layerId !== 41);
     const sliceRoamConfig = normalizeRoamConfigValue(sliceData.roamConfig ?? sliceData.roam_config);
 
     // Layer 41 切片需要关联播放列表下拉，与图层一致
-    let layer41PlaylistOptions = '<option value="">未关联</option>';
+    let layer41PlaylistOptions = '';
     if (isLayer41) {
+        let playlists = [];
         try {
-            const playlists = await apiGet('/playlists');
-            if (playlists && Array.isArray(playlists)) {
-                const boundPlaylistId = layer.playlistId || '';
-                layer41PlaylistOptions += playlists.map(pl =>
-                    `<option value="${pl.id}" ${pl.id === boundPlaylistId ? 'selected' : ''}>${escapeHtml(pl.name)}</option>`
-                ).join('');
-            }
+            const response = await apiGet('/playlists');
+            if (Array.isArray(response)) playlists = response;
         } catch (e) {
-            console.error('[LayerMatrix] 获取播放列表失败 (Layer 41 切片)', e);
+            console.error('[LayerMatrix] Failed to fetch playlists for Layer 41 slice', e);
         }
+        layer41PlaylistOptions = buildLayer41PlaylistOptions(playlists, layer.playlistId || '');
     }
 
     // 注意：这里需要生成完整的HTML表单
+    if (!isCurrentRender()) return;
+
     if (isQRCodeLayer) {
         formContainer.innerHTML = `
             <div class="property-group">
@@ -2275,25 +1894,30 @@ export async function showSliceProperties(
                 </div>
                 <div class="property-content">
                     ${renderQRCodeDashboard(layer, 'slice', coord || { x: 0, y: 0, width: 0, height: 0, priority: layerId })}
+                    ${contentCropBlockHtml(sliceData, 'slice')}
                 </div>
             </div>
         `;
         formContainer.dataset.layerId = String(layerId);
         formContainer.dataset.sliceKey = String(sliceKey);
         setupQRCodeDashboardListeners(layerId, 'slice', sliceKey);
+        registerLivePreviewHandlers(
+            ['slice-crop-left', 'slice-crop-top', 'slice-crop-right', 'slice-crop-bottom'],
+            () => applySliceProperties(layerId, sliceKey)
+        );
     } else {
         // 构建切片特有字段 (基于图层类型，与图层属性面板保持一致)
         let sliceSpecialFields = '';
 
         if (isCaptureLayer) {
             const captureType = sliceData.capture_type ?? sliceData.captureType ?? '';
-            const sliceVolumePct = Math.round((sliceData.volume !== undefined ? sliceData.volume : (layer.volume !== undefined ? layer.volume : 1.0)) * 100);
             const sliceShapeType = Number(sliceData.shapeType ?? sliceData.shape_type ?? 0);
             const sliceShapeParam = Number(sliceData.shapeParam ?? sliceData.shape_param ?? 0.0);
             const sliceInvert = sliceData.invert !== undefined ? sliceData.invert : (sliceData.mirror ? 1 : 0);
             const sliceCaptureBlackToTransparent = sliceData.black_to_transparent !== undefined
                 ? sliceData.black_to_transparent
                 : (sliceData.blackToTransparent ?? layer.black_to_transparent ?? layer.blackToTransparent ?? false);
+            const sliceCaptureGaussianBlur = Math.round(sliceData.gaussian_blur ?? sliceData.gaussianBlur ?? layer.gaussian_blur ?? layer.gaussianBlur ?? 0);
             const sliceFitMode = Number(sliceData.fit_mode !== undefined ? sliceData.fit_mode : (sliceData.fitMode !== undefined ? sliceData.fitMode : (layer.fit_mode ?? 0))) > 0 ? 1 : 0;
 
             sliceSpecialFields += `
@@ -2331,6 +1955,7 @@ export async function showSliceProperties(
                             <option value="true" ${sliceCaptureBlackToTransparent ? 'selected' : ''}>开启</option>
                         </select>
                     </div>
+                    ${createNumInput('slice-gaussian-blur', '高斯模糊', sliceCaptureGaussianBlur, 0, 10, 1, 1)}
                     <div class="setting-item" style="grid-column: span 1;">
                         <label for="slice-fit-mode">填充模式:</label>
                         <select id="slice-fit-mode" class="form-control">
@@ -2438,13 +2063,7 @@ export async function showSliceProperties(
             }).catch(() => { });
 
             sliceSpecialFields += `
-                <div class="setting-section lyric-three-selects">
-                    <div class="setting-item" style="grid-column: span 1;">
-                        <label for="slice-text-font-file">选择字体:</label>
-                        <select id="slice-text-font-file" class="form-control">
-                            <option value="">请选择字体</option>
-                        </select>
-                    </div>
+                <div class="setting-section">
                     <div class="setting-item" style="grid-column: span 1;">
                         <label for="slice-lyric-bind-layer">关联视频层:</label>
                         <select id="slice-lyric-bind-layer" class="form-control">
@@ -2470,7 +2089,6 @@ export async function showSliceProperties(
         const sliceVolumePct = Math.round((sliceData.volume !== undefined ? sliceData.volume : (layer.volume !== undefined ? layer.volume : 1.0)) * 100);
         const sliceGaussianBlur = Math.round(sliceData.gaussian_blur !== undefined ? sliceData.gaussian_blur : (sliceData.gaussianBlur !== undefined ? sliceData.gaussianBlur : (layer.gaussian_blur !== undefined ? layer.gaussian_blur : 0)));
         const sliceInvertVal = sliceData.invert !== undefined ? sliceData.invert : (sliceData.mirror ? 1 : 0);
-        const sliceAlphaPct = Math.round((sliceData.alpha !== undefined ? sliceData.alpha : (sliceData.transparency !== undefined ? sliceData.transparency / 255 : 1.0)) * 100);
         const sliceFitMode = Number(sliceData.fit_mode !== undefined ? sliceData.fit_mode : (sliceData.fitMode !== undefined ? sliceData.fitMode : (layer.fit_mode ?? 0))) > 0 ? 1 : 0;
         const sliceBlackToTransparent = sliceData.black_to_transparent !== undefined ? sliceData.black_to_transparent : (sliceData.blackToTransparent || false);
 
@@ -2568,39 +2186,19 @@ export async function showSliceProperties(
                 ` : ''}
                 <div class="setting-item" style="grid-column: span 1;">
                     <label for="slice-roam-speed">移动速度(像素/秒):</label>
-                    <div class="number-input-wrapper horizontal layer-param-input">
-                        <button type="button" class="number-btn minus" data-target="slice-roam-speed">-</button>
-                        <input type="number" id="slice-roam-speed" min="1" max="1000" step="1" value="${sliceRoamConfig.speed || 100}" data-default="${sliceRoamConfig.speed || 100}" class="form-control number-input">
-                        <button type="button" class="number-btn plus" data-target="slice-roam-speed">+</button>
-                        <button type="button" class="number-btn number-reset" data-target="slice-roam-speed" title="恢复默认">↻</button>
-                    </div>
+                    ${createNumControl('slice-roam-speed', sliceRoamConfig.speed || 100, 1, 1000)}
                 </div>
                 <div id="slice-roam-horizontal-params" class="setting-item" style="grid-column: span 1; display: ${sliceRoamConfig.mode === 1 ? 'block' : 'none'};">
                     <label for="slice-roam-range-x">移动范围(像素):</label>
-                    <div class="number-input-wrapper horizontal layer-param-input">
-                        <button type="button" class="number-btn minus" data-target="slice-roam-range-x">-</button>
-                        <input type="number" id="slice-roam-range-x" min="0" max="4000" step="10" value="${sliceRoamConfig.rangeX || 500}" data-default="${sliceRoamConfig.rangeX || 500}" class="form-control number-input">
-                        <button type="button" class="number-btn plus" data-target="slice-roam-range-x">+</button>
-                        <button type="button" class="number-btn number-reset" data-target="slice-roam-range-x" title="恢复默认">↻</button>
-                    </div>
+                    ${createNumControl('slice-roam-range-x', sliceRoamConfig.rangeX || 500, 0, 4000, 10)}
                 </div>
                 <div id="slice-roam-vertical-params" class="setting-item" style="grid-column: span 1; display: ${sliceRoamConfig.mode === 2 ? 'block' : 'none'};">
                     <label for="slice-roam-range-y">移动范围(像素):</label>
-                    <div class="number-input-wrapper horizontal layer-param-input">
-                        <button type="button" class="number-btn minus" data-target="slice-roam-range-y">-</button>
-                        <input type="number" id="slice-roam-range-y" min="0" max="4000" step="10" value="${sliceRoamConfig.rangeY || 500}" data-default="${sliceRoamConfig.rangeY || 500}" class="form-control number-input">
-                        <button type="button" class="number-btn plus" data-target="slice-roam-range-y">+</button>
-                        <button type="button" class="number-btn number-reset" data-target="slice-roam-range-y" title="恢复默认">↻</button>
-                    </div>
+                    ${createNumControl('slice-roam-range-y', sliceRoamConfig.rangeY || 500, 0, 4000, 10)}
                 </div>
                 <div id="slice-roam-circular-params" class="setting-item" style="grid-column: span 1; display: ${sliceRoamConfig.mode === 3 ? 'block' : 'none'};">
                     <label for="slice-roam-radius">圆形半径(像素):</label>
-                    <div class="number-input-wrapper horizontal layer-param-input">
-                        <button type="button" class="number-btn minus" data-target="slice-roam-radius">-</button>
-                        <input type="number" id="slice-roam-radius" min="0" max="2000" step="10" value="${sliceRoamConfig.radius || 200}" data-default="${sliceRoamConfig.radius || 200}" class="form-control number-input">
-                        <button type="button" class="number-btn plus" data-target="slice-roam-radius">+</button>
-                        <button type="button" class="number-btn number-reset" data-target="slice-roam-radius" title="恢复默认">↻</button>
-                    </div>
+                    ${createNumControl('slice-roam-radius', sliceRoamConfig.radius || 200, 0, 2000, 10)}
                 </div>
                 <div class="setting-item" style="grid-column: span 1;">
                     <label>循环播放:</label>
@@ -2624,6 +2222,7 @@ export async function showSliceProperties(
         const sliceControls = `
             ${sliceSpecialFields}
             ${sliceVideoControlSection}
+            ${contentCropBlockHtml(sliceData, 'slice')}
 
             <div class="property-separator" style="grid-column: 1 / -1; height: 1px; background: rgba(255,255,255,0.1); margin: 5px 0;"></div>
 
@@ -2650,11 +2249,12 @@ export async function showSliceProperties(
                         <button type="button" class="property-tab" data-param-tab="advanced">高级</button>
                     </div>
                     <div class="property-actions">
+                         <button id="slice-toggle-visibility-btn" class="btn small">${isSliceVisible(sliceData) ? '隐藏' : '显示'}</button>
                          <button id="slice-delete-btn" class="btn small danger">删除</button>
                          <button id="slice-save-btn" class="btn small primary">保存</button>
                     </div>
                 </div>
-                <div class="property-content tab-common ${useCompactSliceLayout ? 'property-content--compact-advanced' : ''}">
+                <div class="property-content slice-properties-content tab-common ${useCompactSliceLayout ? 'property-content--compact-advanced' : ''}">
                     ${sliceControls}
                 </div>
             </div>
@@ -2665,7 +2265,7 @@ export async function showSliceProperties(
         applyParamTabs(formContainer);
 
         // 绑定数字输入框加减按钮
-        setupNumberInputButtons(formContainer);
+        setupNumberInputButtons(formContainer, undefined, { excludeSelector: '[id$="-roam-config-section"]' });
 
         // 漫游配置区域事件（切片漫游保存到当前切片）
         if (showRoamForSlice) {
@@ -2721,6 +2321,7 @@ export async function showSliceProperties(
                 'slice-capture-type',
                 'slice-shape-type', 'slice-shape-param', 'slice-black-to-transparent',
                 'slice-fit-mode',
+                'slice-crop-left', 'slice-crop-top', 'slice-crop-right', 'slice-crop-bottom',
                 // Layer 41 切片特有字段
                 'slice-display-align', 'slice-playlist-id', 'slice-show-count', 'slice-start-hint-time', 'slice-end-hint-time'
             ],
@@ -2735,14 +2336,22 @@ export async function showSliceProperties(
             await applySliceProperties(layerId, sliceKey);
         });
 
+        document.getElementById('slice-toggle-visibility-btn')?.addEventListener('click', async (event) => {
+            const button = event.currentTarget;
+            button.disabled = true;
+            try {
+                await toggleSliceVisibility(layerId, sliceKey);
+            } finally {
+                button.disabled = false;
+            }
+        });
+
         // 歌词图层事件监听 (切片版)
         if (isTextLayer && !isQRCodeLayer && !isLyricLayer && !isLayer41) {
             loadFontList(layerId, isLayer40 ? (getSliceData(layer, sliceKey)?.font_file || layer.font_file || '') : (layer.font_file || ''), apiGet, applySliceProperties, 'slice-text-font-file', [sliceKey]);
         }
 
         if (isLyricLayer) {
-            loadFontList(layerId, layer.font_file || '', apiGet, applySliceProperties, 'slice-text-font-file', [sliceKey]);
-
             document.getElementById('slice-lyric-visible')?.addEventListener('change', async (e) => {
                 const visible = e.target.value === 'true';
                 await sendLyricCommand('set_visible', { visible: visible }, apiPost);
@@ -2802,33 +2411,26 @@ function setupRoamConfigListeners(layerId, prefix = 'layer', options = {}) {
         });
     }
 
-    // 绑定基础事件监听辅助函数
-    const bindLiveUpdate = (el, eventType = 'change', debounce = 0) => {
-        if (!el) return;
+    bindLiveUpdate(roamLoopCheckbox);
+
+    // A committed change cancels the input debounce, so one edit saves once.
+    function bindLiveUpdate(element, debounce = 0) {
+        if (!element) return;
         let timer = null;
-        el.addEventListener(eventType, () => {
-            if (debounce > 0) {
+        if (debounce > 0) {
+            element.addEventListener('input', () => {
                 clearTimeout(timer);
                 timer = setTimeout(() => saveRoamConfig(layerId, prefix, false, options), debounce);
-            } else {
-                saveRoamConfig(layerId, prefix, false, options);
-            }
-        });
-    };
-
-    bindLiveUpdate(roamLoopCheckbox);
-    
-    [roamSpeedInput, roamRangeXInput, roamRangeYInput, roamRadiusInput].forEach(input => {
-        if (input) {
-            bindLiveUpdate(input, 'input', 300);
-            bindLiveUpdate(input, 'change');
+            });
         }
-    });
-
-    if (roamCustomPathTextarea) {
-        bindLiveUpdate(roamCustomPathTextarea, 'input', 500);
-        bindLiveUpdate(roamCustomPathTextarea, 'change');
+        element.addEventListener('change', () => {
+            clearTimeout(timer);
+            saveRoamConfig(layerId, prefix, false, options);
+        });
     }
+
+    [roamSpeedInput, roamRangeXInput, roamRangeYInput, roamRadiusInput].forEach(input => bindLiveUpdate(input, 300));
+    bindLiveUpdate(roamCustomPathTextarea, 500);
 
     // 重置计时器按钮
     if (roamResetBtn) {
@@ -2847,9 +2449,7 @@ function setupRoamConfigListeners(layerId, prefix = 'layer', options = {}) {
     }
 
     // 数字输入框加减按钮
-    setupNumberInputButtons(document.getElementById(prefix === 'slice' ? 'slice-roam-config-section' : 'layer-roam-config-section'), () => {
-        saveRoamConfig(layerId, prefix, false, options);
-    });
+    setupNumberInputButtons(document.getElementById(prefix === 'slice' ? 'slice-roam-config-section' : 'layer-roam-config-section'));
 }
 
 /**

@@ -1,0 +1,10 @@
+cc_binary {
+    name: "hsvj-rom-update",
+    srcs: ["rom_update.cpp"],
+    recovery_available: true,
+    host_supported: true,
+    static_libs: ["libjsoncpp", "libsparse", "libz", "libbase", "liblog"],
+    shared_libs: ["libcrypto"],
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+    cppflags: ["-std=c++17", "-fexceptions"],
+}

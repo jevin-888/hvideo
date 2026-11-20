@@ -8,11 +8,9 @@
  * - 登录状态检查
  */
 
-import '../core/interactionGuards.js';
+import '/shared/interactionGuards.js';
 import { parseApiResponse } from '../../shared/apiResponseParser.js';
-
-const AUTH_TOKEN_KEY = 'hvideo_auth_token';
-const AUTH_TOKEN_EXPIRY_KEY = 'hvideo_auth_token_expiry';
+import { getAuthToken, clearAuthToken, saveAuthToken, isLoggedIn, validateSession } from '/shared/authSession.js';
 
 async function readApiResponse(response) {
     const text = await response.text();
@@ -31,68 +29,22 @@ async function readApiResponse(response) {
 }
 
 /**
- * @brief 保存认证令牌
- */
-function saveAuthToken(token, expiresIn = 2 * 60 * 60 * 1000) {
-    const expiry = Date.now() + expiresIn;
-    localStorage.setItem(AUTH_TOKEN_KEY, token);
-    localStorage.setItem(AUTH_TOKEN_EXPIRY_KEY, expiry.toString());
-}
-
-/**
- * @brief 获取认证令牌
- */
-function getAuthToken() {
-    const token = localStorage.getItem(AUTH_TOKEN_KEY);
-    const expiry = localStorage.getItem(AUTH_TOKEN_EXPIRY_KEY);
-    
-    if (!token || !expiry) {
-        return null;
-    }
-    
-    // 检查令牌是否过期
-    if (Date.now() > parseInt(expiry)) {
-        clearAuthToken();
-        return null;
-    }
-    
-    return token;
-}
-
-/**
- * @brief 清除认证令牌
- */
-function clearAuthToken() {
-    localStorage.removeItem(AUTH_TOKEN_KEY);
-    localStorage.removeItem(AUTH_TOKEN_EXPIRY_KEY);
-}
-
-/**
- * @brief 检查是否已登录
- */
-function isLoggedIn() {
-    return getAuthToken() !== null;
-}
-
-/**
  * @brief 登录函数
  */
-async function login(username, password) {
+async function login(username, password, loginType) {
     try {
         const response = await fetch('/api/v1/auth/login', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ username, password })
+            body: JSON.stringify({ username, password, loginType })
         });
         
         const data = await readApiResponse(response);
         
         if (data && data.token) {
             saveAuthToken(data.token, data.expiresIn || 2 * 60 * 60 * 1000);
-            // 跳转到主页
-            window.location.href = '/index.html';
             return { success: true };
         } else {
             return { success: false, message: '登录响应缺少 token' };
@@ -131,20 +83,91 @@ async function logout() {
  * @brief 初始化登录页面
  */
 function initLoginPage() {
+    const destination = new URLSearchParams(window.location.search).get('next') === 'factory-serial'
+        ? '/factory-serial.html' : '/index.html';
     const loginForm = document.getElementById('login-form');
     const loginButton = document.getElementById('login-button');
     const errorMessage = document.getElementById('error-message');
-    
+    const loginTypeSelect = document.getElementById('login-type');
     if (!loginForm) return;
-    
-    // 如果已登录，跳转到主页
-    if (isLoggedIn()) {
-        window.location.href = '/index.html';
-        return;
+    const loginTypeKey = 'hvideo_login_type';
+    if (loginTypeSelect) {
+        try {
+            const savedType = localStorage.getItem(loginTypeKey);
+            loginTypeSelect.value = savedType === 'local' ? 'local' : 'cloud';
+        } catch (_) { /* 浏览器禁用存储时仍可正常选择登录方式。 */ }
     }
+    function updateLoginHint() {
+        const cloud = loginTypeSelect?.value === 'cloud';
+        document.getElementById('login-subtitle').textContent = cloud
+            ? '使用云端代理商账号和密码登录'
+            : '请登录以继续';
+    }
+    loginTypeSelect?.addEventListener('change', () => {
+        try {
+            localStorage.setItem(loginTypeKey, loginTypeSelect.value === 'cloud' ? 'cloud' : 'local');
+        } catch (_) { /* 偏好保存失败不阻止登录。 */ }
+        const usernameInput = document.getElementById('username');
+        if (loginTypeSelect.value === 'local' && !usernameInput.value) usernameInput.value = 'admin';
+        if (loginTypeSelect.value === 'cloud' && usernameInput.value === 'admin') usernameInput.value = '';
+        document.getElementById('password').value = '';
+        errorMessage.classList.remove('show');
+        updateLoginHint();
+    });
+
+    updateLoginHint();
+    
+    async function loadLoginConfig() {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        try {
+            const response = await fetch('/api/v1/auth/config', {
+                cache: 'no-store', signal: controller.signal
+            });
+            const data = await readApiResponse(response);
+            if (typeof data?.localPasswordConfigured !== 'boolean') {
+                throw new Error('登录配置无效，请刷新页面重试');
+            }
+            updateLoginHint();
+            const usernameInput = document.getElementById('username');
+            if (loginTypeSelect?.value !== 'cloud' && !usernameInput.value) usernameInput.value = 'admin';
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    let retryTimer = null;
+    let autoLoginAttempted = false;
+    async function prepareLogin() {
+        loginButton.disabled = true;
+        try {
+            if (await validateSession()) {
+                window.location.replace(destination);
+                return;
+            }
+            await loadLoginConfig();
+            errorMessage.classList.remove('show');
+            loginButton.disabled = false;
+            if (!autoLoginAttempted && new URLSearchParams(window.location.search).get('terminalAutoLogin') === '1') {
+                autoLoginAttempted = true;
+                const usernameInput = document.getElementById('username');
+                const passwordInput = document.getElementById('password');
+                if (loginTypeSelect) loginTypeSelect.value = 'local';
+                if (usernameInput) usernameInput.value = 'admin';
+                if (passwordInput) passwordInput.value = 'admin*';
+                loginForm.requestSubmit();
+            }
+        } catch (_) {
+            showError('设备暂未连接，正在重试...');
+            retryTimer = setTimeout(prepareLogin, 3000);
+        }
+    }
+    window.addEventListener('pagehide', () => clearTimeout(retryTimer), { once: true });
+    void prepareLogin();
     
     loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
+        if (loginButton.disabled) return;
         
         const username = document.getElementById('username').value.trim();
         const password = document.getElementById('password').value;
@@ -159,7 +182,7 @@ function initLoginPage() {
         loginButton.innerHTML = '<span class="loading"></span>登录中...';
         errorMessage.classList.remove('show');
         
-        const result = await login(username, password);
+        const result = await login(username, password, loginTypeSelect?.value === 'cloud' ? 'cloud' : 'local');
         
         // 恢复按钮状态
         loginButton.disabled = false;
@@ -167,7 +190,7 @@ function initLoginPage() {
         
         if (result.success) {
             // 登录成功，跳转到主页
-            window.location.href = '/index.html';
+            window.location.href = destination;
         } else {
             showError(result.message || '登录失败');
         }
@@ -178,12 +201,6 @@ function initLoginPage() {
         errorMessage.classList.add('show');
     }
     
-    // 支持回车键提交
-    document.getElementById('password').addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            loginForm.dispatchEvent(new Event('submit'));
-        }
-    });
 }
 
 // 导出函数供其他模块使用

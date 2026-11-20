@@ -1,0 +1,27 @@
+{
+  "id": "framework-self-test",
+  "name": "测试框架离线自检",
+  "tags": ["framework", "offline"],
+  "variables": {
+    "ready": true
+  },
+  "steps": [
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "ready",
+      "equals": true
+    },
+    {
+      "type": "set",
+      "name": "message",
+      "value": "runner-ready"
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "message",
+      "equals": "runner-ready"
+    }
+  ]
+}

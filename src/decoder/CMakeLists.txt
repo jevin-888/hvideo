@@ -1,4 +1,4 @@
-﻿# 获取项目根目录（相对于当前CMakeLists.txt的位置）
+# 获取项目根目录（相对于当前CMakeLists.txt的位置）
 get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
 # FFmpeg库（仅Android平台）
@@ -18,7 +18,8 @@ if(ANDROID)
         VideoDecoderPool.cpp
         AudioOnlyPlayer.cpp
         RkmppMpeg2Probe.cpp
-        UsbH264RkmppDecoder.cpp
+        H264RkmppDecoder.cpp
+        H264NalUtils.cpp
         
         # 核心模块
         core/DecoderCore.cpp
@@ -118,4 +119,11 @@ else()
         hsvj_utils
     )
 endif()
+
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_decoder PRIVATE
+    hsvj_audio
+    hsvj_utils
+)
+
 

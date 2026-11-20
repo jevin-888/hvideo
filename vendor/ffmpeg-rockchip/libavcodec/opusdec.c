@@ -722,7 +722,7 @@ static av_cold int opus_decode_init(AVCodecContext *avctx)
         if (!s->swr)
             return AVERROR(ENOMEM);
 
-        layout = (s->output_channels == 1) ? (AVChannelLayout)? AV_CHANNEL_LAYOUT_MONO :
+        layout = (s->output_channels == 1) ? (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO :
                                              (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
         av_opt_set_int(s->swr, "in_sample_fmt",      avctx->sample_fmt,  0);
         av_opt_set_int(s->swr, "out_sample_fmt",     avctx->sample_fmt,  0);

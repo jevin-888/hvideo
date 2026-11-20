@@ -165,7 +165,8 @@ uint16_t ff_mlp_checksum16(const uint8_t *buf, unsigned int buf_size);
 uint8_t ff_mlp_restart_checksum(const uint8_t *buf, unsigned int bit_size);
 
 /** XOR together all the bytes of a buffer.
- *  Does this belong in dspcontext*/
+ *  Does this belong in dspcontext?
+ */
 uint8_t ff_mlp_calculate_parity(const uint8_t *buf, unsigned int buf_size);
 
 void ff_mlp_init_crc(void);

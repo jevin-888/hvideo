@@ -5,7 +5,7 @@
  * 提供统一的API操作工具函数，简化常见的数据获取和操作模式
  */
 
-import { addToCommandLog } from '../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 
 // 这里原本有一组通用 CRUD 辅助函数（fetchListData / handleCreateOperation / handleUpdateOperation / handleDeleteOperation），
 // 源码中已经明确标注“目前无外部使用者”，并且在整个项目中没有任何引用。

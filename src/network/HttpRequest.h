@@ -21,6 +21,7 @@ public:
     const std::string& getVersion() const;
     // 获取请求头
     const std::string& getHeader(const std::string& key) const;
+    bool getContentLength(size_t& length) const;
     // 获取所有请求头
     const std::unordered_map<std::string, std::string>& getHeaders() const;
     // 获取请求体
@@ -39,6 +40,8 @@ public:
     // 获取/设置客户端IP
     const std::string& getPeerIp() const { return peerIp_; }
     void setPeerIp(const std::string& ip) { peerIp_ = ip; }
+    const std::string& getLocalIp() const { return localIp_; }
+    void setLocalIp(const std::string& ip) { localIp_ = ip; }
 
 private:
     // 解析请求行
@@ -56,6 +59,7 @@ private:
     std::unordered_map<std::string, std::string> query_params_;  // 查询参数
     std::unordered_map<std::string, std::string> url_params_;    // URL参数
     std::string peerIp_;             // 客户端IP
+    std::string localIp_;            // 本次 TCP 连接的设备端 IP
 };
 
 #endif // 结束 HTTPREQUEST_H

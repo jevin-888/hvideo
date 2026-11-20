@@ -6,12 +6,41 @@
 #include "utils/MediaUtils.h"
 #include "utils/Logger.h"
 #include "vod/LocalVodPlayer.h"
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <thread>
 
 namespace hsvj {
 
+namespace {
+
+bool isNetworkMediaPath(const std::string &path) {
+  const size_t schemeEnd = path.find("://");
+  if (schemeEnd == std::string::npos) return false;
+
+  std::string scheme = path.substr(0, schemeEnd);
+  std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return scheme == "http" || scheme == "https" || scheme == "rtsp" ||
+         scheme == "rtmp" || scheme == "udp" || scheme == "tcp";
+}
+
+long long elapsedMs(const std::chrono::steady_clock::time_point &start) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
+
+} // namespace
+
 LayerPlaybackController::LayerPlaybackController(int layerId) : layerId_(layerId) {}
+
+LayerPlaybackController::~LayerPlaybackController() {
+  if (pendingWorker_.joinable()) {
+    pendingWorker_.join();
+  }
+}
 
 PlaybackResult LayerPlaybackController::requestPlay(const PlaybackRequest &request,
                                                     LayerVideo *layer) {
@@ -68,6 +97,15 @@ PlaybackResult LayerPlaybackController::requestPlay(const PlaybackRequest &reque
       LayerVideo *currentLayer = nullptr;
       {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (stopRequested_) {
+          pendingRequest_.reset();
+          pendingLayer_ = nullptr;
+          activeRequest_.reset();
+          activeLayer_ = nullptr;
+          workerRunning_ = false;
+          state_ = LayerPlaybackState::ShuttingDown;
+          return;
+        }
         if (pendingRequest_) {
           currentRequest = *pendingRequest_;
           currentLayer = pendingLayer_;
@@ -102,7 +140,13 @@ PlaybackResult LayerPlaybackController::requestPlay(const PlaybackRequest &reque
     }
   }
   if (hasPending) {
-    std::thread(std::move(drainPending)).detach();
+    // Keep the worker owned by the controller. PlaybackCoordinator destroys
+    // controllers when layers are removed; a detached worker could then call
+    // through a dangling controller or LayerVideo pointer.
+    if (pendingWorker_.joinable()) {
+      pendingWorker_.join();
+    }
+    pendingWorker_ = std::thread(std::move(drainPending));
   }
   return result;
 }
@@ -126,28 +170,77 @@ PlaybackResult LayerPlaybackController::executePlay(const PlaybackRequest &reque
     return result;
   }
 
+  const auto executeStart = std::chrono::steady_clock::now();
+  // Keep replay inside the controller queue and coordinator admission checks.
+  // Reusing an admitted decoder needs no new resource reservation or media probe.
+  if (request.restartFromBeginning && request.syncStartTime <= 0.0 &&
+      layer->tryReplayCurrent(request.path, request.loop)) {
+    result.code = PlaybackResultCode::Started;
+    result.message = "playback restarted";
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      state_ = LayerPlaybackState::Playing;
+      currentPath_ = request.path;
+      lastResult_ = result;
+    }
+    MediaRuntimeDiagnostics::getInstance().logPlaybackTrace(
+        result.requestId, result.switchId, request.layerId, "EXEC_REPLAY_SEEK",
+        "totalMs=" + std::to_string(elapsedMs(executeStart)));
+    if (logResult) {
+      MediaRuntimeDiagnostics::getInstance().logPlaybackResult(
+          result.requestId, result.switchId, request.layerId, toString(result.code),
+          result.message);
+    }
+    return result;
+  }
   DecoderAdmissionInfo admissionInfo;
   admissionInfo.path = request.path;
-  MediaVideoInfo mediaInfo;
-  std::string probeError;
-  if (MediaUtils::probeVideoInfo(request.path, mediaInfo, &probeError)) {
-    admissionInfo.known = mediaInfo.valid;
-    admissionInfo.hasVideo = mediaInfo.hasVideo;
-    admissionInfo.width = mediaInfo.width;
-    admissionInfo.height = mediaInfo.height;
-    admissionInfo.frameRate = mediaInfo.frameRate;
-    admissionInfo.bitRate = mediaInfo.bitRate;
-    admissionInfo.codecName = mediaInfo.codecName;
+  auto &resourceGate = DecoderResourceGate::getInstance();
+  if (isNetworkMediaPath(request.path)) {
+    // The decoder opens and probes network media itself with interrupt/timeout
+    // protection. Probing here would synchronously open the same URL twice and
+    // could leave the first VOD request waiting indefinitely on a cold server.
+    admissionInfo.known = false;
+    admissionInfo.hasVideo = true;
+    LOG_INFO("[LayerPlaybackTiming] layer=%d request=%llu network_probe=skipped path=%s",
+             request.layerId,
+             static_cast<unsigned long long>(request.requestId),
+             request.path.c_str());
+  } else if (resourceGate.requiresAdmissionProbe(request.layerId)) {
+    const auto probeStart = std::chrono::steady_clock::now();
+    MediaVideoInfo mediaInfo;
+    std::string probeError;
+    if (MediaUtils::probeVideoInfo(request.path, mediaInfo, &probeError)) {
+      admissionInfo.known = mediaInfo.valid;
+      admissionInfo.hasVideo = mediaInfo.hasVideo;
+      admissionInfo.width = mediaInfo.width;
+      admissionInfo.height = mediaInfo.height;
+      admissionInfo.frameRate = mediaInfo.frameRate;
+      admissionInfo.bitRate = mediaInfo.bitRate;
+      admissionInfo.codecName = mediaInfo.codecName;
+    } else {
+      admissionInfo.known = false;
+      admissionInfo.hasVideo = true;
+      LOG_WARN("[LayerPlayback] layer %d probe failed before resource gate: %s path=%s",
+               request.layerId, probeError.c_str(), request.path.c_str());
+    }
+    LOG_INFO("[LayerPlaybackTiming] layer=%d request=%llu local_probe_ms=%lld ok=%d path=%s",
+             request.layerId,
+             static_cast<unsigned long long>(request.requestId),
+             elapsedMs(probeStart), admissionInfo.known ? 1 : 0,
+             request.path.c_str());
   } else {
     admissionInfo.known = false;
     admissionInfo.hasVideo = true;
-    LOG_WARN("[LayerPlayback] layer %d probe failed before resource gate: %s path=%s",
-             request.layerId, probeError.c_str(), request.path.c_str());
+    LOG_INFO("[LayerPlaybackTiming] layer=%d request=%llu local_probe=skipped reason=no-other-4k path=%s",
+             request.layerId,
+             static_cast<unsigned long long>(request.requestId),
+             request.path.c_str());
   }
 
   std::string resourceRejectReason;
-  if (!DecoderResourceGate::getInstance().tryBeginOpen(
-          request.layerId, admissionInfo, &resourceRejectReason)) {
+  if (!resourceGate.tryBeginOpen(request.layerId, admissionInfo,
+                                 &resourceRejectReason)) {
     std::lock_guard<std::mutex> lock(mutex_);
     state_ = LayerPlaybackState::ResourceBusy;
     result.code = PlaybackResultCode::ResourceBusy;
@@ -171,7 +264,9 @@ PlaybackResult LayerPlaybackController::executePlay(const PlaybackRequest &reque
       result.requestId, result.switchId, request.layerId, "EXEC_OPEN_START",
       "path=" + request.path + " loop=" + std::to_string(request.loop));
 
-  bool ok = layer->play(request.path, request.loop);
+  const auto openStart = std::chrono::steady_clock::now();
+  bool ok = layer->play(request.path, request.loop, request.syncStartTime);
+  const long long openCostMs = elapsedMs(openStart);
   if (ok && layer->isPlayingPureAudio()) {
     admissionInfo.known = true;
     admissionInfo.hasVideo = false;
@@ -188,15 +283,20 @@ PlaybackResult LayerPlaybackController::executePlay(const PlaybackRequest &reque
       admissionInfo.height = openedHeight;
     }
   }
-  DecoderResourceGate::getInstance().onDecoderOpenFinished(
-      request.layerId, admissionInfo, ok);
+  resourceGate.onDecoderOpenFinished(request.layerId, admissionInfo, ok);
   if (!ok && !layer->isPlayingPureAudio() && layer->getVideoWidth() <= 0 &&
       layer->getVideoHeight() <= 0) {
-    DecoderResourceGate::getInstance().onLayerStopped(request.layerId);
+    resourceGate.onLayerStopped(request.layerId);
   }
   MediaRuntimeDiagnostics::getInstance().logPlaybackTrace(
       result.requestId, result.switchId, request.layerId, "EXEC_OPEN_FINISH",
-      std::string("ok=") + (ok ? "1" : "0"));
+      std::string("ok=") + (ok ? "1" : "0") +
+          " openMs=" + std::to_string(openCostMs) +
+          " totalMs=" + std::to_string(elapsedMs(executeStart)));
+  LOG_INFO("[LayerPlaybackTiming] layer=%d request=%llu open_ms=%lld total_ms=%lld ok=%d path=%s",
+           request.layerId,
+           static_cast<unsigned long long>(request.requestId), openCostMs,
+           elapsedMs(executeStart), ok ? 1 : 0, request.path.c_str());
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -279,12 +379,26 @@ PlaybackResult LayerPlaybackController::stop(LayerVideo *layer) {
     return result;
   }
 
+  // Prevent the queue worker from starting another switch while stop is being
+  // applied. Wait outside the mutex so the worker can publish completion.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopRequested_ = true;
+    pendingRequest_.reset();
+    pendingLayer_ = nullptr;
+  }
+  if (pendingWorker_.joinable()) {
+    pendingWorker_.join();
+  }
+
   layer->stop();
   DecoderResourceGate::getInstance().onLayerStopped(layerId_);
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    pendingRequest_.reset();
-    pendingLayer_ = nullptr;
+    stopRequested_ = false;
+    workerRunning_ = false;
+    activeRequest_.reset();
+    activeLayer_ = nullptr;
     state_ = LayerPlaybackState::Idle;
     currentPath_.clear();
     result.code = PlaybackResultCode::Started;

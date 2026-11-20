@@ -10,10 +10,12 @@
  */
 
 #include "core/CommandRouter.h"
+#include "core/AudioOutputLayerPolicy.h"
 #include "core/Engine.h"
 #include "core/LicenseManager.h"
-#include "core/PathConfig.h"
-#include "core/Resolution.h"
+#include "core/ModuleLicensePolicy.h"
+#include "foundation/PathConfig.h"
+#include "foundation/Resolution.h"
 #include "core/SceneManager.h"
 #include "core/SystemConfig.h"
 #include "fusion/FusionFileStore.h"
@@ -22,6 +24,7 @@
 #include "fusion/ProjectionCorrectionApi.h"
 #include "renderer/RegionRotationRenderer.h"
 #include "utils/JsonUtils.h"
+#include "utils/FileUtils.h"
 #include "utils/Logger.h"
 #include <algorithm>
 #include <chrono>
@@ -457,6 +460,7 @@ static void appendRegionRuntimeFields(Json::Value &data,
 static bool isFusionAction(const std::string &action) {
   static const std::vector<std::string> actions = {
       "get_geometry_state",
+      "checkpoint_fusion_state",
       "save_geometry",
       "set_geometry_display",
       "set_geometry_display_all",
@@ -464,6 +468,7 @@ static bool isFusionAction(const std::string &action) {
       "set_active_region_id",
       "set_geometry_grid",
       "geometry_resize_grid",
+      "blend_resize_grid",
       "geometry_move",
       "manager_move_point",
       "manager_move_line",
@@ -484,6 +489,7 @@ static bool isFusionAction(const std::string &action) {
       "set_region_geometry_correction",
       "get_cave_wall_config",
       "set_cave_wall_config",
+      projectionApi::kInitializeCaveAction,
       projectionApi::kGetAction,
       projectionApi::kSetAction,
       projectionApi::kSaveConfigAction,
@@ -622,6 +628,7 @@ static bool saveFusionConfigToDisk(SystemConfig *systemConfig,
     savedPaths.append(paths.binaryPath);
     savedPaths.append(paths.maskPath);
     savedPaths.append(paths.correctionPath);
+    savedPaths.append(paths.statePath);
     (*data)["saved_paths"] = savedPaths;
     if (!cleanupError.empty()) {
       Json::Value warnings(Json::arrayValue);
@@ -634,6 +641,28 @@ static bool saveFusionConfigToDisk(SystemConfig *systemConfig,
     s_lastFusionSaveKey = stateKey;
     s_lastFusionSaveMs = nowMs;
     s_lastFusionSaveData = data ? *data : Json::Value(Json::objectValue);
+  }
+  return true;
+}
+
+static bool saveFusionCheckpointToDisk(SystemConfig *systemConfig,
+                                       Json::Value *data,
+                                       std::string *errorMessage) {
+  if (!systemConfig) {
+    if (errorMessage) *errorMessage = "SystemConfig not loaded";
+    return false;
+  }
+
+  std::string checkpointPath;
+  if (!fusion::saveFusionCheckpoint(ROOT_PATH, systemConfig->getFusionState(),
+                                    systemConfig->getRegionCount(),
+                                    errorMessage, &checkpointPath)) {
+    return false;
+  }
+  if (data) {
+    (*data)["saved"] = true;
+    (*data)["checkpoint"] = true;
+    (*data)["checkpoint_path"] = checkpointPath;
   }
   return true;
 }
@@ -917,7 +946,7 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
     response.message = "Get region config successfully";
     response.dataJson = jsonToString(data);
 
-  } else if (action == "set_flexible_mapping") {
+  } else if (action == "set_flexible_mapping" || action == "save_matrix_command") {
     if (!systemConfig_) {
       response.ok = false;
       response.error = 0x0C00;
@@ -1020,6 +1049,13 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
       return response;
     }
 
+    if (finalInputCols > 64 || finalInputRows > 64 ||
+        finalOutputCols > 64 || finalOutputRows > 64 ||
+        finalInputCols * finalInputRows > 144 ||
+        finalOutputCols * finalOutputRows > 144) {
+      setParamError(response, "Matrix layout exceeds supported grid size");
+      return response;
+    }
     const int inputCount = finalInputCols * finalInputRows;
     const int outputCount = finalOutputCols * finalOutputRows;
     int licensedInputChannelCount = 0;
@@ -1086,6 +1122,52 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
       return response;
     }
 
+    if (action == "save_matrix_command") {
+      if (!param["id"].isString() || !param["name"].isString()) {
+        setParamError(response, "Missing matrix command id or name");
+        return response;
+      }
+      const std::string id = param["id"].asString();
+      const std::string name = param["name"].asString();
+      if (id.size() < 8 || id.size() > 72 || id.rfind("matrix_", 0) != 0 ||
+          id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos ||
+          name.empty() || name.size() > 240) {
+        setParamError(response, "Invalid matrix command id or name");
+        return response;
+      }
+      const std::string relativePath = "playback/" + id + ".json";
+      const std::string path = COMMAND_LIST_DIR + relativePath;
+      if (FileUtils::exists(path)) {
+        setParamError(response, "Matrix command already exists; use a new id");
+        return response;
+      }
+      Json::Value command(Json::objectValue);
+      command["type"] = 0;
+      command["code"] = 0x0C;
+      command["name"] = name;
+      command["param"] = param;
+      command["param"].removeMember("id");
+      command["param"].removeMember("name");
+      command["param"].removeMember("_source");
+      command["param"]["action"] = "set_flexible_mapping";
+      if (!FileUtils::writeTextFile(path, JsonUtils::toFormattedString(command, 2))) {
+        response.ok = false;
+        response.error = 0x0C00;
+        response.message = "Failed to write matrix command file";
+        return response;
+      }
+      Json::Value data(Json::objectValue);
+      data["id"] = id;
+      data["name"] = name;
+      data["command_path"] = relativePath;
+      data["saved"] = true;
+      response.ok = true;
+      response.error = 0;
+      response.dataJson = jsonToString(data);
+      response.message = "Matrix command saved";
+      return response;
+    }
+
     bool sourceLayoutChanged = false;
     const int oldInputW = systemConfig_->getInputWidth();
     const int oldInputH = systemConfig_->getInputHeight();
@@ -1149,6 +1231,13 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
     // 矩阵配置只负责画布/布局/映射/旋转，不修改音频输出图层。
     // audioOutputLayerId 只能由公共配置或 set_audio_output_layer 更新。
     systemConfig_->setFlexibleMappings(mappings);
+#ifdef __ANDROID__
+    if (engine_) {
+      // HTTP 矩阵更新不经过 Engine::reinitializeRenderPaths；执行同一套
+      // 单屏画布适配，避免更新后再次把 1920 视频压到左半屏。
+      engine_->adaptCanvasToPhysicalOutput();
+    }
+#endif
     sourceLayoutChanged =
         oldInputW != systemConfig_->getInputWidth() ||
         oldInputH != systemConfig_->getInputHeight() ||
@@ -1264,14 +1353,24 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
     response.message = "Regions refreshed successfully";
 
   } else if (action == "set_audio_output_layer") {
-    if (!param.isMember("layerId")) {
-      setParamError(response, "Missing layerId"); return response;
+    if (!param.isMember("layerId") || !param["layerId"].isIntegral()) {
+      setParamError(response, "layerId must be an integer");
+      return response;
     }
-    int layerId = param["layerId"].asInt();
-    if (systemConfig_) {
-      // 独立公共配置动作：只更新 audioOutputLayerId，不应由矩阵保存链路隐式修改。
-      systemConfig_->setAudioOutputLayerId(layerId);
+    const int layerId = param["layerId"].asInt();
+    if (!AudioOutputLayerPolicy::isValidConfiguredLayer(mubu_, layerId)) {
+      setParamError(response,
+                    "layerId must be 0 (auto) or a video/mirror layer");
+      return response;
     }
+    if (!systemConfig_) {
+      response.ok = false; response.error = 0x0C00;
+      response.message = "SystemConfig not loaded";
+      return response;
+    }
+
+    // This action only updates audioOutputLayerId; matrix saves must not change it.
+    systemConfig_->setAudioOutputLayerId(layerId);
     Json::Value data;
     data["layerId"] = layerId;
     response.ok = true; response.error = 0x0000;
@@ -1279,6 +1378,14 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
     response.dataJson = jsonToString(data);
 
   } else if (isFusionAction(action)) {
+    const char *module = isCaveLicenseAction(action) ? "cave" : "fusion";
+    if (!engine_ || !engine_->getLicenseManager() ||
+        !engine_->getLicenseManager()->isModuleEnabled(module)) {
+      response.ok = false;
+      response.error = 0x0403;
+      response.message = std::string(module) + " module not licensed";
+      return response;
+    }
     if (!systemConfig_) {
       response.ok = false; response.error = 0x0C00;
       response.message = "SystemConfig not loaded";
@@ -1377,7 +1484,22 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
 
     Json::Value data(Json::objectValue);
 
-    if (action == "save_fusion_config") {
+    if (action == "checkpoint_fusion_state") {
+      data["fusion_master_enabled"] = systemConfig_->getFusionState().masterEnabled;
+      data["active_region_id"] = systemConfig_->getFusionState().activeRegionId;
+      data["blend_auto_edges"] = systemConfig_->getFusionState().blendAutoEdges;
+      std::string checkpointError;
+      if (!saveFusionCheckpointToDisk(systemConfig_, &data, &checkpointError)) {
+        response.ok = false;
+        response.error = 0x0C06;
+        response.message = checkpointError.empty()
+            ? "Fusion checkpoint save failed"
+            : checkpointError;
+        return response;
+      }
+      setOk(data, "Fusion checkpoint saved successfully");
+
+    } else if (action == "save_fusion_config") {
       data["fusion_master_enabled"] = systemConfig_->getFusionState().masterEnabled;
       data["manager_mode"] = systemConfig_->getFusionState().managerMode;
       data["active_region_id"] = systemConfig_->getFusionState().activeRegionId;
@@ -1426,6 +1548,7 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
       deleted.append(deletedPaths.binaryPath);
       deleted.append(deletedPaths.maskPath);
       deleted.append(deletedPaths.correctionPath);
+      deleted.append(deletedPaths.statePath);
       data["deleted_paths"] = deleted;
       setOk(data, "Fusion config reset successfully");
 
@@ -1485,37 +1608,36 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
       setOk(data, "Geometry grid updated successfully");
 
     } else if (action == "geometry_resize_grid") {
-      if (systemConfig_->getFusionState().managerMode) {
-        // 融合管理模式(I)的加减行列只调整融合带/融合辅助线密度。
-        // 不能改几何 rows/cols/controlPoints，否则播放画面会跟着变化。
-        const Json::Value adjacency = buildInputAdjacentByRegion(systemConfig_);
-        if (hasRegionIdsParam(param)) {
-          Json::Value regions(Json::arrayValue);
-          const std::vector<int> resizeRegionIds =
-              readRegionIds(param, regionId, systemConfig_->getRegionCount());
-          for (int targetRegionId : resizeRegionIds) {
-            Json::Value item = fusionManager.resizeBlendGrid(
-                targetRegionId, stringParam("op"), adjacency);
-            item["region_id"] = targetRegionId;
-            regions.append(item);
-          }
-          data["regions"] = regions;
-        } else {
-          data = fusionManager.resizeBlendGrid(
-              regionId, stringParam("op"), adjacency);
-        }
-        data["blend_auto_edges"] = systemConfig_->getFusionState().blendAutoEdges;
-        syncRenderer(false, true, false, hasRegionIdsParam(param));
-      } else {
-        data = fusionManager.resizeGeometryGrid(regionId, stringParam("op"));
-        appendRegionRuntimeFields(data, systemConfig_, regionId);
-        if (boolParam("recalculate_blend", false)) {
-          data["blend_auto_recalculated"] = autoRecalculateBlend();
-        }
-        syncRenderer(true, false, false);
+      data = fusionManager.resizeGeometryGrid(regionId, stringParam("op"));
+      appendRegionRuntimeFields(data, systemConfig_, regionId);
+      if (boolParam("recalculate_blend", false)) {
+        data["blend_auto_recalculated"] = autoRecalculateBlend();
       }
+      syncRenderer(true, false, false);
       if (!persistFusion(data)) return response;
       setOk(data, "Geometry grid resized successfully");
+
+    } else if (action == "blend_resize_grid") {
+      const Json::Value adjacency = buildInputAdjacentByRegion(systemConfig_);
+      if (hasRegionIdsParam(param)) {
+        Json::Value regions(Json::arrayValue);
+        const std::vector<int> resizeRegionIds =
+            readRegionIds(param, regionId, systemConfig_->getRegionCount());
+        for (int targetRegionId : resizeRegionIds) {
+          Json::Value item = fusionManager.resizeBlendGrid(
+              targetRegionId, stringParam("op"), adjacency);
+          item["region_id"] = targetRegionId;
+          regions.append(item);
+        }
+        data["regions"] = regions;
+      } else {
+        data = fusionManager.resizeBlendGrid(
+            regionId, stringParam("op"), adjacency);
+      }
+      data["blend_auto_edges"] = systemConfig_->getFusionState().blendAutoEdges;
+      syncRenderer(false, true, false, hasRegionIdsParam(param));
+      if (!persistFusion(data)) return response;
+      setOk(data, "Blend grid resized successfully");
 
     } else if (action == "geometry_move") {
       data = fusionManager.moveGeometry(regionId, stringParam("op"),
@@ -1708,6 +1830,15 @@ CommandRouter::handleRegionConfig(const std::string &paramJson) {
       syncRenderer(true, false, false);
       if (!persistFusion(data)) return response;
       setOk(data, "CAVE wall config updated successfully");
+
+    } else if (action == projectionApi::kInitializeCaveAction) {
+      fusionManager.initializeCaveWall(
+          regionId, std::clamp(intParam("wall_type", 0), 0, 4));
+      data = buildProjectionCorrectionData(regionId);
+      data["initialized"] = true;
+      syncRenderer(true, false, false);
+      if (!persistFusion(data)) return response;
+      setOk(data, "CAVE wall initialized successfully");
 
     } else if (action == "set_fusion_master_enabled") {
       systemConfig_->getMutableFusionState().masterEnabled =

@@ -12,7 +12,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -26,6 +25,39 @@
 namespace hsvj {
 
 namespace {
+
+struct DrmPrimeFormatMapping {
+  VkFormat vulkanFormat = VK_FORMAT_UNDEFINED;
+  const char *name = "unsupported";
+  bool tenBit = false;
+};
+
+DrmPrimeFormatMapping mapDrmPrimeFormat(uint32_t drmFormat) {
+#ifdef __ANDROID__
+  switch (drmFormat) {
+  case DRM_FORMAT_NV12:
+    return {VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, "NV12", false};
+  case DRM_FORMAT_NV16:
+    return {VK_FORMAT_G8_B8R8_2PLANE_422_UNORM, "NV16", false};
+  case DRM_FORMAT_NV24:
+    return {VK_FORMAT_G8_B8R8_2PLANE_444_UNORM, "NV24", false};
+  case DRM_FORMAT_NV15:
+    return {VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+            "NV15", true};
+  case DRM_FORMAT_P010:
+    return {VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+            "P010", true};
+  case DRM_FORMAT_NV20:
+    return {VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16,
+            "NV20", true};
+  default:
+    break;
+  }
+#else
+  (void)drmFormat;
+#endif
+  return {};
+}
 
 bool allowDrmPrimeVulkanImport() {
   // 默认启用 DRM_PRIME Vulkan 导入以获得零拷贝性能。
@@ -100,59 +132,6 @@ void logTextureStallIfSlow(const char *stage, int64_t costMs, int thresholdMs,
            dmaBufFd, width, height, suppressed, total);
 }
 
-bool waitTextureFenceForDmaRebind(VkDevice device, VkFence lastUsageFence,
-                                  const char *stage, uint32_t textureId,
-                                  int dmaBufFd, int width, int height,
-                                  std::function<void(const char *, VkResult)> onDeviceLost) {
-  if (lastUsageFence == VK_NULL_HANDLE) {
-    return true;
-  }
-  VkResult fenceStatus = vkGetFenceStatus(device, lastUsageFence);
-  if (fenceStatus == VK_NOT_READY) {
-    struct RebindLogState {
-      int total = 0;
-      int suppressed = 0;
-      std::chrono::steady_clock::time_point lastLog{};
-    };
-    static std::mutex rebindLogMutex;
-    static std::unordered_map<std::string, RebindLogState> rebindLogStates;
-    int total = 0;
-    int suppressed = 0;
-    {
-      std::lock_guard<std::mutex> lock(rebindLogMutex);
-      RebindLogState &state = rebindLogStates[stage ? stage : "unknown"];
-      ++state.total;
-      const auto now = std::chrono::steady_clock::now();
-      const bool first = state.total <= 1;
-      const bool periodic =
-          state.lastLog.time_since_epoch().count() == 0 ||
-          now - state.lastLog >= std::chrono::seconds(10);
-      if (!first && !periodic) {
-        ++state.suppressed;
-        return false;
-      }
-      total = state.total;
-      suppressed = state.suppressed;
-      state.suppressed = 0;
-      state.lastLog = now;
-    }
-    LOG_WARN("[Vulkan] %s skipped: texture still in use "
-             "(tex=%u fd=%d %dx%d suppressed=%d total=%d)",
-             stage, textureId, dmaBufFd, width, height, suppressed, total);
-    return false;
-  }
-  if (fenceStatus == VK_ERROR_DEVICE_LOST) {
-    onDeviceLost(stage, fenceStatus);
-    return false;
-  }
-  if (fenceStatus != VK_SUCCESS) {
-    LOG_ERROR("[Vulkan] %s fence wait failed: result=%d tex=%u fd=%d %dx%d",
-              stage, fenceStatus, textureId, dmaBufFd, width, height);
-    return false;
-  }
-  return true;
-}
-
 struct ScopedTextureStallLog {
   const char *stage;
   int thresholdMs;
@@ -225,8 +204,7 @@ void VulkanRenderer::destroyTexture(uint32_t textureId) {
   if (it != textures_.end()) {
     Texture &texture = it->second;
 
-    // 清理fence引用（fence本身由Vulkan渲染器管理，不在此销毁）
-    texture.lastUsageFence = VK_NULL_HANDLE;
+    texture.lastUsageSubmissionSerial = 0;
 
     if (deviceLostFatal_.load(std::memory_order_acquire) ||
         device_ == VK_NULL_HANDLE) {
@@ -439,6 +417,19 @@ bool VulkanRenderer::updateTextureFromDmaBuf(uint32_t textureId, int dmaBufFd,
                                            yStride, yHeight);
   }
 
+  if (v4l2Format == 0x3631564E && forceTrueLayoutNV12) {
+    // RK3566's Mali driver rejects importing the UV portion of a contiguous
+    // NV16 DMA-BUF as an independent image when the UV offset is not a valid
+    // image-memory base alignment. Import the buffer once as the standard
+    // two-plane 4:2:2 format instead; this remains a zero-copy path and avoids
+    // repeated VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT failures.
+    static int s_nv16NativeImportLog = 0;
+    if (++s_nv16NativeImportLog <= 3 ||
+        (s_nv16NativeImportLog % 1800) == 0) {
+      LOG_INFO("[Capture][Vulkan] NV16 uses native two-plane YCbCr DMA-BUF import");
+    }
+  }
+
   auto existingIt = textures_.find(textureId);
   if (existingIt != textures_.end()) {
     Texture &existingTex = existingIt->second;
@@ -447,7 +438,21 @@ bool VulkanRenderer::updateTextureFromDmaBuf(uint32_t textureId, int dmaBufFd,
         existingTex.height == (uint32_t)height &&
         existingTex.stride == stride &&
         existingTex.vStride == vStride &&
+        existingTex.drmFormat == v4l2Format &&
         existingTex.isV4L2Capture) {
+      // V4L2 reuses the same DMA-BUF while the GPU samples it every frame.
+      // Keep the image in GENERAL, but still record an ordering barrier for
+      // this submission instead of returning with no per-frame dependency.
+      const bool isPacked = v4l2Format == 0x59565955 || v4l2Format == 0x56595559;
+      const VkImageAspectFlags aspectMask =
+          isPacked ? VK_IMAGE_ASPECT_COLOR_BIT
+                   : (VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT);
+      recordImageBarrier(
+          commandBuffers_[currentFrame_], existingTex.image,
+          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+          VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, aspectMask);
       return true;
     }
   }
@@ -491,34 +496,13 @@ bool VulkanRenderer::updateTextureFromDmaBuf(uint32_t textureId, int dmaBufFd,
   if (it != textures_.end()) {
     const auto waitIdleStart = std::chrono::steady_clock::now();
 
-    // 优化：如果该纹理有记录上次使用的fence，仅等待该fence而非全局waitIdle
-    // 这将等待时间从30ms（全局GPU空闲）降低到几乎0（该纹理可能已完成）
-    if (it->second.lastUsageFence != VK_NULL_HANDLE) {
-      // 非阻塞检查fence状态
-      VkResult fenceStatus = vkGetFenceStatus(device_, it->second.lastUsageFence);
-      if (fenceStatus == VK_NOT_READY) {
-        // [OOM-fix] 超时从 5ms 提高到 16ms，避免 GPU 繁忙时永久跳过采集帧。
-        // 如果 16ms 后仍超时，回退到 waitIdle 确保采集不会冻结。
-        fenceStatus =
-            vkWaitForFences(device_, 1, &it->second.lastUsageFence, VK_TRUE,
-                            16000000); // 16ms超时
-        if (fenceStatus == VK_TIMEOUT) {
-          // GPU 命令队列拥塞（pending 纹理销毁堆积等），回退到全局等待
-          // 而非直接返回 false——否则所有纹理槽永久 "in use"，采集画面冻结。
-          vkDeviceWaitIdle(device_);
-        }
-      }
-      if (fenceStatus == VK_ERROR_DEVICE_LOST) {
-        markDeviceLostFatal("dma_buf_rebind_waitFence", fenceStatus);
-        return false;
-      }
-      // fence 已就绪或已通过 waitIdle 完成，继续 rebind
-    } else {
-      // 回退到原有逻辑（首次创建或旧纹理）
-      vkDeviceWaitIdle(device_);
+    if (!waitForSubmissionCompletion(
+            it->second.lastUsageSubmissionSerial, 16000000ULL, true,
+            "dma_buf_rebind_waitSubmission")) {
+      return false;
     }
 
-    logTextureStallIfSlow("dma_buf_rebind_waitFence",
+    logTextureStallIfSlow("dma_buf_rebind_waitSubmission",
                           elapsedMillisSince(waitIdleStart), 8, textureId,
                           dmaBufFd, width, height);
     destroyTexture(textureId);
@@ -530,6 +514,8 @@ bool VulkanRenderer::updateTextureFromDmaBuf(uint32_t textureId, int dmaBufFd,
   texture.originalWidth = width;
   texture.originalHeight = height;
   texture.isV4L2Capture = true;
+  texture.drmFormat = v4l2Format;
+  texture.drmModifier = 0; // updateTextureFromDmaBuf accepts linear buffers only.
 
   // 根据 FourCC 识别格式（0x3231564E = NV12, 0x3631564E = NV16, 0x59565955 = UYVY, 0x56595559 = YUYV）
   if (v4l2Format == 0x3231564E || v4l2Format == 0x3631564E) {
@@ -730,19 +716,12 @@ bool VulkanRenderer::updateTextureFromRGBADmaBuf(uint32_t textureId,
     if (it->second.dmaBufFd == dmaBufFd && it->second.width == (uint32_t)width)
       return true;
     const auto waitIdleStart = std::chrono::steady_clock::now();
-    if (it->second.lastUsageFence != VK_NULL_HANDLE) {
-      if (!waitTextureFenceForDmaRebind(
-              device_, it->second.lastUsageFence, "rgba_dma_buf_rebind",
-              textureId, dmaBufFd, width, height,
-              [this](const char *stage, VkResult result) {
-                markDeviceLostFatal(stage, result);
-              })) {
-        return false;
-      }
-    } else {
-      vkDeviceWaitIdle(device_);
+    if (!waitForSubmissionCompletion(
+            it->second.lastUsageSubmissionSerial, 16000000ULL, true,
+            "rgba_dma_buf_rebind")) {
+      return false;
     }
-    logTextureStallIfSlow("rgba_dma_buf_rebind_waitFence",
+    logTextureStallIfSlow("rgba_dma_buf_rebind_waitSubmission",
                           elapsedMillisSince(waitIdleStart), 8, textureId,
                           dmaBufFd, width, height);
     destroyTexture(textureId);
@@ -874,19 +853,12 @@ bool VulkanRenderer::updateTextureFromNV24DmaBuf(uint32_t textureId,
     if (it->second.dmaBufFd == dmaBufFd && it->second.width == (uint32_t)tw)
       return true;
     const auto waitIdleStart = std::chrono::steady_clock::now();
-    if (it->second.lastUsageFence != VK_NULL_HANDLE) {
-      if (!waitTextureFenceForDmaRebind(
-              device_, it->second.lastUsageFence, "nv24_dma_buf_rebind",
-              textureId, dmaBufFd, width, height,
-              [this](const char *stage, VkResult result) {
-                markDeviceLostFatal(stage, result);
-              })) {
-        return false;
-      }
-    } else {
-      vkDeviceWaitIdle(device_);
+    if (!waitForSubmissionCompletion(
+            it->second.lastUsageSubmissionSerial, 16000000ULL, true,
+            "nv24_dma_buf_rebind")) {
+      return false;
     }
-    logTextureStallIfSlow("nv24_dma_buf_rebind_waitFence",
+    logTextureStallIfSlow("nv24_dma_buf_rebind_waitSubmission",
                           elapsedMillisSince(waitIdleStart), 8, textureId,
                           dmaBufFd, width, height);
     destroyTexture(textureId);
@@ -1021,373 +993,6 @@ bool VulkanRenderer::updateTextureFromNV24DmaBuf(uint32_t textureId,
   return true;
 }
 
-bool VulkanRenderer::updateTextureFromNV16DmaBuf(uint32_t textureId,
-                                                 int dmaBufFd, int width,
-                                                 int height, int stride,
-                                                 int yHeight) {
-  int tw = (stride > 0) ? stride : width;
-  if (yHeight <= 0) yHeight = height;
-  if (yHeight < height) yHeight = height;
-  const int uvWidth = std::max((tw + 1) / 2, 1);
-  const VkDeviceSize uvOffset = static_cast<VkDeviceSize>(tw) *
-                                static_cast<VkDeviceSize>(yHeight);
-  if (!nv16PipelineInitialized_) {
-    auto stageStart = std::chrono::steady_clock::now();
-    const bool pipelineReady = createNV16Pipeline();
-    logTextureStallIfSlow("nv16_create_pipeline",
-                          elapsedMillisSince(stageStart), 4, textureId,
-                          dmaBufFd, width, height);
-    if (!pipelineReady)
-      return false;
-  }
-  auto it = textures_.find(textureId);
-  if (it != textures_.end()) {
-    if (it->second.dmaBufFd == dmaBufFd &&
-        it->second.width == (uint32_t)tw &&
-        it->second.height == (uint32_t)yHeight &&
-        it->second.originalWidth == (uint32_t)width &&
-        it->second.originalHeight == (uint32_t)height &&
-        it->second.cropOffsetY == yHeight && it->second.isNV16) {
-      recordImageBarrier(commandBuffers_[currentFrame_], it->second.image,
-                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_ACCESS_SHADER_READ_BIT,
-                         VK_ACCESS_SHADER_READ_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                         VK_IMAGE_ASPECT_COLOR_BIT);
-      if (it->second.uvImage != VK_NULL_HANDLE) {
-        recordImageBarrier(commandBuffers_[currentFrame_], it->second.uvImage,
-                           VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                           VK_ACCESS_SHADER_READ_BIT,
-                           VK_ACCESS_SHADER_READ_BIT,
-                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                           VK_IMAGE_ASPECT_COLOR_BIT);
-      }
-      return true;
-    }
-    const auto waitIdleStart = std::chrono::steady_clock::now();
-    if (it->second.lastUsageFence != VK_NULL_HANDLE) {
-      if (!waitTextureFenceForDmaRebind(
-              device_, it->second.lastUsageFence, "nv16_dma_buf_rebind",
-              textureId, dmaBufFd, width, height,
-              [this](const char *stage, VkResult result) {
-                markDeviceLostFatal(stage, result);
-              })) {
-        return false;
-      }
-    } else {
-      vkDeviceWaitIdle(device_);
-    }
-    logTextureStallIfSlow("nv16_dma_buf_rebind_waitFence",
-                          elapsedMillisSince(waitIdleStart), 8, textureId,
-                          dmaBufFd, width, height);
-    destroyTexture(textureId);
-  }
-
-  Texture texture{};
-  texture.width = tw;
-  texture.height = yHeight;
-  texture.originalWidth = width;
-  texture.originalHeight = height;
-
-  VkSubresourceLayout yPlane{};
-  yPlane.offset = 0;
-  yPlane.size = 0;
-  yPlane.rowPitch = (VkDeviceSize)tw;
-  yPlane.arrayPitch = 0;
-  yPlane.depthPitch = 0;
-  VkImageDrmFormatModifierExplicitCreateInfoEXT yMod{
-      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
-      nullptr, 0, 1, &yPlane};
-  VkExternalMemoryImageCreateInfo yExt{
-      VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, &yMod,
-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
-  VkImageCreateInfo yImg{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                         &yExt,
-                         0,
-                         VK_IMAGE_TYPE_2D,
-                         VK_FORMAT_R8_UNORM,
-                         {(uint32_t)tw, (uint32_t)yHeight, 1},
-                         1,
-                         1,
-                         VK_SAMPLE_COUNT_1_BIT,
-                         VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-                         VK_IMAGE_USAGE_SAMPLED_BIT};
-
-  auto stageStart = std::chrono::steady_clock::now();
-  VkResult result = vkCreateImage(device_, &yImg, nullptr, &texture.image);
-  logTextureStallIfSlow("nv16_dma_buf_vkCreateYImage",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (result != VK_SUCCESS || texture.image == VK_NULL_HANDLE) {
-    LOG_ERROR("[NV16] vkCreateImage Y failed: %d (size=%dx%d)", result, tw,
-              yHeight);
-    return false;
-  }
-
-  VkMemoryRequirements yMemReqs;
-  vkGetImageMemoryRequirements(device_, texture.image, &yMemReqs);
-
-  stageStart = std::chrono::steady_clock::now();
-  int yDupFd = dup(dmaBufFd);
-  logTextureStallIfSlow("nv16_dma_buf_dup_y_fd",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (yDupFd < 0) {
-    LOG_ERROR("[NV16] dup Y(dmaBufFd=%d) failed", dmaBufFd);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  VkImportMemoryFdInfoKHR yFdInfo{
-      VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr,
-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, yDupFd};
-  VkMemoryDedicatedAllocateInfo yDedInfo{
-      VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &yFdInfo,
-      texture.image, VK_NULL_HANDLE};
-  VkMemoryAllocateInfo yAllocInfo{
-      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &yDedInfo, yMemReqs.size,
-      findMemoryType(yMemReqs.memoryTypeBits,
-                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
-  if (!validateTextureMemoryType(yAllocInfo.memoryTypeIndex,
-                                 yMemReqs.memoryTypeBits, "NV16-Y",
-                                 textureId, dmaBufFd, width, height, device_,
-                                 texture.image, yDupFd)) {
-    return false;
-  }
-
-  stageStart = std::chrono::steady_clock::now();
-  result = vkAllocateMemory(device_, &yAllocInfo, nullptr, &texture.memory);
-  logTextureStallIfSlow("nv16_dma_buf_vkAllocateYMemory",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (result != VK_SUCCESS || texture.memory == VK_NULL_HANDLE) {
-    LOG_ERROR("[NV16] vkAllocateMemory Y failed: %d", result);
-    close(yDupFd);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  stageStart = std::chrono::steady_clock::now();
-  result = vkBindImageMemory(device_, texture.image, texture.memory, 0);
-  logTextureStallIfSlow("nv16_dma_buf_vkBindYImageMemory",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (result != VK_SUCCESS) {
-    LOG_ERROR("[NV16] vkBindImageMemory Y failed: %d", result);
-    vkFreeMemory(device_, texture.memory, nullptr);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  VkImageViewCreateInfo yViewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                                  nullptr,
-                                  0,
-                                  texture.image,
-                                  VK_IMAGE_VIEW_TYPE_2D,
-                                  VK_FORMAT_R8_UNORM,
-                                  {},
-                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-
-  stageStart = std::chrono::steady_clock::now();
-  result = vkCreateImageView(device_, &yViewInfo, nullptr, &texture.imageView);
-  logTextureStallIfSlow("nv16_dma_buf_vkCreateYImageView",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (result != VK_SUCCESS || texture.imageView == VK_NULL_HANDLE) {
-    LOG_ERROR("[NV16] vkCreateImageView Y failed: %d", result);
-    vkFreeMemory(device_, texture.memory, nullptr);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  VkSubresourceLayout uvPlane{};
-  uvPlane.offset = uvOffset;
-  uvPlane.size = 0;
-  uvPlane.rowPitch = (VkDeviceSize)tw;
-  uvPlane.arrayPitch = 0;
-  uvPlane.depthPitch = 0;
-  VkImageDrmFormatModifierExplicitCreateInfoEXT uvMod{
-      VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
-      nullptr, 0, 1, &uvPlane};
-  VkExternalMemoryImageCreateInfo uvExt{
-      VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, &uvMod,
-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
-  VkImageCreateInfo uvImg{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                          &uvExt,
-                          0,
-                          VK_IMAGE_TYPE_2D,
-                          VK_FORMAT_R8G8_UNORM,
-                          {(uint32_t)uvWidth, (uint32_t)height, 1},
-                          1,
-                          1,
-                          VK_SAMPLE_COUNT_1_BIT,
-                          VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-                          VK_IMAGE_USAGE_SAMPLED_BIT};
-
-  stageStart = std::chrono::steady_clock::now();
-  result = vkCreateImage(device_, &uvImg, nullptr, &texture.uvImage);
-  logTextureStallIfSlow("nv16_dma_buf_vkCreateUvImage",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (result != VK_SUCCESS || texture.uvImage == VK_NULL_HANDLE) {
-    LOG_ERROR("[NV16] vkCreateImage UV failed: %d (size=%dx%d offset=%llu)",
-              result, uvWidth, height, (unsigned long long)uvOffset);
-    vkDestroyImageView(device_, texture.imageView, nullptr);
-    vkFreeMemory(device_, texture.memory, nullptr);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  VkMemoryRequirements uvMemReqs;
-  vkGetImageMemoryRequirements(device_, texture.uvImage, &uvMemReqs);
-
-  stageStart = std::chrono::steady_clock::now();
-  int uvDupFd = dup(dmaBufFd);
-  logTextureStallIfSlow("nv16_dma_buf_dup_uv_fd",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (uvDupFd < 0) {
-    LOG_ERROR("[NV16] dup UV(dmaBufFd=%d) failed", dmaBufFd);
-    vkDestroyImage(device_, texture.uvImage, nullptr);
-    vkDestroyImageView(device_, texture.imageView, nullptr);
-    vkFreeMemory(device_, texture.memory, nullptr);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  VkImportMemoryFdInfoKHR uvFdInfo{
-      VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr,
-      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, uvDupFd};
-  VkMemoryDedicatedAllocateInfo uvDedInfo{
-      VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &uvFdInfo,
-      texture.uvImage, VK_NULL_HANDLE};
-  VkMemoryAllocateInfo uvAllocInfo{
-      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &uvDedInfo, uvMemReqs.size,
-      findMemoryType(uvMemReqs.memoryTypeBits,
-                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
-  if (!validateTextureMemoryType(uvAllocInfo.memoryTypeIndex,
-                                 uvMemReqs.memoryTypeBits, "NV16-UV",
-                                 textureId, dmaBufFd, width, height, device_,
-                                 texture.uvImage, uvDupFd)) {
-    vkDestroyImageView(device_, texture.imageView, nullptr);
-    vkFreeMemory(device_, texture.memory, nullptr);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  stageStart = std::chrono::steady_clock::now();
-  result = vkAllocateMemory(device_, &uvAllocInfo, nullptr, &texture.uvMemory);
-  logTextureStallIfSlow("nv16_dma_buf_vkAllocateUvMemory",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (result != VK_SUCCESS || texture.uvMemory == VK_NULL_HANDLE) {
-    LOG_ERROR("[NV16] vkAllocateMemory UV failed: %d", result);
-    close(uvDupFd);
-    vkDestroyImage(device_, texture.uvImage, nullptr);
-    vkDestroyImageView(device_, texture.imageView, nullptr);
-    vkFreeMemory(device_, texture.memory, nullptr);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  stageStart = std::chrono::steady_clock::now();
-  result = vkBindImageMemory(device_, texture.uvImage, texture.uvMemory, 0);
-  logTextureStallIfSlow("nv16_dma_buf_vkBindUvImageMemory",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (result != VK_SUCCESS) {
-    LOG_ERROR("[NV16] vkBindImageMemory UV failed: %d", result);
-    vkFreeMemory(device_, texture.uvMemory, nullptr);
-    vkDestroyImage(device_, texture.uvImage, nullptr);
-    vkDestroyImageView(device_, texture.imageView, nullptr);
-    vkFreeMemory(device_, texture.memory, nullptr);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  VkImageViewCreateInfo uvViewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                                   nullptr,
-                                   0,
-                                   texture.uvImage,
-                                   VK_IMAGE_VIEW_TYPE_2D,
-                                   VK_FORMAT_R8G8_UNORM,
-                                   {},
-                                   {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-  stageStart = std::chrono::steady_clock::now();
-  result = vkCreateImageView(device_, &uvViewInfo, nullptr,
-                             &texture.uvImageView);
-  logTextureStallIfSlow("nv16_dma_buf_vkCreateUvImageView",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (result != VK_SUCCESS || texture.uvImageView == VK_NULL_HANDLE) {
-    LOG_ERROR("[NV16] vkCreateImageView UV failed: %d", result);
-    vkFreeMemory(device_, texture.uvMemory, nullptr);
-    vkDestroyImage(device_, texture.uvImage, nullptr);
-    vkDestroyImageView(device_, texture.imageView, nullptr);
-    vkFreeMemory(device_, texture.memory, nullptr);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  stageStart = std::chrono::steady_clock::now();
-  const bool samplerReady = createSampler(texture.sampler);
-  logTextureStallIfSlow("nv16_dma_buf_createSampler",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (!samplerReady) {
-    LOG_ERROR("[NV16] createSampler failed");
-    vkDestroyImageView(device_, texture.uvImageView, nullptr);
-    vkFreeMemory(device_, texture.uvMemory, nullptr);
-    vkDestroyImage(device_, texture.uvImage, nullptr);
-    vkDestroyImageView(device_, texture.imageView, nullptr);
-    vkFreeMemory(device_, texture.memory, nullptr);
-    vkDestroyImage(device_, texture.image, nullptr);
-    return false;
-  }
-
-  texture.isNV16 = true;
-  texture.dmaBufFd = dmaBufFd;
-  texture.isV4L2Capture = false;
-  texture.isCaptureDmaBuf = true;
-  texture.stride = tw;
-  texture.vStride = yHeight;
-  texture.cropOffsetY = yHeight;
-  stageStart = std::chrono::steady_clock::now();
-  recordImageBarrier(
-      commandBuffers_[currentFrame_], texture.image, VK_IMAGE_LAYOUT_UNDEFINED,
-      VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_READ_BIT,
-      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-      VK_IMAGE_ASPECT_COLOR_BIT);
-  recordImageBarrier(
-      commandBuffers_[currentFrame_], texture.uvImage,
-      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
-      VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-  logTextureStallIfSlow("nv16_dma_buf_recordImageBarrier",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  static int s_nv16PlanarLog = 0;
-  if (++s_nv16PlanarLog <= 3 || (s_nv16PlanarLog % 1800) == 0) {
-    LOG_INFO("[采集][Vulkan] NV16 two-plane import: visible=%dx%d stride=%d vStride=%d uv=%dx%d uvOffset=%llu fd=%d",
-             width, height, tw, yHeight, uvWidth, height,
-             (unsigned long long)uvOffset, dmaBufFd);
-  }
-
-  textures_[textureId] = texture;
-  stageStart = std::chrono::steady_clock::now();
-  const bool descriptorReady = createDescriptorSetNV16(textures_[textureId]);
-  logTextureStallIfSlow("nv16_dma_buf_descriptorSet",
-                        elapsedMillisSince(stageStart), 4, textureId,
-                        dmaBufFd, width, height);
-  if (!descriptorReady) {
-    destroyTexture(textureId);
-    return false;
-  }
-  return true;
-}
-
 bool VulkanRenderer::updateTextureFromNV12DmaBufDual(uint32_t textureId,
                                                       int dmaBufFd, int width,
                                                       int height, int stride,
@@ -1436,19 +1041,12 @@ bool VulkanRenderer::updateTextureFromNV12DmaBufDual(uint32_t textureId,
       return true;
     }
     const auto waitIdleStart = std::chrono::steady_clock::now();
-    if (existing.lastUsageFence != VK_NULL_HANDLE) {
-      if (!waitTextureFenceForDmaRebind(
-              device_, existing.lastUsageFence, "nv12_dma_buf_rebind",
-              textureId, dmaBufFd, width, height,
-              [this](const char *stage, VkResult result) {
-                markDeviceLostFatal(stage, result);
-              })) {
-        return false;
-      }
-    } else {
-      vkDeviceWaitIdle(device_);
+    if (!waitForSubmissionCompletion(
+            existing.lastUsageSubmissionSerial, 16000000ULL, true,
+            "nv12_dma_buf_rebind")) {
+      return false;
     }
-    logTextureStallIfSlow("nv12_dma_buf_rebind_waitFence",
+    logTextureStallIfSlow("nv12_dma_buf_rebind_waitSubmission",
                           elapsedMillisSince(waitIdleStart), 8, textureId,
                           dmaBufFd, width, height);
     destroyTexture(textureId);
@@ -1965,7 +1563,6 @@ bool VulkanRenderer::createBaseTexture(uint32_t width, uint32_t height,
   texture.height = height;
   texture.descriptorSet = VK_NULL_HANDLE;
   texture.isNV12 = false;
-  texture.isNV16 = false;
   texture.isNV24 = false;
   texture.isBGR3 = false;
   texture.isDrmPrime = false;
@@ -2439,8 +2036,27 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
     return false;
   }
 
-  const AVDRMObjectDescriptor &object = desc->objects[0];
   const AVDRMLayerDescriptor &layer = desc->layers[0];
+  if (layer.nb_planes < 1) {
+    LOG_ERROR("[Vulkan] DRM layer has no planes");
+    return false;
+  }
+  const int objectIndex = layer.planes[0].object_index;
+  if (objectIndex < 0 || objectIndex >= desc->nb_objects) {
+    LOG_ERROR("[Vulkan] DRM plane references invalid object index=%d objects=%d",
+              objectIndex, desc->nb_objects);
+    return false;
+  }
+  for (int planeIndex = 1; planeIndex < layer.nb_planes; ++planeIndex) {
+    if (layer.planes[planeIndex].object_index != objectIndex) {
+      LOG_ERROR("[Vulkan] Disjoint DRM PRIME objects are not supported: "
+                "plane0=%d plane%d=%d",
+                objectIndex, planeIndex,
+                layer.planes[planeIndex].object_index);
+      return false;
+    }
+  }
+  const AVDRMObjectDescriptor &object = desc->objects[objectIndex];
 
   int dmaBufFd = object.fd;
   uint64_t dmaBufDev = 0;
@@ -2464,6 +2080,8 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
                                 : (existing.dmaBufFd == dmaBufFd);
     if (existing.isDrmPrime && sameBuffer &&
         existing.width == width && existing.height == height &&
+        existing.drmFormat == layer.format &&
+        existing.drmModifier == modifier &&
         existing.cropOffsetY == cropOffsetY && drmPrimePipelineInitialized_ &&
         drmPrimePipeline_ != VK_NULL_HANDLE) {
       return true;
@@ -2484,35 +2102,18 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
   ScopedTextureStallLog stall("drm_prime_import", 16, textureId, dmaBufFd,
                               static_cast<int>(width),
                               static_cast<int>(height));
-
-  // 检查DRM 格式，NV12 或10/NV15/P010
-  bool is10Bit =
-      (layer.format == DRM_FORMAT_NV15 || layer.format == DRM_FORMAT_P010);
-
-  // 确定对应的Vulkan 格式
-  // 8位: VK_FORMAT_G8_B8R8_2PLANE_420_UNORM
-  // 10位: VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 (部分 GPU 不支持)
-  // 注意：部分 Mali GPU 对 10 位格式 DRM 导入支持不完整
-  VkFormat ycbcrFormat =
-      is10Bit ? VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
-              : VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
-
-  // ========== 10位格式支持检查==========
-  // 检查 if GPU 支持 10-bit YUV 格式
-  if (is10Bit) {
-    VkFormatProperties props;
-    vkGetPhysicalDeviceFormatProperties(physicalDevice_, ycbcrFormat, &props);
-    if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
-      static int tenBitSupportLog = 0;
-      if (++tenBitSupportLog <= 3 || tenBitSupportLog % 300 == 0) {
-        LOG_WARN("[Vulkan] GPU does not support 10-bit YUV format (0x%x)",
-                 ycbcrFormat);
-      }
-      return false;
-    }
+  // DRM fourcc and Vulkan YCbCr format are a strict one-to-one contract.
+  // Never reinterpret an unknown or differently subsampled buffer as NV12.
+  const DrmPrimeFormatMapping formatMapping = mapDrmPrimeFormat(layer.format);
+  if (formatMapping.vulkanFormat == VK_FORMAT_UNDEFINED) {
+    LOG_ERROR("[Vulkan] Unsupported DRM PRIME fourcc=0x%x; refusing implicit "
+              "NV12 fallback",
+              layer.format);
+    return false;
   }
+  const VkFormat ycbcrFormat = formatMapping.vulkanFormat;
 
-  // 初始化DRM PRIME YCbCr Pipeline（如果还没有初始化）
+  // Initialize the matching DRM PRIME YCbCr pipeline.
   auto stageStart = std::chrono::steady_clock::now();
   const bool drmPrimePipelineReady = initializeDrmPrimeYcbcrPipeline(ycbcrFormat);
   logTextureStallIfSlow("drm_prime_init_ycbcr_pipeline",
@@ -2523,7 +2124,7 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
     LOG_ERROR("[Vulkan] Failed to initialize DRM PRIME YCbCr pipeline for "
               "format 0x%x (%s). "
               "Playback path will reject the frame.",
-              ycbcrFormat, is10Bit ? "10-bit NV15/P010" : "8-bit NV12");
+              ycbcrFormat, formatMapping.name);
     return false;
   }
 
@@ -2539,6 +2140,8 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
                                 : (existing.dmaBufFd == dmaBufFd);
     if (existing.isDrmPrime && sameBuffer &&
         existing.width == width && existing.height == height &&
+        existing.drmFormat == layer.format &&
+        existing.drmModifier == modifier &&
         existing.cropOffsetY == cropOffsetY) {
       return true;
     }
@@ -2557,6 +2160,13 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
 
   // 计算平面布局
   VkSubresourceLayout planeLayouts[2] = {};
+  if (layer.nb_planes != 1 && layer.nb_planes != 2) {
+    LOG_ERROR("[Vulkan] Unsupported DRM modifier memory plane count: %d",
+              layer.nb_planes);
+    return false;
+  }
+  const uint32_t drmMemoryPlaneCount =
+      static_cast<uint32_t>(layer.nb_planes);
   planeLayouts[0].offset = layer.planes[0].offset;
   planeLayouts[0].rowPitch = layer.planes[0].pitch;
   planeLayouts[0].size = 0;
@@ -2564,21 +2174,16 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
   if (layer.nb_planes > 1) {
     planeLayouts[1].offset = layer.planes[1].offset;
     planeLayouts[1].rowPitch = layer.planes[1].pitch;
-  } else {
-    // 计算 Plane 1（NV12 UV平面）
-    // 对于1080p视频，UV偏移是Y 平面大小
-    planeLayouts[1].offset = (VkDeviceSize)planeLayouts[0].rowPitch * height;
-    planeLayouts[1].rowPitch = planeLayouts[0].rowPitch;
-    LOG_DEBUG("[Vulkan] 计算 Plane 1: offset=%llu, pitch=%llu",
-             static_cast<unsigned long long>(planeLayouts[1].offset),
-             static_cast<unsigned long long>(planeLayouts[1].rowPitch));
+    planeLayouts[1].size = 0;
   }
 
-  // 检查是否是分离平面
-  if (layer.nb_planes > 1 &&
-      layer.planes[1].object_index != layer.planes[0].object_index) {
-    LOG_ERROR("[Vulkan] Disjoint planes not supported");
-    return false;
+  static int drmDescriptorLogCount = 0;
+  if (++drmDescriptorLogCount <= 3) {
+    LOG_INFO("[DrmPrimeImport] modifier=0x%llx memoryPlanes=%u "
+             "format=%s/0x%x vkFormat=0x%x pitch0=%u size=%ux%u",
+             static_cast<unsigned long long>(modifier), drmMemoryPlaneCount,
+             formatMapping.name, layer.format, ycbcrFormat,
+             layer.planes[0].pitch, width, height);
   }
 
   // 创建 VkImage，使用DRM format modifier
@@ -2586,7 +2191,7 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
   drmModifierInfo.sType =
       VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
   drmModifierInfo.drmFormatModifier = modifier;
-  drmModifierInfo.drmFormatModifierPlaneCount = 2;
+  drmModifierInfo.drmFormatModifierPlaneCount = drmMemoryPlaneCount;
   drmModifierInfo.pPlaneLayouts = planeLayouts;
 
   VkExternalMemoryImageCreateInfo externalMemoryImageInfo{};
@@ -2620,13 +2225,13 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
   if (createResult != VK_SUCCESS) {
     // 10 位格式失败时GPU 可能不支持该格式
     // 需要回退到软件转换，对于高分辨率视频会很慢
-    if (is10Bit) {
+    if (formatMapping.tenBit) {
       static int tenBitErrorLogCount = 0;
       if (++tenBitErrorLogCount <= 3 || tenBitErrorLogCount % 120 == 0) {
         LOG_ERROR("[Vulkan] Failed to create 10-bit DRM PRIME image "
                   "(format=0x%x, result=%d). "
                   "GPU may not support "
-                  "VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16. "
+                  "mapped Vulkan YCbCr format. "
                   "Playback path will reject the frame. "
                   "[Log throttled: shown %d times]",
                   ycbcrFormat, createResult, tenBitErrorLogCount);
@@ -2747,6 +2352,8 @@ bool VulkanRenderer::createTextureFromDrmPrime(const AVFrame *frame,
   texture.isNV12 = false;               // 不使用NV12 shader
   texture.isDrmPrime = true;            // 使用DRM PRIME YCbCr 路径
   texture.isV4L2Capture = false;
+  texture.drmFormat = layer.format;
+  texture.drmModifier = modifier;
   texture.dmaBufFd = dmaBufFd;          // 记录用于调试
   texture.dmaBufDev = dmaBufDev;
   texture.dmaBufIno = dmaBufIno;

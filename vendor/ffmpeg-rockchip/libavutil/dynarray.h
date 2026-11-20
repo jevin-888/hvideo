@@ -47,7 +47,7 @@
     do { \
         size_t av_size_new = (av_size); \
         if (!((av_size) & ((av_size) - 1))) { \
-            av_size_new = (av_size) (av_size) << 1 : 1; \
+            av_size_new = (av_size) ? (av_size) << 1 : 1; \
             if (av_size_new > (av_size_max) / (av_elt_size)) { \
                 av_size_new = 0; \
             } else { \

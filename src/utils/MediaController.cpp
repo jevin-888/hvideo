@@ -5,10 +5,12 @@
 
 #include "utils/MediaController.h"
 #include "utils/Logger.h"
+#include "utils/ProcessRunner.h"
 
 #include <cstdlib>
-#include <cstdio>
+#include <cctype>
 #include <unistd.h>
+#include <chrono>
 #include <algorithm>
 #include <mutex>
 #include <sstream>
@@ -26,7 +28,7 @@ std::string trim(const std::string &s) {
 }
 
 std::string lowerCopy(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return s;
 }
 
@@ -63,7 +65,7 @@ std::string quotedEntityAfter(const std::string &line, const std::string &arrow)
 }
 
 bool linkEnabled(const std::string &line) {
-  return line.find("[ENABLED]") != std::string::npos ||
+  return line.find("[ENABLED") != std::string::npos ||
          line.find("Enabled") != std::string::npos;
 }
 
@@ -177,15 +179,38 @@ std::string findSensorEntity(const std::string &topology) {
   return findFirstEntityByKeyword(topology, {"sensor", "lt6911", "rk628"});
 }
 
-int countOccurrences(const std::string &text, const std::string &needle) {
-  if (needle.empty()) return 0;
-  int count = 0;
-  size_t pos = 0;
-  while ((pos = text.find(needle, pos)) != std::string::npos) {
-    ++count;
-    pos += needle.size();
+bool padHasFormat(const std::string &topology, const std::string &entity,
+                  const std::string &pad, int width, int height) {
+  std::istringstream lines(topology);
+  std::string line;
+  bool inEntity = false;
+  bool inPad = false;
+  while (std::getline(lines, line)) {
+    if (line.find("- entity ") != std::string::npos) {
+      inEntity = entityNameFromLine(line) == entity;
+      inPad = false;
+    } else if (inEntity) {
+      const std::string content = trim(line);
+      if (content.compare(0, 3, "pad") == 0) {
+        inPad = content.compare(0, pad.size() + 4, "pad" + pad + ":") == 0;
+      } else if (inPad) {
+        auto pos = content.find("fmt:UYVY2X8/");
+        size_t formatPrefixLength = 12;
+        if (pos == std::string::npos) {
+          pos = content.find("fmt:UYVY8_2X8/");
+          formatPrefixLength = 14;
+        }
+        if (pos != std::string::npos) {
+          std::istringstream dimensions(content.substr(pos + formatPrefixLength));
+          int w = 0, h = 0;
+          char separator = 0;
+          dimensions >> w >> separator >> h;
+          return !dimensions.fail() && separator == 'x' && w == width && h == height;
+        }
+      }
+    }
   }
-  return count;
+  return false;
 }
 
 struct MipiPipelineCache {
@@ -234,8 +259,8 @@ bool MediaController::isMediaControllerAvailable(const std::string &mediaDevice)
   }
 
   // 检查 media-ctl 命令是否可用
-  int ret = system("which media-ctl > /dev/null 2>&1");
-  if (ret != 0) {
+  const auto availability = runShellCommand("command -v media-ctl", std::chrono::seconds(2), nullptr, 4096);
+  if (!availability.succeeded()) {
     LOG_DEBUG("[采集][MediaController] media-ctl command not available");
     return false;
   }
@@ -249,27 +274,13 @@ bool MediaController::isMediaControllerAvailable(const std::string &mediaDevice)
 
 bool MediaController::executeMediaCtl(const std::string &command, std::string *output) {
 #ifdef __ANDROID__
-  std::string fullCommand = "media-ctl " + command + " 2>&1";
+  const std::string fullCommand = "media-ctl " + command;
 
-  FILE *pipe = popen(fullCommand.c_str(), "r");
-  if (!pipe) {
-    LOG_ERROR("[采集][MediaController] Failed to execute: %s", fullCommand.c_str());
-    return false;
-  }
-
-  char buffer[256];
-  std::string localOutput;
-  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-    localOutput += buffer;
-  }
-
-  int exitCode = pclose(pipe);
-
-  if (output) *output = localOutput;
-
-  if (exitCode != 0) {
+  const auto result = runShellCommand(fullCommand, std::chrono::seconds(15), nullptr, 256 * 1024);
+  if (output) *output = result.output;
+  if (!result.succeeded()) {
     LOG_WARN("[采集][MediaController] Command failed (exit=%d): %s\nOutput: %s",
-             exitCode, fullCommand.c_str(), localOutput.c_str());
+             result.exitCode, fullCommand.c_str(), result.output.c_str());
     return false;
   }
 
@@ -283,6 +294,7 @@ bool MediaController::executeMediaCtl(const std::string &command, std::string *o
 
 bool MediaController::resetMediaLinks(const std::string &mediaDevice) {
 #ifdef __ANDROID__
+  invalidateMipiPipelineCache();
   if (!isMediaControllerAvailable(mediaDevice)) {
     return false;
   }
@@ -293,8 +305,7 @@ bool MediaController::resetMediaLinks(const std::string &mediaDevice) {
     usleep(50000);
     return true;
   }
-  LOG_WARN("[采集][MediaController] media-ctl reset links failed on %s; "
-           "continue with explicit route setup",
+  LOG_WARN("[采集][MediaController] media-ctl reset links failed on %s",
            mediaDevice.c_str());
   return false;
 #else
@@ -321,11 +332,7 @@ bool MediaController::setupMIPIPipeline(const std::string &mediaDevice,
     return false;
   }
 
-  if (isCachedMipiPipeline(mediaDevice, targetVideo, targetWidth, targetHeight)) {
-    LOG_INFO("[采集][MediaController] Reuse cached MIPI pipeline %s %s %s",
-             mediaDevice.c_str(), targetVideo.c_str(), frameSize.c_str());
-    return true;
-  }
+  const bool cached = isCachedMipiPipeline(mediaDevice, targetVideo, targetWidth, targetHeight);
 
   if (!isMediaControllerAvailable(mediaDevice)) {
     LOG_WARN("[采集][MediaController] Media controller not available");
@@ -390,13 +397,19 @@ bool MediaController::setupMIPIPipeline(const std::string &mediaDevice,
       !enabledSensorEntity.empty() && !enabledDphyEntity.empty() &&
       !enabledMipiEntity.empty() && enabledSensorEntity == sensorEntity &&
       enabledDphyEntity == dphyEntity && enabledMipiEntity == mipiEntity;
-  const bool routeFormatAlreadySet =
-      routeAlreadyEnabled &&
-      countOccurrences(topology, "fmt:UYVY2X8/" + frameSize) >= 3;
+  const std::string mipiSource = findSourcePadToEntity(topology, mipiEntity, streamEntity);
+  const std::vector<std::pair<std::string, std::string>> routePads = {
+      {sensorEntity, "0"}, {dphyEntity, "0"}, {dphyEntity, "1"},
+      {mipiEntity, "0"}, {mipiEntity, mipiSource}};
+  auto formatsMatch = [&](const std::string &graph) {
+    return std::all_of(routePads.begin(), routePads.end(), [&](const auto &pad) {
+      return padHasFormat(graph, pad.first, pad.second, targetWidth, targetHeight);
+    });
+  };
 
-  if (routeFormatAlreadySet) {
+  if (cached && routeAlreadyEnabled && formatsMatch(topology)) {
     rememberMipiPipeline(mediaDevice, targetVideo, targetWidth, targetHeight);
-    LOG_INFO("[采集][MediaController] MIPI route already enabled/formatted; skip media-ctl relink");
+    LOG_INFO("[采集][MediaController] Reuse verified MIPI route and all pad formats");
     return true;
   }
 
@@ -419,26 +432,51 @@ bool MediaController::setupMIPIPipeline(const std::string &mediaDevice,
     return ok;
   };
 
-  std::string mipiSource = findSourcePadToEntity(topology, mipiEntity, streamEntity);
   if (!routeAlreadyEnabled) {
     linkOk = linkRoute();
     if (!linkOk) {
       LOG_WARN("[采集][MediaController] Direct MIPI relink failed; reset graph and retry once");
-      resetMediaLinks(mediaDevice);
+      if (!resetMediaLinks(mediaDevice)) return false;
       linkOk = linkRoute();
     }
   }
 
-  // 6. 设置全链路格式 (UYVY)
-  executeMediaCtl(mediaOpt + " --set-v4l2 '\"" + sensorEntity + "\":0[fmt:UYVY2X8/" + frameSize + "]'");
-  executeMediaCtl(mediaOpt + " --set-v4l2 '\"" + dphyEntity + "\":0[fmt:UYVY2X8/" + frameSize + "]'");
-  executeMediaCtl(mediaOpt + " --set-v4l2 '\"" + dphyEntity + "\":1[fmt:UYVY2X8/" + frameSize + "]'");
-  executeMediaCtl(mediaOpt + " --set-v4l2 '\"" + mipiEntity + "\":0[fmt:UYVY2X8/" + frameSize + "]'");
-  executeMediaCtl(mediaOpt + " --set-v4l2 '\"" + mipiEntity + "\":" + mipiSource + "[fmt:UYVY2X8/" + frameSize + "]'");
-
-  if (linkOk || routeAlreadyEnabled) {
-    rememberMipiPipeline(mediaDevice, targetVideo, targetWidth, targetHeight);
+  if (!linkOk) return false;
+  for (const auto &pad : routePads) {
+    if (!executeMediaCtl(mediaOpt + " --set-v4l2 '\"" + pad.first + "\":" +
+                         pad.second + "[fmt:UYVY2X8/" + frameSize + "]'")) {
+      LOG_WARN("[Capture][MediaController] Required pad configuration failed: %s:%s",
+               pad.first.c_str(), pad.second.c_str());
+      return false;
+    }
   }
+
+  std::string verifiedTopology;
+  const bool readbackOk = executeMediaCtl(mediaOpt + " -p", &verifiedTopology);
+  const bool streamLinkMatches =
+      readbackOk && findUpstreamEntity(verifiedTopology, streamEntity) == mipiEntity;
+  const bool mipiLinkMatches =
+      readbackOk && findUpstreamEntity(verifiedTopology, mipiEntity) == dphyEntity;
+  const bool dphyLinkMatches =
+      readbackOk && findUpstreamEntity(verifiedTopology, dphyEntity) == sensorEntity;
+  if (!readbackOk || !streamLinkMatches || !mipiLinkMatches || !dphyLinkMatches ||
+      !formatsMatch(verifiedTopology)) {
+    LOG_WARN("[Capture][MediaController] MIPI readback mismatch: topology=%s "
+             "sensor-dphy=%s dphy-mipi=%s mipi-stream=%s; defer capture start",
+             readbackOk ? "read" : "unavailable",
+             dphyLinkMatches ? "ok" : "wrong", mipiLinkMatches ? "ok" : "wrong",
+             streamLinkMatches ? "ok" : "wrong");
+    for (const auto &pad : routePads) {
+      if (!padHasFormat(verifiedTopology, pad.first, pad.second,
+                        targetWidth, targetHeight)) {
+        LOG_WARN("[Capture][MediaController] Format readback mismatch at %s:%s "
+                 "expected UYVY %s",
+                 pad.first.c_str(), pad.second.c_str(), frameSize.c_str());
+      }
+    }
+    return false;
+  }
+  rememberMipiPipeline(mediaDevice, targetVideo, targetWidth, targetHeight);
   LOG_INFO("[采集][MediaController] MIPI pipeline setup completed");
   return true;
 #else

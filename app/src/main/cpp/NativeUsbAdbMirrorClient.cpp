@@ -1,6 +1,7 @@
 #include "NativeUsbAdbMirrorClient.h"
 
 #include "audio/AudioPlayerManager.h"
+#include "decoder/H264NalUtils.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
@@ -148,7 +149,7 @@ private:
       bool keyFrame = (ptsAndFlags & SCRCPY_PACKET_FLAG_KEY_FRAME) != 0;
       int64_t ptsUs = static_cast<int64_t>(ptsAndFlags & SCRCPY_PACKET_PTS_MASK);
       std::vector<uint8_t> payload =
-          normalizeH264Payload(pending_.data() + offset, packetSize);
+          normalizeH264AnnexB(pending_.data() + offset, packetSize);
       handlePacket(std::move(payload), ptsUs, config, keyFrame);
       offset += packetSize;
     }
@@ -182,7 +183,7 @@ private:
       pendingConfig_.clear();
       keyFrame = true;
     } else if (!keyFrame) {
-      keyFrame = NativeUsbAdbMirrorClient::containsIdrFrame(payload);
+      keyFrame = containsH264Idr(payload.data(), payload.size());
     }
 
     mediaPacketCount_++;
@@ -198,39 +199,6 @@ private:
     }
   }
 
-  static bool hasAnnexBStartCode(const uint8_t* data, size_t size) {
-    if (!data || size < 4) return false;
-    if (data[0] == 0 && data[1] == 0 && data[2] == 1) return true;
-    return size >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1;
-  }
-
-  static std::vector<uint8_t> normalizeH264Payload(const uint8_t* data, size_t size) {
-    if (!data || size == 0) return {};
-    if (hasAnnexBStartCode(data, size)) {
-      return std::vector<uint8_t>(data, data + size);
-    }
-
-    std::vector<uint8_t> annexb;
-    size_t offset = 0;
-    int nalCount = 0;
-    while (offset + 4 <= size) {
-      uint32_t nalSize = readBe32(data + offset);
-      offset += 4;
-      if (nalSize == 0 || nalSize > size - offset) {
-        annexb.clear();
-        break;
-      }
-      static const uint8_t startCode[] = {0, 0, 0, 1};
-      annexb.insert(annexb.end(), startCode, startCode + sizeof(startCode));
-      annexb.insert(annexb.end(), data + offset, data + offset + nalSize);
-      offset += nalSize;
-      nalCount++;
-    }
-    if (nalCount > 0 && offset == size && !annexb.empty()) {
-      return annexb;
-    }
-    return std::vector<uint8_t>(data, data + size);
-  }
 
   NativeUsbAdbMirrorClient& owner_;
   std::vector<uint8_t> pending_;
@@ -353,7 +321,8 @@ private:
     const int frames = sampleCount / SCRCPY_AUDIO_CHANNELS;
     int written = 0;
     if (outputRate_ == SCRCPY_AUDIO_SAMPLE_RATE) {
-      written = player->write(samples, frames);
+      written = manager.writeForLayer(
+          AudioFocusSource::MIRROR, layerId_, samples, frames);
     } else {
       const double step = static_cast<double>(SCRCPY_AUDIO_SAMPLE_RATE) /
                           static_cast<double>(outputRate_);
@@ -373,12 +342,15 @@ private:
       if (resamplePos_ < 0.0 || resamplePos_ > step * 2.0) resamplePos_ = 0.0;
       int convertedFrames = static_cast<int>(converted.size() / SCRCPY_AUDIO_CHANNELS);
       if (convertedFrames > 0) {
-        written = player->write(converted.data(), convertedFrames);
+        written = manager.writeForLayer(
+            AudioFocusSource::MIRROR, layerId_, converted.data(), convertedFrames);
       }
     }
     if (written > 0) {
       primedFrames_ += written;
-      if (!player->isPlaying() && primedFrames_ >= USB_MIRROR_AUDIO_PRIME_FRAMES) {
+      if (!player->isPlaying() && primedFrames_ >= USB_MIRROR_AUDIO_PRIME_FRAMES &&
+          AudioPlayerManager::getInstance().hasFocus(AudioFocusSource::MIRROR) &&
+          AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId_)) {
         player->start();
       }
     }
@@ -596,7 +568,7 @@ void NativeUsbAdbMirrorClient::workerLoop() {
       streamWidth_ = alignToMacroblock(physicalWidth_, RKMPP_H264_MAX_WIDTH);
       streamHeight_ = alignToMacroblock(physicalHeight_, RKMPP_H264_MAX_HEIGHT);
     }
-    decoder_ = std::make_unique<UsbH264RkmppDecoder>();
+    decoder_ = std::make_unique<H264RkmppDecoder>();
     if (!decoder_->open(streamWidth_, streamHeight_)) {
       throw std::runtime_error("native h264_rkmpp decoder unavailable");
     }
@@ -1268,21 +1240,6 @@ int NativeUsbAdbMirrorClient::alignToMacroblock(int value, int maxValue) {
   return std::max(16, aligned);
 }
 
-bool NativeUsbAdbMirrorClient::containsIdrFrame(const std::vector<uint8_t>& data) {
-  for (size_t i = 0; i + 3 < data.size(); ++i) {
-    int start = -1;
-    if (data[i] == 0 && data[i + 1] == 0) {
-      if (data[i + 2] == 1) start = static_cast<int>(i + 3);
-      else if (i + 4 < data.size() && data[i + 2] == 0 && data[i + 3] == 1) {
-        start = static_cast<int>(i + 4);
-      }
-    }
-    if (start >= 0 && start < static_cast<int>(data.size())) {
-      if ((data[static_cast<size_t>(start)] & 0x1f) == 5) return true;
-    }
-  }
-  return false;
-}
 
 bool NativeUsbAdbMirrorClient::readFile(const std::string& path, std::vector<uint8_t>& out) {
   std::ifstream file(path, std::ios::binary);
@@ -1297,3 +1254,4 @@ bool NativeUsbAdbMirrorClient::readFile(const std::string& path, std::vector<uin
 }
 
 } // namespace hsvj
+

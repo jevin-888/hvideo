@@ -1,16 +1,16 @@
 // 素材管理模块
 import { apiGet, apiPost, sendLayerCommand, apiAction } from '../core/api.js';
-import { addToCommandLog } from '../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { getCurrentPlaylistId, updatePlaylistContent, updatePlaylistList, getPlaylistTargetLayer } from './playlist.js';
 import { showInfo, showConfirm, showPrompt, showError, showWarning, updateConfirmProgress, escapeHtml } from '../components/toast.js';
-import { getSelectedLayer } from '../pages/layerMatrix.js';
+import { getSelectedLayer } from '../pages/layerMatrix.js?v=qr_address_1';
 import { toggleButtonGroupActive } from '../components/buttonGroups.js';
 import { extractFolderName, normalizePath } from '../utils/pathHelpers.js';
 import { clearContainer } from '../utils/domHelpers.js';
 import { handleApiOperation } from '../utils/apiHelpers.js';
 import { openVideoPreview } from './videoPreview.js';
 import { setPreviewMode } from '../pages/videoControl.js?v=2.98';
-import { parseApiResponse } from '../utils/apiResponseParser.js';
+import { parseApiResponse } from '/shared/apiResponseParser.js';
 
 // 发送图片播放命令到图层60
 // 注意：loadImage 是图层渲染命令 (code: 0x03)，在 handleLayerRender 中处理
@@ -38,7 +38,7 @@ async function sendImagePlayCommand(filePath, fileName) {
         // 后端接受相对于 Image/ 目录的路径（支持子目录，如 gb_fusion/19.jpg）
         const result = await apiAction('rendering', 'loadImage', {
             layerId,
-            image_file: imageFile
+            ...(imageDirIdx !== -1 ? { image_file: imageFile } : { path: filePath })
         });
         if (result === null) {
             throw new Error('API 请求失败');
@@ -53,9 +53,72 @@ async function sendImagePlayCommand(filePath, fileName) {
 
 // 全局变量
 let currentMaterialType = 'video';
-let currentViewMode = 'grid';
+let currentMaterialSource = 'all';
+let materialRequestId = 0;
+let folderRequestId = 0;
+let materialRefreshTimer = null;
+let selectedVideoStorage = 'internal';
+function materialStorage() { return currentMaterialType === 'video' ? selectedVideoStorage : 'internal'; }
+function materialSourceQuery() { return `&source=${currentMaterialSource}`; }
+const CLOUD_CATEGORY_PREFIX = 'cloud-category:';
+function materialFolderQuery() {
+    if (!currentFolderFilter) return '';
+    return currentFolderFilter.startsWith(CLOUD_CATEGORY_PREFIX)
+        ? `&categoryId=${encodeURIComponent(currentFolderFilter.slice(CLOUD_CATEGORY_PREFIX.length))}`
+        : `&folder=${encodeURIComponent(currentFolderFilter)}`;
+}
+function materialViewKey() { return `${currentMaterialType}:${materialStorage()}:${currentMaterialSource}:${currentFolderFilter}`; }
 let currentFolderFilter = ''; // 当前选中的文件夹过滤器
 let selectedMaterials = new Set(); // 存储选中的素材路径
+
+const HUOSHAN_STORAGE_SPACE_POLL_INTERVAL_MS = 5000;
+let huoshanStorageSpacePollTimer = null;
+let huoshanStorageSpaceRequestPending = false;
+
+function formatStorageSpaceGb(availableBytes) {
+    const bytes = Number(availableBytes);
+    if (!Number.isFinite(bytes) || bytes < 0) return null;
+    return (bytes / (1024 ** 3)).toFixed(2);
+}
+
+async function refreshHuoshanStorageSpace() {
+    const display = document.getElementById('huoshan-storage-space');
+    if (!display || huoshanStorageSpaceRequestPending) return;
+
+    huoshanStorageSpaceRequestPending = true;
+    try {
+        const requestedStorage = materialStorage();
+        const storage = await apiGet(`/system/storage-space?storage=${requestedStorage}`, {
+            timeoutMs: 4000,
+            retries: 0,
+            silent: true
+        });
+        if (requestedStorage !== materialStorage()) return;
+        const availableGb = storage ? formatStorageSpaceGb(storage.available_bytes) : null;
+        if (availableGb === null) {
+            display.classList.add('is-unavailable');
+            display.textContent = requestedStorage === 'sata' ? '硬盘未就绪或不可写' : '空间读取失败';
+            display.title = display.textContent;
+            return;
+        }
+
+        display.textContent = `剩余空间 ${availableGb} GB`;
+        display.classList.remove('is-unavailable');
+        display.dataset.loaded = 'true';
+        display.title = `${requestedStorage === 'sata' ? 'SATA 硬盘' : '内置存储'}剩余空间：${availableGb} GB`;
+    } finally {
+        huoshanStorageSpaceRequestPending = false;
+    }
+}
+
+function startHuoshanStorageSpacePolling() {
+    if (!document.getElementById('huoshan-storage-space') || huoshanStorageSpacePollTimer) return;
+    refreshHuoshanStorageSpace();
+    huoshanStorageSpacePollTimer = setInterval(
+        refreshHuoshanStorageSpace,
+        HUOSHAN_STORAGE_SPACE_POLL_INTERVAL_MS
+    );
+}
 
 const FUSION_BACKGROUND_FOLDER = 'gb_fusion';
 const IMAGE_FILE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg', 'tif', 'tiff']);
@@ -102,18 +165,21 @@ function getPlaybackResultMessage(result, fallback = DEFAULT_SOFT_BLOCK_MESSAGE)
 
 // 更新上传按钮文本 - 根据当前素材类型
 function updateUploadButtonLabels() {
+    const selector = document.getElementById('material-storage');
+    if (selector) selector.hidden = currentMaterialType !== 'video';
+    refreshHuoshanStorageSpace();
     const uploadBtn = document.getElementById('upload-btn');
     const uploadFolderBtn = document.getElementById('upload-folder-btn');
 
     if (currentMaterialType === 'video') {
         if (uploadBtn) uploadBtn.textContent = '上传视频';
-        if (uploadFolderBtn) uploadFolderBtn.textContent = '上传视频文件夹';
+        if (uploadFolderBtn) uploadFolderBtn.textContent = '上传文件夹';
     } else if (currentMaterialType === 'image') {
         if (uploadBtn) uploadBtn.textContent = '上传图片';
-        if (uploadFolderBtn) uploadFolderBtn.textContent = '上传图片文件夹';
+        if (uploadFolderBtn) uploadFolderBtn.textContent = '上传文件夹';
     } else if (currentMaterialType === 'audio') {
         if (uploadBtn) uploadBtn.textContent = '上传音乐';
-        if (uploadFolderBtn) uploadFolderBtn.textContent = '上传音乐文件夹';
+        if (uploadFolderBtn) uploadFolderBtn.textContent = '上传文件夹';
     }
 }
 
@@ -130,7 +196,19 @@ function initializeThumbnailSSE() {
     try {
         // 创建SSE连接
         // window.apiBaseUrl 固定为 /api/v1，这里只追加资源路径。
-        thumbnailEventSource = new EventSource(`${window.apiBaseUrl}/events`);
+        const token = localStorage.getItem('hvideo_auth_token');
+        const eventPath = `${window.apiBaseUrl}/events`;
+        const eventUrl = token
+            ? `${eventPath}?token=${encodeURIComponent(token)}` : eventPath;
+        thumbnailEventSource = new EventSource(eventUrl);
+
+        thumbnailEventSource.addEventListener('materials', () => {
+            clearTimeout(materialRefreshTimer);
+            materialRefreshTimer = setTimeout(() => {
+                updateFolderList();
+                updateMaterials(document.getElementById('material-search')?.value || '');
+            }, 150);
+        });
 
         // 监听缩略图生成完成事件
         thumbnailEventSource.addEventListener('thumbnail', function (event) {
@@ -201,8 +279,6 @@ function updateThumbnailForPath(filePath) {
 
     // 查找所有匹配的缩略图元素
     const items = listContainer.querySelectorAll('.material-item');
-    let found = false;
-
     items.forEach(item => {
         const preview = item.querySelector('.material-preview');
         if (preview) {
@@ -239,11 +315,10 @@ function updateThumbnailForPath(filePath) {
                 normalizedFilePath.includes(normalizedItemPath);    // filePath 包含 itemPath (新增)
 
             if (isMatch) {
-                found = true;
                 const thumbnail = item.querySelector('img.material-thumbnail');
                 if (thumbnail) {
                     // 使用匹配到的 itemPath 来构建 URL（确保路径一致）
-                    const thumbnailUrl = `${window.apiBaseUrl}/materials/thumbnail?path=${encodeURIComponent(itemPath)}&t=${Date.now()}`;
+                    const thumbnailUrl = `${window.apiBaseUrl}/materials/thumbnail?path=${encodeURIComponent(itemPath)}&t=${Date.now()}&token=${encodeURIComponent(localStorage.getItem('hvideo_auth_token') || '')}`;
                     thumbnail.src = thumbnailUrl;
                     // 移除占位符（如果存在）
                     const placeholder = preview.querySelector('.thumbnail-placeholder');
@@ -520,6 +595,41 @@ async function pollTranscodeStatusSnapshot() {
 
 // 初始化素材管理
 export function initializeMaterials() {
+    document.querySelectorAll('.material-source-btn').forEach(button => {
+        button.addEventListener('click', async () => {
+            currentMaterialSource = button.dataset.source;
+            currentFolderFilter = '';
+            selectedMaterials.clear();
+            document.querySelectorAll('.material-source-btn').forEach(item => {
+                const active = item.dataset.source === currentMaterialSource;
+                item.classList.toggle('active', active);
+                item.setAttribute('aria-pressed', String(active));
+            });
+            updateSelectedMaterialsToolbar();
+            await Promise.all([updateFolderList(), updateMaterials(document.getElementById('material-search')?.value || '')]);
+        });
+    });
+    const uploadButton = document.getElementById('upload-btn');
+    if (uploadButton && !document.getElementById('material-storage')) {
+        const selector = document.createElement('select');
+        selector.id = 'material-storage';
+        selector.className = 'material-storage-select';
+        selector.setAttribute('aria-label', '视频存储位置');
+        selector.title = '选择视频浏览及上传位置';
+        selector.innerHTML = '<option value="internal">内置存储</option><option value="sata">SATA 硬盘</option>';
+        uploadButton.before(selector);
+        selector.addEventListener('change', async () => {
+            selectedVideoStorage = selector.value;
+            currentFolderFilter = '';
+            selectedMaterials.clear();
+            const display = document.getElementById('huoshan-storage-space');
+            if (display) display.textContent = '正在读取空间...';
+            refreshHuoshanStorageSpace();
+            await updateFolderList();
+            await updateMaterials();
+            updateSelectedMaterialsToolbar();
+        });
+    }
     // 初始化按钮选中状态，确保与currentMaterialType同步
     document.querySelectorAll('.type-btn').forEach(btn => {
         if (btn.dataset.type === currentMaterialType) {
@@ -531,6 +641,7 @@ export function initializeMaterials() {
 
     // 初始化上传按钮文本
     updateUploadButtonLabels();
+    startHuoshanStorageSpacePolling();
 
     // 初始化SSE连接以接收缩略图生成通知
     initializeThumbnailSSE();
@@ -541,10 +652,11 @@ export function initializeMaterials() {
         item.addEventListener('click', function () {
             toggleButtonGroupActive('.type-btn', this);
             currentMaterialType = this.dataset.type;
+            selectedMaterials.clear();
             currentFolderFilter = ''; // 切换类型时重置文件夹过滤器
             updateUploadButtonLabels(); // 更新上传按钮文本
             updateFolderList();
-            updateMaterials();
+            updateMaterials(document.getElementById('material-search')?.value || '');
             updateSelectedMaterialsToolbar();
         });
     });
@@ -711,7 +823,10 @@ async function updateFolderList() {
 
     folderContainer.innerHTML = '<span class="folder-loading">加载文件夹...</span>';
 
-    const folders = await apiGet(`/materials/folders?type=${currentMaterialType}`);
+    const requestId = ++folderRequestId;
+    const viewKey = materialViewKey();
+    const folders = await apiGet(`/materials/folders?type=${currentMaterialType}&storage=${materialStorage()}${materialSourceQuery()}`);
+    if (requestId !== folderRequestId || viewKey !== materialViewKey()) return;
     clearContainer(folderContainer);
 
     // 添加"全部"选项
@@ -733,13 +848,15 @@ async function updateFolderList() {
                 const tagWrapper = document.createElement('span');
                 tagWrapper.className = 'folder-tag-wrapper';
 
+                const folderKey = folder.key || folder.name;
                 const tag = document.createElement('span');
-                tag.className = `folder-tag ${currentFolderFilter === folder.name ? 'active' : ''}`;
+                tag.className = `folder-tag ${currentFolderFilter === folderKey ? 'active' : ''}`;
+                tag.setAttribute('translate', 'no');
                 tag.textContent = folder.name;
-                tag.dataset.folder = folder.name;
+                tag.dataset.folder = folderKey;
                 tag.title = `点击过滤: ${folder.name}`;
                 tag.addEventListener('click', () => {
-                    currentFolderFilter = folder.name;
+                    currentFolderFilter = folderKey;
                     updateFolderTagsActive();
                     updateFolderActionsToolbar();
                     updateMaterials(document.getElementById('material-search')?.value || '');
@@ -782,13 +899,15 @@ async function updateFolderActionsToolbar() {
     }
 
     // 获取当前选中的文件夹信息
-    const folders = await apiGet(`/materials/folders?type=${currentMaterialType}`);
+    const viewKey = materialViewKey();
+    const folders = await apiGet(`/materials/folders?type=${currentMaterialType}&storage=${materialStorage()}${materialSourceQuery()}`);
+    if (viewKey !== materialViewKey()) return;
     if (!folders || !Array.isArray(folders)) {
         return;
     }
 
-    const selectedFolder = folders.find(f => f.name === currentFolderFilter);
-    if (!selectedFolder) {
+    const selectedFolder = folders.find(f => (f.key || f.name) === currentFolderFilter);
+    if (!selectedFolder || selectedFolder.kind === 'cloud-category') {
         return;
     }
 
@@ -869,7 +988,7 @@ async function updateFolderActionsToolbar() {
                         attempts++;
 
                         try {
-                            const folders = await apiGet(`/materials/folders?type=${currentMaterialType}`);
+                            const folders = await apiGet(`/materials/folders?type=${currentMaterialType}&storage=${materialStorage()}${materialSourceQuery()}`);
                             const folderExists = folders && Array.isArray(folders) &&
                                 folders.some(f => f.name === selectedFolder.name);
 
@@ -950,49 +1069,60 @@ async function updateFolderActionsToolbar() {
     addToPlaylistBtn.innerHTML = '+ 播放列表';
     addToPlaylistBtn.title = '将文件夹中的所有素材添加到播放列表';
     addToPlaylistBtn.addEventListener('click', async () => {
-        const playlistId = getCurrentPlaylistId();
-        if (!playlistId) {
-            showInfo('请先选择一个播放列表');
-            return;
-        }
-
-        // 获取当前文件夹中的所有素材
-        const folderQuery = currentFolderFilter ? `&folder=${encodeURIComponent(currentFolderFilter)}` : '';
-        const materials = await apiGet(`/materials?type=${currentMaterialType}${folderQuery}`);
-        if (!materials || !Array.isArray(materials)) {
-            showInfo('获取素材列表失败');
-            return;
-        }
-
-        const folderMaterials = materials;
-
-        if (folderMaterials.length === 0) {
-            showInfo('当前文件夹中没有素材');
-            return;
-        }
-
-        // 批量添加到播放列表（图片使用图层 60，视频/音频使用播放列表绑定的目标图层）
-        let successCount = 0;
-        let failCount = 0;
-        const layerIdForAdd = currentMaterialType === 'image' ? 60 : null;
-        for (const file of folderMaterials) {
-            const success = await addVideoToPlaylist(playlistId, file.path, layerIdForAdd);
-            if (success) {
-                successCount++;
-            } else {
-                failCount++;
+        if (addToPlaylistBtn.disabled) return;
+        addToPlaylistBtn.disabled = true;
+        try {
+            const playlistId = getCurrentPlaylistId();
+            if (!playlistId) {
+                showInfo('请先选择一个播放列表');
+                return;
             }
-        }
 
-        if (successCount > 0) {
-            addToCommandLog('添加文件夹到播放列表', 'success',
-                `成功添加 ${successCount} 个素材到播放列表${failCount > 0 ? `，失败 ${failCount} 个` : ''}`);
-            showInfo(`成功添加 ${successCount} 个素材到播放列表${failCount > 0 ? `，失败 ${failCount} 个` : ''}`);
-            // 刷新播放列表显示
-            await updatePlaylistContent(playlistId);
-        } else {
-            addToCommandLog('添加文件夹到播放列表', 'error', '添加失败');
-            showInfo('添加素材到播放列表失败');
+            // 获取当前文件夹中的所有素材
+            const folderQuery = materialFolderQuery();
+            const materials = await apiGet(`/materials?type=${currentMaterialType}&storage=${materialStorage()}${materialSourceQuery()}${folderQuery}`);
+            if (!materials || !Array.isArray(materials)) {
+                showInfo('获取素材列表失败');
+                return;
+            }
+
+            const folderMaterials = materials;
+
+            if (folderMaterials.length === 0) {
+                showInfo('当前文件夹中没有素材');
+                return;
+            }
+
+            // 批量添加到播放列表（图片使用图层 60，视频/音频使用播放列表绑定的目标图层）
+            let successCount = 0;
+            let failCount = 0;
+            const layerIdForAdd = currentMaterialType === 'image' ? 60 : null;
+            for (const file of folderMaterials) {
+                const success = await addVideoToPlaylist(
+                    playlistId,
+                    file.path,
+                    layerIdForAdd,
+                    { logSuccess: false }
+                );
+                if (success) {
+                    successCount++;
+                } else {
+                    failCount++;
+                }
+            }
+
+            if (successCount > 0) {
+                addToCommandLog('添加文件夹到播放列表', 'success',
+                    `成功添加 ${successCount} 个素材到播放列表${failCount > 0 ? `，失败 ${failCount} 个` : ''}`);
+                showInfo(`成功添加 ${successCount} 个素材到播放列表${failCount > 0 ? `，失败 ${failCount} 个` : ''}`);
+                // 刷新播放列表显示
+                await updatePlaylistContent(playlistId);
+            } else {
+                addToCommandLog('添加文件夹到播放列表', 'error', '添加失败');
+                showInfo('添加素材到播放列表失败');
+            }
+        } finally {
+            addToPlaylistBtn.disabled = false;
         }
     });
 
@@ -1025,6 +1155,7 @@ function updateFolderTagsActive() {
 // 处理文件上传（统一处理文件夹和单文件上传）
 async function handleFileUpload(files, isFolderUpload, folderName, logPrefix) {
     if (!files || files.length === 0) return;
+    const uploadTarget = { storage: materialStorage(), type: currentMaterialType, folder: currentFolderFilter.startsWith(CLOUD_CATEGORY_PREFIX) ? '' : currentFolderFilter };
 
     addToCommandLog(isFolderUpload ? '上传文件夹' : '上传文件', 'info',
         isFolderUpload ? `开始上传${logPrefix}，包含 ${files.length} 个文件...` : `开始上传 ${files.length} 个文件...`);
@@ -1070,10 +1201,10 @@ async function handleFileUpload(files, isFolderUpload, folderName, logPrefix) {
             const { file, item } = progressItems[itemId];
 
             try {
-                const success = await uploadFile(file, isFolderUpload ? '' : currentFolderFilter, isFolderUpload, folderName, (progress) => {
+                const success = await uploadFile(file, isFolderUpload ? '' : uploadTarget.folder, isFolderUpload, folderName, (progress) => {
                     updateProgressItem(item, progress);
                     progressItems[itemId].progress = progress;
-                });
+                }, uploadTarget);
 
                 if (success) {
                     markProgressItemSuccess(item);
@@ -1129,7 +1260,7 @@ async function handleFileUpload(files, isFolderUpload, folderName, logPrefix) {
 }
 
 // 更新素材列表
-export async function updateMaterials(filter = '') {
+export async function updateMaterials(filter = document.getElementById('material-search')?.value || '') {
     const listContainer = document.getElementById('material-list');
     if (!listContainer) {
         return;
@@ -1158,8 +1289,11 @@ export async function updateMaterials(filter = '') {
 
     listContainer.innerHTML = '<div class="material-loading">加载中...</div>';
 
-    const folderQuery = currentFolderFilter ? `&folder=${encodeURIComponent(currentFolderFilter)}` : '';
-    const materials = await apiGet(`/materials?type=${currentMaterialType}${folderQuery}`);
+    const requestId = ++materialRequestId;
+    const viewKey = materialViewKey();
+    const folderQuery = materialFolderQuery();
+    const materials = await apiGet(`/materials?type=${currentMaterialType}&storage=${materialStorage()}${materialSourceQuery()}${folderQuery}`);
+    if (requestId !== materialRequestId || viewKey !== materialViewKey()) return;
 
     // 使用工具函数清理，确保没有残留
     clearContainer(listContainer);
@@ -1193,10 +1327,13 @@ export async function updateMaterials(filter = '') {
             // 根据类型显示不同内容
             let previewContent;
             // 获取所属文件夹名称（从路径中提取）
-            const folderName = extractFolderName(file.path);
+            const folderName = file.source === 'cloud' ? (file.categoryName || '') : (file.folder ?? extractFolderName(file.path));
+            const source = file.source === 'cloud' ? 'cloud' : 'local';
+            const safeName = escapeHtml(file.name);
+            const safeFolderName = escapeHtml(folderName);
 
             // 通用缩略图URL
-            const thumbnailUrl = `${window.apiBaseUrl}/materials/thumbnail?path=${encodeURIComponent(file.path)}`;
+            const thumbnailUrl = `${window.apiBaseUrl}/materials/thumbnail?path=${encodeURIComponent(file.path)}&token=${encodeURIComponent(localStorage.getItem('hvideo_auth_token') || '')}`;
 
             if (currentMaterialType === 'video') {
                 // 视频：保持播放图标
@@ -1249,12 +1386,13 @@ export async function updateMaterials(filter = '') {
                     </button>
                 </div>
                 <div class="material-info">
-                    <div class="material-name" title="${file.name}">${file.name}</div>
+                    <div class="material-name" title="${safeName}">${safeName}</div>
                     <div class="material-meta">
+                        <span class="material-source ${source}">${source === 'cloud' ? '云端' : '本地'}</span>
                         <span class="material-size">${sizeStr}</span>
-                        ${folderName ? `<span class="material-folder" title="所属文件夹: ${folderName}">
-                            <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" style="margin-right:2px; vertical-align:middle; opacity:0.8;"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg> 
-                            ${folderName}</span>` : ''}
+                        ${folderName ? `<span class="material-folder" title="所属文件夹: ${safeFolderName}">
+                            <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" style="margin-right:2px; vertical-align:middle; opacity:0.8;"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+                            ${safeFolderName}</span>` : ''}
                     </div>
                 </div>
                 <div class="material-actions">
@@ -1490,11 +1628,13 @@ export async function updateMaterials(filter = '') {
                 }
                 // 图片固定使用图层 60，视频/音频使用播放列表绑定的目标图层
                 const layerIdForAdd = currentMaterialType === 'image' ? 60 : null;
-                const success = await addVideoToPlaylist(playlistId, file.path, layerIdForAdd);
-                if (success) {
-                    addToCommandLog('添加素材', 'success', `添加素材到列表: ${file.name}`);
-                    // 刷新播放列表显示
-                    await updatePlaylistContent(playlistId);
+                if (addToPlaylistBtn.disabled) return;
+                addToPlaylistBtn.disabled = true;
+                try {
+                    const success = await addVideoToPlaylist(playlistId, file.path, layerIdForAdd);
+                    if (success) await updatePlaylistContent(playlistId);
+                } finally {
+                    addToPlaylistBtn.disabled = false;
                 }
             });
 
@@ -1571,7 +1711,7 @@ export async function updateMaterials(filter = '') {
                                 attempts++;
 
                                 try {
-                                    const materials = await apiGet(`/materials?type=${currentMaterialType}`);
+                                    const materials = await apiGet(`/materials?type=${currentMaterialType}&storage=${materialStorage()}`);
                                     const materialExists = materials && Array.isArray(materials) &&
                                         materials.some(m => m.path === file.path);
 
@@ -1723,14 +1863,14 @@ function markProgressItemError(item, errorMsg) {
 }
 
 // 上传文件（支持进度回调）
-async function uploadFile(file, targetFolder, isFolderUpload, folderName, onProgress) {
+async function uploadFile(file, targetFolder, isFolderUpload, folderName, onProgress, uploadTarget) {
     return new Promise((resolve, reject) => {
         try {
             // 文件夹上传时，使用当前选中的标签类型；单文件上传时，根据文件类型判断
             let type;
             if (isFolderUpload) {
                 // 文件夹上传：使用当前选中的素材类型
-                type = currentMaterialType;
+                type = uploadTarget.type;
             } else {
                 // 单文件上传：根据文件类型判断
                 const isVideo = file.type.startsWith('video/');
@@ -1777,7 +1917,8 @@ async function uploadFile(file, targetFolder, isFolderUpload, folderName, onProg
             // 构建查询参数
             const params = new URLSearchParams({
                 filename: relativePath,
-                type: type
+                type: type,
+                storage: type === 'video' ? uploadTarget.storage : 'internal'
             });
 
             // 如果是单个文件，传递目标文件夹
@@ -1817,7 +1958,7 @@ async function uploadFile(file, targetFolder, isFolderUpload, folderName, onProg
                         if (!envelope.ok) {
                             const errorMsg = envelope.error?.message || '上传失败';
                             addToCommandLog('上传文件', 'error', `${file.name}: ${errorMsg}`);
-                            resolve(false);
+                            reject(new Error(errorMsg));
                             return;
                         }
 
@@ -1868,7 +2009,7 @@ async function uploadFile(file, targetFolder, isFolderUpload, folderName, onProg
                     }
 
                     addToCommandLog('上传文件', 'error', `${file.name}: ${errorMessage}`);
-                    resolve(false);
+                    reject(new Error(errorMessage));
                 }
             });
 
@@ -1893,6 +2034,8 @@ async function uploadFile(file, targetFolder, isFolderUpload, folderName, onProg
             // 开始上传
             xhr.open('POST', window.apiBaseUrl + url);
             xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+            const token = localStorage.getItem('hvideo_auth_token');
+            if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
             xhr.send(file);
 
         } catch (error) {
@@ -1954,7 +2097,9 @@ async function downloadMaterial(filePath, fileName) {
         const downloadUrl = `${window.apiBaseUrl}/materials/download_file?path=${encodeURIComponent(filePath)}`;
 
         // 使用fetch获取文件，然后触发下载（这样可以显示原生另存为对话框）
-        const response = await fetch(downloadUrl);
+        const token = localStorage.getItem('hvideo_auth_token');
+        const response = await fetch(downloadUrl, token
+            ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
 
         if (!response.ok) {
             throw new Error(`下载失败: ${response.status}`);
@@ -2005,7 +2150,7 @@ async function showRenameDialog(currentName, onConfirm) {
     }
 }
 
-async function addVideoToPlaylist(playlistId, filePath, layerId = null) {
+async function addVideoToPlaylist(playlistId, filePath, layerId = null, { logSuccess = true } = {}) {
     try {
         if (isFusionBackgroundMaterialPath(filePath)) {
             const message = 'gb_fusion 是融合背景目录，不能加入节目列表';
@@ -2044,7 +2189,7 @@ async function addVideoToPlaylist(playlistId, filePath, layerId = null) {
                 layerId: effectiveLayerId
             }),
             '添加到播放列表',
-            '添加到播放列表成功',
+            logSuccess ? '添加到播放列表成功' : null,
             '添加到播放列表失败'
         );
     } catch (error) {

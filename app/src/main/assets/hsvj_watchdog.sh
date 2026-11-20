@@ -2,16 +2,17 @@
 PACKAGE_NAME="com.hsvj.engine"
 DRM_PROCESS_NAME="com.hsvj.engine:drmkms"
 BACKEND_PROP="persist.hsvj.output.backend"
-TAKEOVER_SCRIPT="/data/local/tmp/hsvj_drm_takeover.sh"
+TAKEOVER_SCRIPT="/vendor/bin/hsvj_drm_takeover.sh"
 DRM_STATUS_FILE="/data/user/0/com.hsvj.engine/files/drm_kms_engine.status"
 WATCHDOG_TAG="hsvj_watchdog"
 PID_FILE="/data/local/tmp/${WATCHDOG_TAG}.pid"
-LOCK_DIR="/data/local/tmp/${WATCHDOG_TAG}.lock"
+LOCK_FILE="/data/local/tmp/${WATCHDOG_TAG}.flock"
 LOG_FILE="/data/local/tmp/${WATCHDOG_TAG}.log"
 RESTART_LOG="/data/local/tmp/hsvj_重启.log"
 RESTART_SCRIPT="/data/local/tmp/hsvj_restart.sh"
 RUNTIME_DISPLAY_LOG="/data/local/tmp/hsvj_runtime_display.log"
-HEARTBEAT_FILE="/data/local/tmp/hsvj_heartbeat"
+HDMI_STATUS_FILE="/sys/class/drm/card0-HDMI-A-1/status"
+HEARTBEAT_FILE="/data/user/0/${PACKAGE_NAME}/files/hsvj_heartbeat"
 SUPPRESS_RESTART_FILE="/data/local/tmp/hsvj_no_watchdog_restart"
 PACKAGE_UPDATE_GRACE_FILE="/data/local/tmp/hsvj_package_update_grace"
 FRPC_BIN="/data/local/tmp/frp/frpc"
@@ -29,8 +30,10 @@ STARTUP_GRACE_SECONDS=10
 DRM_STARTUP_GRACE_SECONDS=60
 DRM_FRAME_STALL_SECONDS=20
 DRM_HTTP_GRACE_SECONDS=60
+HTTP_STARTUP_GRACE_SECONDS=60
 SUPPRESS_RESTART_TIMEOUT_SECONDS=12
 PACKAGE_UPDATE_GRACE_SECONDS=60
+HDMI_RECOVERY_COOLDOWN_SECONDS=30
 APP_RESTART_BASE_DELAY_SECONDS=0
 APP_RESTART_MAX_DELAY_SECONDS=60
 RESTART_LOOP_WINDOW_SECONDS=30
@@ -47,14 +50,31 @@ drm_last_frame=""
 drm_last_progress_ts=0
 drm_process_seen_ts=0
 drm_start_seen_ts=0
+hdmi_last_status=""
+hdmi_last_recovery_ts=0
+
+read_frp_token() {
+    FRP_TOKEN="$(getprop persist.hsvj.frp_token 2>/dev/null)"
+    case "$FRP_TOKEN" in
+        ''|*[!A-Za-z0-9._~-]*)
+            echo "$(date '+%F %T') FRP token is not provisioned or contains unsafe characters; skip config" >> "$FRPC_VERIFY_LOG"
+            return 1
+            ;;
+    esac
+    if [ "${#FRP_TOKEN}" -lt 16 ] || [ "${#FRP_TOKEN}" -gt 256 ]; then
+        echo "$(date '+%F %T') FRP token is not provisioned; skip config" >> "$FRPC_VERIFY_LOG"
+        return 1
+    fi
+}
 
 write_default_frpc_config() {
-    mkdir -p /data/local/tmp/frp 2>/dev/null
+    read_frp_token || return 1
+    mkdir -p /data/local/tmp/frp 2>/dev/null || return 1
     cat > "$FRPC_CONFIG" <<'EOF'
 serverAddr = "60.205.127.117"
 serverPort = 7000
 auth.method = "token"
-auth.token = "HvideoFrpTest2026_ChangeMe"
+auth.token = "__HSVJ_FRP_TOKEN__"
 
 [[proxies]]
 name = "hvideo-web-18081"
@@ -63,6 +83,7 @@ localIP = "127.0.0.1"
 localPort = 8080
 remotePort = 18081
 EOF
+    sed -i "s/__HSVJ_FRP_TOKEN__/$FRP_TOKEN/" "$FRPC_CONFIG" 2>/dev/null || return 1
     chmod 644 "$FRPC_CONFIG" 2>/dev/null
 }
 
@@ -140,7 +161,7 @@ log_runtime_display_once() {
         HDMI_MODE="$(getprop persist.vendor.resolution.HDMI-A-1 2>/dev/null)"
         WM_SIZE="$(wm size 2>/dev/null | tr '\n' '|')"
         echo "$(date '+%F %T') runtime display observed bootanim=$(getprop init.svc.bootanim) surface=$SURFACE_SIZE scale=${SCALE_ENABLE}/${SCALE_RATIO} main=$MAIN_RESOLUTION hdmi=$HDMI_MODE persist=$PERSIST_SIZE wm=$WM_SIZE"
-    ) >> "$RUNTIME_DISPLAY_LOG" 2>&1 < /dev/null &
+    ) 8>&- >> "$RUNTIME_DISPLAY_LOG" 2>&1 < /dev/null &
 }
 
 heartbeat_pid() {
@@ -160,7 +181,7 @@ backend_effective() {
     VALUE="$(getprop "$BACKEND_PROP" 2>/dev/null)"
     case "$VALUE" in
         surface|drm-kms) echo "$VALUE" ;;
-        *) echo drm-kms ;;
+        *) echo surface ;;
     esac
 }
 
@@ -199,11 +220,12 @@ drm_pid_alive() {
     esac
     [ -d "/proc/$PID" ] || return 1
 
+    for LIVE_PID in $(pidof "$DRM_PROCESS_NAME" 2>/dev/null); do
+        [ "$LIVE_PID" = "$PID" ] && return 0
+    done
+
     CMDLINE="$(tr '\000' '\n' < "/proc/$PID/cmdline" 2>/dev/null)"
-    if [ -n "$CMDLINE" ] && ! echo "$CMDLINE" | grep -Fxq "$DRM_PROCESS_NAME"; then
-        return 1
-    fi
-    return 0
+    [ -n "$CMDLINE" ] && echo "$CMDLINE" | grep -Fxq "$DRM_PROCESS_NAME"
 }
 
 # Return 0 for rendering, 2 while startup/progress is being confirmed, 1 for failure.
@@ -223,7 +245,11 @@ check_drm_health() {
     fi
 
     case "$STATE" in
-        created|starting)
+        created|starting|preparing|ready_for_takeover|acquiring_drm)
+            if ! drm_pid_alive "$PID"; then
+                DRM_HEALTH_DETAIL="$DRM_HEALTH_DETAIL,startup_process_dead"
+                return 1
+            fi
             if [ "$drm_start_seen_ts" -le 0 ]; then
                 drm_start_seen_ts="$NOW"
             fi
@@ -278,6 +304,53 @@ check_drm_health() {
     return 1
 }
 
+read_hdmi_status() {
+    [ -r "$HDMI_STATUS_FILE" ] || return 1
+    STATUS="$(cat "$HDMI_STATUS_FILE" 2>/dev/null | tr -d '\r\n')"
+    case "$STATUS" in
+        connected|disconnected) echo "$STATUS"; return 0 ;;
+    esac
+    return 1
+}
+
+# Recreate the existing DRM backend after a real HDMI connector transition.
+# This is deliberately edge-triggered so a missing HPD IRQ cannot create a
+# restart loop while the connector remains in one state.
+check_hdmi_hotplug() {
+    [ "$BACKEND_NOW" = "drm-kms" ] || return 0
+    STATUS="$(read_hdmi_status 2>/dev/null)" || return 0
+    if [ -z "$hdmi_last_status" ]; then
+        hdmi_last_status="$STATUS"
+        return 0
+    fi
+    if [ "$STATUS" = "$hdmi_last_status" ]; then
+        return 0
+    fi
+
+    PREVIOUS_STATUS="$hdmi_last_status"
+    hdmi_last_status="$STATUS"
+    echo "$(date '+%F %T') HDMI status transition ${PREVIOUS_STATUS}->${STATUS}" >> "$LOG_FILE"
+    if [ "$STATUS" != "connected" ]; then
+        return 0
+    fi
+
+    NOW_TS="$(date +%s)"
+    if [ $((NOW_TS - hdmi_last_recovery_ts)) -lt "$HDMI_RECOVERY_COOLDOWN_SECONDS" ]; then
+        echo "$(date '+%F %T') HDMI transition recovery throttled" >> "$LOG_FILE"
+        return 0
+    fi
+    hdmi_last_recovery_ts="$NOW_TS"
+    restart_app "hdmi_hpd_connected"
+    return 2
+}
+
+cleanup_watchdog() {
+    # Never remove a replacement owner's PID, or unlink the flock inode.
+    if [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then
+        rm -f "$PID_FILE" 2>/dev/null
+    fi
+}
+
 protect_app_oom() {
     APP_PID="$(app_pids)"
     if [ -n "$APP_PID" ]; then
@@ -302,6 +375,11 @@ is_frpc_connected() {
 }
 
 ensure_frpc_running() {
+    if ! read_frp_token; then
+        frpc_fail_count=0
+        echo "state=unprovisioned ts=$(date +%s)" > "$FRPC_STATUS_FILE" 2>/dev/null
+        return
+    fi
     if [ ! -x "$FRPC_BIN" ] || [ ! -f "$FRPC_CONFIG" ]; then
         echo "$(date '+%F %T') frpc assets missing bin=$FRPC_BIN config=$FRPC_CONFIG" >> "$LOG_FILE"
         return
@@ -313,7 +391,7 @@ ensure_frpc_running() {
         echo "$(date '+%F %T') frpc config verify failed #$frpc_fail_count: $VERIFY_OUTPUT" >> "$LOG_FILE"
         if grep -q 'unknown field "auth"\|unknown field "token"\|cannot unmarshal' "$FRPC_VERIFY_LOG" 2>/dev/null; then
             echo "$(date '+%F %T') frpc config auto-repair to bundled defaults" >> "$LOG_FILE"
-            write_default_frpc_config
+            write_default_frpc_config || return
             if "$FRPC_BIN" verify -c "$FRPC_CONFIG" >"$FRPC_VERIFY_LOG" 2>&1; then
                 frpc_fail_count=0
             else
@@ -355,7 +433,7 @@ ensure_frpc_running() {
     mkdir -p /data/local/tmp/frp 2>/dev/null
     chmod 755 "$FRPC_BIN" 2>/dev/null
     : > "$FRPC_LOG"
-    setsid "$FRPC_BIN" -c "$FRPC_CONFIG" >> "$FRPC_LOG" 2>&1 < /dev/null &
+    setsid "$FRPC_BIN" -c "$FRPC_CONFIG" 8>&- >> "$FRPC_LOG" 2>&1 < /dev/null &
     sleep 2
     FRPC_PID="$(pidof frpc 2>/dev/null | awk '{print $1}')"
     is_frpc_connected
@@ -403,10 +481,31 @@ start_backend_direct() {
     sh "$TAKEOVER_SCRIPT" "$BACKEND" >> "$LOG_FILE" 2>&1
 }
 
+current_foreground_package() {
+    dumpsys activity activities 2>/dev/null \
+        | grep -m 1 -E "mResumedActivity|topResumedActivity|ResumedActivity" \
+        | sed -n "s|.* u0 \([^/ ]*\)/.*|\1|p"
+}
+
+is_settings_foreground() {
+    case "$(current_foreground_package)" in
+        com.android.settings|com.android.tv.settings) return 0 ;;
+    esac
+    return 1
+}
+
 restart_app() {
     REASON="$1"
+    if is_settings_foreground; then
+        echo "$(date '+%F %T') restart skipped reason=$REASON; settings foreground" >> "$LOG_FILE"
+        return 0
+    fi
+    if [ "$REASON" = "process_not_running" ] && is_app_running; then
+        echo "$(date '+%F %T') restart skipped reason=$REASON; app recheck is running pids=$(app_pids)" >> "$LOG_FILE"
+        return 0
+    fi
     NOW_TS="$(date +%s)"
-    if [ "$restart_loop_first_ts" -le 0 ] || [ $((NOW_TS - restart_loop_first_ts)) -gt "$RESTART_LOOP_WINDOW_SECONDS" ]; then
+    if [ "$restart_loop_first_ts" -le 0 ] || [ "$NOW_TS" -lt "$restart_loop_first_ts" ] || [ $((NOW_TS - restart_loop_first_ts)) -gt "$RESTART_LOOP_WINDOW_SECONDS" ]; then
         restart_loop_first_ts="$NOW_TS"
         restart_loop_count=1
     else
@@ -422,10 +521,12 @@ restart_app() {
     echo "$(date '+%F %T') auto-restart reason=$REASON" >> "$RESTART_LOG"
     if [ -f "$RESTART_SCRIPT" ]; then
         chmod 755 "$RESTART_SCRIPT" 2>/dev/null
-        sh "$RESTART_SCRIPT" "watchdog:$REASON" >> "$LOG_FILE" 2>&1
+        sh "$RESTART_SCRIPT" "watchdog:$REASON" 8>&- >> "$LOG_FILE" 2>&1
     else
-        am force-stop "$PACKAGE_NAME" >> "$LOG_FILE" 2>&1
-        sleep 2
+        if [ "$REASON" != "process_not_running" ]; then
+            am force-stop "$PACKAGE_NAME" >> "$LOG_FILE" 2>&1
+            sleep 2
+        fi
         start_backend_direct
     fi
     WATCHDOG_START_TS="$(date +%s)"
@@ -446,7 +547,11 @@ heartbeat_age_seconds() {
             ;;
         *)
             NOW="$(date +%s)"
-            echo $((NOW - TS))
+            if [ "${#TS}" -gt 10 ] || [ "$TS" -gt "$NOW" ]; then
+                echo 999999
+            else
+                echo $((NOW - TS))
+            fi
             ;;
     esac
 }
@@ -466,7 +571,54 @@ is_http_alive() {
 }
 
 is_process_alive() {
-    [ -n "$1" ] && [ -d "/proc/$1" ] && grep -q "hsvj_watchdog.sh" "/proc/$1/cmdline" 2>/dev/null
+    case "$1" in ''|*[!0-9]*) return 1;; esac
+    [ "$1" -gt 1 ] && [ -d "/proc/$1" ] || return 1
+    # Limit both time and bytes; never feed tr directly from a disappearing proc file.
+    timeout 1 sh -c 'head -c 4096 "/proc/$1/cmdline" 2>/dev/null | tr "\000" "\n" | grep -Fxq /data/local/tmp/hsvj_watchdog.sh' sh "$1"
+}
+
+watchdog_start_time() {
+    sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d ' ' -f 20
+}
+
+install_and_start_watchdog() {
+    # Serialize installers; the daemon must not inherit this lock.
+    exec 9>/data/local/tmp/hsvj_watchdog_install.flock || return 1
+    # Android mksh closes extra exec FDs unless explicitly inherited here.
+    flock -n 9 9>&9 || return 1
+    OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"
+    if is_process_alive "$OLD_PID"; then
+        OLD_START="$(watchdog_start_time "$OLD_PID")"
+        [ -n "$OLD_START" ] || return 1
+        kill "$OLD_PID" 2>/dev/null
+        ATTEMPT=0
+        while is_process_alive "$OLD_PID" && [ "$ATTEMPT" -lt 3 ]; do
+            sleep 1
+            ATTEMPT=$((ATTEMPT + 1))
+        done
+        if is_process_alive "$OLD_PID" && [ "$(watchdog_start_time "$OLD_PID")" = "$OLD_START" ]; then
+            kill -9 "$OLD_PID" 2>/dev/null
+        fi
+    fi
+    # Short-lived children of the old shell can retain its flock until they exit.
+    exec 8>"$LOCK_FILE" || return 1
+    timeout 7 flock 8 8>&8 || return 1
+    exec 8>&-
+    # Atomic replacement also avoids modifying a script a running shell is reading.
+    cp "$0" /data/local/tmp/hsvj_watchdog.sh.new || return 1
+    chmod 755 /data/local/tmp/hsvj_watchdog.sh.new || return 1
+    mv -f /data/local/tmp/hsvj_watchdog.sh.new /data/local/tmp/hsvj_watchdog.sh || return 1
+    setsid sh /data/local/tmp/hsvj_watchdog.sh app 9>&- >> /data/local/tmp/hsvj_watchdog_launcher.log 2>&1 < /dev/null &
+    ATTEMPT=0
+    while [ "$ATTEMPT" -lt 5 ]; do
+        sleep 1
+        NEW_PID="$(cat "$PID_FILE" 2>/dev/null)"
+        if [ "$NEW_PID" != "$OLD_PID" ] && is_process_alive "$NEW_PID"; then
+            return 0
+        fi
+        ATTEMPT=$((ATTEMPT + 1))
+    done
+    return 1
 }
 
 is_restart_suppressed() {
@@ -479,6 +631,10 @@ is_restart_suppressed() {
             ;;
     esac
     NOW="$(date +%s)"
+    if [ "${#TS}" -gt 10 ] || [ "$TS" -gt "$NOW" ]; then
+        rm -f "$SUPPRESS_RESTART_FILE" 2>/dev/null
+        return 1
+    fi
     AGE=$((NOW - TS))
     if [ "$AGE" -lt "$SUPPRESS_RESTART_TIMEOUT_SECONDS" ]; then
         echo "$(date '+%F %T') planned restart suppression active age=${AGE}s" >> "$LOG_FILE"
@@ -499,6 +655,10 @@ is_package_update_grace_active() {
             ;;
     esac
     NOW="$(date +%s)"
+    if [ "${#TS}" -gt 10 ] || [ "$TS" -gt "$NOW" ]; then
+        rm -f "$PACKAGE_UPDATE_GRACE_FILE" 2>/dev/null
+        return 1
+    fi
     AGE=$((NOW - TS))
     if [ "$AGE" -lt "$PACKAGE_UPDATE_GRACE_SECONDS" ]; then
         echo "$(date '+%F %T') package update grace active age=${AGE}s" >> "$LOG_FILE"
@@ -509,30 +669,28 @@ is_package_update_grace_active() {
     return 1
 }
 
+if [ "${1:-}" = "--install" ]; then
+    install_and_start_watchdog
+    exit $?
+fi
+
+# Kernel-owned lock handles simultaneous startup and is released on SIGKILL.
+# A persistent empty file is intentional; deleting it would permit two owners.
+exec 8>"$LOCK_FILE" || exit 1
+flock -n 8 8>&8 || exit 0
+
 log_self_cgroup "before-cgroup-move"
 move_self_to_root_cgroup
 log_self_cgroup "after-cgroup-move"
 
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"
-    if is_process_alive "$OLD_PID"; then
-        exit 0
-    fi
-    rm -rf "$LOCK_DIR" 2>/dev/null
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        exit 0
-    fi
-fi
-
-if [ -f "$PID_FILE" ]; then
-    OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"
-    if is_process_alive "$OLD_PID"; then
-        exit 0
-    fi
-fi
+# Compatibility with an older daemon during an APK upgrade.
+OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"
+if is_process_alive "$OLD_PID"; then exit 0; fi
+rmdir /data/local/tmp/hsvj_watchdog.lock 2>/dev/null
 
 echo "$$" > "$PID_FILE"
-trap 'rm -f "$PID_FILE" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+trap cleanup_watchdog EXIT
+trap 'exit 0' INT TERM
 START_SOURCE="${1:-app}"
 WATCHDOG_START_TS="$(date +%s)"
 log_self_cgroup "started source=$START_SOURCE"
@@ -576,7 +734,22 @@ while true; do
     fi
 
     BACKEND_NOW="$(backend_effective)"
+    if is_settings_foreground; then
+        app_restart_fail_count=0
+        heartbeat_fail_count=0
+        http_fail_count=0
+        device_lost_count=0
+        continue
+    fi
     if [ "$BACKEND_NOW" = "drm-kms" ]; then
+        check_hdmi_hotplug
+        HPD_RESULT=$?
+        if [ "$HPD_RESULT" -eq 2 ]; then
+            heartbeat_fail_count=0
+            http_fail_count=0
+            device_lost_count=0
+            continue
+        fi
         check_drm_health
         DRM_HEALTH_RESULT=$?
         if [ "$DRM_HEALTH_RESULT" -eq 2 ]; then
@@ -587,13 +760,21 @@ while true; do
             continue
         fi
         if [ "$DRM_HEALTH_RESULT" -ne 0 ]; then
-            echo "$(date '+%F %T') drm unhealthy: $DRM_HEALTH_DETAIL; automatic restart disabled" >> "$LOG_FILE"
-            # Do not repeatedly tear down SurfaceFlinger when DRM/KMS is failed.
-            # Recovery must be an explicit backend change or operator action.
+            echo "$(date '+%F %T') drm unhealthy: $DRM_HEALTH_DETAIL; restarting DRM backend" >> "$LOG_FILE"
+            restart_app "drm_unhealthy"
             continue
         fi
     else
         if ! is_app_running; then
+            sleep 2
+            if is_app_running; then
+                echo "$(date '+%F %T') surface app running after recheck; skip restart" >> "$LOG_FILE"
+                app_restart_fail_count=0
+                heartbeat_fail_count=0
+                http_fail_count=0
+                device_lost_count=0
+                continue
+            fi
             echo "$(date '+%F %T') surface app not running, delegate restart to unified script, fail_count=$app_restart_fail_count" >> "$LOG_FILE"
             device_lost_count=0
             heartbeat_fail_count=0
@@ -635,10 +816,10 @@ while true; do
         last_frpc_check_ts="$NOW_TS"
     fi
 
+    UPTIME_SECONDS=$((NOW_TS - WATCHDOG_START_TS))
     if [ "$BACKEND_NOW" = "drm-kms" ]; then
         heartbeat_fail_count=0
     else
-        UPTIME_SECONDS=$((NOW_TS - WATCHDOG_START_TS))
         HEARTBEAT_AGE="$(heartbeat_age_seconds)"
         if [ "$UPTIME_SECONDS" -lt "$STARTUP_GRACE_SECONDS" ]; then
             heartbeat_fail_count=0
@@ -660,6 +841,8 @@ while true; do
 
     if [ "$BACKEND_NOW" = "drm-kms" ] &&
        [ $((NOW_TS - drm_process_seen_ts)) -lt "$DRM_HTTP_GRACE_SECONDS" ]; then
+        http_fail_count=0
+    elif [ "$UPTIME_SECONDS" -lt "$HTTP_STARTUP_GRACE_SECONDS" ]; then
         http_fail_count=0
     elif is_http_alive; then
         http_fail_count=0

@@ -140,7 +140,7 @@ private:
   // 设备检测
   static bool detectRKChip();
   // 硬件配置
-    bool createHardwareDeviceContext(const AVCodec* codec, AVCodecContext* codecCtx);
+  bool createHardwareDeviceContext(const AVCodec* codec);
 
   // 解码器映射表：codecId -> 解码器列表（按优先级排序）
     std::map<AVCodecID, std::vector<DecoderInfo>> decoderMap_;

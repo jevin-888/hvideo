@@ -102,7 +102,7 @@ static av_always_inline uint32_t AV_RB32(const void *p)
 #define AV_WB32 AV_WB32
 static av_always_inline void AV_WB32(void *p, uint32_t v)
 {
-    __asm__ ("st.w %0, %1" : "=m"(*(uint32_t*)? p) : "r"(v));
+    __asm__ ("st.w %0, %1" : "=m"(*(uint32_t*)p) : "r"(v));
 }
 
 /* These two would be defined by generic code, but we need them sooner. */

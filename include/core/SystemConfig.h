@@ -17,6 +17,7 @@
 #include "utils/Logger.h"
 #include <json/json.h>
 #include <cmath>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
@@ -63,6 +64,10 @@ struct SliceConfig {
   int invert;             // 图像反转 (0=无, 1=水平, 2=垂直, 3=水平+垂直)
   float gaussianBlur;     // 高斯模糊强度 (0-10)
   int fitMode;            // 视频/采集适配模式 (0=铺满显示, 1=保持视频比例显示)
+  float cropLeft = 0.0f;   // 在图层裁剪结果上追加的独立裁剪比例 (0..1)
+  float cropTop = 0.0f;
+  float cropRight = 0.0f;
+  float cropBottom = 0.0f;
   std::string roamConfig; // 切片漫游配置 JSON 字符串
   std::string captureType; // 采集切片独立输入源；空值表示跟随主图层
   int captureIndex;        // 采集切片独立设备索引
@@ -128,6 +133,12 @@ struct LayerConfigData {
   bool mirrorReadyHintVisible; // MIRROR 图层未连接时是否显示“投屏就绪”提示
   int tvVerticalCropPx;     // TV 模式上下各裁剪像素，裁剪后拉伸铺满
 
+  // 独立内容裁剪（归一化比例，分别从左/上/右/下裁剪）
+  float cropLeft;
+  float cropTop;
+  float cropRight;
+  float cropBottom;
+
   // 文本图层运行时字体路径（不保存到 config.json，不从 config.json 读取）
   // 由 ROOT_PATH + "ttf/" + 文件名 拼出
   std::string text;
@@ -158,8 +169,6 @@ struct LayerConfigData {
   // 二维码图层属性
   std::string qrContent;    // 二维码内容
   int qrSize;               // 二维码尺寸
-  std::string qrLogoPath;  // 运行时路径（不保存到 config.json）
-  int qrLogoSize;          // Logo 尺寸（百分比，0-30）
   std::string qrText;       // 文字内容
   std::string qrTextColor; // 文字颜色（RGBA格式："R G B A"）
   std::string qrBgColor;   // 背景颜色（RGBA格式："R G B A"）
@@ -174,9 +183,10 @@ struct LayerConfigData {
 
   // 采集图层属性（Layer 10/11）
   std::string captureType;   // "AUTO"、"HDMI"、"USB" 或 "MIPI"；空值按 AUTO 处理
-  int captureRotation;       // 输入采集画面旋转角度（-1=自动，0/90/180/270），默认 0
-  int captureWidth;          // 运行时采集请求宽度（不保存到 config.json）
-  int captureHeight;         // 运行时采集请求高度（不保存到 config.json）
+  int captureRotation;       // 输入采集画面旋转角度（0/90/180/270），默认 0
+  int captureWidth;          // 自定义采集宽度
+  int captureHeight;         // 自定义采集高度
+  bool captureResolutionLocked;
   int captureIndex;          // 采集设备索引（MIPI 索引或 HDMI 索引）
     LayerConfigData()
       : layerId(0), visible(true), position(0, 0), size(1920, 1080),
@@ -190,16 +200,18 @@ struct LayerConfigData {
         audioEffectIds(), audioEffectStackPacked(0), audioEffectBlendMode("sequential"),
         audioEffectColor(0), audioEffectWidth(2.5f), fitMode(0),
         mirrorReadyHintVisible(true), tvVerticalCropPx(0),
+        cropLeft(0.0f), cropTop(0.0f), cropRight(0.0f), cropBottom(0.0f),
         fontSize(48.0f),
         textColor("1.0 1.0 1.0 1.0"), bgColor("0.0 0.0 0.0 0.0"),
         alignment(1), // 居中
         bindLayerId(1), lyricDisplayMode(0), scrollSpeed(0.0f), outlineWidth(2.0f),
         outlineColor("0 0 0 1.0"), shadow(0.0f), showCount(3),
         displayAlign(1), l41DisplayDuration(5.0f), startHintTime(10.0f),
-        endHintTime(10.0f), l41ShowList(true), qrSize(256), qrLogoSize(0),
-        qrTextColor("1.0 1.0 1.0 1.0"), qrBgColor("1.0 1.0 1.0 1.0"),
+        endHintTime(10.0f), l41ShowList(true), qrSize(256),
+        qrTextColor("1.0 1.0 1.0 1.0"), qrBgColor("0 0.2 1 1"),
         qrFgColor("0.0 0.0 0.0 1.0"),         qrErrorCorrection(1), captureType(""),
-        captureRotation(0), captureWidth(0), captureHeight(0), captureIndex(0) {
+        captureRotation(0), captureWidth(0), captureHeight(0),
+        captureResolutionLocked(false), captureIndex(0) {
   } // 默认中等容错级别
 };
 
@@ -210,6 +222,7 @@ struct LayerConfigData {
  */
 class SystemConfig {
 public:
+
   // 每个区域的颜色配置
   struct RegionParams {
     float luminance = 1.0f;
@@ -414,12 +427,25 @@ public:
    * @return 是否启用
    */
   bool isLyricEnabled() const { return lyricEnabled_; }
+  bool isLyricHeaderVisible() const { return lyricHeaderVisible_.load(); }
+  bool isLyricBackgroundVisible() const { return lyricBackgroundVisible_.load(); }
+  bool isLyricPinyinEnabled() const { return lyricPinyinEnabled_.load(); }
+  double getLyricTitleFontSize() const { return lyricTitleFontSize_.load(); }
+  double getLyricTitleOutlineWidth() const { return lyricTitleOutlineWidth_.load(); }
+  double getLyricTextFontSize() const { return lyricTextFontSize_.load(); }
+  double getLyricTextOutlineWidth() const { return lyricTextOutlineWidth_.load(); }
+  double getLyricTextSpacing() const { return lyricTextSpacing_.load(); }
+  const std::string& getLyricProducerText() const { return lyricProducerText_; }
 
   /**
    * @brief 设置歌词功能开关（全局）
    * @param enabled 是否启用
    */
   void setLyricEnabled(bool enabled) { lyricEnabled_ = enabled; }
+
+  /** Bluetooth lyric font relative to FONT_DIR; empty means automatic. */
+  const std::string& getLyricFont() const { return lyricFont_; }
+  void setLyricFont(const std::string& font);
 
   /**
    * @brief 获取 DMX 波特率
@@ -458,6 +484,7 @@ public:
   /** 便捷方法：检查是否启用了网络VOD */
   bool isNetworkVodEnabled() const { return vodMode_ == 2; }
 
+
   /** 授权服务器URL配置 */
   std::string getLicenseServerUrl() const { return licenseServerUrl_; }
   void setLicenseServerUrl(const std::string& url) { licenseServerUrl_ = url; }
@@ -466,11 +493,15 @@ public:
   std::string getOnlineVodHost() const { return onlineVodHost_; }
   int getOnlineVodPort() const { return 9898; }
   std::string getOnlineVodRoomId() const { return onlineVodRoomId_; }
-  void setOnlineVodHost(const std::string& host) { onlineVodHost_ = host; }
+  void setOnlineVodHost(const std::string& host) {
+    onlineVodHost_ = host;
+  }
   void setOnlineVodPort(int port) { (void)port; }
   void setOnlineVodRoomId(const std::string& roomId) { onlineVodRoomId_ = roomId; }
 
   int getVodLayerId() const { return 1; }
+
+  int getVodVolumeGainDb() const { return vodVolumeGainDb_.load(std::memory_order_relaxed); }
 
   bool isLocalSongFileScanEnabled() const { return localSongFileScanEnabled_; }
   void setLocalSongFileScanEnabled(bool enabled) { localSongFileScanEnabled_ = enabled; }
@@ -479,12 +510,37 @@ public:
   bool isAppUpdateEnabled() const { return appUpdateEnabled_; }
   void setAppUpdateEnabled(bool enabled) { appUpdateEnabled_ = enabled; }
 
+  /** 投屏控制配置：统一持久化到 /huoshan/config/config.json。 */
+  bool hasMirrorControlConfig() const { return mirrorControlConfigured_; }
+  std::string getMirrorAutoStartMode() const { return mirrorAutoStartMode_; }
+  bool isUsbAppSceneEnabled() const { return usbAppSceneEnabled_; }
+  std::string getUsbAppSceneName() const { return usbAppSceneName_; }
+  void setMirrorControlConfig(bool configured, const std::string& autoStartMode,
+                              bool appSceneEnabled, const std::string& sceneName) {
+    mirrorControlConfigured_ = configured;
+    mirrorAutoStartMode_ =
+        (autoStartMode == "usb" || autoStartMode == "android" ||
+         autoStartMode == "apple")
+            ? autoStartMode
+            : "none";
+    usbAppSceneEnabled_ = appSceneEnabled;
+    usbAppSceneName_ = sceneName;
+  }
+
   /** 最终合成帧率策略：auto=按内容自适应，fixed30=固定 30fps */
   std::string getRenderFrameRateMode() const { return renderFrameRateMode_; }
   void setRenderFrameRateMode(const std::string& mode) {
     renderFrameRateMode_ = (mode == "fixed30") ? "fixed30" : "auto";
   }
   bool isRenderFrameRateFixed30() const { return renderFrameRateMode_ == "fixed30"; }
+
+  /** 播放操作提示总开关；旧配置默认开启，保存后立即生效。 */
+  bool isPlaybackOperationHintEnabled() const { return playbackOperationHintEnabled_.load(); }
+  void setPlaybackOperationHintEnabled(bool enabled) { playbackOperationHintEnabled_.store(enabled); }
+
+  /** 启动连接提示总开关（IP、热点和调试二维码）；默认开启，保存后立即生效。 */
+  bool isStartupIpHintEnabled() const { return startupIpHintEnabled_.load(); }
+  void setStartupIpHintEnabled(bool enabled) { startupIpHintEnabled_.store(enabled); }
 
   /** Engine Surface 渲染质量：smooth=1920x1080, normal=2560x1440, high=2880x1620, ultra=3840x2160 */
   std::string getRenderQuality() const { return renderQuality_; }
@@ -504,8 +560,39 @@ public:
   void setNetworkGateway(const std::string& gateway) { networkGateway_ = gateway; }
   std::string getNetworkDns() const { return networkDns_; }
   void setNetworkDns(const std::string& dns) { networkDns_ = dns; }
-  bool isDebugHotspotEnabled() const { return debugHotspotEnabled_; }
-  void setDebugHotspotEnabled(bool enabled) { debugHotspotEnabled_ = enabled; }
+  const std::string& getStartupWirelessMode() const { return startupWirelessMode_; }
+  void setStartupWirelessMode(const std::string& mode) {
+    startupWirelessMode_ = mode == "wifi" ? "wifi" : "hotspot";
+  }
+
+  /** 启动融合调试二维码子开关；同时受启动 IP 提示总开关控制，默认开启。 */
+  bool isFusionDebugEnabled() const { return fusionDebugEnabled_; }
+  void setFusionDebugEnabled(bool enabled) { fusionDebugEnabled_ = enabled; }
+
+  /** 多设备同步组：组播命令固定使用 UDP 4322。 */
+  bool isSyncGroupEnabled() const { return syncGroupEnabled_; }
+  const std::string &getSyncGroupId() const { return syncGroupId_; }
+  const std::string &getSyncGroupRole() const { return syncGroupRole_; }
+  const std::string &getSyncLeaderIp() const { return syncLeaderIp_; }
+  const std::string &getSyncLeaderDeviceId() const { return syncLeaderDeviceId_; }
+  const std::string &getSyncMulticastAddress() const { return syncMulticastAddress_; }
+  const std::string &getSyncInterfaceAddress() const { return syncInterfaceAddress_; }
+  int getSyncTtl() const { return syncTtl_; }
+  void setSyncGroupConfig(bool enabled, const std::string &groupId,
+                          const std::string &role,
+                          const std::string &leaderIp,
+                          const std::string &leaderDeviceId,
+                          const std::string &multicastAddress,
+                          const std::string &interfaceAddress, int ttl);
+
+  /** USB OTG port mode: peripheral for flashing, host for mouse/USB devices. */
+  bool hasUsbOtgModeConfig() const { return usbOtgModeConfigured_; }
+  std::string getUsbOtgMode() const { return usbOtgMode_; }
+  void setUsbOtgMode(const std::string& mode) {
+    usbOtgMode_ = mode == "otg" ? "otg" :
+                  (mode == "host" ? "host" : "peripheral");
+    usbOtgModeConfigured_ = true;
+  }
 
   bool isPowerScheduleEnabled() const { return powerScheduleEnabled_; }
   void setPowerScheduleEnabled(bool enabled) { powerScheduleEnabled_ = enabled; }
@@ -659,23 +746,51 @@ private:
   float systemVolume_;           // 系统音量（0.0-1.0）
   int audioOutputLayerId_;       // 多图层同时播放时输出音频的图层 ID，0=自动按优先级
   bool lyricEnabled_;            // 歌词功能全局开关（路径已移至 PathConfig.h）
+  std::atomic<bool> lyricHeaderVisible_{false}; // HTTP 保存、渲染线程读取，旧配置默认隐藏
+  std::atomic<bool> lyricBackgroundVisible_{true}; // 歌词黑色背景开关，默认显示
+  std::atomic<bool> lyricPinyinEnabled_{false}; // HTTP 保存、渲染线程读取，默认原文
+  std::atomic<double> lyricTitleFontSize_{150.0};
+  std::atomic<double> lyricTitleOutlineWidth_{8.0};
+  std::atomic<double> lyricTextFontSize_{140.0};
+  std::atomic<double> lyricTextOutlineWidth_{10.0};
+  std::atomic<double> lyricTextSpacing_{-10.0};
+  std::string lyricProducerText_; // Optional replacement for ASS 出品 text; empty keeps ASS text.
+  std::string lyricFont_;          // Relative to FONT_DIR; empty means automatic.
   int dmxBaudRate_;              // DMX 波特率
   int dmxStartAddress_ = 1;      // DMX 起始地址
   bool audioReactiveEnabled_ = false; // 音频联动总开关（前端"启用联动"复选框）
   bool enableVod_ = false;         // enableVod：兼容旧配置/API；实际模式由 vodMode_ 决定
   int vodMode_ = 0;                // vodMode：VOD模式 (0=关闭, 1=单机LocalVod, 2=在线VOD)
   std::string licenseServerUrl_; // licenseServerUrl：授权服务器URL
-  std::string onlineVodHost_;          // OnlineVodHost：OnlineVod 点播服务器 host/IP（不含协议）
+  std::string onlineVodHost_;          // 仅来自 Web 配置的 OnlineVod 点播服务器 host/IP
   std::string onlineVodRoomId_ = "current"; // OnlineVodRoomId：房间ID（默认 current）
+  std::atomic<int> vodVolumeGainDb_{0}; // VOD PCM gain: 0 (off), +1..+10 dB.
   bool localSongFileScanEnabled_ = false; // localSongFileScanEnabled：启动时扫描歌曲目录并对照 songNo 更新路径
   bool appUpdateEnabled_ = true;          // appUpdateEnabled：App 自动更新检查总开关，默认开启
+  bool mirrorControlConfigured_ = false;
+  std::string mirrorAutoStartMode_ = "none";
+  bool usbAppSceneEnabled_ = false;
+  std::string usbAppSceneName_;
   std::string renderFrameRateMode_ = "auto"; // renderFrameRateMode：最终合成帧率策略 auto/fixed30
+  std::atomic<bool> playbackOperationHintEnabled_{true};
+  std::atomic<bool> startupIpHintEnabled_{true};
   std::string renderQuality_ = "normal";      // renderQuality：Engine Surface 渲染质量 smooth/normal/high/ultra
   std::string networkIpMode_ = "dynamic";
   std::string networkStaticIp_;
   std::string networkGateway_;
   std::string networkDns_;
-  bool debugHotspotEnabled_ = false;
+  std::string startupWirelessMode_ = "hotspot";
+  bool fusionDebugEnabled_ = true;
+  bool syncGroupEnabled_ = false;
+  std::string syncGroupId_ = "default";
+  std::string syncGroupRole_ = "follower";
+  std::string syncLeaderIp_;
+  std::string syncLeaderDeviceId_;
+  std::string syncMulticastAddress_ = "239.255.42.10";
+  std::string syncInterfaceAddress_;
+  int syncTtl_ = 1;
+  bool usbOtgModeConfigured_ = false;
+  std::string usbOtgMode_ = "host";
   bool powerScheduleEnabled_ = false;
   bool powerOnScheduleEnabled_ = false;
   std::string powerOnDate_;

@@ -7,35 +7,32 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-echo "[HSVJ] Setting up port forwarding 80 -> 8080..."
+echo "[HSVJ] Ensuring port forwarding 80 -> 8080..."
+
+IPTABLES="$(command -v iptables 2>/dev/null)"
+if [ -z "$IPTABLES" ]; then
+    echo "[HSVJ] ERROR: iptables is unavailable"
+    exit 1
+fi
 
 clear_hsvj_port_forward() {
     while true; do
-        line="$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | awk '/tcp dpt:80 redir ports 8080/ {print $1; exit}')"
+        line="$($IPTABLES -t nat -L PREROUTING --line-numbers -n 2>/dev/null | awk '/tcp dpt:80 redir ports 8080/ {print $1; exit}')"
         [ -n "$line" ] || break
-        iptables -t nat -D PREROUTING "$line" 2>/dev/null || break
+        $IPTABLES -t nat -D PREROUTING "$line" 2>/dev/null || exit 1
     done
 }
 
 clear_hsvj_port_forward
 
-configured=0
-for ip in $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do
-    [ -n "$ip" ] || continue
-    iptables -t nat -I PREROUTING 1 -d "$ip"/32 -p tcp --dport 80 -j REDIRECT --to-port 8080
-    echo "[HSVJ] $ip:80 -> 8080 is now active"
-    configured=$((configured + 1))
-done
+$IPTABLES -t nat -I PREROUTING 1 \
+    -p tcp --dport 80 -j REDIRECT --to-ports 8080 || exit 1
 
-if [ "$configured" -le 0 ]; then
-    echo "[HSVJ] ERROR: no global IPv4 address, skip 80 -> 8080"
-    exit 1
+if $IPTABLES -t nat -C PREROUTING \
+    -p tcp --dport 80 -j REDIRECT --to-ports 8080 2>/dev/null; then
+    echo "[HSVJ] Port forwarding 0.0.0.0:80 -> 8080 is active"
+    exit 0
 fi
 
-# 验证
-if iptables -t nat -L PREROUTING -n | grep -q "tcp dpt:80 redir ports 8080"; then
-    echo "[HSVJ] Port forwarding configured successfully"
-else
-    echo "[HSVJ] ERROR: Port forwarding failed"
-    exit 1
-fi
+echo "[HSVJ] ERROR: forwarding rule verification failed"
+exit 1

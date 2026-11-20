@@ -1,11 +1,19 @@
 import { clamp } from './grid.js';
 
+const MIN_BLEND_GAMMA = 0.1;
+const MIN_BLEND_SLOPE = 0.01;
+
+function finiteNumber(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+}
+
 export function getBlendPlotRect(canvas) {
     return {
-        x: 24,
-        y: 20,
-        width: Math.max(80, canvas.width - 48),
-        height: Math.max(80, canvas.height - 40)
+        x: 42,
+        y: 22,
+        width: Math.max(1, finiteNumber(canvas?.width, 0) - 58),
+        height: Math.max(1, finiteNumber(canvas?.height, 0) - 62)
     };
 }
 
@@ -17,8 +25,8 @@ export function blendPointToCanvas(point, rect) {
 }
 
 export function getBlendCurveParams(sideState = {}) {
-    const rawStart = clamp(sideState.stripStart ?? 0, 0, 255);
-    const rawEnd = clamp(sideState.stripEnd ?? 255, 0, 255);
+    const rawStart = Math.round(clamp(finiteNumber(sideState.stripStart, 0), 0, 255));
+    const rawEnd = Math.round(clamp(finiteNumber(sideState.stripEnd, 255), 0, 255));
     const stripStart = Math.min(rawStart, rawEnd);
     const stripEnd = Math.max(rawStart, rawEnd);
     return {
@@ -26,14 +34,14 @@ export function getBlendCurveParams(sideState = {}) {
         stripEnd,
         stripStartRatio: stripStart / 255,
         stripEndRatio: stripEnd / 255,
-        anchor: clamp(sideState.anchor ?? 0.5, 0, 1),
-        slope: Math.max(0.01, Number(sideState.slope ?? 1.0)),
-        gamma: Math.max(0.1, Number(sideState.gamma ?? 1.8))
+        anchor: clamp(finiteNumber(sideState.anchor, 0.5), 0, 1),
+        slope: Math.max(MIN_BLEND_SLOPE, finiteNumber(sideState.slope, 1.0)),
+        gamma: Math.max(MIN_BLEND_GAMMA, finiteNumber(sideState.gamma, 1.8))
     };
 }
 
 function gammaBlend(anchor, slope, gamma, x) {
-    // 与渲染路径的 blendTexture gamma 曲线保持一致：
+    // 与 region.frag 的实时融合 gamma 曲线保持一致：
     // 两个分支都把 gamma 指数作用在整个 x1 上，保证 anchor≠0.5 时 x=0.5 处连续。
     const clampedX = clamp(x, 0, 1);
     if (clampedX <= 0) return 0;
@@ -44,30 +52,36 @@ function gammaBlend(anchor, slope, gamma, x) {
     return Math.pow(x1, gamma);
 }
 
-function legacyBlendValue(anchor, slope, gamma, x) {
-    const steps = 500;
-    const id = Math.floor(clamp(x, 0, 0.999999) * steps);
-    const x1 = (steps - id - 1) / steps;
-    return 1 - gammaBlend(anchor, slope, gamma, x1);
+function blendCurveValue(anchor, slope, gamma, x) {
+    return 1 - gammaBlend(anchor, slope, gamma, 1 - clamp(x, 0, 1));
 }
 
 export function getBlendCurveAnchorFromDisplayValue(sideState, displayValue) {
     const params = getBlendCurveParams(sideState);
-    const y = clamp(displayValue, 0, 1);
-    if (y <= 0) return 0;
-    if (y >= 1) return 1;
-    const steps = 500;
-    const id = Math.floor(0.5 * steps);
-    const x1 = (steps - id - 1) / steps;
-    const gammaRoot = Math.pow(y, 1 / params.gamma);
-    if (x1 < 0.5) {
-        const factor = Math.pow(clamp(2 * x1, 0, 1), params.slope);
-        if (factor <= 0.000001) return params.anchor;
-        return clamp(gammaRoot / factor, 0, 1);
+    const y = clamp(finiteNumber(displayValue, 0), 0, 1);
+    if (y <= 0) return 1;
+    if (y >= 1) return 0;
+    return clamp(Math.pow(1 - y, 1 / params.gamma), 0, 1);
+}
+
+export function getBlendCurvePatchFromDisplayPoint(sideState, handleId, displayPoint = {}) {
+    const params = getBlendCurveParams(sideState);
+    const x = clamp(finiteNumber(displayPoint.x, 0), 0, 1);
+    if (handleId === 'stripStart') {
+        return {
+            stripStart: Math.round(clamp(x * 255, 0, Math.max(0, params.stripEnd - 1))),
+            stripEnd: params.stripEnd
+        };
     }
-    const factor = Math.pow(clamp(2 * (1 - x1), 0, 1), params.slope);
-    if (factor <= 0.000001) return params.anchor;
-    return clamp(1 - ((1 - gammaRoot) / factor), 0, 1);
+    if (handleId === 'stripEnd') {
+        return {
+            stripStart: params.stripStart,
+            stripEnd: Math.round(clamp(x * 255, Math.min(255, params.stripStart + 1), 255))
+        };
+    }
+    return {
+        anchor: Number(getBlendCurveAnchorFromDisplayValue(sideState, displayPoint.y).toFixed(3))
+    };
 }
 
 export function getBlendCurveAlpha(sideState, x) {
@@ -77,7 +91,7 @@ export function getBlendCurveAlpha(sideState, x) {
     const span = params.stripEndRatio - params.stripStartRatio;
     if (span < 0.000001) return x >= params.stripEndRatio ? 1 : 0;
     const localX = (x - params.stripStartRatio) / span;
-    return legacyBlendValue(params.anchor, params.slope, params.gamma, localX);
+    return blendCurveValue(params.anchor, params.slope, params.gamma, localX);
 }
 
 export function getBlendCurveHandleLayout(canvas, sideState) {
@@ -85,7 +99,7 @@ export function getBlendCurveHandleLayout(canvas, sideState) {
     const params = getBlendCurveParams(sideState);
     const anchorX = params.stripStartRatio + (params.stripEndRatio - params.stripStartRatio) * 0.5;
     const makeHandle = (id, x, label) => {
-        const y = 1 - getBlendCurveAlpha(sideState, x);
+        const y = getBlendCurveAlpha(sideState, x);
         return {
             id,
             label,

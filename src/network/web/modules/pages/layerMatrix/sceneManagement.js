@@ -1,9 +1,10 @@
 // 场景管理模块
-import { apiGet, apiDelete } from '../../core/api.js';
+import { apiGet, apiDelete, getLastApiError } from '../../core/api.js';
 import { sendSceneCommand } from '../../core/commandHelper.js';
-import { addToCommandLog } from '../../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { showPrompt, showSuccess, showError, showConfirm } from '../../components/toast.js';
 import { handleApiOperation } from '../../utils/apiHelpers.js';
+import { isModuleLicensed } from '../../core/moduleLicense.js';
 
 let currentLoadedSceneName = '默认配置';
 
@@ -69,7 +70,7 @@ export async function refreshSceneDropdown(selectId) {
             const normalizedScene = normalizeSceneName(scene);
             if (isDefaultSceneName(normalizedScene)) return;
             const selected = (normalizedScene === currentVal) ? 'selected' : '';
-            html += `<option value="${normalizedScene}" ${selected}>${normalizedScene}</option>`;
+            html += `<option translate="no" value="${normalizedScene}" ${selected}>${normalizedScene}</option>`;
         });
 
         select.innerHTML = html;
@@ -79,6 +80,7 @@ export async function refreshSceneDropdown(selectId) {
 
     // 1. Initial 渲染 (HTML injection)
     renderHTML([]);
+    if (!isModuleLicensed('scene')) return;
 
     try {
         const response = await apiGet('/scenes');
@@ -104,23 +106,22 @@ export async function refreshSceneDropdown(selectId) {
 /**
  * 加载默认模板
  */
-export async function loadDefaultScene(selectedLayer, selectedSlice, updateLayerMatrix) {
+export async function loadDefaultScene(onSceneLoaded) {
     addToCommandLog('场景管理', 'info', '正在加载默认模板...');
 
-    const success = await handleApiOperation(
+    return handleApiOperation(
         sendSceneCommand('load_default'),
         '场景管理',
         '默认模板已加载',
         '加载默认模板失败',
-        async (result) => {
+        async () => {
             currentLoadedSceneName = '默认配置';
             const sceneDropdown = document.getElementById('select-template-dropdown');
             if (sceneDropdown) sceneDropdown.value = '默认配置';
 
-            selectedLayer = null;
-            selectedSlice = null;
-
-            await updateLayerMatrix();
+            if (typeof onSceneLoaded === 'function') {
+                await onSceneLoaded();
+            }
 
             const propertiesPanel = document.querySelector('.properties-panel');
             if (propertiesPanel) {
@@ -152,7 +153,7 @@ export async function saveDefaultScene(layers = []) {
         addToCommandLog('场景管理', 'info', `[保存步骤3] save_current 响应: ${JSON.stringify(result)}`);
 
         if (!result || typeof result !== 'object' || Array.isArray(result)) {
-            const errorMsg = '保存失败：后端未返回保存结果';
+            const errorMsg = `保存失败：${getLastApiError()?.message || '后端未返回保存结果'}`;
             addToCommandLog('场景管理', 'error', `[保存步骤5-失败] ${errorMsg}`);
             showError(errorMsg);
             return false;
@@ -186,7 +187,7 @@ export async function saveDefaultScene(layers = []) {
 /**
  * 显示场景选择器
  */
-export async function showSceneSelector(selectedLayer, selectedSlice, updateLayerMatrix) {
+export async function showSceneSelector(onSceneLoaded) {
     try {
         const response = await apiGet('/scenes');
         let scenes = Array.isArray(response) ? response : [];
@@ -300,7 +301,7 @@ export async function showSceneSelector(selectedLayer, selectedSlice, updateLaye
         dialog.querySelectorAll('.scene-item').forEach(item => {
             item.addEventListener('click', async (e) => {
                 const sceneName = item.dataset.scene;
-                await loadScene(sceneName, selectedLayer, selectedSlice, updateLayerMatrix);
+                await loadScene(sceneName, onSceneLoaded);
                 dialog.remove(); // 关闭 after loading
             });
         });
@@ -337,25 +338,24 @@ export async function showSceneSelector(selectedLayer, selectedSlice, updateLaye
 /**
  * 加载场景
  */
-export async function loadScene(sceneName, selectedLayer, selectedSlice, updateLayerMatrix) {
+export async function loadScene(sceneName, onSceneLoaded) {
     sceneName = normalizeSceneName(sceneName);
     addToCommandLog('场景管理', 'info', `正在加载场景: ${sceneName}...`);
 
-    await handleApiOperation(
+    return handleApiOperation(
         sendSceneCommand('switch_scene', { scene_name: sceneName }),
         '场景管理',
         `已加载场景: ${sceneName}`,
         '加载场景失败',
-        async (result) => {
+        async () => {
             document.querySelector('.scene-dialog')?.remove();
             currentLoadedSceneName = sceneName;
             const sceneDropdown = document.getElementById('select-template-dropdown');
             if (sceneDropdown) sceneDropdown.value = sceneName;
 
-            selectedLayer = null;
-            selectedSlice = null;
-
-            await updateLayerMatrix();
+            if (typeof onSceneLoaded === 'function') {
+                await onSceneLoaded();
+            }
 
             const propertiesPanel = document.querySelector('.properties-panel');
             if (propertiesPanel) {
@@ -388,6 +388,13 @@ export async function deleteScene(sceneName) {
  * 保存当前场景
  */
 export async function saveCurrentScene(layers) {
+    if (!isModuleLicensed('scene')) {
+        const message = '另存场景需要场景模板授权，当前设备未开通此模块';
+        addToCommandLog('场景管理', 'error', message);
+        showError(message);
+        return null;
+    }
+
     const sceneName = await showPrompt('请输入场景名称:', '保存场景', '场景1');
     if (!sceneName) return null;
 
@@ -399,12 +406,20 @@ async function saveSceneByName(sceneName) {
     sceneName = normalizeSceneName(sceneName);
     try {
         addToCommandLog('场景管理', 'info', `正在保存场景: ${sceneName}...`);
-        const saved = await handleApiOperation(
-            sendSceneCommand('save_as', { scene_name: sceneName }),
-            '场景管理',
-            `已保存场景: ${sceneName}`,
-            '保存场景失败'
-        );
+        const result = await sendSceneCommand('save_as', { scene_name: sceneName });
+        const blocked = result && (result.softBlocked === true || result.notice === true || result.state === 'blocked');
+        const saved = !!result && typeof result === 'object' && !Array.isArray(result) && !blocked;
+        if (!saved) {
+            const reason = result?.message || getLastApiError()?.message || '后端未返回保存结果';
+            const message = reason.includes('scene module not licensed')
+                ? '保存场景失败：当前设备未开通场景模板授权'
+                : `保存场景失败：${reason}`;
+            addToCommandLog('场景管理', 'error', message);
+            showError(message);
+            return false;
+        }
+        addToCommandLog('场景管理', 'success', `已保存场景: ${sceneName}`);
+        showSuccess(`已保存场景: ${sceneName}`);
         if (saved) {
             currentLoadedSceneName = sceneName;
             const sceneDropdown = document.getElementById('select-template-dropdown');
@@ -412,7 +427,9 @@ async function saveSceneByName(sceneName) {
         }
         return saved;
     } catch (error) {
-        addToCommandLog('场景管理', 'error', `保存场景失败: ${error.message}`);
+        const message = `保存场景失败：${error.message || '未知错误'}`;
+        addToCommandLog('场景管理', 'error', message);
+        showError(message);
         return false;
     }
 }

@@ -1,4 +1,4 @@
-import { loadMaskState, updateMaskState, saveMask, setMaskGuideVisibility, resizeMaskGridOp, moveMaskOp, seedMaskFromGeometryState } from '../api.js?v=2.95';
+import { loadMaskState, updateMaskState, saveMask, setMaskGuideVisibility, resizeMaskGridOp, moveMaskOp, seedMaskFromGeometryState } from '../api.js?v=2.97';
 import { ensureGlobalMask, getState } from '../actions.js?v=2.95';
 import { hydrateMask } from '../mask/actions.js?v=2.95';
 

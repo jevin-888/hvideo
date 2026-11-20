@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 
 class SceneTemplateManager {
 public:

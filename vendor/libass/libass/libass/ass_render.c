@@ -2813,6 +2813,11 @@ static void add_background(RenderContext *state, EventImages *event_images)
     int top     = event_images->top  - size_y;
     int right   = event_images->left + event_images->width  + size_x;
     int bottom  = event_images->top  + event_images->height + size_y;
+    const char *style_name = state->style->Name;
+    bool lyric_background = style_name &&
+        (state->alignment == 1 || state->alignment == 3) &&
+        (!strcmp(style_name, "Lyric") ||
+         !strcmp(style_name, "\xe6\xad\x8c\xe8\xaf\x8d"));
     left        = FFMINMAX(left,   0, render_priv->width);
     top         = FFMINMAX(top,    0, render_priv->height);
     right       = FFMINMAX(right,  0, render_priv->width);
@@ -2825,9 +2830,13 @@ static void add_background(RenderContext *state, EventImages *event_images)
     if (!nbuffer)
         return;
     memset(nbuffer, 0xFF, w * h);
+    // HSVJ karaoke uses c[3] for the sung outline, so the backdrop must not
+    // reuse its RGB. Use 92% opacity (8% transparency) and honor fades.
+    uint32_t background_color = 20 + (235 * (state->c[3] & 0xFF) + 127) / 255;
     ASS_Image *img = my_draw_bitmap(nbuffer, w, h, w, left, top,
-                                    state->c[3], NULL);
+                                    background_color, NULL);
     if (img) {
+        img->type = lyric_background ? IMAGE_TYPE_LYRIC_BACKGROUND : IMAGE_TYPE_SHADOW;
         img->next = event_images->imgs;
         event_images->imgs = img;
     }

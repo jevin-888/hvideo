@@ -45,7 +45,6 @@ HEADERS = adler32.h                                                     \
           hwcontext_drm.h                                               \
           hwcontext_dxva2.h                                             \
           hwcontext_qsv.h                                               \
-          hwcontext_mediacodec.h                                        \
           hwcontext_opencl.h                                            \
           hwcontext_vaapi.h                                             \
           hwcontext_videotoolbox.h                                      \

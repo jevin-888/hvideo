@@ -2,6 +2,7 @@
 #define HSVJ_CLOUD_LICENSE_CLIENT_H
 
 #include <string>
+#include <cstdint>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -19,10 +20,8 @@ class CloudLicenseClient {
 public:
     struct LicenseState {
         bool success = false;
-        std::string status;
-        int64_t license_expiry = 0;
         int64_t server_time = 0;
-        std::string serial;
+        std::string content;
     };
 
     using Callback = std::function<void(const LicenseState&)>;

@@ -6,7 +6,7 @@
 #include "text/MessageHintRenderer.h"
 #include "text/VulkanTextOverlayBridge.h"
 #include "renderer/VulkanRenderer.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "utils/Logger.h"
 #include "stb_image.h"
 #include "utils/FileUtils.h"
@@ -754,7 +754,7 @@ void MessageHintRenderer::updateTextures(VulkanRenderer* renderer, int width, in
     if (dirty_) dirty_ = false;
 }
 
-void MessageHintRenderer::render(VulkanRenderer* renderer, int x, int y, int width, int height, float alpha, int displayAlign) {
+void MessageHintRenderer::render(VulkanRenderer* renderer, int x, int y, int width, int height, float alpha, int displayAlign, bool isSlice) {
     if (!initialized_ || !renderer) {
         return;
     }
@@ -771,10 +771,15 @@ void MessageHintRenderer::render(VulkanRenderer* renderer, int x, int y, int wid
         texType = currentTextureType_;
     }
     if (opActive) {
-        if (texType != 1) {
+        if (texType != 1 || isSlice) {
             return;
         }
-        renderOperationHint(renderer, x, y, width, height, alpha);
+        // Layer 41 may be a bottom-positioned playlist strip in existing configs.
+        // Operation hints belong to the whole logical canvas, independent of that
+        // strip and its slices. Both direct and region passes set this resolution.
+        renderOperationHint(renderer, 0, 0,
+                            static_cast<int>(renderer->getLogicalWidth()),
+                            static_cast<int>(renderer->getLogicalHeight()), alpha);
         return;
     }
     if (plVisible && plHasItems && texType == 2) {
@@ -802,12 +807,17 @@ void MessageHintRenderer::renderPlaylistHint(VulkanRenderer* renderer, int x, in
 }
 
 void MessageHintRenderer::renderOperationHint(VulkanRenderer* renderer, int x, int y, int width, int height, float alpha) {
-    if (!renderer) return;
+    if (!renderer || width <= 0 || height <= 0) return;
     bool active = false;
-    { std::lock_guard<std::mutex> lock(hintMutex_); active = operationHintActive_; }
+    bool protectedHint = false;
+    {
+        std::lock_guard<std::mutex> lock(hintMutex_);
+        active = operationHintActive_;
+        protectedHint = protectedOperationHint_;
+    }
     if (!active) return;
 
-    // 从多纹理缓存取文字纹理
+    // Fetch the active text texture from the multi-texture cache.
     uint32_t textTexId = 0;
     int textWidth = 0, textHeight = 0;
     auto it = textCache_.find(lastOperationCacheKey_);
@@ -816,8 +826,31 @@ void MessageHintRenderer::renderOperationHint(VulkanRenderer* renderer, int x, i
         textWidth  = it->second.width;
         textHeight = it->second.height;
     }
-    if (textWidth <= 0) textWidth = 200;
-    if (textHeight <= 0) textHeight = 48;
+    const bool hasText = textTexId != 0 && textWidth > 0 && textHeight > 0;
+
+    // Startup and regular operation hints share Layer 41. Scale against the canvas short side
+    // and fit both axes so low-resolution output stays readable without overflowing.
+    const int shortSide = std::min(width, height);
+    const int maxPadding = std::max(0, (shortSide - 1) / 2);
+    const int padding = std::min(std::clamp(shortSide / 12, 8, 40), maxPadding);
+    const int availableWidth = std::max(1, width - padding * 2);
+    const int availableHeight = std::max(1, height - padding * 2);
+    const float baseFontSize = normalizeHintFontSize(fontSize_);
+    const float resolutionScale = std::clamp(
+        static_cast<float>(shortSide) / (24.0f * baseFontSize), 0.35f, 1.0f);
+    const auto scaledSize = [](int value, float scale) {
+        return std::max(1, static_cast<int>(std::lround(static_cast<float>(value) * scale)));
+    };
+    const auto resolveBlockY = [protectedHint, y, height, padding](int blockHeight) {
+        const int centeredY = y + (height - blockHeight) / 2;
+        if (!protectedHint) return centeredY;
+
+        // Protected startup/network hints share the screen with the centered VJENGINE
+        // watermark. Move them into the upper quarter without changing font scaling.
+        const int desiredShift = height / 4;
+        const int maximumShift = std::max(0, centeredY - (y + padding));
+        return centeredY - std::min(desiredShift, maximumShift);
+    };
 
     IconTextureInfo* iconInfo = nullptr;
     switch (lastOperationHintType_) {
@@ -835,38 +868,51 @@ void MessageHintRenderer::renderOperationHint(VulkanRenderer* renderer, int x, i
     }
 
     if (iconInfo && iconInfo->loaded && iconInfo->textureId != 0) {
-        float maxIconWidth = 80.0f;
-        float scale = maxIconWidth / static_cast<float>(std::max(iconInfo->width, 1));
-        int iconW = static_cast<int>(iconInfo->width * scale);
-        int iconH = static_cast<int>(iconInfo->height * scale);
-        const int gap = 8;
-        int blockH = iconH + gap + textHeight;
-        int blockY = y + (height - blockH) / 2;
-        int iconX = x + (width - iconW) / 2;
-        renderer->renderLayer(iconInfo->textureId, iconX, blockY, iconW, iconH, 0.0f, 1.0f, alpha);
-        if (textTexId != 0) {
-            int drawW = textWidth, drawH = textHeight;
-            if (drawW > width) {
-                float s = static_cast<float>(width) / drawW;
-                drawW = width; drawH = static_cast<int>(drawH * s);
-            }
-            int textX = x + (width - drawW) / 2;
-            int textY = blockY + iconH + gap;
-            renderer->renderLayer(textTexId, textX, textY, drawW, drawH, 0.0f, 1.0f, alpha);
+        const float iconScale = 80.0f / static_cast<float>(std::max(iconInfo->width, 1));
+        const int baseIconW = std::max(1, static_cast<int>(std::lround(iconInfo->width * iconScale)));
+        const int baseIconH = std::max(1, static_cast<int>(std::lround(iconInfo->height * iconScale)));
+        const int baseGap = hasText ? 8 : 0;
+        const int baseBlockW = std::max(baseIconW, hasText ? textWidth : 0);
+        const int baseBlockH = baseIconH + baseGap + (hasText ? textHeight : 0);
+        const float fitScale = std::min({
+            resolutionScale,
+            static_cast<float>(availableWidth) / std::max(baseBlockW, 1),
+            static_cast<float>(availableHeight) / std::max(baseBlockH, 1),
+            1.0f});
+        const int iconW = scaledSize(baseIconW, fitScale);
+        const int iconH = scaledSize(baseIconH, fitScale);
+        const int gap = hasText ? scaledSize(baseGap, fitScale) : 0;
+        const int drawW = hasText ? scaledSize(textWidth, fitScale) : 0;
+        const int drawH = hasText ? scaledSize(textHeight, fitScale) : 0;
+        const int blockW = std::max(iconW, drawW);
+        const int blockH = iconH + gap + drawH;
+        const int blockX = x + (width - blockW) / 2;
+        const int blockY = resolveBlockY(blockH);
+        const int iconX = blockX + (blockW - iconW) / 2;
+        renderer->renderLayer(iconInfo->textureId, iconX, blockY, iconW, iconH,
+                              0.0f, 1.0f, alpha);
+        if (hasText) {
+            const int textX = blockX + (blockW - drawW) / 2;
+            const int textY = blockY + iconH + gap;
+            renderer->renderLayer(textTexId, textX, textY, drawW, drawH,
+                                  0.0f, 1.0f, alpha);
         }
         return;
     }
 
-    // 无图标：只显示文字，垂直居中
-    if (textTexId != 0) {
-        int drawW = textWidth, drawH = textHeight;
-        if (drawW > width) {
-            float s = static_cast<float>(width) / drawW;
-            drawW = width; drawH = static_cast<int>(drawH * s);
-        }
-        int textX = x + (width - drawW) / 2;
-        int textY = y + (height - drawH) / 2;
-        renderer->renderLayer(textTexId, textX, textY, drawW, drawH, 0.0f, 1.0f, alpha);
+    // Text-only hints use the same resolution and two-axis fitting policy.
+    if (hasText) {
+        const float fitScale = std::min({
+            resolutionScale,
+            static_cast<float>(availableWidth) / textWidth,
+            static_cast<float>(availableHeight) / textHeight,
+            1.0f});
+        const int drawW = scaledSize(textWidth, fitScale);
+        const int drawH = scaledSize(textHeight, fitScale);
+        const int textX = x + (width - drawW) / 2;
+        const int textY = resolveBlockY(drawH);
+        renderer->renderLayer(textTexId, textX, textY, drawW, drawH,
+                              0.0f, 1.0f, alpha);
     }
 }
 
@@ -918,12 +964,30 @@ void MessageHintRenderer::setPlaylistHintVisible(bool visible) {
     }
 }
 
+void MessageHintRenderer::setPlaybackOperationHintEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(hintMutex_);
+    playbackOperationHintEnabled_ = enabled;
+    if (!enabled && operationHintActive_ && !protectedOperationHint_ &&
+        currentOperationHint_.type >= HintType::PLAY &&
+        currentOperationHint_.type <= HintType::BACKING_TRACK) {
+        operationHintActive_ = false;
+        if (currentTextureType_ == 1) currentTextureType_ = 0;
+        dirty_ = true;
+    }
+}
+
 void MessageHintRenderer::showOperationHint(HintType type, const std::string& customText) {
     std::lock_guard<std::mutex> lock(hintMutex_);
+    if (!playbackOperationHintEnabled_ && type >= HintType::PLAY &&
+        type <= HintType::BACKING_TRACK) return;
+
     if (protectedOperationHint_) {
-        LOG_DEBUG("MessageHintRenderer: protected operation hint active, ignore type=%d text='%s'",
+        if (!protectedHintInterruptible_) return;
+        // User controls dismiss the ordinary startup hint. Mandatory license
+        // warnings keep their existing protection.
+        protectedOperationHint_ = false;
+        LOG_DEBUG("MessageHintRenderer: regular operation hint overrides protected hint type=%d text='%s'",
                   static_cast<int>(type), customText.c_str());
-        return;
     }
 
     bool wasActive = operationHintActive_;
@@ -948,8 +1012,14 @@ void MessageHintRenderer::showOperationHint(HintType type, const std::string& cu
     if (contentChanged || !wasActive) dirty_ = true;
 }
 
-void MessageHintRenderer::showProtectedOperationHint(HintType type, const std::string& customText) {
+bool MessageHintRenderer::showProtectedOperationHint(HintType type, const std::string& customText,
+                                                     bool interruptible, bool refreshOnly) {
     std::lock_guard<std::mutex> lock(hintMutex_);
+    // A refresh cannot resurrect a startup hint after a user dismissed it,
+    // even if the user's transient hint has already expired.
+    if (refreshOnly && !protectedOperationHint_) {
+        return false;
+    }
     bool contentChanged = (type != currentOperationHint_.type || customText != currentOperationHint_.text);
     bool wasActive = operationHintActive_;
 
@@ -959,12 +1029,24 @@ void MessageHintRenderer::showProtectedOperationHint(HintType type, const std::s
     currentOperationHint_.isPermanent = true;
     currentOperationHint_.displayDuration = 0.0f;
     protectedOperationHint_ = true;
+    protectedHintInterruptible_ = interruptible;
     playlistHintVisible_ = false;
     operationHintActive_ = true;
 
     if (contentChanged || !wasActive || currentTextureType_ != 1) {
         dirty_ = true;
     }
+    return true;
+}
+
+bool MessageHintRenderer::clearProtectedOperationHint() {
+    std::lock_guard<std::mutex> lock(hintMutex_);
+    if (!protectedOperationHint_) return false;
+    protectedOperationHint_ = false;
+    operationHintActive_ = false;
+    if (currentTextureType_ == 1) currentTextureType_ = 0;
+    dirty_ = true;
+    return true;
 }
 
 void MessageHintRenderer::clearOperationHint() {

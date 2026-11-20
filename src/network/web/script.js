@@ -10,24 +10,25 @@
  */
 
 // 导入核心模块
-import './modules/core/interactionGuards.js';
-import { initializeApi, apiGet, apiPost, apiPut, apiDelete, apiAction } from './modules/core/api.js';
-import { initializeNavigation, showPage } from './modules/core/navigation.js?v=3.05';
-import { initializeEventListeners } from './modules/core/eventListeners.js';
-import { initializeCommandLog, addToCommandLog } from './modules/core/commandLog.js';
+import '/shared/interactionGuards.js';
+import { apiGet, apiPost, apiPut, apiDelete, apiAction } from './modules/core/api.js';
+import { initializeNavigation, showPage } from './modules/core/navigation.js?v=3.26';
+import { initializeEventListeners } from './modules/core/eventListeners.js?v=3.04';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { initConnectionManager } from './modules/core/connectionManager.js';
 import { refreshAppTitleFromLicense } from './modules/core/appTitle.js';
+import { refreshModuleLicense, isModuleLicensed } from './modules/core/moduleLicense.js';
 import { isLoggedIn, logout } from './modules/pages/login.js';
 
 // 导入页面模块
-import { initializeSceneTemplates } from './modules/pages/sceneTemplates.js';
+import { initializeSceneTemplates } from './modules/pages/sceneTemplates.js?v=license_1';
 
-import { initializeSettings } from './modules/pages/systemSettings.js?v=2.66';
-import { initializePeripheralManagement } from './modules/pages/peripheralManagement.js?v=3.03';
-import { initializeImportFolders } from './modules/pages/importFolders.js';
-import { syncEffectLicenseVisibility } from './modules/pages/effectControl.js?v=2.99';
+import { initializeSettings } from './modules/pages/systemSettings.js?v=2.96';
+import { initializePeripheralManagement } from './modules/pages/peripheralManagement.js?v=3.07';
+import { initializeConfigBackup } from './modules/pages/configBackup.js?v=4';
+import { syncEffectLicenseVisibility } from './modules/pages/effectControl.js?v=3.00';
 import { initializePlaylist } from './modules/features/playlist.js';
-import { initializeMaterials } from './modules/features/materials.js';
+import { initializeMaterials } from './modules/features/materials.js?v=qr_address_1';
 // 导入组件模块
 import { initializeDialogs } from './modules/components/dialogs.js';
 import { initializeButtonGroups } from './modules/components/buttonGroups.js';
@@ -43,12 +44,12 @@ async function initializeApp() {
     // 检查登录状态
     if (!isLoggedIn()) {
         // 未登录，跳转到登录页面
-        window.location.href = '/login.html';
+        const loginQuery = window.location.search || '';
+        window.location.href = `/login.html${loginQuery}`;
         return;
     }
 
     // 初始化API请求
-    initializeApi();
     refreshAppTitleFromLicense();
 
     // 初始化连接管理器（断线重连、连接状态指示器）
@@ -58,25 +59,23 @@ async function initializeApp() {
     initializeNavigation();
 
     // 根据系统授权隐藏未授权页面入口
+    await refreshModuleLicense();
     await syncEffectLicenseVisibility();
 
     // 初始化事件监听器
     initializeEventListeners();
 
     // 初始化场景模板列表
-    initializeSceneTemplates();
+    if (isModuleLicensed('scene')) initializeSceneTemplates();
 
     // 初始化系统设置
     initializeSettings();
 
-    // 初始化导入文件夹功能
-    initializeImportFolders();
+    // 初始化配置备份与还原
+    initializeConfigBackup();
 
     // 初始化中控配置
     initializePeripheralManagement();
-
-    // 初始化命令日志
-    initializeCommandLog();
 
     // 初始化播放列表
     initializePlaylist();
@@ -123,15 +122,16 @@ async function refreshAllPages() {
     try {
         addToCommandLog('页面刷新', 'info', 'HTTP重连成功，开始刷新页面数据');
         await refreshAppTitleFromLicense();
+        await refreshModuleLicense();
 
         // 动态导入刷新函数
         const { updateSystemStatus } = await import('./modules/pages/systemStatus.js');
-        const { updateSceneTemplates } = await import('./modules/pages/sceneTemplates.js');
-        const { updateSettings } = await import('./modules/pages/systemSettings.js?v=2.66');
+        const { updateSceneTemplates } = await import('./modules/pages/sceneTemplates.js?v=license_1');
+        const { updateSettings } = await import('./modules/pages/systemSettings.js?v=2.96');
         const { updateVideoControl } = await import('./modules/pages/videoControl.js?v=2.98');
-        const { updateMaterials } = await import('./modules/features/materials.js');
+        const { updateMaterials } = await import('./modules/features/materials.js?v=qr_address_1');
         const { updatePlaylistList } = await import('./modules/features/playlist.js');
-        const { initializeEffects, syncEffectLicenseVisibility, isEffectsLicenseDenied } = await import('./modules/pages/effectControl.js?v=2.99');
+        const { initializeEffects, syncEffectLicenseVisibility, isEffectsLicenseDenied } = await import('./modules/pages/effectControl.js?v=3.00');
 
         // 刷新系统状态
         try {
@@ -145,7 +145,7 @@ async function refreshAllPages() {
 
         // 刷新场景模板列表
         try {
-            await updateSceneTemplates();
+            if (isModuleLicensed('scene')) await updateSceneTemplates();
         } catch (e) {
             console.error('刷新场景模板列表失败:', e);
         }
@@ -220,8 +220,18 @@ function initRestartButtons() {
             body,
             signal: controller.signal,
             keepalive: true
-        }).catch(() => {
-            // Restart intentionally interrupts the 当前 HTTP service.
+        }).then(response => {
+            if (!response.ok) {
+                const error = new Error(`HTTP ${response.status}`);
+                error.isHttpFailure = true;
+                throw error;
+            }
+        }).catch(error => {
+            // A successful restart can close the socket before the response;
+            // only report definite request failures to the operator.
+            if (error && error.isHttpFailure) {
+                showWarning(`重启请求失败: ${error.message || '网络错误'}`);
+            }
         }).finally(() => clearTimeout(timeoutId));
     };
 

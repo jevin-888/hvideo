@@ -243,6 +243,36 @@ bool VulkanTextOverlayBridge::rasterizeText(const std::string& text, float fontS
   return true;
 }
 
+float VulkanTextOverlayBridge::measureTextWidth(const std::string& text,
+                                                   float fontSize) {
+  if (!initialized_ || !impl_ || !impl_->face || text.empty()) {
+    return 0.0f;
+  }
+  const float fs = fontSize > 0.0f ? fontSize : impl_->defaultFontSize;
+  const int px = std::max(1, static_cast<int>(fs));
+  if (FT_Set_Pixel_Sizes(impl_->face, 0, static_cast<FT_UInt>(px)) != 0) {
+    return 0.0f;
+  }
+  const int fallbackAdvance = std::max(1, static_cast<int>(fs * 0.6f));
+  const char* cursor = text.c_str();
+  const char* end = cursor + text.size();
+  float width = 0.0f;
+  while (cursor < end) {
+    uint32_t codepoint = 0;
+    if (!utf8NextCodepoint(cursor, end, codepoint)) {
+      break;
+    }
+    const FT_UInt glyphIndex = FT_Get_Char_Index(impl_->face, codepoint);
+    if (glyphIndex == 0 ||
+        FT_Load_Glyph(impl_->face, glyphIndex, FT_LOAD_DEFAULT) != 0) {
+      width += static_cast<float>(fallbackAdvance);
+      continue;
+    }
+    width += static_cast<float>(impl_->face->glyph->advance.x >> 6);
+  }
+  return width;
+}
+
 bool VulkanTextOverlayBridge::prepareText(VulkanRenderer* renderer, const std::string& text,
                                          float r, float g, float b, float a, float fontSize,
                                          float bgR, float bgG, float bgB, float bgA,
@@ -474,7 +504,8 @@ bool VulkanTextOverlayBridge::prepareTextLines(hsvj::VulkanRenderer* renderer,
                                               float bgR, float bgG, float bgB, float bgA,
                                               int paddingH, int paddingV, int maxLineWidth,
                                               bool centerFirstLine, int cornerRadius,
-                                              int rightAlignFromLineIndex) {
+                                              int rightAlignFromLineIndex,
+                                              bool fitToContentWidth) {
   if (!initialized_ || !renderer || !renderer->isInitialized() || lines.empty()) return false;
   if (renderer->isRenderPassStarted()) return false;
   if (paddingH < 0) paddingH = 0;
@@ -520,7 +551,12 @@ bool VulkanTextOverlayBridge::prepareTextLines(hsvj::VulkanRenderer* renderer,
     }
     contentHeight += static_cast<int>(lh);
   }
-  if (maxLineWidth > 0) contentWidth = maxLineWidth;
+  const int measuredContentWidth = contentWidth;
+  if (maxLineWidth > 0) {
+    contentWidth = fitToContentWidth
+                       ? std::min(measuredContentWidth, maxLineWidth)
+                       : maxLineWidth;
+  }
   if (contentWidth <= 0) contentWidth = 1;
   if (contentHeight <= 0) contentHeight = px;
 
@@ -605,13 +641,19 @@ bool VulkanTextOverlayBridge::prepareTextLines(hsvj::VulkanRenderer* renderer,
       }
     }
     int penX;
-    const bool isRightAligned = (rightAlignFromLineIndex >= 0 && lineIndex >= rightAlignFromLineIndex);
-    if (isRightAligned) {
+    const bool isRightAligned =
+        rightAlignFromLineIndex >= 0 && lineIndex >= rightAlignFromLineIndex;
+    const bool shouldTruncate = maxLineWidth > 0 && lineW > contentWidth;
+    if (isRightAligned && !shouldTruncate) {
       penX = contentLeft + contentWidth - lineW;
+    } else if (centerFirstLine && lineIndex == 0) {
+      const int centeredWidth = std::min(firstLineWidth, contentWidth);
+      penX = contentLeft + (contentWidth - centeredWidth) / 2;
     } else {
-      penX = (centerFirstLine && lineIndex == 0) ? (contentLeft + (contentWidth - firstLineWidth) / 2) : contentLeft;
+      penX = contentLeft;
     }
-    const int effectiveTruncate = isRightAligned ? (contentLeft + contentWidth + 1) : truncateThreshold;
+    const int effectiveTruncate =
+        isRightAligned ? (contentLeft + contentWidth + 1) : truncateThreshold;
     while (p < end) {
       uint32_t cp = 0;
       const char* pPrev = p;
@@ -620,7 +662,7 @@ bool VulkanTextOverlayBridge::prepareTextLines(hsvj::VulkanRenderer* renderer,
       if (gindex == 0) continue;
       if (FT_Load_Glyph(impl_->face, gindex, FT_LOAD_DEFAULT) != 0) continue;
       int advance = static_cast<int>(impl_->face->glyph->advance.x >> 6);
-      if (maxLineWidth > 0 && penX + advance > effectiveTruncate) {
+      if (shouldTruncate && penX + advance > effectiveTruncate) {
         p = pPrev;
         for (int i = 0; i < 3; ++i) {
           FT_UInt dotIndex = FT_Get_Char_Index(impl_->face, static_cast<FT_ULong>('.'));

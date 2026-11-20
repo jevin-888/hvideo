@@ -83,7 +83,8 @@ bool VulkanRenderer::uploadAssMaskTextureRegion(Texture &tex,
   tex.pendingFirstBarrier = false;
 
   VkBufferImageCopy region{};
-  region.bufferOffset = bufferOffset;
+  auto& buffers = assMaskFrameBuffers_[currentFrame_];
+  region.bufferOffset = buffers.stagingOffset + bufferOffset;
   region.bufferRowLength = rowLength;
   region.bufferImageHeight = imageHeight;
   region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -92,7 +93,7 @@ bool VulkanRenderer::uploadAssMaskTextureRegion(Texture &tex,
   region.imageSubresource.layerCount = 1;
   region.imageOffset = imageOffset;
   region.imageExtent = imageExtent;
-  vkCmdCopyBufferToImage(cmd, assMaskStagingBuffer_, tex.image,
+  vkCmdCopyBufferToImage(cmd, buffers.stagingBuffer, tex.image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
   VkImageMemoryBarrier toRead{};
@@ -123,42 +124,34 @@ bool VulkanRenderer::uploadAssMaskTextureRegion(Texture &tex,
 uint32_t VulkanRenderer::uploadAssMaskInstances(
     const std::vector<AssMaskDrawCmd> &draws) {
   if (draws.empty()) return 0;
-  const size_t instanceCount = draws.size();
-  const VkDeviceSize requiredBytes =
-      static_cast<VkDeviceSize>(instanceCount * sizeof(AssMaskGpuInstance));
-  if (assMaskInstanceBuffer_ == VK_NULL_HANDLE ||
-      assMaskInstanceCapacity_ < instanceCount) {
-    if (assMaskInstanceBuffer_ != VK_NULL_HANDLE) {
-      vkDestroyBuffer(device_, assMaskInstanceBuffer_, nullptr);
-      assMaskInstanceBuffer_ = VK_NULL_HANDLE;
-    }
-    if (assMaskInstanceMemory_ != VK_NULL_HANDLE) {
-      vkFreeMemory(device_, assMaskInstanceMemory_, nullptr);
-      assMaskInstanceMemory_ = VK_NULL_HANDLE;
-    }
-
-    assMaskInstanceCapacity_ = nextInstanceCapacity(instanceCount);
-    const VkDeviceSize capacityBytes =
-        static_cast<VkDeviceSize>(assMaskInstanceCapacity_ *
-                                  sizeof(AssMaskGpuInstance));
-    if (!createBuffer(capacityBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      assMaskInstanceBuffer_, assMaskInstanceMemory_)) {
-      assMaskInstanceCapacity_ = 0;
+  auto& buffers = assMaskFrameBuffers_[currentFrame_];
+  const size_t needed = buffers.instanceUsed + draws.size();
+  if (!buffers.instanceBuffer || buffers.instanceCapacity < needed) {
+    if (buffers.instanceMapped) vkUnmapMemory(device_, buffers.instanceMemory);
+    if (buffers.instanceBuffer)
+      requestDestroyBuffer(buffers.instanceBuffer, buffers.instanceMemory);
+    buffers.instanceBuffer = VK_NULL_HANDLE;
+    buffers.instanceMemory = VK_NULL_HANDLE;
+    buffers.instanceMapped = nullptr;
+    buffers.instanceUsed = 0;
+    buffers.instanceCapacity = nextInstanceCapacity(needed);
+    if (!createBuffer(buffers.instanceCapacity * sizeof(AssMaskGpuInstance),
+                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      buffers.instanceBuffer, buffers.instanceMemory)) {
+      buffers.instanceCapacity = 0;
       return 0;
     }
   }
-
-  void *mapped = nullptr;
-  if (vkMapMemory(device_, assMaskInstanceMemory_, 0, requiredBytes, 0,
-                  &mapped) != VK_SUCCESS ||
-      mapped == nullptr) {
+  if (!buffers.instanceMapped &&
+      vkMapMemory(device_, buffers.instanceMemory, 0, VK_WHOLE_SIZE, 0,
+                  &buffers.instanceMapped) != VK_SUCCESS) {
     return 0;
   }
-  uint32_t visibleCount =
-      fillAssMaskInstances(static_cast<AssMaskGpuInstance *>(mapped), draws);
-  vkUnmapMemory(device_, assMaskInstanceMemory_);
+  buffers.instanceOffset = buffers.instanceUsed * sizeof(AssMaskGpuInstance);
+  auto* instances = static_cast<AssMaskGpuInstance*>(buffers.instanceMapped) + buffers.instanceUsed;
+  const uint32_t visibleCount = fillAssMaskInstances(instances, draws);
+  buffers.instanceUsed += draws.size();
   return visibleCount;
 }
 
@@ -276,10 +269,8 @@ bool VulkanRenderer::beginMaskTextureWrite(uint32_t textureId, uint32_t width,
 
   cancelPendingTextureDestruction(textureId);
 
-  if (assMaskStagingMapped_) {
-    vkUnmapMemory(device_, assMaskStagingMemory_);
-    assMaskStagingMapped_ = false;
-  }
+  auto& buffers = assMaskFrameBuffers_[currentFrame_];
+  if (buffers.stagingWriteActive) return false;
 
   const VkDeviceSize imageSize = static_cast<VkDeviceSize>(width) * height;
   auto it = textures_.find(textureId);
@@ -347,34 +338,35 @@ bool VulkanRenderer::beginMaskTextureWrite(uint32_t textureId, uint32_t width,
     textures_[textureId] = texture;
   }
 
-  // 需要扩容，或缩至不足 1/4 时回收（避免只增不减导致内存常驻 16MB+）
-  const bool needGrow = assMaskStagingBuffer_ == VK_NULL_HANDLE ||
-                        assMaskStagingSize_ < imageSize;
-  const bool needShrink = assMaskStagingBuffer_ != VK_NULL_HANDLE &&
-                          imageSize < assMaskStagingSize_ / 4;
-  if (needGrow || needShrink) {
-    if (assMaskStagingBuffer_ != VK_NULL_HANDLE) {
-      vkDestroyBuffer(device_, assMaskStagingBuffer_, nullptr);
-      vkFreeMemory(device_, assMaskStagingMemory_, nullptr);
-      assMaskStagingBuffer_ = VK_NULL_HANDLE;
-      assMaskStagingMemory_ = VK_NULL_HANDLE;
-    }
-    assMaskStagingSize_ = imageSize;
-    if (!createBuffer(assMaskStagingSize_, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      assMaskStagingBuffer_, assMaskStagingMemory_)) {
+  // Append within the completed frame slot. Older submissions and earlier
+  // uploads in this command buffer keep their own immutable byte ranges.
+  VkDeviceSize offset = (buffers.stagingUsed + 3) & ~VkDeviceSize(3);
+  if (!buffers.stagingBuffer || buffers.stagingCapacity < offset + imageSize) {
+    if (buffers.stagingMapped) vkUnmapMemory(device_, buffers.stagingMemory);
+    if (buffers.stagingBuffer)
+      requestDestroyBuffer(buffers.stagingBuffer, buffers.stagingMemory);
+    buffers.stagingBuffer = VK_NULL_HANDLE;
+    buffers.stagingMemory = VK_NULL_HANDLE;
+    buffers.stagingMapped = nullptr;
+    buffers.stagingUsed = 0;
+    buffers.stagingCapacity = std::max(imageSize, buffers.stagingCapacity * 2);
+    offset = 0;
+    if (!createBuffer(buffers.stagingCapacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      buffers.stagingBuffer, buffers.stagingMemory)) {
+      buffers.stagingCapacity = 0;
       return false;
     }
   }
-
-  void *mapped = nullptr;
-  if (vkMapMemory(device_, assMaskStagingMemory_, 0, assMaskStagingSize_, 0,
-                  &mapped) != VK_SUCCESS || mapped == nullptr) {
+  if (!buffers.stagingMapped &&
+      vkMapMemory(device_, buffers.stagingMemory, 0, VK_WHOLE_SIZE, 0,
+                  &buffers.stagingMapped) != VK_SUCCESS) {
     return false;
   }
-  assMaskStagingMapped_ = true;
-  *outMappedPtr = mapped;
+  buffers.stagingOffset = offset;
+  buffers.stagingUsed = offset + imageSize;
+  buffers.stagingWriteActive = true;
+  *outMappedPtr = static_cast<uint8_t*>(buffers.stagingMapped) + offset;
   *outRowPitch = static_cast<size_t>(width);
   return true;
 #else
@@ -389,11 +381,11 @@ bool VulkanRenderer::beginMaskTextureWrite(uint32_t textureId, uint32_t width,
 
 void VulkanRenderer::endMaskTextureWrite(uint32_t textureId) {
 #ifdef __ANDROID__
-  if (!initialized_ || !assMaskStagingMapped_) {
+  auto& buffers = assMaskFrameBuffers_[currentFrame_];
+  if (!initialized_ || !buffers.stagingWriteActive) {
     return;
   }
-  assMaskStagingMapped_ = false;
-  vkUnmapMemory(device_, assMaskStagingMemory_);
+  buffers.stagingWriteActive = false;
 
   auto it = textures_.find(textureId);
   if (it == textures_.end() || !it->second.isAssMask) {
@@ -410,11 +402,11 @@ void VulkanRenderer::endMaskTextureWriteRows(uint32_t textureId,
                                              uint32_t rowBegin,
                                              uint32_t rowEnd) {
 #ifdef __ANDROID__
-  if (!initialized_ || !assMaskStagingMapped_) {
+  auto& buffers = assMaskFrameBuffers_[currentFrame_];
+  if (!initialized_ || !buffers.stagingWriteActive) {
     return;
   }
-  assMaskStagingMapped_ = false;
-  vkUnmapMemory(device_, assMaskStagingMemory_);
+  buffers.stagingWriteActive = false;
 
   auto it = textures_.find(textureId);
   if (it == textures_.end() || !it->second.isAssMask) {
@@ -444,11 +436,11 @@ void VulkanRenderer::endMaskTextureWriteRows(uint32_t textureId,
 
 void VulkanRenderer::endMaskTextureUnmap() {
 #ifdef __ANDROID__
-  if (!initialized_ || !assMaskStagingMapped_) {
+  auto& buffers = assMaskFrameBuffers_[currentFrame_];
+  if (!initialized_ || !buffers.stagingWriteActive) {
     return;
   }
-  assMaskStagingMapped_ = false;
-  vkUnmapMemory(device_, assMaskStagingMemory_);
+  buffers.stagingWriteActive = false;
 #endif
 }
 
@@ -534,14 +526,23 @@ void VulkanRenderer::renderAssMaskBatch(
                           pipelineLayout_, 0, 1, &texture.descriptorSet, 0,
                           nullptr);
 
-  VkBuffer vertexBuffers[] = {vertexBuffer_, assMaskInstanceBuffer_};
-  VkDeviceSize offsets[] = {0, 0};
+  const auto& buffers = assMaskFrameBuffers_[currentFrame_];
+  VkBuffer vertexBuffers[] = {vertexBuffer_, buffers.instanceBuffer};
+  VkDeviceSize offsets[] = {0, buffers.instanceOffset};
   vkCmdBindVertexBuffers(cmdBuffer, 0, 2, vertexBuffers, offsets);
 
   PushConstants pc{};
   pc.color[3] = std::clamp(globalAlpha, 0.0f, 1.0f);
-  pc.cropInfo[0] = static_cast<float>(targetW);
-  pc.cropInfo[1] = static_cast<float>(targetH);
+  // Glyph rectangles use logical layer coordinates, just like renderLayer.
+  // The viewport maps them to the physical target (which can be smaller for
+  // other quality presets). Dividing by targetW/H clips or enlarges lyrics.
+  uint32_t logicalW = logicalWidth_ > 0 ? logicalWidth_ : targetW;
+  uint32_t logicalH = logicalHeight_ > 0 ? logicalHeight_ : targetH;
+  if (targetH > targetW && logicalW > logicalH) {
+    std::swap(logicalW, logicalH);
+  }
+  pc.cropInfo[0] = static_cast<float>(logicalW);
+  pc.cropInfo[1] = static_cast<float>(logicalH);
   pc.cropInfo[2] =
       (screenRotate_ == 0)
           ? 0.0f
@@ -768,8 +769,9 @@ void VulkanRenderer::renderAssMaskToTexture(uint32_t maskTextureId,
     vkCmdBindDescriptorSets(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             pipelineLayout_, 0, 1, &maskTexture.descriptorSet, 0,
                             nullptr);
-    VkBuffer vertexBuffers[] = {vertexBuffer_, assMaskInstanceBuffer_};
-    VkDeviceSize offsets[] = {0, 0};
+    const auto& buffers = assMaskFrameBuffers_[currentFrame_];
+    VkBuffer vertexBuffers[] = {vertexBuffer_, buffers.instanceBuffer};
+    VkDeviceSize offsets[] = {0, buffers.instanceOffset};
     vkCmdBindVertexBuffers(cmdBuffer, 0, 2, vertexBuffers, offsets);
 
     PushConstants pc{};

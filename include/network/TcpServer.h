@@ -95,7 +95,7 @@ public:
    * @brief 广播消息给所有客户端
    * @param message 消息内容
    */
-  void broadcast(const std::string& message);
+  size_t broadcast(const std::string& message);
 
   /**
    * @brief 发送消息给指定客户端
@@ -142,7 +142,8 @@ private:
     std::thread acceptThread_;                    // 接受连接线程
     std::thread heartbeatThread_;                 // 心跳检测线程
   
-  mutable std::mutex clientsMutex_;             // 客户端列表锁
+  mutable std::mutex clientsMutex_;
+    std::mutex sendMutex_;             // 客户端列表锁
     std::unordered_map<int, TcpClientInfo> clients_; // 客户端连接
     std::unordered_map<int, std::thread> clientThreads_; // 客户端处理线程
   

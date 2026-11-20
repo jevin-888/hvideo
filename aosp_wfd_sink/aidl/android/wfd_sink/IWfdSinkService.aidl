@@ -8,6 +8,8 @@ import android.view.Surface;
 /**
  * WFD Miracast Sink 系统服务接口。
  *
+ * @hide
+ *
  * 运行在 system_server 进程，通过 Service管理器.getService("wfd_sink") 获取。
  * 引擎 app 通过 WfdSink管理器 (Context.WFD_SINK_SERVICE) 调用。
  *

@@ -18,6 +18,43 @@
 
 namespace hsvj {
 
+namespace {
+bool writeAllSerialBytes(int fd, const uint8_t* data, size_t size) {
+    size_t offset = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (offset < size) {
+        const ssize_t written = ::write(fd, data + offset, size - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        if (written == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return false;
+            const int remainingMs = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+            pollfd pfd{fd, POLLOUT, 0};
+            int pollResult;
+            do {
+                pollResult = poll(&pfd, 1, remainingMs);
+            } while (pollResult < 0 && errno == EINTR);
+            if (pollResult <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+
+    int drainResult;
+    do {
+        drainResult = tcdrain(fd);
+    } while (drainResult < 0 && errno == EINTR);
+    return drainResult == 0;
+}
+} // namespace
+
 Rs232Server::Rs232Server(const std::string& device, int baudRate)
     : device_(device), baudRate_(baudRate), fd_(-1), 
       flowControl_(FlowControl::NONE), isRunning_(false) {
@@ -27,7 +64,8 @@ Rs232Server::~Rs232Server() {
     stop();
 }
 
-bool Rs232Server::start() {
+bool Rs232Server::start(bool startReader) {
+    std::lock_guard<std::mutex> writeLock(writeMutex_);
     if (isRunning_) return true;
 
     fd_ = open(device_.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
@@ -42,6 +80,10 @@ bool Rs232Server::start() {
         fd_ = -1;
         return false;
     }
+
+    // Binary peripheral protocols must not inherit terminal text conversions
+    // (for example ICRNL would rewrite 0x0D to 0x0A).
+    cfmakeraw(&tty);
 
     // 设置波特
     speed_t speed = B115200;
@@ -91,8 +133,7 @@ bool Rs232Server::start() {
     }
 
     // 原始模式设置
-    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-    tty.c_oflag &= ~OPOST;
+    // Keep reads interruptible so stop() can join the reader promptly.
     tty.c_cc[VMIN] = 0;
     tty.c_cc[VTIME] = 1;
 
@@ -104,20 +145,25 @@ bool Rs232Server::start() {
     }
 
     isRunning_ = true;
-    readThread_ = std::thread(rawFrameCallback_ ? &Rs232Server::readRawLoop
-                                                : &Rs232Server::readLoop,
-                              this);
+    if (startReader) {
+        readThread_ = std::thread(rawFrameCallback_ ? &Rs232Server::readRawLoop
+                                                    : &Rs232Server::readLoop,
+                                  this);
+    }
 
     LOG_DEBUG("Rs232Server started on %s @ %d bps", device_.c_str(), baudRate_);
     return true;
 }
 
 void Rs232Server::stop() {
-    if (!isRunning_) return;
-    isRunning_ = false;
-    if (fd_ >= 0) {
-        close(fd_);
-        fd_ = -1;
+    {
+        std::lock_guard<std::mutex> writeLock(writeMutex_);
+        if (!isRunning_ && fd_ < 0) return;
+        isRunning_ = false;
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
     }
     if (readThread_.joinable()) readThread_.join();
     LOG_DEBUG("Rs232Server stopped");
@@ -195,8 +241,19 @@ void Rs232Server::readRawLoop() {
 
     while (isRunning_) {
         if (fd_ < 0) break;
+        int pollTimeoutMs = 50;
+        if (hasPending) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - lastByteAt).count();
+            const int remainingMs = frameGapMs_ - static_cast<int>(elapsed);
+            if (remainingMs <= 0) {
+                flushFrame();
+                continue;
+            }
+            pollTimeoutMs = std::min(pollTimeoutMs, remainingMs);
+        }
         struct pollfd pfd = {fd_, POLLIN, 0};
-        int ret = poll(&pfd, 1, 50);
+        int ret = poll(&pfd, 1, pollTimeoutMs);
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;
@@ -226,16 +283,19 @@ void Rs232Server::readRawLoop() {
 }
 
 bool Rs232Server::write(const std::string& data) {
-    if (fd_ < 0) return false;
-    ssize_t written = ::write(fd_, data.c_str(), data.length());
-    return written == (ssize_t)data.length();
+    return writeRaw(std::vector<uint8_t>(data.begin(), data.end()));
 }
 
 bool Rs232Server::writeRaw(const std::vector<uint8_t>& data) {
-    if (fd_ < 0) return false;
-    ssize_t written = ::write(fd_, data.data(), data.size());
-    tcdrain(fd_);
-    return written == static_cast<ssize_t>(data.size());
+    if (data.empty()) return true;
+    std::lock_guard<std::mutex> writeLock(writeMutex_);
+    if (fd_ < 0 || !isRunning_) return false;
+    const bool ok = writeAllSerialBytes(fd_, data.data(), data.size());
+    if (!ok) {
+        LOG_WARN("Rs232Server: Failed to write %zu bytes to %s: %s",
+                 data.size(), device_.c_str(), strerror(errno));
+    }
+    return ok;
 }
 
 } // 命名空间 hsvj

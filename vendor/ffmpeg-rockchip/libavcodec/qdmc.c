@@ -255,7 +255,7 @@ static av_cold int qdmc_decode_init(AVCodecContext *avctx)
         return AVERROR_INVALIDDATA;
     }
     av_channel_layout_uninit(&avctx->ch_layout);
-    avctx->ch_layout = s->nb_channels == 2 ? (AVChannelLayout)? AV_CHANNEL_LAYOUT_STEREO :
+    avctx->ch_layout = s->nb_channels == 2 ? (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO :
                                              (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
     avctx->sample_rate = bytestream2_get_be32u(&b);

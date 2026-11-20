@@ -18,12 +18,55 @@ AudioPlayer* AudioPlayerManager::getAudioPlayer() {
     return audioPlayer_.get();
 }
 
-bool AudioPlayerManager::ensureInitialized(int32_t sampleRate, 
-                                          int32_t channelCount,
-                                          int32_t format,
-                                          int32_t deviceId) {
+void AudioPlayerManager::invalidatePcmRouteLocked() {
+    const uint64_t generation =
+        audioClockGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (audioPlayer_) {
+        audioPlayer_->switchPcmGeneration(generation);
+    }
+}
+
+void AudioPlayerManager::setFocusOwnerLocked(AudioFocusSource source) {
+    const int previous = focusOwner_.exchange(static_cast<int>(source),
+                                              std::memory_order_acq_rel);
+    if (previous != static_cast<int>(source)) {
+        invalidatePcmRouteLocked();
+    }
+}
+
+bool AudioPlayerManager::ensureInitialized(int32_t sampleRate,
+                                           int32_t channelCount,
+                                           int32_t format,
+                                           int32_t deviceId) {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+    return ensureInitializedLocked(sampleRate, channelCount, format, deviceId);
+}
+
+bool AudioPlayerManager::ensureInitializedForLayer(AudioFocusSource source,
+                                                   int layerId,
+                                                   int32_t sampleRate,
+                                                   int32_t channelCount,
+                                                   int32_t format,
+                                                   int32_t deviceId) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const int owner = focusOwner_.load(std::memory_order_acquire);
+    const int currentLayer = currentAudioLayerId_.load(std::memory_order_acquire);
+    if (externalBluetoothAudioActive_.load(std::memory_order_acquire) ||
+        owner != static_cast<int>(source) || layerId <= 0 ||
+        currentLayer != layerId) {
+        LOG_DEBUG("[AudioPlayerManager] Reject stream init without route ownership: source=%d owner=%d layer=%d currentLayer=%d",
+                  static_cast<int>(source), owner, layerId, currentLayer);
+        return false;
+    }
+    return ensureInitializedLocked(sampleRate, channelCount, format, deviceId);
+}
+
+bool AudioPlayerManager::ensureInitializedLocked(int32_t sampleRate,
+                                                 int32_t channelCount,
+                                                 int32_t format,
+                                                 int32_t deviceId) {
+    bool pcmRouteInvalidated = false;
+
     if (initialized_ && audioPlayer_) {
         const bool sameParams =
             audioPlayer_->getSampleRate() == sampleRate &&
@@ -38,20 +81,29 @@ bool AudioPlayerManager::ensureInitialized(int32_t sampleRate,
                  audioPlayer_->getSampleRate(), audioPlayer_->getChannelCount(),
                  audioPlayer_->getFormat(), audioPlayer_->getDeviceId(),
                  sampleRate, channelCount, format, deviceId);
+        invalidatePcmRouteLocked();
+        pcmRouteInvalidated = true;
         audioPlayer_->shutdown();
         initialized_ = false;
     }
-    
+
     if (!audioPlayer_) {
         audioPlayer_ = std::make_unique<AudioPlayer>();
     }
-    
+
     appliedQueuePolicySource_ = AudioFocusSource::NONE;
+    // One stream replacement maps to one PCM generation. Reinitialization has
+    // already discarded the old route before shutdown; initial creation still
+    // needs to publish the manager generation to the new AudioPlayer instance.
+    if (!pcmRouteInvalidated) {
+        invalidatePcmRouteLocked();
+    }
     bool success = audioPlayer_->initialize(sampleRate, channelCount, format, deviceId);
     if (success) {
         initialized_ = true;
-        AudioFocusSource owner = static_cast<AudioFocusSource>(
-            focusOwner_.load(std::memory_order_acquire));
+        AudioFocusSource owner = externalBluetoothAudioActive_.load(std::memory_order_acquire)
+            ? AudioFocusSource::EXTERNAL_BLUETOOTH
+            : static_cast<AudioFocusSource>(focusOwner_.load(std::memory_order_acquire));
         applyQueuePolicyLocked(owner);
         LOG_INFO("[AudioPlayerManager] Global AudioPlayer initialized: %dHz, %dch",
                  sampleRate, channelCount);
@@ -66,13 +118,23 @@ void AudioPlayerManager::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (audioPlayer_) {
+        // Shutdown publishes exactly one dead route. If focus already is NONE,
+        // there is still a live stream generation that must be invalidated.
+        if (focusOwner_.load(std::memory_order_acquire) !=
+            static_cast<int>(AudioFocusSource::NONE)) {
+            setFocusOwnerLocked(AudioFocusSource::NONE);
+        } else {
+            invalidatePcmRouteLocked();
+        }
         audioPlayer_->shutdown();
-        audioPlayer_.reset();
+        // Keep the singleton object alive. Decoder/capture threads cache this pointer;
+        // deleting it here would turn a concurrent start()/write() into use-after-free.
         initialized_ = false;
-        focusOwner_.store(static_cast<int>(AudioFocusSource::NONE), std::memory_order_release);
         videoRefCount_ = 0;
         audioOnlyRefCount_ = 0;
         mirrorRefCount_ = 0;
+        externalBluetoothAudioActive_.store(false, std::memory_order_release);
+        externalBluetoothRefCount_ = 0;
         mirrorAudioLayerId_.store(0, std::memory_order_release);
         appliedQueuePolicySource_ = AudioFocusSource::NONE;
         LOG_INFO("[AudioPlayerManager] Global AudioPlayer shutdown");
@@ -86,7 +148,31 @@ int& AudioPlayerManager::refCountForSourceLocked(AudioFocusSource source) {
     if (source == AudioFocusSource::AUDIO_ONLY) {
         return audioOnlyRefCount_;
     }
+    if (source == AudioFocusSource::EXTERNAL_BLUETOOTH) {
+        return externalBluetoothRefCount_;
+    }
     return videoRefCount_;
+}
+
+AudioFocusSource AudioPlayerManager::chooseFallbackFocusLocked(
+        AudioFocusSource releasedSource) const {
+    if (externalBluetoothAudioActive_.load(std::memory_order_acquire)) {
+        return AudioFocusSource::EXTERNAL_BLUETOOTH;
+    }
+
+    const int currentLayerId = currentAudioLayerId_.load(std::memory_order_acquire);
+    const int mirrorLayerId = mirrorAudioLayerId_.load(std::memory_order_acquire);
+    if (mirrorRefCount_ > 0 && releasedSource != AudioFocusSource::MIRROR &&
+        mirrorLayerId > 0 && currentLayerId == mirrorLayerId) {
+        return AudioFocusSource::MIRROR;
+    }
+    if (audioOnlyRefCount_ > 0 && releasedSource != AudioFocusSource::AUDIO_ONLY) {
+        return AudioFocusSource::AUDIO_ONLY;
+    }
+    if (videoRefCount_ > 0 && releasedSource != AudioFocusSource::VIDEO) {
+        return AudioFocusSource::VIDEO;
+    }
+    return AudioFocusSource::NONE;
 }
 
 void AudioPlayerManager::applyQueuePolicyLocked(AudioFocusSource source) {
@@ -123,6 +209,12 @@ void AudioPlayerManager::applyQueuePolicyLocked(AudioFocusSource source) {
             waitMs = 5;
             sourceName = "mirror";
             break;
+        case AudioFocusSource::EXTERNAL_BLUETOOTH:
+            queueItems = 8;
+            burstCount = 4;
+            waitMs = 5;
+            sourceName = "external_bluetooth";
+            break;
         case AudioFocusSource::NONE:
         default:
             queueItems = 8;
@@ -143,17 +235,30 @@ void AudioPlayerManager::applyQueuePolicyLocked(AudioFocusSource source) {
 void AudioPlayerManager::requestFocus(AudioFocusSource source) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (source == AudioFocusSource::NONE) {
-        focusOwner_.store(static_cast<int>(AudioFocusSource::NONE), std::memory_order_release);
-        applyQueuePolicyLocked(AudioFocusSource::NONE);
+        AudioFocusSource owner = externalBluetoothAudioActive_.load(std::memory_order_acquire)
+            ? AudioFocusSource::EXTERNAL_BLUETOOTH
+            : AudioFocusSource::NONE;
+        setFocusOwnerLocked(owner);
+        applyQueuePolicyLocked(owner);
         return;
     }
+
     int& refCount = refCountForSourceLocked(source);
     refCount++;
+    if (externalBluetoothAudioActive_.load(std::memory_order_acquire)) {
+        setFocusOwnerLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        if (audioPlayer_) {
+            audioPlayer_->stop();
+        }
+        applyQueuePolicyLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        return;
+    }
+
     int currentLayerId = currentAudioLayerId_.load(std::memory_order_acquire);
     const int mirrorLayerId = mirrorAudioLayerId_.load(std::memory_order_acquire);
     if (mirrorRefCount_ > 0 && mirrorLayerId > 0 && currentLayerId == mirrorLayerId &&
         source != AudioFocusSource::MIRROR) {
-        focusOwner_.store(static_cast<int>(AudioFocusSource::MIRROR), std::memory_order_release);
+        setFocusOwnerLocked(AudioFocusSource::MIRROR);
         applyQueuePolicyLocked(AudioFocusSource::MIRROR);
         return;
     }
@@ -161,23 +266,31 @@ void AudioPlayerManager::requestFocus(AudioFocusSource source) {
         currentLayerId != mirrorLayerId) {
         return;
     }
-    focusOwner_.store(static_cast<int>(source), std::memory_order_release);
+    setFocusOwnerLocked(source);
     applyQueuePolicyLocked(source);
 }
 
-void AudioPlayerManager::restoreFocus(AudioFocusSource source) {
+bool AudioPlayerManager::restoreFocus(AudioFocusSource source) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (externalBluetoothAudioActive_.load(std::memory_order_acquire)) {
+        setFocusOwnerLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        applyQueuePolicyLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        return false;
+    }
+
     int currentLayerId = currentAudioLayerId_.load(std::memory_order_acquire);
     const int mirrorLayerId = mirrorAudioLayerId_.load(std::memory_order_acquire);
     if (source == AudioFocusSource::MIRROR &&
         (mirrorLayerId <= 0 || currentLayerId != mirrorLayerId)) {
-        return;
+        return false;
     }
     if (source != AudioFocusSource::NONE &&
         refCountForSourceLocked(source) > 0) {
-        focusOwner_.store(static_cast<int>(source), std::memory_order_release);
+        setFocusOwnerLocked(source);
         applyQueuePolicyLocked(source);
+        return true;
     }
+    return false;
 }
 
 void AudioPlayerManager::releaseFocus(AudioFocusSource source) {
@@ -190,43 +303,84 @@ void AudioPlayerManager::releaseFocus(AudioFocusSource source) {
     if (refCount > 0) {
         refCount--;
     }
+    if (externalBluetoothAudioActive_.load(std::memory_order_acquire)) {
+        setFocusOwnerLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        applyQueuePolicyLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        return;
+    }
     if (refCount <= 0) {
         refCount = 0;
         if (audioPlayer_ &&
             focusOwner_.load(std::memory_order_acquire) == static_cast<int>(source)) {
-            AudioFocusSource fallback = AudioFocusSource::NONE;
-            const int currentLayerId = currentAudioLayerId_.load(std::memory_order_acquire);
-            const int mirrorLayerId = mirrorAudioLayerId_.load(std::memory_order_acquire);
-            if (mirrorRefCount_ > 0 && source != AudioFocusSource::MIRROR &&
-                mirrorLayerId > 0 && currentLayerId == mirrorLayerId) {
-                fallback = AudioFocusSource::MIRROR;
-            } else if (audioOnlyRefCount_ > 0 && source != AudioFocusSource::AUDIO_ONLY) {
-                fallback = AudioFocusSource::AUDIO_ONLY;
-            } else if (videoRefCount_ > 0 && source != AudioFocusSource::VIDEO) {
-                fallback = AudioFocusSource::VIDEO;
-            }
+            AudioFocusSource fallback = chooseFallbackFocusLocked(source);
 
             if (fallback != AudioFocusSource::NONE) {
-                audioPlayer_->flush();
                 if (fallback == AudioFocusSource::VIDEO || fallback == AudioFocusSource::MIRROR) {
                     audioPlayer_->setTargetVolume(1.0f);
                 }
-                focusOwner_.store(static_cast<int>(fallback), std::memory_order_release);
+                setFocusOwnerLocked(fallback);
                 applyQueuePolicyLocked(fallback);
                 LOG_INFO("[AudioPlayerManager] Audio focus fallback: %d -> %d",
                          static_cast<int>(source), static_cast<int>(fallback));
             } else {
-                audioPlayer_->stop();
-                focusOwner_.store(static_cast<int>(AudioFocusSource::NONE), std::memory_order_release);
+                // Invalidate and wake every old producer before pausing/flushing
+                // AAudio, so no stale PCM can enter while stop() is completing.
+                setFocusOwnerLocked(AudioFocusSource::NONE);
                 applyQueuePolicyLocked(AudioFocusSource::NONE);
+                audioPlayer_->stop();
             }
         }
     }
 }
 
 bool AudioPlayerManager::hasFocus(AudioFocusSource source) const {
-    // 热路径：无锁原子读取
+    // Hot path: lock-free atomic read.
     return focusOwner_.load(std::memory_order_acquire) == static_cast<int>(source);
+}
+
+void AudioPlayerManager::setExternalBluetoothAudioActive(bool active) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (externalBluetoothAudioActive_.load(std::memory_order_acquire) == active) {
+        if (active && focusOwner_.load(std::memory_order_acquire) !=
+                static_cast<int>(AudioFocusSource::EXTERNAL_BLUETOOTH)) {
+            setFocusOwnerLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+            applyQueuePolicyLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        }
+        return;
+    }
+
+    externalBluetoothAudioActive_.store(active, std::memory_order_release);
+    if (active) {
+        externalBluetoothRefCount_ = 1;
+        setFocusOwnerLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        if (audioPlayer_) {
+            audioPlayer_->stop();
+        }
+        applyQueuePolicyLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        LOG_INFO("[AudioPlayerManager] External Bluetooth audio focus active");
+        return;
+    }
+
+    externalBluetoothRefCount_ = 0;
+    AudioFocusSource fallback = chooseFallbackFocusLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+    setFocusOwnerLocked(fallback);
+    applyQueuePolicyLocked(fallback);
+    if (audioPlayer_) {
+        if (fallback != AudioFocusSource::NONE) {
+            if (fallback == AudioFocusSource::VIDEO || fallback == AudioFocusSource::MIRROR) {
+                audioPlayer_->setTargetVolume(1.0f);
+            }
+            audioPlayer_->resume();
+        } else {
+            audioPlayer_->stop();
+        }
+    }
+    LOG_INFO("[AudioPlayerManager] External Bluetooth audio focus inactive, fallback=%d",
+             static_cast<int>(fallback));
+}
+
+bool AudioPlayerManager::isExternalBluetoothAudioActive() const {
+    return externalBluetoothAudioActive_.load(std::memory_order_acquire);
 }
 
 void AudioPlayerManager::setMirrorAudioLayerId(int layerId) {
@@ -235,25 +389,41 @@ void AudioPlayerManager::setMirrorAudioLayerId(int layerId) {
         layerId = 0;
     }
     mirrorAudioLayerId_.store(layerId, std::memory_order_release);
+    if (externalBluetoothAudioActive_.load(std::memory_order_acquire)) {
+        setFocusOwnerLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        applyQueuePolicyLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        return;
+    }
     int currentLayerId = currentAudioLayerId_.load(std::memory_order_acquire);
     if (layerId > 0 && mirrorRefCount_ > 0 && currentLayerId == layerId) {
-        focusOwner_.store(static_cast<int>(AudioFocusSource::MIRROR), std::memory_order_release);
+        setFocusOwnerLocked(AudioFocusSource::MIRROR);
         applyQueuePolicyLocked(AudioFocusSource::MIRROR);
     } else if (layerId == 0 &&
                focusOwner_.load(std::memory_order_acquire) ==
                    static_cast<int>(AudioFocusSource::MIRROR)) {
-        focusOwner_.store(static_cast<int>(AudioFocusSource::NONE), std::memory_order_release);
+        setFocusOwnerLocked(AudioFocusSource::NONE);
         applyQueuePolicyLocked(AudioFocusSource::NONE);
     }
 }
 
 void AudioPlayerManager::setCurrentAudioLayerId(int layerId) {
-    // 写操作加锁保证可见性（写频率极低）
     std::lock_guard<std::mutex> lock(mutex_);
-    currentAudioLayerId_.store(layerId, std::memory_order_release);
+    const int previousLayerId =
+        currentAudioLayerId_.exchange(layerId, std::memory_order_acq_rel);
+    if (previousLayerId != layerId) {
+        // A route change invalidates the shared PCM timeline before the new
+        // owner can enqueue data. Decoder clocks must remain on wall time until
+        // that owner writes fresh PCM for this generation.
+        invalidatePcmRouteLocked();
+    }
+    if (externalBluetoothAudioActive_.load(std::memory_order_acquire)) {
+        setFocusOwnerLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        applyQueuePolicyLocked(AudioFocusSource::EXTERNAL_BLUETOOTH);
+        return;
+    }
     const int mirrorLayerId = mirrorAudioLayerId_.load(std::memory_order_acquire);
     if (mirrorLayerId > 0 && layerId == mirrorLayerId && mirrorRefCount_ > 0) {
-        focusOwner_.store(static_cast<int>(AudioFocusSource::MIRROR), std::memory_order_release);
+        setFocusOwnerLocked(AudioFocusSource::MIRROR);
         applyQueuePolicyLocked(AudioFocusSource::MIRROR);
     } else {
         AudioFocusSource owner = static_cast<AudioFocusSource>(
@@ -267,9 +437,41 @@ int AudioPlayerManager::getCurrentAudioLayerId() const {
 }
 
 bool AudioPlayerManager::hasAudioFocusForLayer(int layerId) const {
-    // 热路径：无锁原子读取
+    if (focusOwner_.load(std::memory_order_acquire) ==
+            static_cast<int>(AudioFocusSource::EXTERNAL_BLUETOOTH)) {
+        return false;
+    }
     int cur = currentAudioLayerId_.load(std::memory_order_acquire);
     return cur != 0 && cur == layerId;
+}
+
+int32_t AudioPlayerManager::writeForLayer(AudioFocusSource source, int layerId,
+                                          const void* data, int32_t numFrames,
+                                          uint64_t* acceptedGeneration) {
+    AudioPlayer* player = nullptr;
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!data || numFrames <= 0 || layerId <= 0 ||
+            externalBluetoothAudioActive_.load(std::memory_order_acquire) ||
+            focusOwner_.load(std::memory_order_acquire) != static_cast<int>(source) ||
+            currentAudioLayerId_.load(std::memory_order_acquire) != layerId ||
+            !initialized_ || !audioPlayer_) {
+            return 0;
+        }
+        player = audioPlayer_.get();
+        generation = audioClockGeneration_.load(std::memory_order_acquire);
+    }
+
+    const int32_t written = player->write(data, numFrames, generation);
+    if (written > 0 && acceptedGeneration) {
+        *acceptedGeneration = generation;
+    }
+    return written;
+}
+
+uint64_t AudioPlayerManager::getAudioClockGeneration() const {
+    return audioClockGeneration_.load(std::memory_order_acquire);
 }
 
 } // 命名空间 hsvj

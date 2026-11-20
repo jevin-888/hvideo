@@ -14,6 +14,8 @@ import android.view.Surface;
 import com.huoshan.mirror.impl.LympServer;
 import com.huoshan.mirror.base.IBaseServer;
 import com.huoshan.mirror.base.INotifyListener;
+import com.hsvj.engine.airplay.AirPlayPlayerInjector;
+import com.hsvj.engine.airplay.AirPlayRkmppPlayer;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.Random;
@@ -26,6 +28,8 @@ import java.util.Random;
 public class MirrorManager {
     private static final String TAG = "MirrorManager";
     private static final long HARDWARE_BUFFER_USAGE_COMPOSER_OVERLAY = 1L << 11;
+    private static final String SERVICE_APPLE = "苹果";
+    private static final String SERVICE_ANDROID = "安卓";
     
     private final Context mContext;
     private final int mLayerId;
@@ -35,6 +39,14 @@ public class MirrorManager {
     private Surface mSurface;
     private int mReaderWidth;
     private int mReaderHeight;
+    // Decoder buffers may be stride-aligned (for example 498 -> 512). These
+    // fields describe only the valid source picture, never the layer size.
+    private volatile int mSourceWidth;
+    private volatile int mSourceHeight;
+    private int mLastLoggedBufferWidth;
+    private int mLastLoggedBufferHeight;
+    private int mLastLoggedVisibleWidth;
+    private int mLastLoggedVisibleHeight;
     
     private HandlerThread mHandlerThread;
     private Handler mHandler;
@@ -52,36 +64,30 @@ public class MirrorManager {
     }
 
     public void start(String deviceName, int pinCode) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-            android.util.Log.w(TAG, "Mirror requires Android 9+ HardwareBuffer support");
-            HSVJEngine.setMirroringState(false);
-            return;
-        }
         if (mIsStarted.get()) return;
         mDeviceName = deviceName;
         mPinCode = pinCode;
-        
-        mHandlerThread = new HandlerThread("MirrorFrameThread");
-        mHandlerThread.start();
-        mHandler = new Handler(mHandlerThread.getLooper());
+        resetSourceGeometry();
 
-        // [核心策略] 始终使用 1080p PRIVATE(0x22) 格式，作为 C++ 引擎的稳定视频源
-        recreateImageReader(1920, 1080);
+        LympServer lympServer = new LympServer(mContext);
+        AirPlayRkmppPlayer player = new AirPlayRkmppPlayer(mLayerId);
+        if (!AirPlayPlayerInjector.inject(lympServer, player)) {
+            player.releasePlayer();
+            android.util.Log.e(TAG, "AirPlay service not started: RKMPP player injection failed");
+            HSVJEngine.setMirroringState(false);
+            syncServiceState("", false, false);
+            return;
+        }
 
-        mServer = new LympServer(mContext);
-        mServer.setDeviceName(deviceName);
-        mServer.setPinCode(pinCode);
-        mServer.setSurface(mSurface);
-        
-        // 同步 PIN 码等元数据到 C++ 层
-        HSVJEngine.setMirrorPin(mLayerId, pinCode);
-        
-        mServer.setNotifyListener(new INotifyListener() {
+        lympServer.setDeviceName(deviceName);
+        lympServer.setPinCode(pinCode);
+        lympServer.setNotifyListener(new INotifyListener() {
             @Override
             public void onConnectedDevice(long ip) {
                 android.util.Log.i(TAG, "Mirror Connected: " + ip);
                 mConnectedIp = ip;
                 mIsConnected.set(true);
+                syncServiceState(SERVICE_APPLE, true, true);
             }
 
             @Override
@@ -90,11 +96,20 @@ public class MirrorManager {
                 if (mConnectedIp == ip) {
                     mConnectedIp = 0;
                     mIsConnected.set(false);
+                    resetSourceGeometry();
+                    syncServiceState(SERVICE_APPLE, true, false);
                 }
             }
 
             @Override
             public void onResolutionChanged(long ip, int width, int height) {
+                if (width <= 0 || height <= 0) {
+                    android.util.Log.w(TAG, "Ignoring invalid source resolution: "
+                            + width + "x" + height);
+                    return;
+                }
+                mSourceWidth = width;
+                mSourceHeight = height;
                 android.util.Log.i(TAG, "Source resolution change: " + width + "x" + height);
                 if (mIsStarted.get()) {
                     HSVJEngine.updateMirrorSourceInfo(mLayerId, 0, 0, width, height);
@@ -102,13 +117,26 @@ public class MirrorManager {
             }
         });
 
-        mServer.startServer();
-        mAppleServerStarted.set(true);
+        mServer = lympServer;
         mIsStarted.set(true);
-        HSVJEngine.setMirroringState(true);
-        android.util.Log.i(TAG, "Mirror Data Feeder started successfully");
-    }
+        mAppleServerStarted.set(true);
+        try {
+            lympServer.startServer();
+        } catch (RuntimeException exception) {
+            android.util.Log.e(TAG, "AirPlay server start failed", exception);
+            mServer = null;
+            mIsStarted.set(false);
+            mAppleServerStarted.set(false);
+            player.releasePlayer();
+            syncServiceState("", false, false);
+            HSVJEngine.setMirroringState(false);
+            return;
+        }
 
+        syncServiceState(SERVICE_APPLE, true, false);
+        HSVJEngine.setMirroringState(true);
+        android.util.Log.i(TAG, "AirPlay service started; video output uses native RKMPP");
+    }
     public Surface prepareFrameSurface() {
         return prepareFrameSurface(1920, 1080);
     }
@@ -135,7 +163,11 @@ public class MirrorManager {
 
     public void startAndroidSurfaceSink() {
         if (mIsStarted.get()) return;
+        if (mDeviceName.isEmpty()) {
+            mDeviceName = defaultDeviceName();
+        }
         mIsStarted.set(true);
+        syncServiceState(SERVICE_ANDROID, true, false);
         HSVJEngine.setMirroringState(true);
     }
 
@@ -165,16 +197,23 @@ public class MirrorManager {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                         HardwareBuffer buffer = image.getHardwareBuffer();
                         if (buffer != null && mIsStarted.get()) {
-                            // HardwareBuffer 可能被解码器按 stride 对齐，visible 尺寸来自 ImageReader。
+                            final int bufferWidth = buffer.getWidth();
+                            final int bufferHeight = buffer.getHeight();
+                            final int visibleWidth = resolveVisibleDimension(
+                                    mSourceWidth, image.getWidth(), bufferWidth);
+                            final int visibleHeight = resolveVisibleDimension(
+                                    mSourceHeight, image.getHeight(), bufferHeight);
+                            logFrameGeometryIfChanged(bufferWidth, bufferHeight,
+                                    visibleWidth, visibleHeight);
                             HSVJEngine.pushMirrorFrame(mLayerId, buffer,
-                                    buffer.getWidth(), buffer.getHeight(),
-                                    image.getWidth(), image.getHeight());
+                                    bufferWidth, bufferHeight, visibleWidth, visibleHeight);
                         }
                     }
                     image.close();
                 }
             } catch (Exception e) {
                 if (image != null) image.close();
+                android.util.Log.w(TAG, "Failed to forward mirror frame", e);
             }
         }, mHandler);
 
@@ -183,13 +222,19 @@ public class MirrorManager {
     }
 
     public void stop() {
-        if (!mIsStarted.get() && mServer == null && mImageReader == null && mHandlerThread == null) return;
+        if (!mIsStarted.get() && mServer == null && mImageReader == null && mHandlerThread == null) {
+            syncServiceState("", false, false);
+            return;
+        }
         
         mIsStarted.set(false);
         if (mServer != null) {
             mServer.stopServer();
             mServer = null;
         }
+        // stopServer() is asynchronous in the SDK; this is the deterministic
+        // native-side lifecycle boundary and is safe when no AirPlay session exists.
+        HSVJEngine.stopNativeAirPlayMirror();
         mAppleServerStarted.set(false);
         
         if (mImageReader != null) {
@@ -199,17 +244,37 @@ public class MirrorManager {
         mSurface = null;
         mReaderWidth = 0;
         mReaderHeight = 0;
-        
-        if (mHandlerThread != null) {
-            mHandlerThread.quitSafely();
-            mHandlerThread = null;
+        resetSourceGeometry();
+
+        Handler handler = mHandler;
+        if (handler != null) {
+            handler.removeCallbacksAndMessages(null);
         }
+        
+        HandlerThread handlerThread = mHandlerThread;
+        mHandlerThread = null;
+        if (handlerThread != null) {
+            handlerThread.quitSafely();
+            if (handlerThread != Thread.currentThread()) {
+                try {
+                    handlerThread.join(1000L);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+        mHandler = null;
         
         HSVJEngine.setMirroringState(false);
         mConnectedIp = 0;
         mIsConnected.set(false);
+        syncServiceState("", false, false);
     }
     
+    public void syncAndroidReadyState(boolean started, boolean connected) {
+        syncServiceState(SERVICE_ANDROID, started, connected);
+    }
+
     public boolean isStarted() {
         return mIsStarted.get();
     }
@@ -239,7 +304,63 @@ public class MirrorManager {
         if (mServer != null) {
             mServer.setPinCode(mPinCode);
         }
-        HSVJEngine.setMirrorPin(mLayerId, mPinCode);
+        if (mAppleServerStarted.get()) {
+            syncServiceState(SERVICE_APPLE, true, mIsConnected.get());
+        } else {
+            HSVJEngine.setMirrorPin(mLayerId, mPinCode);
+        }
         return mPinCode;
+    }
+
+    private static int resolveVisibleDimension(int sourceDimension,
+                                               int imageDimension,
+                                               int bufferDimension) {
+        if (bufferDimension <= 0) {
+            return 0;
+        }
+        if (sourceDimension > 0) {
+            return Math.min(sourceDimension, bufferDimension);
+        }
+        if (imageDimension > 0) {
+            return Math.min(imageDimension, bufferDimension);
+        }
+        return bufferDimension;
+    }
+
+    private void logFrameGeometryIfChanged(int bufferWidth, int bufferHeight,
+                                           int visibleWidth, int visibleHeight) {
+        if (bufferWidth == mLastLoggedBufferWidth
+                && bufferHeight == mLastLoggedBufferHeight
+                && visibleWidth == mLastLoggedVisibleWidth
+                && visibleHeight == mLastLoggedVisibleHeight) {
+            return;
+        }
+        mLastLoggedBufferWidth = bufferWidth;
+        mLastLoggedBufferHeight = bufferHeight;
+        mLastLoggedVisibleWidth = visibleWidth;
+        mLastLoggedVisibleHeight = visibleHeight;
+        android.util.Log.i(TAG, "Mirror frame geometry: buffer="
+                + bufferWidth + "x" + bufferHeight
+                + " visible=" + visibleWidth + "x" + visibleHeight
+                + " source=" + mSourceWidth + "x" + mSourceHeight
+                + " reader=" + mReaderWidth + "x" + mReaderHeight);
+    }
+
+    private void resetSourceGeometry() {
+        mSourceWidth = 0;
+        mSourceHeight = 0;
+        mLastLoggedBufferWidth = 0;
+        mLastLoggedBufferHeight = 0;
+        mLastLoggedVisibleWidth = 0;
+        mLastLoggedVisibleHeight = 0;
+    }
+
+    private String defaultDeviceName() {
+        return Build.MODEL;
+    }
+
+    private void syncServiceState(String serviceName, boolean started, boolean connected) {
+        HSVJEngine.setMirrorServiceState(mLayerId, serviceName, started, connected,
+                mDeviceName.isEmpty() ? defaultDeviceName() : mDeviceName, mPinCode);
     }
 }

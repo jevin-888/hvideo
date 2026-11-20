@@ -1,8 +1,15 @@
-import { createFusionApi } from '../../modules/pages/fusion/apiCore.js?v=2.95';
+import { createFusionApi } from '../../modules/pages/fusion/apiCore.js?v=2.98';
 import { buildModuleActionRequest } from '../../shared/moduleActions.js';
 import { parseApiResponse } from '../../shared/apiResponseParser.js';
 
 const API_BASE = '/api/v1';
+
+// 页面保留默认 HTTP 地址，接口复用设备现有的免登录手机服务。
+export function mobileServiceUrl(path) {
+    const url = new URL(path, window.location.origin);
+    url.port = '8081';
+    return url.href;
+}
 
 
 async function request(method, path, data = null, timeoutMs = 6000) {
@@ -16,7 +23,7 @@ async function request(method, path, data = null, timeoutMs = 6000) {
     if (data !== null) options.body = JSON.stringify(data);
 
     try {
-        const response = await fetch(API_BASE + path, options);
+        const response = await fetch(mobileServiceUrl(API_BASE + path), options);
         const text = await response.text();
         if (!text) {
             throw new Error('后端返回空响应，不符合统一 API contract');

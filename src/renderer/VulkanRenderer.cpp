@@ -9,11 +9,10 @@
 #include "VulkanRenderer_Internal.h" // 引入内部头文件
 #include "decoder/VideoDecoder.h"
 #include "renderer/DrmKmsProbe.h"
-#include "renderer/RKDRMRenderer.h"
 #include "utils/FileUtils.h"
 #include "utils/Logger.h"
 #include "utils/MemoryMonitor.h"
-#include "core/PathConfig.h"  // 用于 SHADERS_DIR
+#include "foundation/PathConfig.h"  // 用于 SHADERS_DIR
 #include "core/TextureIdConstants.h"
 #include <algorithm>
 #include <chrono>
@@ -47,7 +46,8 @@ const std::vector<const char *> DEVICE_EXTENSIONS = {
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
     // RKMPP DMA-BUF 支持
-    "VK_EXT_external_memory_dma_buf", "VK_EXT_image_drm_format_modifier"};
+    "VK_EXT_external_memory_dma_buf", "VK_EXT_image_drm_format_modifier",
+    "VK_EXT_queue_family_foreign"};
 
 // 说明：注意：PushConstants、PipelineStateHelper、recordImageBarrier、
 // recordCopyAndTransition are defined in Vulkan渲染器_Internal.h
@@ -155,21 +155,33 @@ bool VulkanRenderer::initialize(ANativeWindow *window,
     return false;
   }
 #endif
-  if (!createInstance())
+  if (!createInstance()) {
+    LOG_ERROR("[Vulkan] Initialization stopped at createInstance");
     return false;
+  }
 #ifdef __ANDROID__
-  if (!drmKmsBackendRequested_ && !createSurface(window))
+  if (!drmKmsBackendRequested_ && !createSurface(window)) {
+    LOG_ERROR("[Vulkan] Initialization stopped at createSurface");
     return failAfterInstanceCreation();
+  }
 #else
-  if (!createSurface(window))
+  if (!createSurface(window)) {
+    LOG_ERROR("[Vulkan] Initialization stopped at createSurface");
     return failAfterInstanceCreation();
+  }
 #endif
-  if (!selectPhysicalDevice())
+  if (!selectPhysicalDevice()) {
+    LOG_ERROR("[Vulkan] Initialization stopped at selectPhysicalDevice");
     return failAfterInstanceCreation();
-  if (!createLogicalDevice())
+  }
+  if (!createLogicalDevice()) {
+    LOG_ERROR("[Vulkan] Initialization stopped at createLogicalDevice");
     return failAfterInstanceCreation();
-  if (!createDeviceDependentRenderingState())
+  }
+  if (!createDeviceDependentRenderingState()) {
+    LOG_ERROR("[Vulkan] Initialization stopped at createDeviceDependentRenderingState");
     return failAfterInstanceCreation();
+  }
 
   initialized_ = true;
   LOG_RENDER("VulkanRenderer initialized: %dx%d", swapchainExtent_.width,
@@ -244,11 +256,9 @@ bool VulkanRenderer::createDeviceDependentRenderingState() {
     initializeDrmKmsPresenterIfRequested();
   warmUpCommonYcbcrPipelines();
 
-  // Product output is converging on a final-frame DRM/KMS presenter. Keep the
-  // old per-video RKDRM overlay path disabled so composition, projection, and
-  // blend stay in one renderer before final scanout.
-  rkDrmRenderer_.reset();
-  rkDrmZeroCopyEnabled_ = false;
+  // DRM_PRIME is decoder input. Final output is selected once: either
+  // Android Surface/SurfaceFlinger/HWC or the final-frame DrmKmsPresenter.
+  // Per-video DRM overlay ownership is intentionally not part of this renderer.
 #endif
   configureAsyncPresent();
   configureAsyncAcquire();
@@ -271,23 +281,31 @@ void VulkanRenderer::shutdown(bool releaseInstanceAndSurface,
     clearOnLogicalDeviceRecreated();
   }
 
-  // RKDRM渲染器 资源清理：Android 上关闭 DRM Overlay/零拷贝状态。
-#ifdef __ANDROID__
-  if (rkDrmRenderer_) {
-    rkDrmRenderer_->shutdown();
-    rkDrmRenderer_.reset();
-    rkDrmZeroCopyEnabled_ = false;
-  }
-  shutdownDrmKmsPresenter();
-#endif
-  // ==========================================================================
   if (device_ != VK_NULL_HANDLE) {
     // deviceLostMode：GPU 已经 DEVICE_LOST，vkDeviceWaitIdle 会永久阻塞，必须跳过
     if (!deviceLostMode) {
-      vkDeviceWaitIdle(device_);
-      drainPendingDestructionsNow();
+      const VkResult waitResult = vkDeviceWaitIdle(device_);
+      if (waitResult == VK_SUCCESS) {
+        drainSubmissionCallbacks(true, "shutdown");
+        drainPendingDestructionsNow();
+      } else {
+        if (waitResult == VK_ERROR_DEVICE_LOST) {
+          markDeviceLostFatal("vkDeviceWaitIdle(shutdown)", waitResult);
+        }
+        drainSubmissionCallbacks(false, "shutdown wait failed");
+      }
+    } else {
+      drainSubmissionCallbacks(false, "shutdown device lost");
     }
+  } else {
+    drainSubmissionCallbacks(false, "shutdown without device");
   }
+
+  // Vulkan submissions must retire before their DRM/KMS images are destroyed.
+#ifdef __ANDROID__
+  shutdownDrmKmsPresenter();
+#endif
+  // ==========================================================================
 
   // 清理待销毁队列，防止 shutdown 后仍有后台线程尝试销毁纹理
   {
@@ -297,6 +315,12 @@ void VulkanRenderer::shutdown(bool releaseInstanceAndSurface,
     pendingImageDestructions_.clear();
   }
   destroyLyricOffscreenResources();
+
+  // Blur texture entries only alias FBO-owned images. Remove them before
+  // generic texture destruction and before destroying the descriptor pool.
+  if (device_ != VK_NULL_HANDLE) {
+    cleanupKawasePipelines();
+  }
 
   // 清理 all textures
   if (device_ != VK_NULL_HANDLE) {
@@ -407,38 +431,21 @@ void VulkanRenderer::shutdown(bool releaseInstanceAndSurface,
     }
     smallStagingSize_ = 0;
 
-    if (assMaskStagingBuffer_ != VK_NULL_HANDLE) {
-      if (assMaskStagingMapped_) {
-        vkUnmapMemory(device_, assMaskStagingMemory_);
-        assMaskStagingMapped_ = false;
-      }
-      vkDestroyBuffer(device_, assMaskStagingBuffer_, nullptr);
-      assMaskStagingBuffer_ = VK_NULL_HANDLE;
+    for (auto& buffers : assMaskFrameBuffers_) {
+      if (buffers.stagingMapped) vkUnmapMemory(device_, buffers.stagingMemory);
+      if (buffers.stagingBuffer) vkDestroyBuffer(device_, buffers.stagingBuffer, nullptr);
+      if (buffers.stagingMemory) vkFreeMemory(device_, buffers.stagingMemory, nullptr);
+      if (buffers.instanceMapped) vkUnmapMemory(device_, buffers.instanceMemory);
+      if (buffers.instanceBuffer) vkDestroyBuffer(device_, buffers.instanceBuffer, nullptr);
+      if (buffers.instanceMemory) vkFreeMemory(device_, buffers.instanceMemory, nullptr);
+      buffers = {};
     }
-    if (assMaskStagingMemory_ != VK_NULL_HANDLE) {
-      vkFreeMemory(device_, assMaskStagingMemory_, nullptr);
-      assMaskStagingMemory_ = VK_NULL_HANDLE;
-    }
-    assMaskStagingSize_ = 0;
-
-    if (assMaskInstanceBuffer_ != VK_NULL_HANDLE) {
-      vkDestroyBuffer(device_, assMaskInstanceBuffer_, nullptr);
-      assMaskInstanceBuffer_ = VK_NULL_HANDLE;
-    }
-    if (assMaskInstanceMemory_ != VK_NULL_HANDLE) {
-      vkFreeMemory(device_, assMaskInstanceMemory_, nullptr);
-      assMaskInstanceMemory_ = VK_NULL_HANDLE;
-    }
-    assMaskInstanceCapacity_ = 0;
 
     // 销毁 descriptor pool
     if (descriptorPool_ != VK_NULL_HANDLE) {
       vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
       descriptorPool_ = VK_NULL_HANDLE;
     }
-
-    // 清理 Kawase pipelines
-    cleanupKawasePipelines();
 
     // 清理 command pool
     if (commandPool_ != VK_NULL_HANDLE) {
@@ -455,6 +462,21 @@ void VulkanRenderer::shutdown(bool releaseInstanceAndSurface,
     }
 
     // 清理 NV12 管线
+    if (rgbaFastPipeline_ != VK_NULL_HANDLE) {
+      vkDestroyPipeline(device_, rgbaFastPipeline_, nullptr);
+      rgbaFastPipeline_ = VK_NULL_HANDLE;
+    }
+    rgbaFastPipelineLogged_ = false;
+
+    if (graphicsPipeline_ != VK_NULL_HANDLE) {
+      vkDestroyPipeline(device_, graphicsPipeline_, nullptr);
+      graphicsPipeline_ = VK_NULL_HANDLE;
+    }
+    if (pipelineLayout_ != VK_NULL_HANDLE) {
+      vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+      pipelineLayout_ = VK_NULL_HANDLE;
+    }
+
     if (nv12Pipeline_ != VK_NULL_HANDLE) {
       vkDestroyPipeline(device_, nv12Pipeline_, nullptr);
       nv12Pipeline_ = VK_NULL_HANDLE;
@@ -520,6 +542,10 @@ void VulkanRenderer::shutdown(bool releaseInstanceAndSurface,
     ycbcrExternalFormat_ = 0;
 
     // 清理 DRM PRIME YCbCr 管线 (RKMPP 支持)
+    if (drmPrimeFastPipeline_ != VK_NULL_HANDLE) {
+      vkDestroyPipeline(device_, drmPrimeFastPipeline_, nullptr);
+      drmPrimeFastPipeline_ = VK_NULL_HANDLE;
+    }
     if (drmPrimePipeline_ != VK_NULL_HANDLE) {
       vkDestroyPipeline(device_, drmPrimePipeline_, nullptr);
       drmPrimePipeline_ = VK_NULL_HANDLE;
@@ -549,6 +575,10 @@ void VulkanRenderer::shutdown(bool releaseInstanceAndSurface,
     drmPrimePipelineInitialized_ = false;
 
     // 清理 V4L2 capture YCbCr 管线
+    if (v4l2FastPipeline_ != VK_NULL_HANDLE) {
+      vkDestroyPipeline(device_, v4l2FastPipeline_, nullptr);
+      v4l2FastPipeline_ = VK_NULL_HANDLE;
+    }
     if (v4l2Pipeline_ != VK_NULL_HANDLE) {
       vkDestroyPipeline(device_, v4l2Pipeline_, nullptr);
       v4l2Pipeline_ = VK_NULL_HANDLE;

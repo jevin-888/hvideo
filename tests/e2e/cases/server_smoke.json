@@ -1,0 +1,44 @@
+{
+  "id": "server-smoke",
+  "name": "真实点歌服务器基础接口",
+  "tags": ["real-server", "read-only"],
+  "steps": [
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "${server_url}/api/v1/terminals/pad-list",
+      "expect_status": 200,
+      "save_as": "terminals"
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "terminals.body.code",
+      "equals": 0
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "${server_url}/api/v1/songdb/songs?page=1&pageSize=1",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "${server_url}/api/v1/songdb/singers?page=1&pageSize=1",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "${server_url}/api/v1/service-types",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "${server_url}/api/v1/system/dicts",
+      "expect_status": 200
+    }
+  ]
+}

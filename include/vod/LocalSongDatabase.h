@@ -19,6 +19,7 @@ public:
         std::string initialKey;
         std::string languageCode;
         std::string categoryCode;
+        std::string lightCode;
         std::string absolutePath;
         std::string relativePath;
         std::string fileName;
@@ -58,7 +59,16 @@ public:
 
     bool initialize(const std::string& dbPath);
     void shutdown();
-    bool isOpen() const { return db_ != nullptr; }
+    bool isOpen() const {
+        std::lock_guard<std::mutex> lock(dbMutex_);
+        return db_ != nullptr;
+    }
+    // True when the real song database was unavailable and an empty in-memory
+    // database is being used so the engine can finish starting.
+    bool isTemporary() const {
+        std::lock_guard<std::mutex> lock(dbMutex_);
+        return temporary_;
+    }
 
     bool getSongByNo(const std::string& songNo, SongInfo& out);
     std::vector<SongInfo> searchSongs(const std::string& keyword, int page, int pageSize, int& total);
@@ -71,6 +81,7 @@ public:
 
 private:
     sqlite3* db_ = nullptr;
+    bool temporary_ = false;
     mutable std::mutex dbMutex_;
 };
 

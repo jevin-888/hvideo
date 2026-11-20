@@ -1,7 +1,7 @@
 // 矩阵配置模块
-import { apiPost, getLastApiError, apiAction } from '../core/api.js';
-import { addToCommandLog } from '../core/commandLog.js';
-import { showSuccess, showError } from '../components/toast.js';
+import { getLastApiError, apiAction } from '../core/api.js';
+import { addToCommandLog } from '/shared/commandLog.js';
+import { showSuccess, showError, showPrompt } from '../components/toast.js';
 
 // 当前映射配置
 // 矩阵配置负责：幕布布局、幕布分辨率、输出分辨率、输出布局、输出映射、旋转角度
@@ -253,6 +253,17 @@ function setupEventListeners() {
         });
     }
 
+    const saveCommandBtn = document.getElementById('save-matrix-command');
+    if (saveCommandBtn) {
+        const newSaveCommandBtn = saveCommandBtn.cloneNode(true);
+        saveCommandBtn.parentNode.replaceChild(newSaveCommandBtn, saveCommandBtn);
+        newSaveCommandBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            saveMatrixCommand();
+        });
+    }
+
     // 重置按钮
     const resetBtn = document.getElementById('reset-flexible-mapping');
     if (resetBtn) {
@@ -334,6 +345,68 @@ function setupEventListeners() {
 
     // 标记事件监听器已绑定
     eventListenersBound = true;
+}
+
+function readMatrixConfigFromForm() {
+    const container = document.querySelector('.flexible-mapping-container');
+    if (!container) throw new Error('矩阵配置区域未加载，请刷新页面重试');
+    const value = (id) => Number(container.querySelector(`#${id}`)?.value);
+    const canvasWidth = value('flexible-canvas-width');
+    const canvasHeight = value('flexible-canvas-height');
+    const canvasRows = value('flexible-canvas-rows');
+    const canvasCols = value('flexible-canvas-cols');
+    const outputWidth = value('flexible-output-width');
+    const outputHeight = value('flexible-output-height');
+    const outputRows = value('flexible-output-rows');
+    const outputCols = value('flexible-output-cols');
+    [canvasWidth, canvasHeight, canvasRows, canvasCols, outputWidth, outputHeight, outputRows, outputCols]
+        .forEach((n) => {
+            if (!Number.isInteger(n) || n <= 0) throw new Error('矩阵参数必须为正整数');
+        });
+    validateLayoutSizeOrThrow(canvasRows, canvasCols, '输入布局');
+    validateLayoutSizeOrThrow(outputRows, outputCols, '输出布局');
+    enforceLicensedInputLayoutOrThrow(canvasRows, canvasCols);
+    if (canvasWidth % canvasCols || canvasHeight % canvasRows ||
+        outputWidth % outputCols || outputHeight % outputRows) {
+        throw new Error('分辨率必须能被对应布局整除');
+    }
+    const mappings = buildMappingsForSave(
+        currentMappingConfig.mappings, canvasRows * canvasCols, outputRows * outputCols);
+    return {
+        canvas_in_width: canvasWidth,
+        canvas_in_height: canvasHeight,
+        layout_in_cols: canvasCols,
+        layout_in_rows: canvasRows,
+        canvas_out_width: outputWidth,
+        canvas_out_height: outputHeight,
+        layout_out_cols: outputCols,
+        layout_out_rows: outputRows,
+        rotation_angle: Math.min(360, Math.max(0, Math.round(value('flexible-canvas-rotation') || 0))),
+        split_direction: 0,
+        mappings: mappings.map((m) => ({
+            in_id: m.inputRegionId,
+            out_idx: m.enabled ? m.outputIndex : -1,
+            enabled: Boolean(m.enabled && m.outputIndex >= 0)
+        }))
+    };
+}
+
+async function saveMatrixCommand() {
+    try {
+        const config = readMatrixConfigFromForm();
+        const defaultName = `矩阵映射 ${config.layout_in_rows}x${config.layout_in_cols} 到 ${config.layout_out_rows}x${config.layout_out_cols}`;
+        const name = (await showPrompt('保存到设备的中控命令目录', '生成中控命令', defaultName))?.trim();
+        if (!name) return;
+        const id = `matrix_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+        const response = await apiAction('regions', 'save_matrix_command', { id, name, ...config });
+        if (!response?.saved || response.id !== id) {
+            throw new Error(getLastApiError()?.message || '写入中控命令目录失败');
+        }
+        showSuccess(`${name} 已保存，可从中控功能列表调用`, 4000);
+        addToCommandLog('生成中控命令', 'success', `${name} 已保存至 CommandList/${response.command_path}`);
+    } catch (error) {
+        showError(error.message || '矩阵配置无效');
+    }
 }
 
 /**
@@ -466,7 +539,6 @@ function updateInputFields() {
     const outputHeightInput = flexibleMappingContainer.querySelector('#flexible-output-height');
     const outputColsInput = flexibleMappingContainer.querySelector('#flexible-output-cols');
     const outputRowsInput = flexibleMappingContainer.querySelector('#flexible-output-rows');
-    const rotationInput = flexibleMappingContainer.querySelector('#flexible-canvas-rotation');
 
     // 零硬编码：未配置时为 0，须用户配置矩阵
     const canvasWidth = currentMappingConfig.canvas.width > 0 ? currentMappingConfig.canvas.width : 0;
@@ -979,176 +1051,12 @@ function updateOutputGrid() {
  */
 async function applyFlexibleMapping() {
     try {
-        const flexibleMappingContainer = document.querySelector('.flexible-mapping-container');
-        if (!flexibleMappingContainer) {
-            const errorMsg = '矩阵配置区域未加载，请刷新页面重试';
-            showError(errorMsg, 3000);
-            addToCommandLog('配置失败', 'error', errorMsg);
-            return;
-        }
-
-        const getElement = (id) => flexibleMappingContainer.querySelector(`#${id}`);
-
-        const canvasWidthInput = getElement('flexible-canvas-width');
-        const canvasHeightInput = getElement('flexible-canvas-height');
-        const canvasRowsInput = getElement('flexible-canvas-rows');
-        const canvasColsInput = getElement('flexible-canvas-cols');
-        // 输出分辨率和输出布局是矩阵配置的一部分
-        const outputWidthInput = getElement('flexible-output-width');
-        const outputHeightInput = getElement('flexible-output-height');
-        const outputRowsInput = getElement('flexible-output-rows');
-        const outputColsInput = getElement('flexible-output-cols');
-        // 旋转角度是矩阵配置的一部分
-        const rotationInput = getElement('flexible-canvas-rotation');
-
-        // 验证必要的输入框是否存在（矩阵配置含输出分辨率与布局）
-        if (!canvasWidthInput || !canvasHeightInput || !canvasColsInput || !canvasRowsInput ||
-            !outputWidthInput || !outputHeightInput || !outputColsInput || !outputRowsInput) {
-            const errorMsg = '找不到配置输入框，请刷新页面重试';
-            showError(errorMsg, 3000);
-            addToCommandLog('配置失败', 'error', errorMsg);
-            return;
-        }
-
-        // 先从输入框读取最新值并更新配置
-        // 注意：必须从输入框读取，因为用户可能修改了值但还没有触发change事件
-        // 使用严格的验证，确保值有效
-        const readRequiredInteger = (input, fieldName, minValue = 1) => {
-            if (!input || !input.value || input.value.trim() === '') {
-                throw new Error(`${fieldName}不能为空`);
-            }
-            const val = Math.floor(Number(input.value));
-            if (isNaN(val) || val < minValue) {
-                throw new Error(`${fieldName}必须是大于等于${minValue}的整数`);
-            }
-            return val;
-        };
-
-        const readOptionalNumber = (input, defaultValue = 0) => {
-            if (!input || !input.value || input.value.trim() === '') {
-                return defaultValue;
-            }
-            const val = Number(input.value);
-            return isNaN(val) ? defaultValue : val;
-        };
-
-        // 读取并验证必需的配置值（矩阵配置包括输出参数和旋转角度）
-        let canvasWidth, canvasHeight, canvasCols, canvasRows;
-        let outputWidth, outputHeight, outputCols, outputRows;
-
-        try {
-            canvasWidth = readRequiredInteger(canvasWidthInput, '幕布分辨率宽度');
-            canvasHeight = readRequiredInteger(canvasHeightInput, '幕布分辨率高度');
-            canvasRows = readRequiredInteger(canvasRowsInput, '幕布布局行数');
-            canvasCols = readRequiredInteger(canvasColsInput, '幕布布局列数');
-            validateLayoutSizeOrThrow(canvasRows, canvasCols, '输入布局');
-            enforceLicensedInputLayoutOrThrow(canvasRows, canvasCols);
-            outputWidth = readRequiredInteger(outputWidthInput, '输出分辨率宽度');
-            outputHeight = readRequiredInteger(outputHeightInput, '输出分辨率高度');
-            outputRows = readRequiredInteger(outputRowsInput, '输出布局行数');
-            outputCols = readRequiredInteger(outputColsInput, '输出布局列数');
-            validateLayoutSizeOrThrow(outputRows, outputCols, '输出布局');
-        } catch (error) {
-            const errorMsg = error.message || '配置参数验证失败';
-            showError(errorMsg, 3000);
-            addToCommandLog('配置错误', 'error', errorMsg);
-            return;
-        }
-
-        // 读取旋转角度（矩阵配置的一部分，0/90/180/270 或 0-360 取整）
-        const rawRotation = readOptionalNumber(rotationInput, 0);
-        const rotationAngle = Math.min(360, Math.max(0, Math.round(Number(rawRotation))));
-
-        // 更新当前配置
-        currentMappingConfig.canvas.width = canvasWidth;
-        currentMappingConfig.canvas.height = canvasHeight;
-        currentMappingConfig.canvas.gridRows = canvasRows;
-        currentMappingConfig.canvas.gridCols = canvasCols;
-        currentMappingConfig.output.width = outputWidth;
-        currentMappingConfig.output.height = outputHeight;
-        currentMappingConfig.output.gridRows = outputRows;
-        currentMappingConfig.output.gridCols = outputCols;
-
-        const totalInputRegions = canvasCols * canvasRows;
-        const totalOutputRegions = outputCols * outputRows;
-        if (canvasWidth % canvasCols !== 0 || canvasHeight % canvasRows !== 0) {
-            const errorMsg = '幕布分辨率必须能被幕布布局整除';
-            showError(errorMsg, 3000);
-            addToCommandLog('配置错误', 'error', errorMsg);
-            return;
-        }
-        if (outputWidth % outputCols !== 0 || outputHeight % outputRows !== 0) {
-            const errorMsg = '输出分辨率必须能被输出布局整除';
-            showError(errorMsg, 3000);
-            addToCommandLog('配置错误', 'error', errorMsg);
-            return;
-        }
-        const mappingsToSave = buildMappingsForSave(
-            currentMappingConfig.mappings,
-            totalInputRegions,
-            totalOutputRegions
-        );
-        currentMappingConfig.mappings = mappingsToSave;
-
-        // split_direction: 0=水平分割, 1=垂直分割
-        // 默认使用水平分割（从左到右排列），如果需要垂直分割，需要用户配置
-        // 这里先使用水平分割，后续如果需要可以添加UI让用户选择
-        const splitDirection = 0; // 默认水平分割
-
-        // 使用已验证的值构建请求数据（矩阵配置包括输出参数和旋转角度）
-        const config = {
-            canvas_in_width: canvasWidth,
-            canvas_in_height: canvasHeight,
-            layout_in_cols: canvasCols,
-            layout_in_rows: canvasRows,
-            canvas_out_width: outputWidth,
-            canvas_out_height: outputHeight,
-            layout_out_cols: outputCols,
-            layout_out_rows: outputRows,
-            rotation_angle: rotationAngle,
-            split_direction: splitDirection,
-            mappings: mappingsToSave.map(m => ({
-                in_id: m.inputRegionId,
-                out_idx: m.enabled ? m.outputIndex : -1,
-                enabled: Boolean(m.enabled && m.outputIndex >= 0)
-            }))
-        };
-
-        // 验证配置
-        if (config.canvas_in_width <= 0 || config.canvas_in_height <= 0) {
-            const errorMsg = '幕布分辨率必须大于0';
-            showError(errorMsg, 3000);
-            addToCommandLog('配置错误', 'error', errorMsg);
-            return;
-        }
-
-        if (config.layout_in_cols <= 0 || config.layout_in_rows <= 0) {
-            const errorMsg = '幕布布局必须大于0';
-            showError(errorMsg, 3000);
-            addToCommandLog('配置错误', 'error', errorMsg);
-            return;
-        }
-
-        // 验证输出参数（矩阵配置的一部分）
-        if (config.canvas_out_width <= 0 || config.canvas_out_height <= 0) {
-            const errorMsg = '输出分辨率必须大于0';
-            showError(errorMsg, 3000);
-            addToCommandLog('配置错误', 'error', errorMsg);
-            return;
-        }
-
-        if (config.layout_out_cols <= 0 || config.layout_out_rows <= 0) {
-            const errorMsg = '输出布局必须大于0';
-            showError(errorMsg, 3000);
-            addToCommandLog('配置错误', 'error', errorMsg);
-            return;
-        }
-
+        const config = readMatrixConfigFromForm();
         // 后端会按同一事务语义完成运行时应用与 config.json 持久化。
         addToCommandLog(
             '配置保存',
             'info',
-            `提交矩阵: 输入${canvasWidth}×${canvasHeight} 布局${formatLayout(canvasRows, canvasCols)}，输出${outputWidth}×${outputHeight} 布局${formatLayout(outputRows, outputCols)}`
+            `提交矩阵: 输入${config.canvas_in_width}×${config.canvas_in_height} 布局${formatLayout(config.layout_in_rows, config.layout_in_cols)}，输出${config.canvas_out_width}×${config.canvas_out_height} 布局${formatLayout(config.layout_out_rows, config.layout_out_cols)}`
         );
         const response = await apiAction('regions', 'set_flexible_mapping', config, MATRIX_SAVE_TIMEOUT_MS);
 

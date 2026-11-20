@@ -736,6 +736,8 @@ endif ()
 ## Install
 include (GNUInstallDirs)
 
+set(SKIP_INSTALL_ALL ON CACHE BOOL "Disable HarfBuzz install/export rules for embedded Android build" FORCE)
+
 if (NOT SKIP_INSTALL_HEADERS AND NOT SKIP_INSTALL_ALL)
   install(FILES ${project_headers} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/harfbuzz)
   if (HB_HAVE_GOBJECT)

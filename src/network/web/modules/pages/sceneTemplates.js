@@ -1,15 +1,19 @@
 import { apiGet, apiPost, apiPut, apiDelete } from '../core/api.js';
 import { roundNumbersInObject } from '../utils/configUtils.js';
-import { addToCommandLog } from '../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { clearContainer } from '../utils/domHelpers.js';
 import { toggleButtonGroupActive } from '../components/buttonGroups.js';
 import { showConfirm } from '../components/toast.js';
+import { isModuleLicensed } from '../core/moduleLicense.js';
 
 // 全局变量，用于跟踪当前选中的场景
 let selectedScene = null;
+let initialized = false;
 
 // 初始化场景模板列表
 export function initializeSceneTemplates() {
+    if (initialized || !isModuleLicensed('scene')) return;
+    initialized = true;
     updateSceneTemplates();
     initializeDefaultConfigEditor(); // 新增：初始化 config.json 编辑器
     initializeSceneTabs();

@@ -17,6 +17,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.media.AudioManager;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.os.UserHandle;
@@ -111,6 +112,52 @@ public class DSPControl {
         return sIsDSP;
     }
 
+    /**
+     * Bluetooth A2DP Sink absolute-volume events already update STREAM_MUSIC.
+     * While that route owns audio, engine route synchronization must not replace
+     * the phone-selected value with the persisted engine UI volume.
+     */
+    public static synchronized void setExternalBluetoothAudioActive(boolean active) {
+        if (sExternalBluetoothAudioActive == active) {
+            return;
+        }
+        sExternalBluetoothAudioActive = active;
+        ++sVolumeRampGeneration;
+        sPendingRouteRampPath = ROUTE_VOLUME_PATH_UNKNOWN;
+        sPendingRouteRampUptimeMs = 0;
+        if (active) {
+            // Bluetooth spectrum capture reads the system mix directly. The stale
+            // HDMI/MIPI AudioRecord recovery loop must not keep toggling the HAL
+            // route behind it, otherwise Surface/Vulkan presents stall periodically.
+            resetHdmiAudioRecoveryLocked("Bluetooth audio became active");
+            stopAudioLoopback();
+            Log.i(TAG, "Bluetooth audio owns STREAM_MUSIC and capture route; preserving phone volume");
+            return;
+        }
+
+        if (sAudioDSPType >= 0) {
+            Log.i(TAG, "Bluetooth audio released DSP route; applying deferred type="
+                    + sAudioDSPType);
+            setAudioDSPType_Legacy(sAudioDSPType);
+        }
+        if (sHasDeferredManagedVolume) {
+            float deferredVolume = sDeferredManagedVolume;
+            int deferredPath = sDeferredManagedVolumePath;
+            sHasDeferredManagedVolume = false;
+            Log.i(TAG, "Bluetooth audio released STREAM_MUSIC; applying deferred engine volume="
+                    + deferredVolume + ", path=" + deferredPath);
+            setDSPVolume(deferredVolume, deferredPath);
+        }
+        if (!isHuoshanVSeriesAudioBoard() && sCaptureSourceType >= 0
+                && (sAudioDSPType == DSP_SYSTEM
+                        || sAudioDSPType == DSP_HDMI1
+                        || sAudioDSPType == DSP_HDMI2)) {
+            Log.i(TAG, "Bluetooth audio released capture route; resuming selected source="
+                    + sCaptureSourceType);
+            startAudioLoopback();
+        }
+    }
+
     private static boolean isHuoshanVSeriesAudioBoard() {
         switch (sDeviceType) {
             case DSP_DEV_V02:
@@ -149,9 +196,30 @@ public class DSPControl {
     private static final int CAPTURE_AUDIO_READ_FRAMES = 1024;
     private static final int CAPTURE_AUDIO_PREREAD_MS = 80;
     private static final int HDMI_SILENT_FALLBACK_MS = 300;
+    private static final int DEFAULT_HDMI_CAPTURE_RATE_HZ = 48000;
+    private static final int USB_CAPTURE_RATE_HZ = 44100;
+    private static final long CAPTURE_READ_STALL_TIMEOUT_MS = 2000;
+    private static final long CAPTURE_READ_POLL_MS = 5;
+    private static final int HDMI_ROUTE_RESET_FAILURE_THRESHOLD = 2;
+    private static final long HDMI_ROUTE_DISABLE_MS = 300;
+    private static final long HDMI_ROUTE_SETTLE_MS = 1000;
+    private static final long HDMI_ZERO_PCM_STARTUP_TIMEOUT_MS = 3000;
+    private static int sHdmiAudioFailureCount = 0;
+    private static final Object sCaptureRouteRequestLock = new Object();
+    private static int sRequestedCaptureSourceType = -1;
+    private static int sCaptureRouteGeneration = 0;
+    private static final HandlerThread sCaptureRouteThread;
+    private static final Handler sCaptureRouteHandler;
+    static {
+        sCaptureRouteThread = new HandlerThread("HSVJCaptureRoute");
+        sCaptureRouteThread.start();
+        sCaptureRouteHandler = new Handler(sCaptureRouteThread.getLooper());
+    }
     private static final long VOLUME_REPEAT_SUPPRESS_MS = 300;
     private static final Handler sCaptureAudioRetryHandler = new Handler(Looper.getMainLooper());
-    private static final Handler sVolumeRampHandler = new Handler(Looper.getMainLooper());
+    // Volume ramp writes AudioManager/system properties; keep them on the same serial route
+    // worker as DSP type and capture source transitions.
+    private static final Handler sVolumeRampHandler = sCaptureRouteHandler;
     private static final long CAPTURE_VOLUME_RAMP_STEP_MS = 40;
     private static final float CAPTURE_VOLUME_PREROLL = 0.06f;
     private static final float[] CAPTURE_VOLUME_RAMP_FACTORS =
@@ -166,31 +234,96 @@ public class DSPControl {
     private static int sVolumeRampGeneration = 0;
     private static int sPendingRouteRampPath = ROUTE_VOLUME_PATH_UNKNOWN;
     private static long sPendingRouteRampUptimeMs = 0;
+    private static boolean sExternalBluetoothAudioActive = false;
+    private static boolean sHasDeferredManagedVolume = false;
+    private static float sDeferredManagedVolume = 1.0f;
+    private static int sDeferredManagedVolumePath = 0;
 
-    public synchronized static void setAudioDSPType(int type) {
+    /**
+     * Queues the single DSP output route update. Native scene/render code must not wait for
+     * AudioManager/SystemProperties/HAL calls while applying a scene.
+     */
+    public static void setAudioDSPType(int type) {
+        sCaptureRouteHandler.post(() -> {
+            synchronized (DSPControl.class) {
+                applyAudioDSPTypeLocked(type);
+            }
+        });
+    }
+
+    private static void applyAudioDSPTypeLocked(int type) {
+        if (sExternalBluetoothAudioActive) {
+            sAudioDSPType = type;
+            Log.d(TAG, "Bluetooth audio active, defer DSP route update: " + type);
+            return;
+        }
         if (sAudioDSPType == type) {
             Log.d(TAG, "setAudioDSPType unchanged, skip route update: " + type);
-            if (isHuoshanVSeriesAudioBoard()) {
-                stopHuoshanVSeriesSoftwareAudioLocked("V-series DSP route unchanged");
-            } else if (sCaptureSourceType >= 0 && sLoopbackThread == null &&
-                    (type == DSP_SYSTEM || type == DSP_HDMI1 || type == DSP_HDMI2)) {
-                startAudioLoopback();
-            }
             return;
         }
         sAudioDSPType = type;
         setAudioDSPType_Legacy(type);
-        if (isHuoshanVSeriesAudioBoard()) {
-            stopHuoshanVSeriesSoftwareAudioLocked("V-series DSP route uses hardware audio path");
-        } else if (sCaptureSourceType >= 0 &&
-                (type == DSP_SYSTEM || type == DSP_HDMI1 || type == DSP_HDMI2)) {
-            startAudioLoopback();
+        // DSP type only owns the output route. Capture source selection is the
+        // single owner of AudioRecord/HDMI-in lifetime, so one scene transition
+        // cannot start or stop the capture loopback twice.
+    }
+
+    /**
+     * Records the single requested capture source and returns immediately.
+     *
+     * Scene application runs on the native render thread. Audio HAL routing must never run on
+     * that thread, otherwise a scene containing a capture layer stalls video presentation while
+     * setParameters/SystemProperties are applied. A single serial route worker owns all source
+     * transitions; the generation check discards superseded scene states.
+     */
+    public static void setCaptureAudioSource(int type) {
+        final int requestedType;
+        if (type < 0) {
+            requestedType = -1;
+        } else if (type == 0 || type == 1) {
+            requestedType = type;
         } else {
-            stopAudioLoopback();
+            Log.w(TAG, "Unsupported capture audio source: " + type);
+            return;
+        }
+
+        final int generation;
+        synchronized (sCaptureRouteRequestLock) {
+            sRequestedCaptureSourceType = requestedType;
+            generation = ++sCaptureRouteGeneration;
+        }
+
+        sCaptureRouteHandler.post(() -> {
+            try {
+                applyCaptureAudioSource(requestedType, generation);
+            } catch (Throwable error) {
+                Log.e(TAG, "Failed to apply capture audio source=" + requestedType, error);
+            }
+        });
+    }
+
+    private static void applyCaptureAudioSource(int type, int generation) {
+        synchronized (sCaptureRouteRequestLock) {
+            if (generation != sCaptureRouteGeneration || type != sRequestedCaptureSourceType) {
+                Log.d(TAG, "Skip superseded capture route: source=" + type
+                        + " generation=" + generation);
+                return;
+            }
+        }
+
+        synchronized (DSPControl.class) {
+            synchronized (sCaptureRouteRequestLock) {
+                if (generation != sCaptureRouteGeneration || type != sRequestedCaptureSourceType) {
+                    Log.d(TAG, "Skip superseded capture route after lock: source=" + type
+                            + " generation=" + generation);
+                    return;
+                }
+            }
+            applyCaptureAudioSourceLocked(type);
         }
     }
 
-    public synchronized static void setCaptureAudioSource(int type) {
+    private static void applyCaptureAudioSourceLocked(int type) {
         if (type < 0) {
             boolean changed = sCaptureSourceType != -1;
             if (changed) {
@@ -198,6 +331,7 @@ public class DSPControl {
             }
             sCaptureSourceType = -1;
             sCaptureAudioRetryGeneration++;
+            resetHdmiAudioRecoveryLocked("capture audio source cleared");
             if (isHuoshanVSeriesAudioBoard()) {
                 if (changed) {
                     stopHuoshanVSeriesSoftwareAudioLocked("capture audio stopped");
@@ -209,12 +343,13 @@ public class DSPControl {
             }
             return;
         }
-        if (type != 0 && type != 1) {
-            Log.w(TAG, "Unsupported capture audio source: " + type);
-            return;
-        }
+
         boolean changed = sCaptureSourceType != type;
         sCaptureSourceType = type;
+        if (changed) {
+            sCaptureAudioRetryGeneration++;
+            resetHdmiAudioRecoveryLocked("capture audio source changed");
+        }
         if (!changed && isHuoshanVSeriesAudioBoard()) {
             stopSoftwareLoopbackLocked();
             return;
@@ -228,6 +363,12 @@ public class DSPControl {
             return;
         }
 
+        if (sExternalBluetoothAudioActive) {
+            Log.d(TAG, "Bluetooth audio active, remember capture source without starting loopback: "
+                    + type);
+            stopSoftwareLoopbackLocked();
+            return;
+        }
         if (!changed && sLoopbackThread != null) {
             return;
         }
@@ -389,6 +530,11 @@ public class DSPControl {
      * 再由 AudioRecord 推送给 Native；V 系列板保持外置 DSP 硬件链路。
      */
     private synchronized static void startAudioLoopback() {
+        if (sExternalBluetoothAudioActive) {
+            Log.d(TAG, "Bluetooth audio active, skip capture AudioRecord start");
+            stopSoftwareLoopbackLocked();
+            return;
+        }
         if (sContext == null) {
             Log.w(TAG, "startAudioLoopback: context is null");
             return;
@@ -401,13 +547,18 @@ public class DSPControl {
         boolean hdmiMipiCapture = sCaptureSourceType == 0;
         Log.i(TAG, "Starting Audio Loopback");
 
-        // HDMI/MIPI 需要打开这个 HAL 参数；在 RK628/MIPI 板上它不仅是直通开关，
-        // 还会影响 CAMCORDER/HDMIIn 输入路由，否则 AudioRecord 只能读到近似底噪。
-        setHdmiInEnabledLocked(hdmiMipiCapture, false,
+        // Keep the HDMI-in route enabled before waiting for RK628 audio timing.
+        // Disabling the route while timing is absent prevents later recovery.
+        boolean hdmiInEnabled = setHdmiInEnabledLocked(hdmiMipiCapture, false,
                 hdmiMipiCapture ? "capture HDMI/MIPI selected" : "non HDMI/MIPI capture selected");
-        if (hdmiMipiCapture && !isHdmiInAudioPresent()) {
-            Log.w(TAG, "HDMI/MIPI audio is not reported yet; postpone AudioRecord");
-            scheduleHdmiAudioRetryLocked("HDMI/MIPI audio not present at loopback start");
+        if (hdmiMipiCapture && !hdmiInEnabled) {
+            Log.w(TAG, "HDMI/MIPI route could not be enabled; postpone AudioRecord");
+            scheduleHdmiAudioRetryLocked("HDMI/MIPI route enable failed");
+            return;
+        }
+        if (hdmiMipiCapture && !isHdmiInAudioReady()) {
+            Log.w(TAG, "HDMI/MIPI audio is not ready yet; keep route enabled and postpone AudioRecord");
+            scheduleHdmiAudioRetryLocked("HDMI/MIPI audio timing not ready at loopback start");
             return;
         }
 
@@ -429,7 +580,7 @@ public class DSPControl {
     private synchronized static void stopAudioLoopback() {
         sCaptureAudioRetryGeneration++;
         // 1. 禁用硬件 Bypass。状态未变化时不重复写 HAL 参数，避免切场景时音频路由抖动。
-        setHdmiInEnabledLocked(false, true, "capture audio stopped");
+        setHdmiInEnabledLocked(false, false, "capture audio stopped");
 
         // 2. 停止软件 Loopback
         stopSoftwareLoopbackLocked();
@@ -443,14 +594,41 @@ public class DSPControl {
         }
     }
 
-    private synchronized static void onLoopbackThreadExited(AudioLoopbackThread thread, boolean hdmiAudioLost) {
+    private synchronized static void onLoopbackThreadExited(AudioLoopbackThread thread,
+            boolean captureNeedsRestart, int restartSourceType) {
         if (sLoopbackThread == thread) {
             sLoopbackThread = null;
         }
-        if (hdmiAudioLost && sCaptureSourceType == 0 && !isHuoshanVSeriesAudioBoard()) {
-            setHdmiInEnabledLocked(false, false, "HDMI/MIPI audio lost");
-            scheduleHdmiAudioRetryLocked("HDMI/MIPI audio lost while recording");
+        if (!captureNeedsRestart || sCaptureSourceType != restartSourceType
+                || sExternalBluetoothAudioActive || isHuoshanVSeriesAudioBoard()) {
+            return;
         }
+        if (restartSourceType == 0) {
+            int failureCount = ++sHdmiAudioFailureCount;
+            if (failureCount >= HDMI_ROUTE_RESET_FAILURE_THRESHOLD) {
+                scheduleHdmiAudioRouteRecoveryLocked(failureCount);
+                return;
+            }
+            setHdmiInEnabledLocked(true, false,
+                    "HDMI/MIPI first audio failure; rebuild AudioRecord only");
+        }
+        scheduleCaptureAudioRetryLocked(restartSourceType,
+                restartSourceType == 0 ? "HDMI/MIPI capture stalled" : "USB capture stalled");
+    }
+
+    private synchronized static void onCapturePcmReady(int sourceType) {
+        if (sourceType != 0 || sCaptureSourceType != sourceType) {
+            return;
+        }
+        resetHdmiAudioRecoveryLocked("valid HDMI/MIPI PCM received");
+    }
+
+    private static void resetHdmiAudioRecoveryLocked(String reason) {
+        if (sHdmiAudioFailureCount > 0) {
+            Log.i(TAG, "Reset HDMI/MIPI audio recovery state after " + reason
+                    + "; failures=" + sHdmiAudioFailureCount);
+        }
+        sHdmiAudioFailureCount = 0;
     }
 
     private static void stopHuoshanVSeriesSoftwareAudioLocked(String reason) {
@@ -458,6 +636,54 @@ public class DSPControl {
         stopSoftwareLoopbackLocked();
     }
 
+    private static void scheduleHdmiAudioRouteRecoveryLocked(int failureCount) {
+        final int generation = ++sCaptureAudioRetryGeneration;
+
+        Log.w(TAG, "HDMI/MIPI audio recovery stage failures=" + failureCount
+                + " routeReset=true videoCaptureRestart=false settleMs=" + HDMI_ROUTE_SETTLE_MS);
+        setHdmiInEnabledLocked(false, true,
+                "HDMI/MIPI audio recovery route reset stage " + failureCount);
+
+        sCaptureAudioRetryHandler.postDelayed(() -> {
+            synchronized (DSPControl.class) {
+                if (generation != sCaptureAudioRetryGeneration || sCaptureSourceType != 0
+                        || sExternalBluetoothAudioActive || sLoopbackThread != null
+                        || isHuoshanVSeriesAudioBoard()) {
+                    return;
+                }
+
+                setHdmiInEnabledLocked(true, true,
+                        "HDMI/MIPI audio recovery route restore stage " + failureCount);
+
+                sCaptureAudioRetryHandler.postDelayed(() -> {
+                    synchronized (DSPControl.class) {
+                        if (generation != sCaptureAudioRetryGeneration || sCaptureSourceType != 0
+                                || sExternalBluetoothAudioActive || sLoopbackThread != null
+                                || isHuoshanVSeriesAudioBoard()) {
+                            return;
+                        }
+                        if (!isHdmiInAudioReady()) {
+                            scheduleCaptureAudioRetryLocked(0,
+                                    "HDMI/MIPI timing not ready after route recovery");
+                            return;
+                        }
+                        Log.i(TAG, "HDMI/MIPI route recovery settled; rebuilding AudioRecord");
+                        startAudioLoopback();
+                    }
+                }, HDMI_ROUTE_SETTLE_MS);
+            }
+        }, HDMI_ROUTE_DISABLE_MS);
+    }
+
+    private static boolean containsNonZeroPcm(short[] data, int sampleCount) {
+        int limit = Math.min(sampleCount, data.length);
+        for (int i = 0; i < limit; i++) {
+            if (data[i] != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
     private static boolean isHdmiInAudioPresent() {
         String present = readHdmiInAudioPresent();
         if (present.isEmpty()) {
@@ -467,7 +693,59 @@ public class DSPControl {
                 || "yes".equalsIgnoreCase(present);
     }
 
+    private static boolean isSupportedCaptureSampleRate(int rateHz) {
+        switch (rateHz) {
+            case 32000:
+            case 44100:
+            case 48000:
+            case 88200:
+            case 96000:
+            case 176400:
+            case 192000:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static int resolveCaptureSampleRate(int sourceType) {
+        if (sourceType != 0) {
+            return USB_CAPTURE_RATE_HZ;
+        }
+        String rateValue = readHdmiInAudioRate();
+        try {
+            int rateHz = Integer.parseInt(rateValue);
+            if (isSupportedCaptureSampleRate(rateHz)) {
+                return rateHz;
+            }
+        } catch (NumberFormatException ignored) {
+        }
+        return DEFAULT_HDMI_CAPTURE_RATE_HZ;
+    }
+
+    private static boolean isHdmiInAudioReady() {
+        if (!isHdmiInAudioPresent()) {
+            return false;
+        }
+
+        String rateValue = readHdmiInAudioRate();
+        if (rateValue.isEmpty()) {
+            // Preserve compatibility with receivers that do not expose audio_rate.
+            return true;
+        }
+
+        try {
+            return isSupportedCaptureSampleRate(Integer.parseInt(rateValue));
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
     private static void scheduleHdmiAudioRetryLocked(String reason) {
+        scheduleCaptureAudioRetryLocked(0, reason);
+    }
+
+    private static void scheduleCaptureAudioRetryLocked(int sourceType, String reason) {
         int generation = ++sCaptureAudioRetryGeneration;
         long now = SystemClock.uptimeMillis();
         if (now - sLastHdmiNoAudioLogUptimeMs >= HDMI_NO_AUDIO_LOG_SUPPRESS_MS) {
@@ -476,38 +754,43 @@ public class DSPControl {
         }
         sCaptureAudioRetryHandler.postDelayed(() -> {
             synchronized (DSPControl.class) {
-                if (generation != sCaptureAudioRetryGeneration || sCaptureSourceType != 0
-                        || sLoopbackThread != null || isHuoshanVSeriesAudioBoard()) {
+                if (generation != sCaptureAudioRetryGeneration || sCaptureSourceType != sourceType
+                        || sExternalBluetoothAudioActive || sLoopbackThread != null
+                        || isHuoshanVSeriesAudioBoard()) {
                     return;
                 }
-                if (!isHdmiInAudioPresent()) {
-                    setHdmiInEnabledLocked(false, false, "HDMI/MIPI audio still not present");
-                    scheduleHdmiAudioRetryLocked("HDMI/MIPI audio still not present");
+                if (sourceType == 0 && !isHdmiInAudioReady()) {
+                    scheduleCaptureAudioRetryLocked(0, "HDMI/MIPI audio timing still not ready");
                     return;
                 }
-                Log.i(TAG, "HDMI/MIPI audio present, retrying software loopback");
+                Log.i(TAG, (sourceType == 0 ? "HDMI/MIPI" : "USB")
+                        + " capture ready, rebuilding AudioRecord");
                 startAudioLoopback();
             }
         }, HDMI_AUDIO_RETRY_MS);
     }
 
-    private static void setHdmiInEnabledLocked(boolean enabled, boolean force, String reason) {
+    private static boolean setHdmiInEnabledLocked(boolean enabled, boolean force, String reason) {
         if (sContext == null) {
-            return;
+            return false;
         }
 
         if (!force && sHdmiInStateKnown && sHdmiInEnabled == enabled) {
             Log.d(TAG, "HDMIin_enable already " + enabled + ", skip (" + reason + ")");
-            return;
+            return true;
         }
 
         if (enabled) {
             setSystemProperty("media.audio.device_policy", "");
             Log.i(TAG, "Set media.audio.device_policy to empty (auto)");
             String audioRate = readHdmiInAudioRate();
-            if (!audioRate.isEmpty()) {
+            if (!audioRate.isEmpty() && isHdmiInAudioReady()) {
                 setSystemProperty("vendor.hdmiin.audiorate", audioRate);
                 Log.i(TAG, "Set vendor.hdmiin.audiorate to " + audioRate);
+            } else if (sCaptureSourceType == 0 && !audioRate.isEmpty()) {
+                // audio_rate=0 means the input clock is not ready; keep HDMI-in enabled.
+                Log.w(TAG, "HDMI-in audio rate not ready yet: " + audioRate
+                        + "; keep HDMI-in route enabled");
             }
         }
         setSystemProperty("media.audio.hdmiin", enabled ? "1" : "0");
@@ -520,19 +803,13 @@ public class DSPControl {
                 am.setParameters("HDMIin_enable=" + (enabled ? "true" : "false"));
                 Log.i(TAG, "Set AudioManager param: HDMIin_enable=" + enabled
                         + " (" + reason + ")");
-                if (enabled && sCaptureSourceType == 0 && !sIsDSP) {
-                    // Rockchip HAL 只在
-                    // 说明：处理输出路由/启动时才应用 HDMI-in 输出路由，因此这里刷新活动扬声器
-                    // + HDMI route after enabling HDMI-in so it does not 等待
-                    // 说明：避免等待 audioserver 或主输出流重启。
-                    am.setParameters("routing=1026");
-                    Log.i(TAG, "Refresh AudioManager routing=1026 for HDMI-in output route");
-                }
             }
             sHdmiInEnabled = enabled;
             sHdmiInStateKnown = true;
+            return true;
         } catch (Exception e) {
             Log.w(TAG, "Failed to set HDMIin_enable=" + enabled, e);
+            return false;
         }
     }
 
@@ -558,27 +835,32 @@ public class DSPControl {
 
         @Override
         public void run() {
-            // 设置为音频级高优先级，防止系统调度导致录音断续
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
-            
+
             android.media.AudioRecord record = null;
-            boolean hdmiAudioLost = false;
+            boolean captureNeedsRestart = false;
+            int restartSourceType = sCaptureSourceType;
 
             try {
-                // 与 C++ 全局 AudioPlayer/普通视频解码输出保持一致，避免采集/视频
-                // 切场景时在 48000/44100Hz 之间重建 AAudio 导致数秒断续。
-                int frequency = 44100;
-                int inputChannelConfig = android.media.AudioFormat.CHANNEL_IN_STEREO;
-                int audioEncoding = android.media.AudioFormat.ENCODING_PCM_16BIT;
+                final int openedSourceType = sCaptureSourceType;
+                restartSourceType = openedSourceType;
+                final int frequency = resolveCaptureSampleRate(openedSourceType);
+                final int inputChannelConfig = android.media.AudioFormat.CHANNEL_IN_STEREO;
+                final int audioEncoding = android.media.AudioFormat.ENCODING_PCM_16BIT;
 
-                int minInBufSize = android.media.AudioRecord.getMinBufferSize(frequency, inputChannelConfig, audioEncoding);
+                int minInBufSize = android.media.AudioRecord.getMinBufferSize(
+                        frequency, inputChannelConfig, audioEncoding);
                 if (minInBufSize <= 0) {
-                    Log.e(TAG, "Invalid audio record buffer size: in=" + minInBufSize);
+                    Log.e(TAG, "Invalid AudioRecord buffer size=" + minInBufSize
+                            + " rate=" + frequency + " sourceType=" + openedSourceType);
+                    captureNeedsRestart = openedSourceType >= 0;
                     return;
                 }
 
                 int inBufSize = Math.max(minInBufSize * 2, 8192);
-                Log.i(TAG, "AudioRecord buffer size: " + inBufSize);
+                Log.i(TAG, "Creating AudioRecord source="
+                        + (openedSourceType == 0 ? "HDMI/MIPI" : "USB")
+                        + " rate=" + frequency + " bufferBytes=" + inBufSize);
 
                 record = createAudioRecord(
                         context,
@@ -587,154 +869,146 @@ public class DSPControl {
                         inputChannelConfig,
                         audioEncoding,
                         inBufSize);
-                if (record == null) {
-                    Log.e(TAG, "Audio Record creation failed");
+                if (record == null || record.getState() != android.media.AudioRecord.STATE_INITIALIZED) {
+                    Log.e(TAG, "AudioRecord initialization failed");
+                    captureNeedsRestart = openedSourceType >= 0;
                     return;
                 }
 
-                if (record.getState() != android.media.AudioRecord.STATE_INITIALIZED) {
-                    Log.e(TAG, "Audio Record initialization failed: recordState="
-                            + record.getState());
-                    return;
-                }
+                // Bind before startRecording. Reusing a started AudioRecord after a source or
+                // AudioPolicy port change can retain a stale HAL stream/port ID.
+                selectPreferredInputDevice(record, openedSourceType, "initial capture");
 
-                // Keep each blocking read short so capture 音频 reaches Native without a
-                // large startup 缓冲区. AudioRecord still owns the larger internal 缓冲区.
                 short[] buffer = new short[CAPTURE_AUDIO_READ_FRAMES * 2];
-
-                // 枚举所有可用输入设备并打印（仅日志，实际选择由 updateInputDevice 完成，
-                // 以避免“最后一个匹配胜出”的非确定行为，并尊重 sCaptureSourceType）。
-                try {
-                    AudioManager am = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
-                    if (am != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                        android.media.AudioDeviceInfo[] devices = am.getDevices(AudioManager.GET_DEVICES_INPUTS);
-                        Log.i(TAG, "Available input devices: " + devices.length);
-                        for (android.media.AudioDeviceInfo device : devices) {
-                            int type = device.getType();
-                            // 参考 android.media.AudioDeviceInfo 常量值
-                            String typeName;
-                            switch (type) {
-                                case android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC:    typeName = "BUILTIN_MIC"; break;     // 15
-                                case android.media.AudioDeviceInfo.TYPE_HDMI:           typeName = "HDMI"; break;            // 9
-                                case android.media.AudioDeviceInfo.TYPE_HDMI_ARC:       typeName = "HDMI_ARC"; break;        // 10
-                                case android.media.AudioDeviceInfo.TYPE_USB_DEVICE:     typeName = "USB_DEVICE"; break;      // 11
-                                case android.media.AudioDeviceInfo.TYPE_USB_ACCESSORY:  typeName = "USB_ACCESSORY"; break;   // 12
-                                case android.media.AudioDeviceInfo.TYPE_USB_HEADSET:    typeName = "USB_HEADSET"; break;     // 22
-                                case android.media.AudioDeviceInfo.TYPE_TV_TUNER:       typeName = "TV_TUNER"; break;        // 17
-                                case android.media.AudioDeviceInfo.TYPE_FM_TUNER:       typeName = "FM_TUNER"; break;        // 16
-                                case android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET:  typeName = "WIRED_HEADSET"; break;   // 3
-                                case android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO:  typeName = "BLUETOOTH_SCO"; break;   // 7
-                                default:                                                typeName = "Unknown(" + type + ")"; break;
-                            }
-                            Log.i(TAG, "  Input device: type=" + type + " (" + typeName + "), id=" + device.getId());
-                        }
-                    }
-                } catch (Exception e) {
-                    Log.w(TAG, "Failed to enumerate input devices", e);
-                }
-
-                // 注意：系统属性已在 startAudioLoopback() 中设置，线程启动前就已生效
-
                 try {
                     record.startRecording();
                 } catch (Exception e) {
-                    Log.e(TAG, "Failed to start audio loopback", e);
+                    Log.e(TAG, "Failed to start AudioRecord", e);
+                    captureNeedsRestart = openedSourceType >= 0;
                     return;
                 }
-                
-                // Discard 仅 a tiny preroll to avoid the previous near-1s startup mute.
+
                 int preReadTargetFrames = Math.max(CAPTURE_AUDIO_READ_FRAMES,
                         (frequency * CAPTURE_AUDIO_PREREAD_MS) / 1000);
                 int preReadFrames = 0;
-                int lastSourceType = -1;
-
+                long lastReadProgressMs = SystemClock.uptimeMillis();
+                long zeroPcmDeadlineMs = lastReadProgressMs + HDMI_ZERO_PCM_STARTUP_TIMEOUT_MS;
+                boolean nonZeroPcmSeen = openedSourceType != 0;
                 while (isRunning && preReadFrames < preReadTargetFrames) {
-                    int readSize = record.read(buffer, 0, buffer.length);
+                    int readSize = record.read(buffer, 0, buffer.length,
+                            android.media.AudioRecord.READ_NON_BLOCKING);
+                    if (readSize > 0) {
+                        preReadFrames += readSize / 2;
+                        lastReadProgressMs = SystemClock.uptimeMillis();
+                        if (!nonZeroPcmSeen && containsNonZeroPcm(buffer, readSize)) {
+                            nonZeroPcmSeen = true;
+                            onCapturePcmReady(openedSourceType);
+                        }
+                        continue;
+                    }
                     if (readSize < 0) {
                         Log.w(TAG, "AudioRecord pre-read failed: " + readSize);
-                        break;
+                        captureNeedsRestart = openedSourceType >= 0;
+                        return;
                     }
-                    if (readSize == 0) {
-                        break;
+                    long now = SystemClock.uptimeMillis();
+                    if (now - lastReadProgressMs >= CAPTURE_READ_STALL_TIMEOUT_MS) {
+                        Log.w(TAG, "AudioRecord produced no frames during startup for "
+                                + (now - lastReadProgressMs) + " ms; rebuild stream");
+                        captureNeedsRestart = openedSourceType >= 0;
+                        return;
                     }
-                    preReadFrames += readSize / 2;
+                    SystemClock.sleep(CAPTURE_READ_POLL_MS);
                 }
 
                 if (!isRunning) {
                     return;
                 }
 
-                Log.i(TAG, "Audio Loopback started");
-                int silentHdmiFrames = 0;
-                boolean hdmiPreferredFallbackApplied = false;
+                Log.i(TAG, "Audio loopback started source="
+                        + (openedSourceType == 0 ? "HDMI/MIPI" : "USB")
+                        + " rate=" + frequency);
                 long loopbackStartedMs = SystemClock.uptimeMillis();
                 long lastHdmiAudioPresentCheckMs = loopbackStartedMs;
-                final int silentFallbackFrames =
-                        (frequency * HDMI_SILENT_FALLBACK_MS) / 1000;
+                lastReadProgressMs = loopbackStartedMs;
 
                 while (isRunning) {
-                    if (sCaptureSourceType < 0) {
-                        Log.i(TAG, "Audio Loopback source cleared, exiting");
+                    int currentSourceType = sCaptureSourceType;
+                    if (currentSourceType < 0) {
+                        Log.i(TAG, "Audio loopback source cleared, exiting");
                         break;
                     }
-                    if (sCaptureSourceType == 0) {
-                        long now = SystemClock.uptimeMillis();
-                        if (now - lastHdmiAudioPresentCheckMs >= HDMI_AUDIO_PRESENT_CHECK_MS) {
-                            lastHdmiAudioPresentCheckMs = now;
-                            if (!isHdmiInAudioPresent()) {
-                                if (now - loopbackStartedMs < HDMI_AUDIO_PRESENT_STARTUP_GRACE_MS) {
-                                    Log.d(TAG, "HDMI/MIPI audio not reported during startup grace; keep recording");
-                                    continue;
-                                }
-                                hdmiAudioLost = true;
-                                Log.w(TAG, "HDMI/MIPI audio lost, stopping software loopback");
+                    if (currentSourceType != openedSourceType) {
+                        Log.i(TAG, "Capture source changed; rebuild AudioRecord instead of reusing stale port");
+                        captureNeedsRestart = true;
+                        restartSourceType = currentSourceType;
+                        break;
+                    }
+
+                    long now = SystemClock.uptimeMillis();
+                    if (openedSourceType == 0
+                            && now - lastHdmiAudioPresentCheckMs >= HDMI_AUDIO_PRESENT_CHECK_MS) {
+                        lastHdmiAudioPresentCheckMs = now;
+                        if (!isHdmiInAudioReady()) {
+                            if (now - loopbackStartedMs >= HDMI_AUDIO_PRESENT_STARTUP_GRACE_MS) {
+                                Log.w(TAG, "HDMI/MIPI timing lost; release and rebuild AudioRecord");
+                                captureNeedsRestart = true;
+                                break;
+                            }
+                        } else {
+                            int currentRate = resolveCaptureSampleRate(0);
+                            if (currentRate != frequency) {
+                                Log.i(TAG, "HDMI/MIPI sample rate changed " + frequency + " -> "
+                                        + currentRate + "; rebuild AudioRecord");
+                                captureNeedsRestart = true;
                                 break;
                             }
                         }
                     }
-                    // 动态切换输入设备 (HDMI/MIPI vs USB)
-                    if (sCaptureSourceType != lastSourceType) {
-                        lastSourceType = sCaptureSourceType;
-                        silentHdmiFrames = 0;
-                        hdmiPreferredFallbackApplied = false;
-                        updateInputDevice(record, sCaptureSourceType);
-                    }
 
-                    int readSize = record.read(buffer, 0, buffer.length);
+                    int readSize = record.read(buffer, 0, buffer.length,
+                            android.media.AudioRecord.READ_NON_BLOCKING);
                     if (readSize > 0) {
-                        int peak = 0;
-                        for (int i = 0; i < readSize; i++) {
-                            int sample = buffer[i];
-                            int abs = Math.abs(sample);
-                            if (abs > peak) peak = abs;
-                        }
-
-                        if (sCaptureSourceType == 0 && !hdmiPreferredFallbackApplied) {
-                            if (peak == 0) {
-                                silentHdmiFrames += readSize / 2;
-                                if (silentHdmiFrames >= silentFallbackFrames) {
-                                    hdmiPreferredFallbackApplied = true;
-                                    Log.w(TAG, "HDMI/MIPI default input route is silent; trying preferred HDMI input device");
-                                    selectPreferredInputDevice(record, sCaptureSourceType, "silent HDMI/MIPI fallback");
-                                }
+                        now = SystemClock.uptimeMillis();
+                        lastReadProgressMs = now;
+                        if (!nonZeroPcmSeen) {
+                            if (containsNonZeroPcm(buffer, readSize)) {
+                                nonZeroPcmSeen = true;
+                                onCapturePcmReady(openedSourceType);
+                            } else if (now >= zeroPcmDeadlineMs) {
+                                Log.w(TAG, "HDMI/MIPI AudioRecord returned all-zero PCM for "
+                                        + HDMI_ZERO_PCM_STARTUP_TIMEOUT_MS
+                                        + " ms during startup; recover stale HAL/FIFO route");
+                                captureNeedsRestart = true;
+                                break;
                             } else {
-                                silentHdmiFrames = 0;
+                                // Do not start the playback route with the HAL's startup
+                                // silence. Wait for the first valid PCM block instead.
+                                continue;
                             }
                         }
-
-                        // 推送数据到 Native 引擎进行播放和可视化
                         HSVJEngine.pushAudioData(buffer, readSize / 2, frequency);
-                    } else if (readSize < 0) {
+                        continue;
+                    }
+                    if (readSize < 0) {
                         Log.w(TAG, "AudioRecord read failed: " + readSize);
-                        if (sCaptureSourceType == 0) {
-                            hdmiAudioLost = true;
-                        }
+                        captureNeedsRestart = true;
                         break;
                     }
-                }
 
+                    now = SystemClock.uptimeMillis();
+                    if (now - lastReadProgressMs >= CAPTURE_READ_STALL_TIMEOUT_MS) {
+                        Log.w(TAG, "AudioRecord active but frame count did not advance for "
+                                + (now - lastReadProgressMs) + " ms; release and rebuild stream");
+                        captureNeedsRestart = true;
+                        break;
+                    }
+                    SystemClock.sleep(CAPTURE_READ_POLL_MS);
+                }
             } catch (Exception e) {
-                Log.e(TAG, "Audio Loopback Error", e);
+                Log.e(TAG, "Audio loopback error", e);
+                captureNeedsRestart = sCaptureSourceType >= 0;
+                restartSourceType = sCaptureSourceType;
             } finally {
                 if (record != null) {
                     try {
@@ -742,15 +1016,22 @@ public class DSPControl {
                                 == android.media.AudioRecord.RECORDSTATE_RECORDING) {
                             record.stop();
                         }
+                    } catch (Exception e) {
+                        Log.w(TAG, "AudioRecord stop failed during recovery", e);
+                    }
+                    try {
                         record.release();
                     } catch (Exception e) {
+                        Log.w(TAG, "AudioRecord release failed during recovery", e);
                     }
                 }
-                Log.i(TAG, "Audio Loopback stopped");
+                Log.i(TAG, "Audio loopback stopped; restart=" + captureNeedsRestart
+                        + " sourceType=" + restartSourceType);
                 final AudioLoopbackThread exitedThread = this;
-                final boolean shouldRetryHdmiAudio = hdmiAudioLost;
+                final boolean shouldRestart = captureNeedsRestart;
+                final int failedSourceType = restartSourceType;
                 sCaptureAudioRetryHandler.post(() ->
-                        onLoopbackThreadExited(exitedThread, shouldRetryHdmiAudio));
+                        onLoopbackThreadExited(exitedThread, shouldRestart, failedSourceType));
             }
         }
 
@@ -928,7 +1209,16 @@ public class DSPControl {
      * @param volume  音量值 (0.0 - 1.0)
      * @param isHdmin 是否是HDMI输入 (0=否, 1=是)
      */
-    public static synchronized void setDSPVolume(float volume, int isHdmin) {
+    /** Queues the single managed output-volume update off the native render thread. */
+    public static void setDSPVolume(float volume, int isHdmin) {
+        sCaptureRouteHandler.post(() -> {
+            synchronized (DSPControl.class) {
+                applyDSPVolumeLockedEntry(volume, isHdmin);
+            }
+        });
+    }
+
+    private static void applyDSPVolumeLockedEntry(float volume, int isHdmin) {
         if (sContext == null) {
             Log.w(TAG, "setDSPVolume: context is null");
             return;
@@ -936,6 +1226,15 @@ public class DSPControl {
 
         float effectiveVolume = clampVolume(volume);
         int volumePath = isHdmin == 0 ? 0 : 1;
+        if (sExternalBluetoothAudioActive) {
+            sHasDeferredManagedVolume = true;
+            sDeferredManagedVolume = effectiveVolume;
+            sDeferredManagedVolumePath = volumePath;
+            ++sVolumeRampGeneration;
+            Log.d(TAG, "Bluetooth audio active, defer engine volume="
+                    + effectiveVolume + ", path=" + volumePath);
+            return;
+        }
         int rampGeneration = ++sVolumeRampGeneration;
         if (isHuoshanRoutePrerollRequest(effectiveVolume, volumePath)) {
             prepareHuoshanRoutePrerollLocked(volumePath);

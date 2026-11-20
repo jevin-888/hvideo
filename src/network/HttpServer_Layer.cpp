@@ -9,7 +9,7 @@
 #include "HttpRequest.h"
 #include "HttpResponse.h"
 #include "core/CommandRouter.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "utils/FileUtils.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"

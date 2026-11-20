@@ -15,8 +15,8 @@ float clampFloat(float value, float minValue, float maxValue) {
 float evaluateGammaBlend(float anchor, float slope, float gamma, float x) {
   const float clampedX = clampFloat(x, 0.0f, 1.0f);
   const float safeAnchor = clampFloat(anchor, 0.0f, 1.0f);
-  const float safeSlope = std::max(0.001f, slope);
-  const float safeGamma = std::max(0.001f, gamma);
+  const float safeSlope = std::max(kMinBlendSlope, slope);
+  const float safeGamma = std::max(kMinBlendGamma, gamma);
   const float x1 = clampedX < 0.5f
       ? safeAnchor * std::pow(clampedX * 2.0f, safeSlope)
       : 1.0f - (1.0f - safeAnchor) *

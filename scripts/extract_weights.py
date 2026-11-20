@@ -8,7 +8,6 @@
 import sys
 import torch
 import pickle
-import io
 
 # 修复 Unicode 编码
 if sys.platform == 'win32':
@@ -46,8 +45,6 @@ class WeightExtractor:
         print(f"Opening {filename}...")
         
         # 创建自定义 Unpickler 子类
-        extractor = self
-        
         class CustomUnpickler(pickle.Unpickler):
             def persistent_load(self, saved_id):
                 # persistent load 返回 None，忽略 storage 引用

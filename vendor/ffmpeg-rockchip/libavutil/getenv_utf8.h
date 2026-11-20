@@ -48,7 +48,7 @@ static inline char *getenv_utf8(const char *varname)
 
     return var;
 
-    // No CP_ACP fallback compared to other *_utf8() ? functions:
+    // No CP_ACP fallback compared to other *_utf8() functions:
     // non UTF-8 strings must not be returned.
 }
 

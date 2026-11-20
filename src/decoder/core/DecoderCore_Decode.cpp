@@ -4,6 +4,7 @@
  */
 
 #include "decoder/core/DecoderCore.h"
+#include "decoder/VideoProfile.h"
 #include "audio/AudioPlayer.h"
 #include "audio/AudioPlayerManager.h"
 #include "decoder/core/HardwareManager.h"
@@ -11,6 +12,7 @@
 #include "decoder/frame/FramePool.h"
 #include "decoder/sync/FrameSyncManager.h"
 #include "utils/Logger.h"
+#include "utils/AndroidProperty.h"
 #include <algorithm>
 #include <pthread.h>
 #include <chrono>
@@ -18,6 +20,7 @@
 #include <cerrno>
 #include <cinttypes>
 #include <cstring>
+#include <cmath>
 #include <atomic>
 #include <thread>
 
@@ -45,13 +48,6 @@ extern "C" {
 namespace hsvj {
 
 namespace {
-bool isWideOrHeavyVideo(int width, int height) {
-  const int64_t pixels = static_cast<int64_t>(width) * static_cast<int64_t>(height);
-  return (width >= 3840 && height >= 720) ||
-         height >= 1800 ||
-         pixels >= static_cast<int64_t>(3000) * 1080;
-}
-
 int64_t nowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -62,12 +58,28 @@ constexpr int64_t kPlaybackFlowLogIntervalMs = 5000;
 constexpr int64_t kPlaybackIssueLogIntervalMs = 10000;
 
 size_t rkmppDrmFrameQueueBudget(int width, int height, double frameRate) {
+  const int propertyOverride =
+      getAndroidIntProperty("debug.hsvj.rkmpp_drm_queue_budget", -1);
+  if (propertyOverride >= 1) {
+    return static_cast<size_t>(std::max(1, std::min(propertyOverride, 12)));
+  }
+
   const int64_t pixels = static_cast<int64_t>(width) * static_cast<int64_t>(height);
+  if (video_profile::isUltraWideVideo(width, height)) {
+    // 7680x1080 has the same decoded pixel count as 4K-class content but a
+    // much wider scanout. Keep one extra DRM frame to absorb present jitter.
+    return 4;
+  }
   if (width >= 4096 && height >= 720) {
-    return 3;
+    return 4;
   }
   if (pixels >= static_cast<int64_t>(3840) * 2160) {
     return 4;
+  }
+  // Keep a short presentation cushion for ordinary RKMPP streams. Holding 20-30
+  // DRM PRIME frames can exhaust the MPP output pool and block receive_frame.
+  if (width > 0 && height > 0) {
+    return 6;
   }
   (void)frameRate;
   return 0;
@@ -127,22 +139,33 @@ void DecoderCore::decodeThreadFunc() {
 
     // 检查 AudioPlayer 是否需要重新初始化（AudioFlinger 断开、设备切换等）
     // 注意：不限于 videoStreamIdx_ < 0，视频音频混合流同样需要恢复
-  if (audioPlayer_ && audioCodecCtx_ && audioPlayer_->needsReinit()) {
+  {
+    std::unique_lock<std::mutex> recoveryLock(eofDrainMutex_, std::try_to_lock);
+    if (recoveryLock.owns_lock() && !isSeeking_ &&
+      audioPlayer_ && audioCodecCtx_ && audioPlayer_->needsReinit() &&
+      AudioPlayerManager::getInstance().hasFocus(AudioFocusSource::VIDEO) &&
+      AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId_)) {
         LOG_WARN("[DecoderCore] AudioPlayer needs reinit, attempting recovery...");
         // audio 异步线程：reinit AudioPlayer 期间必须先停 audio thread，
         // 防止它在旧 audioPlayer_ 上 write，避免 race / use-after-free。
         stopAudioDecodeThread(false);
         // 先清零，防止 shutdown() 时 audioPlayer_ 变成悬空指针
+        auto &audioManager = AudioPlayerManager::getInstance();
         audioPlayer_ = nullptr;
-        AudioPlayerManager::getInstance().shutdown();
-        bool reinitOk = AudioPlayerManager::getInstance().ensureInitialized(44100, 2);
+        bool reinitOk = audioManager.ensureInitializedForLayer(
+            AudioFocusSource::VIDEO, layerId_, 44100, 2);
         if (reinitOk) {
-            audioPlayer_ = AudioPlayerManager::getInstance().getAudioPlayer();
+            audioPlayer_ = audioManager.getAudioPlayer();
             if (audioPlayer_) {
-                audioPlayer_->flush();
-                audioPlayer_->start();
+                audioPlayer_->prepareForPlayback(16384, 1000);
                 audioPlayer_->clearReinitFlag();
-                AudioPlayerManager::getInstance().restoreFocus(AudioFocusSource::VIDEO);
+                preparedAudioRouteGeneration_.store(
+                    audioManager.getAudioClockGeneration(), std::memory_order_release);
+                startAudioDecodeThread();
+                if (audioManager.hasFocus(AudioFocusSource::VIDEO) &&
+                    audioManager.hasAudioFocusForLayer(layerId_)) {
+                    audioPlayer_->start();
+                }
                 consecutiveAudioWriteFailures_ = 0;
                 lastAudioWriteFailureMs_ = 0;
                 LOG_INFO("[DecoderCore] AudioPlayer reinitialized successfully");
@@ -152,9 +175,9 @@ void DecoderCore::decodeThreadFunc() {
         } else {
             LOG_ERROR("[DecoderCore] AudioPlayer reinit failed");
         }
-        // 重启 audio 线程继续消化后续 audio packet
-        startAudioDecodeThread();
+        // The audio worker can now feed PCM; start() never waits for demux.
     }
+  }
 
     if (videoStreamIdx_ < 0 && audioPlayer_ && audioCodecCtx_) {
         if (audioPlayer_->getPendingFrames() > 48000) {
@@ -203,30 +226,89 @@ void DecoderCore::decodeThreadFunc() {
     }
 
     if (ret == AVERROR_EOF) {
-      const bool httpMidStreamEof = isHttpStream_ && duration_ > 0.0 && getCurrentPlayTime() < duration_ - 1.0;
+      const double currentPlayPosition = getCurrentPlayTime();
+      // Demux can reach a complete file's EOF several seconds before its
+      // queued frames are presented. Only a transport error or a truncated
+      // byte stream justifies HTTP recovery, never the playback clock alone.
+      bool incompleteHttpInput = false;
+      if (isHttpStream_) {
+        std::lock_guard<std::mutex> formatLock(formatMutex_);
+        if (formatCtx_ && formatCtx_->pb) {
+          AVIOContext* input = formatCtx_->pb;
+          const int64_t size = avio_size(input);
+          const int64_t position = avio_tell(input);
+          incompleteHttpInput = input->error < 0 ||
+              (input->eof_reached && size > 0 && position >= 0 && position < size);
+        }
+      }
+      constexpr double kHttpEofRecoveryTailGuardSeconds = 3.0;
+      const bool httpMidStreamEof =
+          incompleteHttpInput && duration_ > 0.0 &&
+          currentPlayPosition < duration_ - kHttpEofRecoveryTailGuardSeconds;
       if (httpMidStreamEof && consecutiveReadErrors < 5) {
         ++consecutiveReadErrors;
-        LOG_WARN("[DecoderCore] HTTP EOF before media end, retry %d/5", consecutiveReadErrors);
+        // A transient HTTP disconnect leaves the existing demuxer at EOF;
+        // sleeping and calling av_read_frame again cannot restore it.  Seek
+        // back to the current playback position so FFmpeg issues a fresh
+        // Range request. Keep already queued PCM alive while the compressed
+        // packet queues are rebuilt, which avoids turning recovery into a
+        // second audible mute.
+        const double recoveryPosition = std::max(0.0, currentPlayPosition);
+        const int seekStream = videoStreamIdx_ >= 0 ? videoStreamIdx_ : audioStreamIdx_;
+        const int64_t seekTimestamp = secondsToPTS(
+            recoveryPosition, videoStreamIdx_ >= 0 ? videoTimeBase_ : audioTimeBase_);
+        int seekRet = AVERROR(EINVAL);
+        {
+          std::lock_guard<std::mutex> formatLock(formatMutex_);
+          if (formatCtx_) {
+            avformat_flush(formatCtx_);
+            seekRet = av_seek_frame(formatCtx_, seekStream, seekTimestamp,
+                                    AVSEEK_FLAG_BACKWARD);
+          }
+        }
+        if (seekRet >= 0) {
+          flushAudioPacketQueue();
+          flushVideoPacketQueue();
+          {
+            std::lock_guard<std::mutex> audioLock(audioCodecMutex_);
+            if (audioCodecCtx_) avcodec_flush_buffers(audioCodecCtx_);
+          }
+          {
+            std::lock_guard<std::recursive_mutex> videoLock(videoCodecMutex_);
+            if (videoCodecCtx_) avcodec_flush_buffers(videoCodecCtx_);
+          }
+          LOG_WARN("[DecoderCore] HTTP EOF before media end, recovered by seek "
+                   "retry %d/5 position=%.3f", consecutiveReadErrors, recoveryPosition);
+        } else {
+          LOG_WARN("[DecoderCore] HTTP EOF before media end, seek recovery failed "
+                   "retry %d/5 ret=%d position=%.3f", consecutiveReadErrors,
+                   seekRet, recoveryPosition);
+        }
         av_packet_unref(packet);
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         continue;
       }
-      if (loop_ == 2) {
-        seek(0.0);
-        continue;
-      } else {
+      {
         // EOF：video/audio 都用 EOF sentinel 让各自线程 drain 完毕再退出。
-        enqueueVideoPacket(nullptr);
-        stopVideoDecodeThread(true);
-
-        // audio 也送 EOF sentinel；audio_thread 看到 nullptr 会调用 decodeAudioFrame(nullptr) flush codec
-        enqueueAudioPacket(nullptr);
-        stopAudioDecodeThread(true);
-
-        if (videoStreamIdx_ < 0 && audioPlayer_) {
-            while (!shouldStop_ && audioPlayer_->getPendingFrames() > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            }
+        // Publish audio EOF before waiting for video, which may have a long
+        // silent tail. Queued PCM must survive until hardware presentation.
+        {
+          std::lock_guard<std::mutex> eofDrainLock(eofDrainMutex_);
+          if (isSeeking_ || shouldStop_) continue;
+          demuxInputEnded_.store(true, std::memory_order_release);
+          enqueueAudioPacket(nullptr);
+          enqueueVideoPacket(nullptr);
+          stopVideoDecodeThread(true);
+          stopAudioDecodeThread(true);
+        }
+        waitForPresentationEnd();
+        if (shouldStop_) break;
+        if (isSeeking_ || !demuxInputEnded_) continue;
+        if (loop_ == 2) {
+          if (!seek(0.0)) break;
+          if (videoCodecCtx_) startVideoDecodeThread();
+          startAudioDecodeThread();
+          continue;
         }
 
 #ifdef __ANDROID__
@@ -267,8 +349,7 @@ void DecoderCore::decodeThreadFunc() {
       if (!isMpegPsStream_ && consecutiveDrops_ >= 3 && (packet->flags & AV_PKT_FLAG_KEY)) {
         consecutiveDrops_ = 0;
       }
-      if (skippedAudioDuringCatchup_ && (packet->flags & AV_PKT_FLAG_KEY)) {
-        skippedAudioDuringCatchup_ = false;
+      if (packet->flags & AV_PKT_FLAG_KEY) {
         severeDriftStreak_ = 0;
       }
       // 推到视频解码线程异步处理；主线程立刻继续读下一包
@@ -323,21 +404,11 @@ void DecoderCore::decodeThreadFunc() {
                  drained);
       }
 
-      if (!isMpegPsStream_ && consecutiveDrops_ >= 3) {
-        av_packet_unref(packet);
-        skippedAudioDuringCatchup_ = true;
-        continue;
-      }
-      if (!isMpegPsStream_ && skippedAudioDuringCatchup_) {
-        std::lock_guard<std::mutex> lock(audioCodecMutex_);
-        if (audioCodecCtx_) {
-          avcodec_flush_buffers(audioCodecCtx_);
-        }
-        if (audioPlayer_) {
-          audioPlayer_->flush();
-        }
-        skippedAudioDuringCatchup_ = false;
-      }
+      // Video catch-up drops apply to video packets only.  The audio clock is
+      // the playback master, so discarding interleaved audio here (and then
+      // flushing the codec/PCM queue) creates an audible hole whenever the
+      // video decoder falls behind.  Keep feeding the audio worker; it has
+      // its own bounded backpressure and can continue across video drops.
       // audio 异步路径：主线程把 packet 入 audio queue，audio_thread 自行解码。
       // 这样 video queue 满阻塞主线程 enqueueVideoPacket 时，audio_thread 仍能持续工作。
       enqueueAudioPacket(packet);
@@ -449,12 +520,38 @@ int DecoderCore::sendPacketToDecoder(AVPacket *packet) {
   if (ret < 0 && ret != AVERROR(EAGAIN)) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
     av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+
+    // A short damaged packet burst on an HTTP source must not tear down the
+    // whole decoder.  Dropping the bad packet and flushing after a few
+    // consecutive failures lets the hardware decoder resume at the next
+    // usable reference/key frame while the audio route keeps running.
+    if (isHttpStream_) {
+      const int errors = ++consecutiveVideoPacketErrors_;
+      if (errors <= 3 || errors % 30 == 0) {
+        LOG_WARN("[DecoderCore] HTTP video packet rejected: %d (%s), "
+                 "dropping packet and continuing (consecutive=%d)",
+                 ret, errbuf, errors);
+      }
+      if (errors >= 3) {
+        avcodec_flush_buffers(videoCodecCtx_);
+        consecutiveVideoPacketErrors_ = 0;
+        LOG_WARN("[DecoderCore] HTTP video decoder flushed after corrupt packet burst; "
+                 "waiting for the next decodable frame");
+      }
+      return 0;
+    }
+
+    consecutiveVideoPacketErrors_ = 0;
     LOG_ERROR("[DecoderCore] Send packet failed: %d (%s)", ret, errbuf);
     const bool recoverable =
         errorHandler_ && errorHandler_->handleError(ErrorHandler::ErrorType::SEND_PACKET_FAILED, ret);
     if (!recoverable) {
       failVideoDecode(DecodeErrorCode::DecodeFailed, "视频解码失败，已跳过");
     }
+  }
+
+  if (ret == 0) {
+    consecutiveVideoPacketErrors_ = 0;
   }
 
   return ret;
@@ -491,6 +588,10 @@ int DecoderCore::receiveDecodedFrames() {
   }
 
   for (int attempt = 0; attempt < maxAttempts; attempt++) {
+    if (videoDecodeShouldStop_.load(std::memory_order_acquire) &&
+        !videoDecodeDrainOnStop_.load(std::memory_order_acquire)) {
+      break;
+    }
     auto tRecv0 = std::chrono::steady_clock::now();
     int ret = avcodec_receive_frame(videoCodecCtx_, avFrame);
     auto tRecv1 = std::chrono::steady_clock::now();
@@ -499,6 +600,7 @@ int DecoderCore::receiveDecodedFrames() {
     stats_.lastDecodeMs = std::chrono::duration<double, std::milli>(tRecv1 - tRecv0).count();
 
     if (ret == 0) {
+      consecutiveVideoFrameErrors_ = 0;
       stats_.totalFramesReceived++;
       frameCount++;
       ++flowReceiveCount_;
@@ -606,6 +708,24 @@ int DecoderCore::receiveDecodedFrames() {
     } else {
       char errbuf[AV_ERROR_MAX_STRING_SIZE];
       av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+
+      if (isHttpStream_) {
+        const int errors = ++consecutiveVideoFrameErrors_;
+        if (errors <= 3 || errors % 30 == 0) {
+          LOG_WARN("[DecoderCore] HTTP video frame rejected: %d (%s), "
+                   "dropping damaged frame (consecutive=%d)",
+                   ret, errbuf, errors);
+        }
+        if (errors >= 3) {
+          avcodec_flush_buffers(videoCodecCtx_);
+          consecutiveVideoFrameErrors_ = 0;
+          LOG_WARN("[DecoderCore] HTTP video decoder flushed after frame error burst; "
+                   "waiting for the next decodable frame");
+        }
+        break;
+      }
+
+      consecutiveVideoFrameErrors_ = 0;
       LOG_WARN("[DecoderCore] Receive frame failed: %d (%s)", ret, errbuf);
       const bool recoverable = errorHandler_ &&
           errorHandler_->handleError(ErrorHandler::ErrorType::RECEIVE_FRAME_FAILED, ret);
@@ -640,6 +760,10 @@ bool DecoderCore::handleEagainAndDrain(AVPacket *packet) {
   bool packetSent = false;
 
   for (int retry = 0; retry < maxDrainRetries && !packetSent; retry++) {
+    if (videoDecodeShouldStop_.load(std::memory_order_acquire) &&
+        !videoDecodeDrainOnStop_.load(std::memory_order_acquire)) {
+      break;
+    }
     AVFrame *drainFrame = av_frame_alloc();
     int recvRet = avcodec_receive_frame(videoCodecCtx_, drainFrame);
 
@@ -679,6 +803,121 @@ bool DecoderCore::handleEagainAndDrain(AVPacket *packet) {
 // 音频解码
 // ============================================================================
 
+bool DecoderCore::audioDecodeInterrupted() const {
+#ifdef __ANDROID__
+  return shouldStop_.load(std::memory_order_acquire) ||
+      (isSeeking_ && audioDecodeDrainOnStop_.load(std::memory_order_acquire)) ||
+      (audioDecodeShouldStop_.load(std::memory_order_acquire) &&
+       !audioDecodeDrainOnStop_.load(std::memory_order_acquire));
+#else
+  return shouldStop_;
+#endif
+}
+
+void DecoderCore::handleAudioPacketError(AVPacket *packet, int error,
+                                       double decodedEndPts) {
+#ifdef __ANDROID__
+  ++consecutiveAudioErrors_;
+  const bool report = consecutiveAudioErrors_ == 1 || consecutiveAudioErrors_ % 30 == 0;
+  double pts = packet && packet->pts != AV_NOPTS_VALUE
+      ? packet->pts * av_q2d(audioTimeBase_) : -1.0;
+  double seconds = packet && packet->duration > 0
+      ? packet->duration * av_q2d(audioTimeBase_)
+      : (audioCodecCtx_->sample_rate > 0
+             ? static_cast<double>(audioCodecCtx_->frame_size) / audioCodecCtx_->sample_rate : 0.0);
+  // A codec may emit valid frames before rejecting the rest of a packet.
+  // Conceal only the missing interval, never repeat already decoded samples.
+  const double packetEnd = pts + seconds;
+  pts = std::max(pts, decodedEndPts);
+  seconds = packetEnd - pts;
+  int concealed = 0;
+  auto& manager = AudioPlayerManager::getInstance();
+  const uint64_t generation = manager.getAudioClockGeneration();
+  // Invalid AAC/MP2 packets are not valid silence. Preserve their bounded
+  // timeline with zero PCM rather than collapsing time or restarting output.
+  if (error == AVERROR_INVALIDDATA && std::isfinite(pts) && pts >= 0.0 &&
+      std::isfinite(seconds) && seconds > 0.0 && seconds <= 1.0 &&
+      (duration_ <= 0.0 || pts <= duration_) &&
+      std::abs(pts - getCurrentPlayTime()) <= 5.0 &&
+      !audioOutputSuppressed_.load() && !audioTrackSwitching_.load() &&
+      !seekAudioDropActive_.load() && manager.hasFocus(AudioFocusSource::VIDEO) &&
+      manager.hasAudioFocusForLayer(layerId_)) {
+    constexpr int rate = 44100;
+    const int16_t silence[1024 * 2] = {};
+    int remaining = static_cast<int>(std::llround(seconds * rate));
+    while (remaining > 0 && !audioDecodeInterrupted() && !isSeeking_ &&
+           manager.getAudioClockGeneration() == generation) {
+      if (isPaused_ || audioPlayer_->getPendingFrames() > rate / 2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        continue;
+      }
+      uint64_t accepted = 0;
+      const int written = manager.writeForLayer(AudioFocusSource::VIDEO, layerId_,
+          silence, std::min(remaining, 1024), &accepted);
+      if (written <= 0) break;
+      updateAudioMasterClock(pts + static_cast<double>(concealed) / rate,
+                             written, rate, accepted);
+      concealed += written;
+      remaining -= written;
+    }
+  }
+  if (report) {
+    LOG_WARN("[AudioConceal] layer=%d error=%d pts=%.3f duration=%.3f "
+             "consecutive=%d silenceFrames=%d; continuing media timeline",
+             layerId_, error, pts, seconds, consecutiveAudioErrors_, concealed);
+  }
+  if (consecutiveAudioErrors_ % 30 == 0) {
+    // Reset codec prediction only. The resampler and already queued valid PCM
+    // are not corrupt and must not be thrown away during recovery.
+    avcodec_flush_buffers(audioCodecCtx_);
+  }
+#else
+  (void)packet;
+  (void)error;
+  (void)decodedEndPts;
+#endif
+}
+
+void DecoderCore::waitForPresentationEnd() {
+#ifdef __ANDROID__
+  auto& manager = AudioPlayerManager::getInstance();
+  const uint64_t generation = preparedAudioRouteGeneration_.load();
+  double endPts = std::max(0.0, duration_);
+  {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    if (!frameQueue_.empty()) {
+      endPts = std::max(endPts, frameQueue_.back()->pts +
+          (frameRate_ > 0.0 ? 1.0 / frameRate_ : 0.04));
+    }
+  }
+  LOG_INFO("[PlaybackTail] draining layer=%d position=%.3f end=%.3f",
+           layerId_, getCurrentPlayTime(), endPts);
+  double outputDrainedAt = -1.0;
+  while (!shouldStop_ && !isSeeking_ && demuxInputEnded_) {
+    if (isPaused_) {
+      outputDrainedAt = -1.0;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
+    }
+    const bool ownsAudio = audioPlayer_ && manager.hasFocus(AudioFocusSource::VIDEO) &&
+        manager.hasAudioFocusForLayer(layerId_) &&
+        manager.getAudioClockGeneration() == generation;
+    const double now = nowMs() / 1000.0;
+    const int pending = ownsAudio ? audioPlayer_->getPendingFrames() : 0;
+    if (pending > 0) {
+      outputDrainedAt = -1.0;
+    } else if (outputDrainedAt < 0.0) {
+      outputDrainedAt = now + (ownsAudio ? audioPlayer_->estimatedOutputDelaySeconds() : 0.0);
+    }
+    if (getCurrentPlayTime() >= endPts && pending == 0 && now >= outputDrainedAt) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  LOG_INFO("[PlaybackTail] %s layer=%d position=%.3f end=%.3f",
+           shouldStop_ || isSeeking_ || !demuxInputEnded_ ? "cancelled" : "presented",
+           layerId_, getCurrentPlayTime(), endPts);
+#endif
+}
+
 bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
 #ifdef __ANDROID__
   std::lock_guard<std::mutex> lock(audioCodecMutex_);
@@ -703,35 +942,12 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
   //       在正确 PTS 上、首帧即时可出。
 
   int ret = avcodec_send_packet(audioCodecCtx_, packet);
+  bool resendPacket = ret == AVERROR(EAGAIN);
+  double decodedEndPts = -1.0;
   if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
-    consecutiveAudioErrors_++;
-    if (isHttpStream_ && !audioFirstFrameLogged_) {
-      // 网络流起始阶段的 Header Missing (或码流不完整) 是预期内的，降级 DEBUG 并继
-   } else {
-      char errbuf[AV_ERROR_MAX_STRING_SIZE];
-      av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
-      LOG_WARN("[DecoderCore] Send audio packet failed: %d (%s), consecutive=%d",
-               ret, errbuf, consecutiveAudioErrors_);
-    }
-    // 连续音频包解码失败超过阈值（MP2 Header Missing 持续出现）：
-    // 自动禁用音频流，让视频继续正常播放，避免因音频错误拖死整个解码器
-    if (consecutiveAudioErrors_ >= 30) {
-      LOG_ERROR("[DecoderCore] Layer %d: Too many consecutive audio errors (%d), "
-                "disabling audio stream to keep video alive (path may have corrupt MP2/audio track)",
-                layerId_, consecutiveAudioErrors_);
-      // 释放音频解码器资源（audioCodecMutex_ 锁内是安全的
-     avcodec_free_context(&audioCodecCtx_);
-      audioCodecCtx_ = nullptr;
-      if (swrContext_) {
-        swr_free(&swrContext_);
-        swrContext_ = nullptr;
-      }
-      audioStreamIdx_ = -1;
-      consecutiveAudioErrors_ = 0;
-    }
+    handleAudioPacketError(packet, ret, decodedEndPts);
     return false;
   }
-  consecutiveAudioErrors_ = 0;
   AVFrame *frame = av_frame_alloc();
   if (!frame) {
     LOG_ERROR("[DecoderCore] Failed to allocate audio frame");
@@ -739,19 +955,50 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
   }
 
   while (true) {
-    if (shouldStop_ || audioDecodeShouldStop_.load(std::memory_order_acquire)) {
+    if (shouldStop_ || audioDecodeInterrupted()) {
       av_frame_free(&frame);
       return false;
     }
     ret = avcodec_receive_frame(audioCodecCtx_, frame);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+      if (ret == AVERROR(EAGAIN) && resendPacket) {
+        resendPacket = false;
+        const int sendRet = avcodec_send_packet(audioCodecCtx_, packet);
+        if (sendRet >= 0) continue;
+        handleAudioPacketError(packet, sendRet, decodedEndPts);
+        av_frame_free(&frame);
+        return false;
+      }
       av_frame_free(&frame);
       return true;
     }
     if (ret < 0) {
-      char errbuf[AV_ERROR_MAX_STRING_SIZE];
-      av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
-      LOG_WARN("[DecoderCore] Receive audio frame failed: %d (%s)", ret, errbuf);
+      handleAudioPacketError(packet, ret, decodedEndPts);
+      av_frame_free(&frame);
+      return false;
+    }
+
+    if (consecutiveAudioErrors_ > 0) {
+      LOG_INFO("[AudioConceal] recovered layer=%d after=%d corrupt packets",
+               layerId_, consecutiveAudioErrors_);
+      consecutiveAudioErrors_ = 0;
+    }
+    if (frame->pts != AV_NOPTS_VALUE && frame->sample_rate > 0) {
+      decodedEndPts = std::max(decodedEndPts,
+          frame->pts * av_q2d(audioTimeBase_) +
+          static_cast<double>(frame->nb_samples) / frame->sample_rate);
+    }
+
+    // A prepared sync decoder keeps decoding video, but must hold its first
+    // audio frame until the shared presentation gate is released. Blocking
+    // here preserves packet order and avoids consuming the whole file while
+    // audio output is suppressed.
+    while (audioOutputSuppressed_.load(std::memory_order_acquire) &&
+           !shouldStop_ &&
+           !audioDecodeInterrupted()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (shouldStop_ || audioDecodeInterrupted()) {
       av_frame_free(&frame);
       return false;
     }
@@ -760,48 +1007,59 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
       const double audioPts = frame->pts * av_q2d(audioTimeBase_);
       const double playTime = getCurrentPlayTime();
       const double targetPts = audioTrackSwitchTargetPts_;
-      if (audioPts < targetPts - 0.08) {
-        if (audioTrackSwitchDropCount_ > 120) {
-          LOG_WARN("[AudioTrack] Switch gate timeout on early frames, accepting pts=%.3f target=%.3f playTime=%.3f",
+      // The wall clock keeps advancing while the new track catches up. Never
+      // accept stale audio merely because a frame-count limit was reached: it
+      // can pin the audio master clock several seconds behind the video clock.
+      const double minAcceptablePts = std::max(targetPts, playTime);
+      if (audioPts < minAcceptablePts - 0.08) {
+        const int dropCount = ++audioTrackSwitchDropCount_;
+        if (dropCount <= 8) {
+          LOG_INFO("[AudioTrack] Drop early switch audio frame pts=%.3f target=%.3f playTime=%.3f",
                    audioPts, targetPts, playTime);
-          audioTrackSwitching_.store(false, std::memory_order_release);
-        } else {
-          if (audioTrackSwitchDropCount_++ < 8) {
-            LOG_INFO("[AudioTrack] Drop early switch audio frame pts=%.3f target=%.3f playTime=%.3f",
-                     audioPts, targetPts, playTime);
-          }
-          av_frame_unref(frame);
-          continue;
+        } else if (dropCount == 121 || (dropCount % 240) == 0) {
+          LOG_WARN("[AudioTrack] Switch gate still dropping stale frames pts=%.3f target=%.3f playTime=%.3f drops=%d",
+                   audioPts, targetPts, playTime, dropCount);
         }
+        av_frame_unref(frame);
+        continue;
       }
       const double lead = audioPts - playTime;
       if (lead > 0.25) {
-        if (audioTrackSwitchDropCount_++ < 8) {
-          LOG_WARN("[AudioTrack] Switch audio frame still ahead pts=%.3f playTime=%.3f lead=%.3f",
-                   audioPts, playTime, lead);
+        // Ordered future frames cannot catch the clock if each one is discarded:
+        // demux read-ahead keeps every following frame ahead and AAudio stays empty.
+        // Retain this frame until it is due. Seek publishes isSeeking_ before
+        // joining workers; stop/track/route changes also cancel this wait, so a
+        // paused clock cannot block those operations while we own audioCodecMutex_.
+        auto& audioManager = AudioPlayerManager::getInstance();
+        const uint64_t routeGeneration = audioManager.getAudioClockGeneration();
+        LOG_INFO("[AudioTrack] Hold ahead switch audio frame pts=%.3f playTime=%.3f lead=%.3f",
+                 audioPts, playTime, lead);
+        while (isPaused_.load(std::memory_order_acquire) ||
+               audioPts - getCurrentPlayTime() > 0.25) {
+          if (shouldStop_.load(std::memory_order_acquire) ||
+              audioDecodeInterrupted() ||
+              isSeeking_.load(std::memory_order_acquire) ||
+              audioOutputSuppressed_.load(std::memory_order_acquire) ||
+              !audioManager.hasAudioFocusForLayer(layerId_) ||
+              audioManager.getAudioClockGeneration() != routeGeneration) {
+            av_frame_free(&frame);
+            return false;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        const int waitMs = std::min(static_cast<int>((lead - 0.05) * 1000.0), 30);
-        int waitedMs = 0;
-        while (waitedMs < waitMs && !shouldStop_ &&
-               !audioDecodeShouldStop_.load(std::memory_order_acquire)) {
-          const int stepMs = std::min(10, waitMs - waitedMs);
-          std::this_thread::sleep_for(std::chrono::milliseconds(stepMs));
-          waitedMs += stepMs;
+        if (shouldStop_.load(std::memory_order_acquire) ||
+            audioDecodeInterrupted() ||
+            isSeeking_.load(std::memory_order_acquire) ||
+            audioManager.getAudioClockGeneration() != routeGeneration) {
+          av_frame_free(&frame);
+          return false;
         }
-        if (shouldStop_ || audioDecodeShouldStop_.load(std::memory_order_acquire)) {
+        // Scheduling delays may make the held frame stale; keep the same lower
+        // bound as the immediate path before establishing the new audio clock.
+        if (audioPts < std::max(targetPts, getCurrentPlayTime()) - 0.08) {
+          ++audioTrackSwitchDropCount_;
           av_frame_unref(frame);
           continue;
-        }
-        const double leadAfterWait = audioPts - getCurrentPlayTime();
-        if (leadAfterWait > 0.25) {
-          if (audioTrackSwitchDropCount_ > 120) {
-            LOG_WARN("[AudioTrack] Switch gate timeout on ahead frames, accepting pts=%.3f playTime=%.3f lead=%.3f",
-                     audioPts, getCurrentPlayTime(), leadAfterWait);
-            audioTrackSwitching_.store(false, std::memory_order_release);
-          } else {
-            av_frame_unref(frame);
-            continue;
-          }
         }
       }
       audioTrackSwitching_.store(false, std::memory_order_release);
@@ -847,7 +1105,7 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         if (lastClockRealignMs_ == 0 || nowMs - lastClockRealignMs_ >= 3000) {
           LOG_WARN("[DecoderCore] HTTP stream sync: audio drift too large (diff=%+1.3fs), realigning clock", audioPts - playTime);
-          realignClock(audioPts);
+          realignClock(audioPts, false);
           lastClockRealignMs_ = nowMs;
         } else {
           LOG_WARN("[DecoderCore] HTTP stream sync: audio drift too large (diff=%+1.3fs), skip realign during cooldown", audioPts - playTime);
@@ -895,12 +1153,12 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
         if (waitMs > 5) {
           int waitedMs = 0;
           while (waitedMs < waitMs && !shouldStop_ &&
-                 !audioDecodeShouldStop_.load(std::memory_order_acquire)) {
+                 !audioDecodeInterrupted()) {
             int stepMs = std::min(10, waitMs - waitedMs);
             std::this_thread::sleep_for(std::chrono::milliseconds(stepMs));
             waitedMs += stepMs;
           }
-          if (shouldStop_ || audioDecodeShouldStop_.load(std::memory_order_acquire)) {
+          if (shouldStop_ || audioDecodeInterrupted()) {
             av_frame_unref(frame);
             continue;
           }
@@ -955,11 +1213,60 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
     }
 
     bool willWrite = (numFrames > 0 && canWriteAudioToSharedPlayer);
+    const bool reachedAudioTrackEnd = audioStreamEndPts_ > 0.0 &&
+        frame->pts != AV_NOPTS_VALUE && frame->sample_rate > 0 &&
+        frame->pts * av_q2d(audioTimeBase_) +
+            static_cast<double>(frame->nb_samples) / frame->sample_rate >=
+                audioStreamEndPts_ - 0.01;
+
+    const double replayThrottleEndPts =
+        audioTrackReplayThrottleEndPts_.load(std::memory_order_acquire);
+    if (replayThrottleEndPts >= 0.0 && frame->pts != AV_NOPTS_VALUE) {
+      const double framePts = frame->pts * av_q2d(audioTimeBase_);
+      if (willWrite) {
+        constexpr double kMaxReplayAudioLeadSeconds = 0.45;
+        const int32_t maxReplayPendingFrames =
+            std::max<int32_t>(4096, static_cast<int32_t>(
+                                        outSampleRate *
+                                        kMaxReplayAudioLeadSeconds));
+        int waitedMs = 0;
+        while (!shouldStop_ &&
+               !audioDecodeInterrupted()) {
+          const double clockLead = framePts - getCurrentPlayTime();
+          const int32_t pendingFrames =
+              audioPlayer_ ? audioPlayer_->getPendingFrames() : 0;
+          // A preroll/stalled output cannot drain PCM or advance its clock.
+          // Feed startup (or let write() request recovery) instead of waiting
+          // forever for the very consumer that this producer must restart.
+          if (!audioPlayer_ || !audioPlayer_->isOutputProgressing() ||
+              ((pendingFrames == 0 || clockLead <= kMaxReplayAudioLeadSeconds) &&
+               pendingFrames <= maxReplayPendingFrames)) {
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          waitedMs += 5;
+        }
+        if (waitedMs >= 100) {
+          LOG_INFO("[AudioTrack] replay PCM throttled framePts=%.3f "
+                   "play=%.3f pending=%d limit=%d waited=%dms end=%.3f",
+                   framePts, getCurrentPlayTime(),
+                   audioPlayer_ ? audioPlayer_->getPendingFrames() : 0,
+                   maxReplayPendingFrames, waitedMs, replayThrottleEndPts);
+        }
+      }
+      if (framePts >= replayThrottleEndPts - 0.02) {
+        double expected = replayThrottleEndPts;
+        audioTrackReplayThrottleEndPts_.compare_exchange_strong(
+            expected, -1.0, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+      }
+    }
 
     if (willWrite) {
       if (isMpegPsStream_ && useRkmppMpeg2Direct_ && audioPlayer_) {
         int waitedMs = 0;
-        while (!shouldStop_ && !audioDecodeShouldStop_.load(std::memory_order_acquire) &&
+        while (!shouldStop_ && !audioDecodeInterrupted() &&
+               audioPlayer_->isPlaying() &&
                audioPlayer_->getPendingFrames() > 4096) {
           std::this_thread::sleep_for(std::chrono::milliseconds(5));
           waitedMs += 5;
@@ -968,7 +1275,7 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
                      audioPlayer_->getPendingFrames(), waitedMs);
           }
         }
-        if (shouldStop_ || audioDecodeShouldStop_.load(std::memory_order_acquire)) {
+        if (shouldStop_ || audioDecodeInterrupted()) {
           av_frame_unref(frame);
           continue;
         }
@@ -981,7 +1288,7 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
         size_t startupVideoFrames = 0;
         const int maxWaitTries = useRkmppMpeg2Direct_ ? 0 : 20;
         for (int waitTry = 0; (useRkmppMpeg2Direct_ || waitTry < maxWaitTries) && !shouldStop_ &&
-             !audioDecodeShouldStop_.load(std::memory_order_acquire); ++waitTry) {
+             !audioDecodeInterrupted(); ++waitTry) {
           {
             std::lock_guard<std::mutex> psLock(mpegPsStartupFramesMutex_);
             startupVideoFrames = mpegPsStartupFrames_.size();
@@ -992,7 +1299,7 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        if (shouldStop_ || audioDecodeShouldStop_.load(std::memory_order_acquire)) {
+        if (shouldStop_ || audioDecodeInterrupted()) {
           av_frame_unref(frame);
           continue;
         }
@@ -1008,16 +1315,17 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
       const bool waitVideoFirstFrame = isHttpStream_ && !isMpegPsStream_ && videoStreamIdx_ >= 0 &&
           isInStartupGracePeriod() && stats_.totalFramesReceived == 0;
       if (waitVideoFirstFrame) {
-        if (audioWriteCountAfterSwitch_ < 3) {
-          LOG_DEBUG("[AudioTrack] Waiting for first video frame before audio output during HTTP startup");
+        // Hold the decoded samples instead of discarding the song's opening.
+        // Bound the wait so an audio-heavy interleave cannot deadlock demux.
+        for (int waitedMs = 0; waitedMs < 500 &&
+             stats_.totalFramesReceived == 0 && !audioDecodeInterrupted();
+             waitedMs += 5) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        ++audioWriteCountAfterSwitch_;
-        av_frame_unref(frame);
-        if (shouldStop_ || audioDecodeShouldStop_.load(std::memory_order_acquire)) {
+        if (audioDecodeInterrupted()) {
+          av_frame_unref(frame);
           continue;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        continue;
       }
 
       // 应用图层音量：在写入AudioPlayer前，将音频数据乘以图层音量
@@ -1039,10 +1347,27 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
       }
 
       // 关键：写入音频播放器前检查播放器状态
-      int32_t written = audioPlayer_->write(audioBuffer_, numFrames);
+      uint64_t audioClockGeneration = 0;
+      int32_t written = mgr.writeForLayer(
+          AudioFocusSource::VIDEO, layerId_, audioBuffer_, numFrames,
+          &audioClockGeneration);
+      if (written > 0 && frame->pts != AV_NOPTS_VALUE) {
+        const double framePts = frame->pts * av_q2d(audioTimeBase_);
+        updateAudioMasterClock(framePts, written, outSampleRate,
+                               audioClockGeneration);
+        if (reachedAudioTrackEnd && audioPlayer_) {
+          // A valid, shorter audio stream ends before the video container.
+          // Mark that boundary so AAudio supplies normal tail silence without
+          // reporting a false underrun while the video continues.
+          audioPlayer_->finishInput(audioClockGeneration);
+          LOG_INFO("[DecoderCore] Audio track reached natural end at %.3f; "
+                   "continuing video tail as silence layer=%d",
+                   framePts + static_cast<double>(written) / outSampleRate, layerId_);
+        }
+      }
 
-      // MPEG-PS：捕获本曲首次成功写入音频时的 AAudio 累计帧锚点。
-      // AAudioStream_getFramesRead/Written 是流生命周期累计值（跨歌不重置），
+      // MPEG-PS：捕获本曲首次成功写入音频时的播放器累计帧锚点。
+      // AudioPlayer 的计数是流生命周期累计值（跨歌不重置），
       // 必须减去本曲开始时的锚点才能得到"本曲已播帧数"。
       if (written > 0 && isMpegPsStream_ && !mpegPsAudioFramesAnchorInitialized_ &&
           audioPlayer_) {
@@ -1056,8 +1381,8 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
                  mpegPsFirstAudioPts_, mpegPsFirstWrittenAudioPts_);
       }
 
-      // MPEG-PS：等本曲音频在 AAudio 真正开始出声后再锁时钟。
-      // "本曲已播帧数" = framesRead - anchor，> 0 表示本曲的第一个样本已经在播了。
+      // MPEG-PS：等本曲音频进入输出回调后再锁时钟。
+      // "本曲已播帧数" = framesRead - anchor，> 0 表示本曲的第一个样本已经进入输出时间轴。
       if (written > 0 && isMpegPsStream_ && (mpegPsStartupPrerollDone_ || useRkmppMpeg2Direct_) && !firstFrameAligned_ &&
           mpegPsFirstAudioPtsInitialized_ && mpegPsAudioFramesAnchorInitialized_) {
         int64_t framesReadAbs = audioPlayer_->getAAudioFramesRead();
@@ -1073,6 +1398,7 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
           int64_t hwFramePos = 0;
           int64_t hwTimeNs = 0;
           bool hwOk = audioPlayer_->getAAudioPresentationTimestamp(hwFramePos, hwTimeNs);
+          double alignedStartTime;
           if (!useRkmppMpeg2Direct_ && hwOk && hwFramePos >= mpegPsAudioFramesAnchor_) {
             // hwFramePos 在本曲范围：换算到本曲 PTS 时间轴
             const double hwTimeSec = static_cast<double>(hwTimeNs) / 1e9;
@@ -1084,11 +1410,11 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
             // HAL 读出而非真实出声时刻，用户可正向微调让视频再晚 N ms。
             const double userOffsetHw =
                 sAudioLipSyncOffsetMs.load(std::memory_order_relaxed) / 1000.0;
-            startTime_ = hwTimeSec - hwPts + userOffsetHw;
+            alignedStartTime = hwTimeSec - hwPts + userOffsetHw;
             mpegPsPrerollCompensation_ = userOffsetHw;
             LOG_DEBUG("[DecoderCore] MPEG-PS clock locked via AAudio HW timestamp: hwFrame=%lld hwTimeSec=%.6f hwPts=%.3f userOffset=%.3f startTime=%.6f anchor=%lld firstAudioPts=%.3f",
                      static_cast<long long>(hwFramePos), hwTimeSec, hwPts, userOffsetHw,
-                     startTime_, static_cast<long long>(mpegPsAudioFramesAnchor_),
+                     alignedStartTime, static_cast<long long>(mpegPsAudioFramesAnchor_),
                      mpegPsFirstAudioPts_);
           } else {
             // 说明：回退方案：framesRead 加输出延迟补偿。
@@ -1102,14 +1428,18 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
             if (compensation > 0.6) compensation = 0.6;
             mpegPsPrerollCompensation_ = compensation;
             currentlyPlayingPts -= compensation;
-            startTime_ = currentSystemTime - currentlyPlayingPts;
+            alignedStartTime = currentSystemTime - currentlyPlayingPts;
             LOG_DEBUG("[DecoderCore] MPEG-PS clock locked via framesRead fallback: scrPtsGap=%.3f audioOutputDelay=%.3f userOffset=%.3f compensation=%.3f currentlyPlayingPts=%.3f startTime=%.6f",
                      mpegPsFirstScrInitialized_ ? (mpegPsFirstAudioPts_ - mpegPsFirstScr_) : -1.0,
-                     audioOutputDelay, userOffset, compensation, currentlyPlayingPts, startTime_);
+                     audioOutputDelay, userOffset, compensation, currentlyPlayingPts, alignedStartTime);
           }
-          pausedTime_ = 0.0;
-          pauseStartTime_ = 0.0;
-          firstFrameAligned_ = true;
+          {
+            std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+            startTime_ = alignedStartTime;
+            pausedTime_ = 0.0;
+            pauseStartTime_ = 0.0;
+            firstFrameAligned_ = true;
+          }
           int32_t inFlight = audioPlayer_->getAAudioInFlightFrames();
           // 跨线程取走预滚帧：视频线程可能正在 append；用 mpegPsStartupFramesMutex_ 保护
           std::deque<DecodedFrame*> prerollFrames;
@@ -1123,7 +1453,7 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
                    static_cast<long long>(framesPlayedThisSong),
                    static_cast<long long>(mpegPsAudioFramesAnchor_),
                    static_cast<long long>(framesReadAbs), inFlight,
-                   startTime_, prerollFrames.size());
+                   alignedStartTime, prerollFrames.size());
           // 注意：syncAndDisplayFrame 内部会按 PTS 等待显示时刻；
           // 这里我们在 audio 线程里执行 drain 是历史路径，但 syncAndDisplayFrame 实际只是 push 到帧队列，
           // 真正的等待在 render 线程里；所以这里阻塞是可接受的（毫秒级 push 调用）。
@@ -1176,6 +1506,7 @@ bool DecoderCore::decodeAudioFrame(AVPacket *packet) {
             currentlyPlayingPts -= mpegPsPrerollCompensation_;
             idealStartTime = currentSystemTime - currentlyPlayingPts;
           }
+          std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
           double delta = idealStartTime - startTime_;
           if (std::abs(delta) <= 1.0) {
             const double alpha = 0.05;
@@ -1271,10 +1602,11 @@ void DecoderCore::processDecodedFrame(AVFrame *avFrame) {
     rawPts = normalizeMpegPsVideoPts(rawPts, demuxerName);
   }
 
-  // MPEG-PS 起播乱序在预滚阶段统一建模处理，不在这里即时 drop/clamp。
-  if (!isMpegPsTimeline && videoWidth_ < 1280 && lastAcceptedPts_ > 0 && rawPts < lastAcceptedPts_ - 0.5) {
+  // MPEG-PS startup disorder is handled by its preroll model, not by this clamp.
+  if (!isMpegPsTimeline && videoWidth_ < 1280 && lastAcceptedPts_ > 0 &&
+      rawPts < lastAcceptedPts_ - 0.5) {
     if (vpuDropLogCounter_++ % 60 == 0) {
-      LOG_WARN("[DecoderCore] MPEG-PS PTS backward jump clamped: rawPts=%.3f last=%.3f frame=%lld",
+      LOG_WARN("[DecoderCore] Low-res video PTS backward jump clamped: rawPts=%.3f last=%.3f frame=%lld",
                rawPts, lastAcceptedPts_, static_cast<long long>(totalDecodedFrames_));
     }
     rawPts = lastAcceptedPts_ + 0.04;
@@ -1429,17 +1761,21 @@ void DecoderCore::processDecodedFrame(AVFrame *avFrame) {
       // 等待超时回退：以视频 firstPts 锁时钟并 drain
       auto now = std::chrono::steady_clock::now();
       double currentSystemTime = std::chrono::duration<double>(now.time_since_epoch()).count();
-      startTime_ = currentSystemTime - lastAcceptedPts_;
-      pausedTime_ = 0.0;
-      pauseStartTime_ = 0.0;
-      firstFrameAligned_ = true;
+      const double alignedStartTime = currentSystemTime - lastAcceptedPts_;
+      {
+        std::lock_guard<std::recursive_mutex> clockLock(playbackClockMutex_);
+        startTime_ = alignedStartTime;
+        pausedTime_ = 0.0;
+        pauseStartTime_ = 0.0;
+        firstFrameAligned_ = true;
+      }
       std::deque<DecodedFrame*> prerollFrames;
       {
         std::lock_guard<std::mutex> psLock(mpegPsStartupFramesMutex_);
         prerollFrames.swap(mpegPsStartupFrames_);
       }
       LOG_WARN("[DecoderCore] MPEG-PS audio clock not arriving, fallback to video-locked clock: firstPts=%.3f startTime=%.6f cached=%zu",
-               lastAcceptedPts_, startTime_, prerollFrames.size());
+               lastAcceptedPts_, alignedStartTime, prerollFrames.size());
       for (auto* prerollFrame : prerollFrames) {
         if (prerollFrame) {
           syncAndDisplayFrame(prerollFrame);
@@ -1483,15 +1819,16 @@ void DecoderCore::syncAndDisplayFrame(DecodedFrame *frame) {
     auto syncCheck = frameSyncManager_->checkFrameSync(frame->pts, currentPlayTime, playbackRate_);
     const bool startupPrequeue =
         isInStartupGracePeriod() && isRkmppCodec && !isMpegPsStream_ &&
-        isWideOrHeavyVideo(videoWidth_, videoHeight_);
+        video_profile::isWideOrHeavyVideo(videoWidth_, videoHeight_);
 
     const bool inStartupGrace = isInStartupGracePeriod();
     const bool isRkmppHighResNoPs =
         isRkmppCodec && !isMpegPsStream_ &&
-        isWideOrHeavyVideo(videoWidth_, videoHeight_);
+        video_profile::isWideOrHeavyVideo(videoWidth_, videoHeight_);
     const bool isUltraWideRkmppNoPs =
         isRkmppCodec && !isMpegPsStream_ &&
-        videoWidth_ >= 3840 && videoHeight_ < 1080 && frameRate_ < 45.0;
+        video_profile::isUltraWideVideo(videoWidth_, videoHeight_) &&
+        frameRate_ < 45.0;
     const bool protectRkmppStartupClock =
         (isRkmppHighResNoPs || isUltraWideRkmppNoPs) &&
         (inStartupGrace || stats_.lastDecodeMs > 250.0 || consecutiveDrops_ > 0);
@@ -1549,7 +1886,7 @@ void DecoderCore::syncAndDisplayFrame(DecodedFrame *frame) {
             if (severeDriftStreak_ >= 3 && realignCooldownPassed) {
                 LOG_WARN("[DecoderCore] Severe time drift confirmed: %.3fs, realigning clock to pts=%.3f (streak=%d)",
                          syncCheck.timeDiff, frame->pts, severeDriftStreak_);
-                realignClock(frame->pts);
+                realignClock(frame->pts, true);
                 lastClockRealignMs_ = nowMs;
                 severeDriftStreak_ = 0;
                 consecutiveDrops_ = 0;
@@ -1671,22 +2008,42 @@ bool DecoderCore::extractDrmPrimeData(AVFrame *avFrame, DecodedFrame *frame) {
   }
 
   frame->drmData.reset();
-  frame->drmPrimeFd = desc->objects[0].fd;
-  frame->drmData.fd = desc->objects[0].fd;
-  frame->drmData.width = static_cast<uint32_t>(avFrame->width);
-  frame->drmData.height = static_cast<uint32_t>(avFrame->height);
+  frame->drmData.visibleWidth = static_cast<uint32_t>(avFrame->width);
+  frame->drmData.visibleHeight = static_cast<uint32_t>(avFrame->height);
+  // FFmpeg exposes the visible size here. Storage extent is represented by
+  // each plane pitch/offset; do not manufacture an aligned width from it.
+  frame->drmData.codedWidth = frame->drmData.visibleWidth;
+  frame->drmData.codedHeight = frame->drmData.visibleHeight;
 
-  AVDRMLayerDescriptor *layer = &desc->layers[0];
+  frame->drmData.numObjects =
+      std::min(desc->nb_objects, DrmPrimeData::MAX_OBJECTS);
+  for (int i = 0; i < frame->drmData.numObjects; ++i) {
+    frame->drmData.objects[i].fd = desc->objects[i].fd;
+    frame->drmData.objects[i].size = desc->objects[i].size;
+    frame->drmData.objects[i].modifier = desc->objects[i].format_modifier;
+  }
+
+  const AVDRMLayerDescriptor *layer = &desc->layers[0];
   frame->drmData.format = layer->format;
-  frame->drmData.numPlanes = layer->nb_planes;
-
-  int maxPlanes = std::min(layer->nb_planes, DrmPrimeData::MAX_PLANES);
-  for (int i = 0; i < maxPlanes; i++) {
+  frame->drmData.numPlanes =
+      std::min(layer->nb_planes, DrmPrimeData::MAX_PLANES);
+  for (int i = 0; i < frame->drmData.numPlanes; ++i) {
+    frame->drmData.planes[i].objectIndex = layer->planes[i].object_index;
     frame->drmData.planes[i].offset = layer->planes[i].offset;
     frame->drmData.planes[i].pitch = layer->planes[i].pitch;
   }
 
-  frame->drmData.modifier = 0;
+  frame->drmPrimeFd = frame->drmData.planeFd(0);
+  if (desc->nb_objects > DrmPrimeData::MAX_OBJECTS ||
+      layer->nb_planes > DrmPrimeData::MAX_PLANES) {
+    LOG_ERROR("[DRM_PRIME] descriptor exceeds supported limits: objects=%d/%d "
+              "planes=%d/%d",
+              desc->nb_objects, DrmPrimeData::MAX_OBJECTS, layer->nb_planes,
+              DrmPrimeData::MAX_PLANES);
+    frame->drmData.reset();
+    frame->drmPrimeFd = -1;
+    return false;
+  }
 
   if (!stats_.firstDrmFrameLogged) {
     stats_.firstDrmFrameLogged = true;
@@ -1742,7 +2099,6 @@ void DecoderCore::waitForFrameSync(double framePts, int initialWaitMs) {
 
 void DecoderCore::updateCurrentFrame(DecodedFrame *frame) {
   std::lock_guard<std::mutex> lock(queueMutex_);
-  // 将阵列推入缓冲区，不再受限于单帧阻
   frame->addRef();
   frameQueue_.push_back(frame);
   ++flowEnqueueCount_;
@@ -1769,6 +2125,28 @@ void DecoderCore::updateCurrentFrame(DecodedFrame *frame) {
 // 辅助 函数
 // ============================================================================
 
+size_t DecoderCore::flushFrameQueue() {
+#ifdef __ANDROID__
+  std::vector<DecodedFrame *> framesToRelease;
+  size_t releasedFrames = 0;
+  {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    while (!frameQueue_.empty()) {
+      framesToRelease.push_back(frameQueue_.front());
+      frameQueue_.pop_front();
+      ++releasedFrames;
+    }
+  }
+  frameQueueCv_.notify_all();
+  for (DecodedFrame *frame : framesToRelease) {
+    enqueueFrameRelease(frame);
+  }
+  return releasedFrames;
+#else
+  return 0;
+#endif
+}
+
 void DecoderCore::flushDecoders() {
 #ifdef __ANDROID__
   std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
@@ -1778,13 +2156,7 @@ void DecoderCore::flushDecoders() {
       avcodec_flush_buffers(videoCodecCtx_);
     }
   }
-  {
-    std::lock_guard<std::mutex> lock(queueMutex_);
-    while (!frameQueue_.empty()) {
-      frameQueue_.front()->release();
-      frameQueue_.pop_front();
-    }
-  }
+  flushFrameQueue();
   {
     std::lock_guard<std::mutex> lock(audioCodecMutex_);
     if (audioCodecCtx_) {
@@ -1820,7 +2192,8 @@ double DecoderCore::getPTSInSeconds(int64_t pts,
 
 void DecoderCore::startAudioDecodeThread() {
 #ifdef __ANDROID__
-  if (audioDecodeThreadRunning_.load(std::memory_order_acquire)) {
+  std::lock_guard<std::mutex> lifecycleLock(audioDecodeThreadLifecycleMutex_);
+  if (shouldStop_ || audioDecodeThreadRunning_.load(std::memory_order_acquire)) {
     return;
   }
   if (!audioCodecCtx_ || !swrContext_ || !audioPlayer_) {
@@ -1838,6 +2211,7 @@ void DecoderCore::startAudioDecodeThread() {
 
 void DecoderCore::stopAudioDecodeThread(bool drain) {
 #ifdef __ANDROID__
+  std::lock_guard<std::mutex> lifecycleLock(audioDecodeThreadLifecycleMutex_);
   if (!audioDecodeThreadRunning_.load(std::memory_order_acquire)) {
     return;
   }
@@ -1864,18 +2238,175 @@ void DecoderCore::stopAudioDecodeThread(bool drain) {
 void DecoderCore::flushAudioPacketQueue() {
 #ifdef __ANDROID__
   std::lock_guard<std::mutex> lock(audioPacketQueueMutex_);
-  for (auto& entry : audioPacketQueues_) {
-    auto& queue = entry.second;
-    while (!queue.empty()) {
-      AVPacket *p = queue.front();
-      queue.pop_front();
-      if (p) {
-        av_packet_free(&p);
+  auto freeQueues = [](auto& queues) {
+    for (auto& entry : queues) {
+      auto& queue = entry.second;
+      while (!queue.empty()) {
+        AVPacket *packet = queue.front();
+        queue.pop_front();
+        if (packet) {
+          av_packet_free(&packet);
+        }
+      }
+    }
+    queues.clear();
+  };
+  freeQueues(audioPacketQueues_);
+  freeQueues(audioPacketHistoryQueues_);
+  audioTrackRestoreNeedsDecodeCatchup_.store(false,
+                                              std::memory_order_release);
+  audioTrackReplayThrottleEndPts_.store(-1.0, std::memory_order_release);
+  audioPacketQueueCv_.notify_all();
+#endif
+}
+
+bool DecoderCore::restoreAudioPacketQueueFromHistory(int streamIndex,
+                                                       double position) {
+#ifdef __ANDROID__
+  std::unique_lock<std::mutex> lock(audioPacketQueueMutex_);
+  if (!formatCtx_ || streamIndex < 0 ||
+      static_cast<unsigned int>(streamIndex) >= formatCtx_->nb_streams ||
+      !formatCtx_->streams[streamIndex]) {
+    LOG_INFO("[AudioTrack] history unavailable stream=%d target=%.3f",
+             streamIndex, position);
+    return false;
+  }
+
+  const double timeBase = av_q2d(formatCtx_->streams[streamIndex]->time_base);
+  const double minPts = position - kAudioTrackSwitchPrerollSeconds;
+  const double maxCoveragePts = position + kAudioTrackSwitchMaxLeadSeconds;
+  double firstPts = -1.0;
+  double lastPts = -1.0;
+  size_t historySize = 0;
+
+  const auto inspectHistory = [&]() {
+    firstPts = -1.0;
+    lastPts = -1.0;
+    historySize = 0;
+    bool coversPosition = false;
+    const auto historyIt = audioPacketHistoryQueues_.find(streamIndex);
+    if (historyIt == audioPacketHistoryQueues_.end()) {
+      return false;
+    }
+    historySize = historyIt->second.size();
+    for (const AVPacket *packet : historyIt->second) {
+      if (!packet) {
+        continue;
+      }
+      const int64_t timestamp =
+          packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+      if (timestamp == AV_NOPTS_VALUE) {
+        continue;
+      }
+      const double pts = timestamp * timeBase;
+      if (firstPts < 0.0) {
+        firstPts = pts;
+      }
+      lastPts = pts;
+      if (pts >= minPts && pts <= maxCoveragePts) {
+        coversPosition = true;
+      }
+    }
+    return coversPosition;
+  };
+
+  bool coversPosition = inspectHistory();
+  const bool historyCanCatchUp =
+      lastPts < 0.0 ||
+      (position > lastPts &&
+       position - lastPts <= kAudioTrackSwitchHistoryWaitMaxLagSeconds);
+  if (!coversPosition && historyCanCatchUp && !(firstPts > maxCoveragePts)) {
+    LOG_INFO("[AudioTrack] waiting for history stream=%d target=%.3f "
+             "size=%zu range=%.3f..%.3f maxWait=%dms",
+             streamIndex, position, historySize, firstPts, lastPts,
+             kAudioTrackSwitchHistoryWaitMs);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(
+                              kAudioTrackSwitchHistoryWaitMs);
+    while (!coversPosition && std::chrono::steady_clock::now() < deadline) {
+      audioPacketQueueCv_.wait_until(lock, deadline);
+      coversPosition = inspectHistory();
+      if (firstPts > maxCoveragePts ||
+          (lastPts >= 0.0 &&
+           position - lastPts > kAudioTrackSwitchHistoryWaitMaxLagSeconds)) {
+        break;
       }
     }
   }
-  audioPacketQueues_.clear();
+
+  const bool decodeCatchup =
+      !coversPosition && firstPts >= 0.0 && lastPts >= 0.0 &&
+      lastPts < minPts && position - lastPts <=
+                              kAudioTrackSwitchDecodeCatchupMaxLagSeconds;
+  if (!coversPosition && !decodeCatchup) {
+    LOG_INFO("[AudioTrack] history miss stream=%d target=%.3f size=%zu "
+             "range=%.3f..%.3f",
+             streamIndex, position, historySize, firstPts, lastPts);
+    return false;
+  }
+  if (decodeCatchup) {
+    LOG_INFO("[AudioTrack] history decode catch-up stream=%d target=%.3f "
+             "lag=%.3f range=%.3f..%.3f",
+             streamIndex, position, position - lastPts, firstPts, lastPts);
+  }
+
+  auto historyIt = audioPacketHistoryQueues_.find(streamIndex);
+  if (historyIt == audioPacketHistoryQueues_.end()) {
+    return false;
+  }
+  auto& decodeQueue = audioPacketQueues_[streamIndex];
+  while (!decodeQueue.empty()) {
+    AVPacket *packet = decodeQueue.front();
+    decodeQueue.pop_front();
+    if (packet) {
+      av_packet_free(&packet);
+    }
+  }
+
+  const double restoreMinPts =
+      decodeCatchup
+          ? std::max(firstPts,
+                     position - kAudioTrackSwitchDecodeCatchupMaxLagSeconds)
+          : minPts;
+  size_t restored = 0;
+  double restoredEndPts = -1.0;
+  for (const AVPacket *packet : historyIt->second) {
+    if (!packet) {
+      continue;
+    }
+    const int64_t timestamp =
+        packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+    const double packetPts =
+        timestamp != AV_NOPTS_VALUE ? timestamp * timeBase : -1.0;
+    if (timestamp == AV_NOPTS_VALUE || packetPts < restoreMinPts) {
+      continue;
+    }
+    AVPacket *clone = av_packet_clone(packet);
+    if (!clone) {
+      LOG_WARN("[AudioTrack] failed to clone history packet stream=%d "
+               "restored=%zu",
+               streamIndex, restored);
+      continue;
+    }
+    decodeQueue.push_back(clone);
+    restoredEndPts = packetPts;
+    ++restored;
+  }
+
+  audioTrackRestoreNeedsDecodeCatchup_.store(decodeCatchup,
+                                              std::memory_order_release);
+  audioTrackReplayThrottleEndPts_.store(
+      restored > 0 ? restoredEndPts : -1.0, std::memory_order_release);
   audioPacketQueueCv_.notify_all();
+  LOG_INFO("[AudioTrack] history restored stream=%d target=%.3f history=%zu "
+           "range=%.3f..%.3f restored=%zu",
+           streamIndex, position, historyIt->second.size(), firstPts, lastPts,
+           restored);
+  return restored > 0;
+#else
+  (void)streamIndex;
+  (void)position;
+  return false;
 #endif
 }
 
@@ -1934,80 +2465,112 @@ size_t DecoderCore::dropAudioPacketsBefore(int streamIndex, double position) {
 void DecoderCore::enqueueAudioPacket(AVPacket *packet) {
 #ifdef __ANDROID__
   const auto enqueueStart = std::chrono::steady_clock::now();
-  AVPacket *clone = nullptr;
   int streamIndex = audioStreamIdx_;
   if (!packet && streamIndex < 0) {
     return;
   }
   if (packet) {
     streamIndex = packet->stream_index;
-    clone = av_packet_clone(packet);
-    if (!clone) {
-      LOG_ERROR("[DecoderCore] av_packet_clone failed in enqueueAudioPacket");
-      return;
-    }
   }
-  // clone == nullptr 表示 EOF sentinel
+
+  AVPacket *decodeClone = packet ? av_packet_clone(packet) : nullptr;
+  AVPacket *historyClone = packet ? av_packet_clone(packet) : nullptr;
+  if (packet && !decodeClone) {
+    LOG_ERROR("[DecoderCore] av_packet_clone failed in enqueueAudioPacket");
+    if (historyClone) {
+      av_packet_free(&historyClone);
+    }
+    return;
+  }
 
   std::unique_lock<std::mutex> lock(audioPacketQueueMutex_);
-  // audio 队列回压：满了就阻塞主 demux 等 audio thread 消化。
-  // 实践中 audio decode <1ms/包，audio queue 几乎不会满。设上限只是防止异常情况下 OOM。
-  // 用 shouldStop_（不是 audioDecodeShouldStop_）让 close() 能立刻解阻塞。
-  if (streamIndex == audioStreamIdx_ && audioDecodeThreadRunning_.load(std::memory_order_acquire)) {
+  // Only the selected stream enters the decode queue. Every audio stream keeps
+  // a bounded read-ahead history so a rapid track switch can rebuild packets
+  // around the audible clock without flushing the shared video timeline.
+  if (streamIndex == audioStreamIdx_ &&
+      audioDecodeThreadRunning_.load(std::memory_order_acquire)) {
     audioPacketQueueCv_.wait(lock, [this] {
       auto it = audioPacketQueues_.find(audioStreamIdx_);
-      const size_t activeSize = (it != audioPacketQueues_.end()) ? it->second.size() : 0;
+      const size_t activeSize =
+          (it != audioPacketQueues_.end()) ? it->second.size() : 0;
       return audioDecodeShouldStop_.load(std::memory_order_acquire) ||
-             shouldStop_ ||
-             isPaused_ ||
-             activeSize < kAudioPacketQueueCap;
+             shouldStop_ || isSeeking_ || activeSize < kAudioPacketQueueCap;
     });
   }
+
   const auto waitEnd = std::chrono::steady_clock::now();
   const double waitMs = std::chrono::duration<double, std::milli>(
       waitEnd - enqueueStart).count();
-  if (audioDecodeShouldStop_.load(std::memory_order_acquire) || shouldStop_ || isPaused_) {
-    if (clone) av_packet_free(&clone);
+  if (audioDecodeShouldStop_.load(std::memory_order_acquire) || shouldStop_ || isSeeking_) {
+    if (decodeClone) {
+      av_packet_free(&decodeClone);
+    }
+    if (historyClone) {
+      av_packet_free(&historyClone);
+    }
     return;
   }
-  auto& queue = audioPacketQueues_[streamIndex];
-  queue.push_back(clone);
-  while (streamIndex != audioStreamIdx_ && queue.size() > kAudioPacketQueueCap) {
-    AVPacket *old = queue.front();
-    queue.pop_front();
-    if (old) av_packet_free(&old);
+
+  size_t queueSize = 0;
+  const bool isActiveStream = streamIndex == audioStreamIdx_;
+  if (!packet || isActiveStream) {
+    auto& queue = audioPacketQueues_[streamIndex];
+    queue.push_back(decodeClone);
+    decodeClone = nullptr;
+    queueSize = queue.size();
   }
-  if (streamIndex != audioStreamIdx_ && formatCtx_ &&
-      streamIndex >= 0 && static_cast<unsigned int>(streamIndex) < formatCtx_->nb_streams &&
+  if (decodeClone) {
+    av_packet_free(&decodeClone);
+  }
+
+  if (historyClone && formatCtx_ && streamIndex >= 0 &&
+      static_cast<unsigned int>(streamIndex) < formatCtx_->nb_streams &&
       formatCtx_->streams[streamIndex]) {
-    AVPacket *latest = queue.empty() ? nullptr : queue.back();
-    if (latest && latest->pts != AV_NOPTS_VALUE) {
-      const double latestPts = latest->pts * av_q2d(formatCtx_->streams[streamIndex]->time_base);
-      while (!queue.empty()) {
-        AVPacket *old = queue.front();
-        if (!old || old->pts == AV_NOPTS_VALUE) {
-          break;
-        }
-        const double oldPts = old->pts * av_q2d(formatCtx_->streams[streamIndex]->time_base);
-        if (latestPts - oldPts <= kInactiveAudioQueueWindowSeconds) {
-          break;
-        }
-        queue.pop_front();
-        av_packet_free(&old);
+    auto& history = audioPacketHistoryQueues_[streamIndex];
+    history.push_back(historyClone);
+    historyClone = nullptr;
+
+    const double timeBase = av_q2d(formatCtx_->streams[streamIndex]->time_base);
+    AVPacket *latest = history.back();
+    const int64_t latestTimestamp =
+        latest->pts != AV_NOPTS_VALUE ? latest->pts : latest->dts;
+    const double latestPts = latestTimestamp != AV_NOPTS_VALUE
+                                 ? latestTimestamp * timeBase
+                                 : -1.0;
+    while (history.size() > kAudioPacketHistoryCap) {
+      AVPacket *old = history.front();
+      history.pop_front();
+      av_packet_free(&old);
+    }
+    while (latestPts >= 0.0 && !history.empty()) {
+      AVPacket *old = history.front();
+      const int64_t oldTimestamp =
+          old->pts != AV_NOPTS_VALUE ? old->pts : old->dts;
+      if (oldTimestamp == AV_NOPTS_VALUE ||
+          latestPts - oldTimestamp * timeBase <=
+              kAudioPacketHistoryWindowSeconds) {
+        break;
       }
+      history.pop_front();
+      av_packet_free(&old);
     }
   }
+  if (historyClone) {
+    av_packet_free(&historyClone);
+  }
+
   audioPacketQueueCv_.notify_all();
   if (waitMs > 20.0) {
     static thread_local int64_t s_lastSlowAudioEnqueueLogMs = 0;
     const int64_t traceNowMs = nowMs();
     if (s_lastSlowAudioEnqueueLogMs == 0 ||
-        traceNowMs - s_lastSlowAudioEnqueueLogMs >= kPlaybackIssueLogIntervalMs) {
+        traceNowMs - s_lastSlowAudioEnqueueLogMs >=
+            kPlaybackIssueLogIntervalMs) {
       s_lastSlowAudioEnqueueLogMs = traceNowMs;
-      LOG_WARN("[DecoderCore] slow audio enqueue layer=%d stream=%d active=%d wait=%.2fms "
-               "queue=%zu cap=%zu thread=%d stop=%d paused=%d",
-               layerId_, streamIndex, streamIndex == audioStreamIdx_ ? 1 : 0,
-               waitMs, queue.size(), kAudioPacketQueueCap,
+      LOG_WARN("[DecoderCore] slow audio enqueue layer=%d stream=%d active=%d "
+               "wait=%.2fms queue=%zu cap=%zu thread=%d stop=%d paused=%d",
+               layerId_, streamIndex, isActiveStream ? 1 : 0, waitMs,
+               queueSize, kAudioPacketQueueCap,
                audioDecodeThreadRunning_.load(std::memory_order_acquire) ? 1 : 0,
                audioDecodeShouldStop_.load(std::memory_order_acquire) ? 1 : 0,
                isPaused_.load(std::memory_order_acquire) ? 1 : 0);
@@ -2030,8 +2593,7 @@ void DecoderCore::audioDecodeLoop() {
   LOG_DEBUG("[DecoderCore] Audio decode loop entered (layer %d)", layerId_);
 
   while (true) {
-    if (audioDecodeShouldStop_.load(std::memory_order_acquire) &&
-        !audioDecodeDrainOnStop_.load(std::memory_order_acquire)) {
+    if (audioDecodeInterrupted()) {
       break;
     }
     if (isPaused_) {
@@ -2045,16 +2607,15 @@ void DecoderCore::audioDecodeLoop() {
       audioPacketQueueCv_.wait(lock, [this] {
         auto it = audioPacketQueues_.find(audioStreamIdx_);
         const bool activeHasPackets = (it != audioPacketQueues_.end()) && !it->second.empty();
-        return audioDecodeShouldStop_.load(std::memory_order_acquire) ||
+        return shouldStop_ || audioDecodeShouldStop_.load(std::memory_order_acquire) ||
                activeHasPackets;
       });
 
       const bool shouldStop = audioDecodeShouldStop_.load(std::memory_order_acquire);
-      const bool drainBeforeStop = audioDecodeDrainOnStop_.load(std::memory_order_acquire);
       auto it = audioPacketQueues_.find(audioStreamIdx_);
       const bool activeEmpty = (it == audioPacketQueues_.end()) || it->second.empty();
 
-      if (shouldStop && (activeEmpty || !drainBeforeStop)) {
+      if (audioDecodeInterrupted() || (shouldStop && activeEmpty)) {
         break;
       }
       if (activeEmpty) {
@@ -2071,7 +2632,11 @@ void DecoderCore::audioDecodeLoop() {
     if (isEofSentinel) {
       // EOF：发 NULL 包给 audio codec flush 出残余帧
       decodeAudioFrame(nullptr);
+      if (audioPlayer_ && !audioDecodeInterrupted()) {
+        audioPlayer_->finishInput(preparedAudioRouteGeneration_.load());
+      }
       LOG_INFO("[DecoderCore] Audio decode loop drained EOF sentinel (layer %d)", layerId_);
+      break;
     } else if (packet) {
       decodeAudioFrame(packet);
     }
@@ -2108,13 +2673,29 @@ void DecoderCore::startVideoDecodeThread() {
 
 void DecoderCore::stopVideoDecodeThread(bool drain) {
 #ifdef __ANDROID__
-  if (!videoDecodeThreadRunning_.load(std::memory_order_acquire)) {
-    return;
-  }
-  const bool effectiveDrain = drain && !shouldStop_.load(std::memory_order_acquire);
+  const bool threadRunning =
+      videoDecodeThreadRunning_.load(std::memory_order_acquire);
+  const bool effectiveDrain =
+      threadRunning && drain && !shouldStop_.load(std::memory_order_acquire);
   videoDecodeDrainOnStop_.store(effectiveDrain, std::memory_order_release);
   videoDecodeShouldStop_.store(true, std::memory_order_release);
   videoPacketQueueCv_.notify_all();
+  frameQueueCv_.notify_all();
+
+  // RKMPP DRM_PRIME frames hold hardware output buffers. Releasing the display
+  // queue before join prevents a full output pool from deadlocking seek/close.
+  if (!effectiveDrain) {
+    const size_t releasedFrames = flushFrameQueue();
+    if (releasedFrames > 0) {
+      LOG_INFO("[DecoderCore] Released %zu queued video frames before decoder join layer=%d",
+               releasedFrames, layerId_);
+    }
+  }
+
+  if (!threadRunning) {
+    flushVideoPacketQueue();
+    return;
+  }
   if (videoDecodeThread_.joinable()) {
     auto t0 = std::chrono::steady_clock::now();
     LOG_DEBUG("[DecoderCore] joining video decode thread layer=%d drain=%d requestedDrain=%d",
@@ -2165,13 +2746,16 @@ void DecoderCore::enqueueVideoPacket(AVPacket *packet) {
 
   // 避免拿 videoCodecMutex_ 锁（解码线程长期持有会导致 demux 阻塞 70ms+）。
   // 在 Rockchip 平台上 codec 始终是 RKMPP。
-  // cap 设大一些让 demux 线程不被回压阻塞，保证音频包及时送达。
-  // [OOM-fix] 4K 及以上分辨率视频每帧 DMA-buf 约 12MB，cap=30 时单套缓冲区就占 360MB+。
-  // 在 2GB 内存设备上降低 cap 到 12，将单套缓冲区占用控制在 ~144MB，为切歌并存留余量。
+  // This queue owns compressed AVPackets, not decoded 4K DMA-BUF frames. The
+  // decoded DRM frame budget is enforced separately by the frame queue. A
+  // 12-packet cap gives the demuxer less than one second of read-ahead and
+  // repeatedly starves interleaved audio while RKMPP is backpressured.
+  // Keep roughly two seconds of compressed 4K packets so the audio worker can
+  // build and maintain its PCM cushion without increasing the DMA-BUF budget.
   const bool is4KOrAbove = (videoWidth_ >= 3840 || videoHeight_ >= 2160);
   const size_t effectiveCap = (isMpegPsStream_ && useRkmppMpeg2Direct_) ? 300 :
                               ((isMpegPsStream_ && !useRkmppMpeg2Direct_) ? 12 :
-                              (is4KOrAbove ? 12 : 30));
+                              (is4KOrAbove ? 48 : 30));
   std::unique_lock<std::mutex> lock(videoPacketQueueMutex_);
   // 视频队列回压：永远不能丢中间包（会破坏 H264/HEVC GOP 解码链导致绿屏/卡死）。
   // 队列 cap 已经够大（kVideoPacketQueueCap），仅在解码完全停止时才可能填满。
@@ -2181,8 +2765,7 @@ void DecoderCore::enqueueVideoPacket(AVPacket *packet) {
   size_t waitLogCount = 0;
   bool waitedForQueue = false;
   while (!videoDecodeShouldStop_.load(std::memory_order_acquire) &&
-         !shouldStop_ &&
-         !isPaused_ &&
+         !shouldStop_ && !isSeeking_ &&
          videoPacketQueue_.size() >= effectiveCap) {
     waitedForQueue = true;
     const auto waitTimeout = (isMpegPsStream_ && !useRkmppMpeg2Direct_)
@@ -2190,8 +2773,7 @@ void DecoderCore::enqueueVideoPacket(AVPacket *packet) {
                                  : std::chrono::milliseconds(500);
     const bool queueReady = videoPacketQueueCv_.wait_for(lock, waitTimeout, [this, effectiveCap] {
       return videoDecodeShouldStop_.load(std::memory_order_acquire) ||
-             shouldStop_ ||
-             isPaused_ ||
+             shouldStop_ || isSeeking_ ||
              videoPacketQueue_.size() < effectiveCap;
     });
     if (!queueReady && (waitLogCount++ % 4u) == 0u) {
@@ -2199,11 +2781,7 @@ void DecoderCore::enqueueVideoPacket(AVPacket *packet) {
                layerId_, videoPacketQueue_.size(), effectiveCap, isMpegPsStream_ ? 1 : 0);
     }
   }
-  if (isPaused_) {
-    if (clone) av_packet_free(&clone);
-    return;
-  }
-  if (videoDecodeShouldStop_.load(std::memory_order_acquire) || shouldStop_) {
+  if (videoDecodeShouldStop_.load(std::memory_order_acquire) || shouldStop_ || isSeeking_) {
     if (clone) av_packet_free(&clone);
     return;
   }
@@ -2248,8 +2826,16 @@ void DecoderCore::videoDecodeLoop() {
     }
   }
   const bool isUltraWideH264Rkmpp =
-      isRkmpp && isH264 && videoWidth_ >= 4096 && videoHeight_ < 1080;
-  if (isUltraWideH264Rkmpp) {
+      isRkmpp && isH264 &&
+      video_profile::isUltraWideVideo(videoWidth_, videoHeight_);
+  const int64_t videoPixels =
+      static_cast<int64_t>(videoWidth_) * static_cast<int64_t>(videoHeight_);
+  const bool isTrue4KHighFps =
+      isRkmpp && videoPixels >= static_cast<int64_t>(3840) * 2160 &&
+      frameRate_ >= 45.0;
+  const bool prioritizeRkmppDecode =
+      isUltraWideH264Rkmpp || isTrue4KHighFps;
+  if (prioritizeRkmppDecode) {
     requestedNice = 0;
   }
   errno = 0;
@@ -2260,12 +2846,15 @@ void DecoderCore::videoDecodeLoop() {
   const int getNiceErrno = errno;
   LOG_INFO("[DecoderCore] Video decode loop priority layer=%d requestedNice=%d "
            "actualNice=%d setRet=%d setErrno=%d getErrno=%d codec=%s "
-           "size=%dx%d ultraWideH264Rkmpp=%d",
+           "size=%dx%d fps=%.2f ultraWideH264Rkmpp=%d true4KHighFps=%d "
+           "prioritized=%d",
            layerId_, requestedNice, actualNice, niceRet, niceErrno,
-           getNiceErrno, codecName, videoWidth_, videoHeight_,
-           isUltraWideH264Rkmpp ? 1 : 0);
+           getNiceErrno, codecName, videoWidth_, videoHeight_, frameRate_,
+           isUltraWideH264Rkmpp ? 1 : 0, isTrue4KHighFps ? 1 : 0,
+           prioritizeRkmppDecode ? 1 : 0);
   LOG_DEBUG("[DecoderCore] Video decode loop entered (layer %d)", layerId_);
   while (true) {
+    if (shouldStop_ || (isSeeking_ && videoDecodeDrainOnStop_)) break;
     if (videoDecodeShouldStop_.load(std::memory_order_acquire) &&
         !videoDecodeDrainOnStop_.load(std::memory_order_acquire)) {
       break;
@@ -2306,8 +2895,27 @@ void DecoderCore::videoDecodeLoop() {
       {
         std::lock_guard<std::recursive_mutex> codecLock(videoCodecMutex_);
         if (videoCodecCtx_) {
-          avcodec_send_packet(videoCodecCtx_, nullptr);
-          receiveDecodedFrames();
+          int sendRet = avcodec_send_packet(videoCodecCtx_, nullptr);
+          while (!shouldStop_ && !isSeeking_ &&
+                 !(videoDecodeShouldStop_ && !videoDecodeDrainOnStop_)) {
+            const size_t budget = (!isMpegPsStream_ && isRkmpp)
+                ? rkmppDrmFrameQueueBudget(videoWidth_, videoHeight_, frameRate_) : 0;
+            if (budget > 0) {
+              std::unique_lock<std::mutex> qlock(queueMutex_);
+              frameQueueCv_.wait(qlock, [this, budget] {
+                return shouldStop_ || isSeeking_ ||
+                    (videoDecodeShouldStop_ && !videoDecodeDrainOnStop_) ||
+                    frameQueue_.size() < budget;
+              });
+            }
+            if (shouldStop_ || isSeeking_) break;
+            const int received = receiveDecodedFrames();
+            if (sendRet == AVERROR(EAGAIN)) {
+              sendRet = avcodec_send_packet(videoCodecCtx_, nullptr);
+              if (sendRet >= 0) continue;
+            }
+            if (received == 0) break;
+          }
         }
       }
       LOG_INFO("[DecoderCore] Video decode loop drained EOF sentinel (layer %d)", layerId_);
@@ -2317,21 +2925,23 @@ void DecoderCore::videoDecodeLoop() {
               ? rkmppDrmFrameQueueBudget(videoWidth_, videoHeight_, frameRate_)
               : 0;
       if (drmQueueBudget > 0) {
-        bool waitedForFrameQueue = false;
         const auto waitStart = std::chrono::steady_clock::now();
-        while (!shouldStop_.load(std::memory_order_acquire) &&
-               !videoDecodeShouldStop_.load(std::memory_order_acquire) &&
-               !isPaused_.load(std::memory_order_acquire)) {
-          size_t frameQueueSize = 0;
-          {
-            std::lock_guard<std::mutex> qlock(queueMutex_);
+        size_t frameQueueSize = 0;
+        bool waitedForFrameQueue = false;
+        {
+          std::unique_lock<std::mutex> qlock(queueMutex_);
+          frameQueueSize = frameQueue_.size();
+          waitedForFrameQueue = frameQueueSize >= drmQueueBudget;
+          if (waitedForFrameQueue) {
+            frameQueueCv_.wait(qlock, [this, drmQueueBudget] {
+              return shouldStop_.load(std::memory_order_acquire) || isSeeking_ ||
+                     (videoDecodeShouldStop_.load(std::memory_order_acquire) &&
+                      !videoDecodeDrainOnStop_.load(std::memory_order_acquire)) ||
+                     isPaused_.load(std::memory_order_acquire) ||
+                     frameQueue_.size() < drmQueueBudget;
+            });
             frameQueueSize = frameQueue_.size();
           }
-          if (frameQueueSize < drmQueueBudget) {
-            break;
-          }
-          waitedForFrameQueue = true;
-          std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         if (waitedForFrameQueue) {
           static thread_local int64_t s_lastRkmppBackpressureLogMs = 0;
@@ -2339,11 +2949,6 @@ void DecoderCore::videoDecodeLoop() {
           if (s_lastRkmppBackpressureLogMs == 0 ||
               traceNowMs - s_lastRkmppBackpressureLogMs >=
                   kPlaybackIssueLogIntervalMs) {
-            size_t frameQueueSize = 0;
-            {
-              std::lock_guard<std::mutex> qlock(queueMutex_);
-              frameQueueSize = frameQueue_.size();
-            }
             const int64_t waitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                        std::chrono::steady_clock::now() - waitStart)
                                        .count();

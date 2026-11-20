@@ -1,0 +1,33 @@
+{
+  "id": "player-server-link",
+  "name": "播放器与点歌服务器在线关联",
+  "tags": ["real-device", "real-server", "integration", "read-only"],
+  "steps": [
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/system/status",
+      "expect_status": 200,
+      "save_as": "player_status"
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "player_status.body.data.onlineVodHost",
+      "equals": "192.168.2.105"
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "${server_url}/api/v1/terminals/pad-list",
+      "expect_status": 200,
+      "save_as": "server_terminals"
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "server_terminals.raw",
+      "contains": "192.168.2.101"
+    }
+  ]
+}

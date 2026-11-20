@@ -17,6 +17,9 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <chrono>
+#include <map>
+#include <vector>
 
 namespace hsvj {
 
@@ -37,14 +40,16 @@ public:
    * @brief 启动发现服务
    * @param httpPort 主 HTTP 端口（8080）
    * @param mobilePort 移动端端口（8081）
-   * @param vodPort 点歌端口（8089）
+   * @param vodPort 点歌端口（9898）
    * @param wsPort WebSocket 端口（8090）
    * @param tcpPort TCP 端口（9000）
    * @param udpPort UDP 端口（8000）
+   * @param syncPort 同步组播端口（固定 4322；传 0 表示未启用）
    * @return 是否启动成功
    */
-  bool start(int httpPort = 8080, int mobilePort = 8081, int vodPort = 8089,
-             int wsPort = 8090, int tcpPort = 9000, int udpPort = 8000);
+  bool start(int httpPort = 8080, int mobilePort = 8081, int vodPort = 9898,
+             int wsPort = 8090, int tcpPort = 9000, int udpPort = 8000,
+             int syncPort = 4322);
 
   /**
    * @brief 停止发现服务
@@ -56,15 +61,20 @@ public:
    */
   bool isRunning() const { return isRunning_.load(); }
 
+  // A short startup probe uses an ephemeral socket before network services start.
+  std::vector<std::string> probeOnlineVodServers(int timeoutMs = 1200);
+  std::vector<std::string> onlineVodServers();
+
   /**
-   * @brief 构建发现协议 JSON（与 Beacon/API 一致，缺项不上报）
-   * @param ip 设备主 IP
+   * @brief 构建发现协议 JSON（与 Beacon/API 一致，身份或连接缺失返回 null）
+   * @param ip 本次消息实际使用的网卡 IP
    * @param deviceName 设备名称（空则不上报）
    * @param mac MAC 地址（空则不上报）
-   * @param serial 序列号（空则不上报）
+   * @param serial 有效硬件序列号（必填）
+   * @param network 本次网卡的 networkType、interfaceName、macAddress（必填）
    * @param model 型号（空则不上报）
-   * @param httpPort,mobilePort,vodPort,wsPort,tcpPort,udpPort 各服务端口
-   * @return 发现信息 Json::Value，可直接用于 Beacon 或 /api/system/discovery
+   * @param httpPort,mobilePort,vodPort,wsPort,tcpPort,udpPort,syncPort 各服务端口；syncPort 仅支持 4322 或 0
+   * @return 发现信息 Json::Value，可直接用于 Beacon 或 /api/v1/system/discovery
    */
   static Json::Value buildDiscoveryJson(const std::string &ip,
                                         const std::string &deviceName,
@@ -72,7 +82,9 @@ public:
                                         const std::string &serial,
                                         const std::string &model, int httpPort,
                                         int mobilePort, int vodPort, int wsPort,
-                                        int tcpPort, int udpPort);
+                                        int tcpPort, int udpPort,
+                                        int syncPort,
+                                        const Json::Value& network);
 
 private:
   DeviceDiscoveryService();
@@ -80,10 +92,13 @@ private:
 
   void beaconLoop();
   void receiveLoop();
+  bool rememberServerOffer(const std::string& body, const std::string& sourceIp);
+  std::mutex serverOffersMutex_;
+  std::map<std::string, std::chrono::steady_clock::time_point> serverOffers_;
 
   std::string buildBeaconJson(const std::string &ip) const;
-  std::string getPrimaryIp() const;
-  bool isDiscoveryQuery(const std::string &msg) const;
+  bool parseDiscoveryQuery(const std::string &msg,
+                           std::string &challenge) const;
 
   int socketFd_{-1};
   std::atomic<bool> isRunning_{false};
@@ -92,10 +107,11 @@ private:
 
   int httpPort_{8080};
   int mobilePort_{8081};
-  int vodPort_{8089};
+  int vodPort_{9898};
   int wsPort_{8090};
   int tcpPort_{9000};
   int udpPort_{8000};
+  int syncPort_{4322};
 };
 
 } // 命名空间 hsvj

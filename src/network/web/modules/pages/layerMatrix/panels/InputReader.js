@@ -49,11 +49,9 @@ export function readLayerCommonInputs(layerId, layer) {
         if (layerId === 70) r.alpha_255 = Math.round(rawAlpha);
     }
 
-    // 视频/采集图层音量：video-volume 0-100，layer.volume 0-1.0
+    // 视频图层音量：video-volume 0-100，layer.volume 0-1.0
     if (has('video-volume')) {
         r.volume = num('video-volume', 100) / 100;
-    } else if (has('capture-volume')) {
-        r.volume = num('capture-volume', 100) / 100;
     }
 
     if (has('video-gaussian-blur')) {
@@ -72,6 +70,18 @@ export function readLayerCommonInputs(layerId, layer) {
 
     if (has('layer-invert')) {
         r.invert = intNum('layer-invert', 0);
+    }
+
+    const cropIds = ['left', 'top', 'right', 'bottom'];
+    if (cropIds.some(side => has(`layer-crop-${side}`))) {
+        const values = cropIds.map(side => Math.max(0, Math.min(100,
+            num(`layer-crop-${side}`, 0))) / 100);
+        const left = values[0];
+        const top = values[1];
+        r.crop_left = left;
+        r.crop_top = top;
+        r.crop_right = Math.min(values[2], 1 - left);
+        r.crop_bottom = Math.min(values[3], 1 - top);
     }
 
     if (has('video-fit-mode')) {

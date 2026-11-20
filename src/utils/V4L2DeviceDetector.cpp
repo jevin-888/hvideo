@@ -7,6 +7,7 @@
 #include "utils/Logger.h"
 
 #include <algorithm>
+#include <cctype>
 #include <mutex>
 #include <dirent.h>
 #include <fcntl.h>
@@ -26,7 +27,7 @@ namespace hsvj {
 namespace {
 
 std::string lowerCopy(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return s;
 }
 
@@ -66,20 +67,6 @@ bool isMetadataDeviceName(const std::string &name) {
   return containsAny(name, {"luma", "metadata", "meta", "stats", "params"});
 }
 
-bool isMipiDeviceNameProfile(const std::string &name) {
-  if (name.empty()) return false;
-  std::string lowerName = lowerCopy(name);
-  static const std::vector<std::string> mipiPatterns = {
-      "stream_cif_mipi", "mipi",       "cif_mipi", "rkcif",
-      "rkcif-mipi",      "rkcif_mipi", "lvds"};
-  for (const auto &pattern : mipiPatterns) {
-    if (lowerName.find(pattern) != std::string::npos) {
-      return lowerName.find("luma") == std::string::npos;
-    }
-  }
-  return false;
-}
-
 struct MipiDeviceCache {
   bool valid = false;
   int index = 0;
@@ -110,8 +97,9 @@ bool pathExists(const std::string &path) {
 
 bool looksLikeMipiVideoNode(const std::string &path) {
   if (!pathExists(path)) return false;
-  std::string name = sysVideoName(path);
-  return isMipiDeviceNameProfile(name) && !isMetadataDeviceName(name);
+  // H66_POR exposes dedicated MIPI capture nodes as video0..video4.
+  // Avoid /sys enumeration: the engine only needs the already labelled node.
+  return videoIndexFromPath(path) >= 0 && videoIndexFromPath(path) < 5;
 }
 
 } // 命名空间
@@ -192,7 +180,7 @@ std::string V4L2DeviceDetector::findMIPIDevice(int index) {
     return cached;
   }
 
-  if (index >= 0 && index < 4) {
+  if (index >= 0 && index < 5) {
     std::string fixedPath = "/dev/video" + std::to_string(index);
     if (looksLikeMipiVideoNode(fixedPath)) {
       rememberMipiDevicePath(index, fixedPath);
@@ -341,7 +329,7 @@ bool V4L2DeviceDetector::queryDeviceCapabilities(const std::string &devicePath,
 
   // 检查 if it's a camera
   std::string lowerName = info.deviceName;
-  std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+  std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   info.isCamera = !info.isMIPI &&
                   ((lowerName.find("camera") != std::string::npos) ||
                   (lowerName.find("cam") != std::string::npos) ||
@@ -438,7 +426,7 @@ bool V4L2DeviceDetector::isHDMIRXDeviceByName(const std::string &name) {
   if (name.empty()) return false;
 
   std::string lowerName = name;
-  std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+  std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
   // Common HDMI RX 设备 name patterns
   static const std::vector<std::string> hdmiPatterns = {
@@ -465,7 +453,7 @@ bool V4L2DeviceDetector::isHDMIRXDeviceByName(const std::string &name) {
 bool V4L2DeviceDetector::isMIPIDeviceByName(const std::string &name) {
   if (name.empty()) return false;
   std::string lowerName = name;
-  std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+  std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   static const std::vector<std::string> mipiPatterns = {
     "stream_cif_mipi",  // Prefer stream_cif_mipi_id* devices (actual 视频 capture)
     "mipi",

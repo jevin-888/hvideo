@@ -1031,10 +1031,10 @@ vec2 sampleChromaLinear(vec2 uv, int visibleWidth, int visibleHeight,
     return mix(mix(uv00, uv10, f.x), mix(uv01, uv11, f.x), f.y);
 }
 
-vec3 yuvToRgbBt601Full(float yVal, float uVal, float vVal) {
-    float y = yVal;
-    float u = uVal - 0.5;
-    float v = vVal - 0.5;
+vec3 yuvToRgbBt601Limited(float yVal, float uVal, float vVal) {
+    float y = (yVal - 16.0 / 255.0) * (255.0 / 219.0);
+    float u = (uVal - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (vVal - 128.0 / 255.0) * (255.0 / 224.0);
     return vec3(y + 1.402 * v,
                 y - 0.344136 * u - 0.714136 * v,
                 y + 1.772 * u);
@@ -1049,14 +1049,6 @@ vec3 yuvToRgbBt709Limited(float yVal, float uVal, float vVal) {
                 y + 2.112402 * u);
 }
 
-vec3 yuvToRgbBt709Full(float yVal, float uVal, float vVal) {
-    float y = yVal;
-    float u = uVal - 0.5;
-    float v = vVal - 0.5;
-    return vec3(y + 1.5748 * v,
-                y - 0.187324 * u - 0.468124 * v,
-                y + 1.8556 * u);
-}
 
 float fetchLumaClamped(int x, int y, int visibleWidth, int visibleHeight,
                        int stride) {
@@ -1078,87 +1070,24 @@ float sharpenCaptureLuma(vec2 uv, float yVal, int visibleWidth,
     float up = fetchLumaClamped(p.x, p.y - 1, visibleWidth, visibleHeight, stride);
     float down = fetchLumaClamped(p.x, p.y + 1, visibleWidth, visibleHeight, stride);
     float neighborAvg = (left + right + up + down) * 0.25;
+    float localMin = min(min(left, right), min(up, down));
+    float localMax = max(max(left, right), max(up, down));
+    float localContrast = localMax - localMin;
 
     vec2 srcPx = fwidth(uv) * vec2(float(visibleWidth), float(visibleHeight));
     float maxSrcPx = max(srcPx.x, srcPx.y);
-    float upscaleGate = clamp(1.20 - maxSrcPx, 0.0, 1.0);
-    float minifyFade = 1.0 - smoothstep(1.2, 2.0, maxSrcPx);
-    float localContrast = max(max(abs(yVal - left), abs(yVal - right)),
-                              max(abs(yVal - up), abs(yVal - down)));
-    float detail = yVal - neighborAvg;
-    float detailGate = smoothstep(0.012, 0.120, localContrast);
-    float hardEdgeGate = smoothstep(0.070, 0.220, localContrast);
-    float highlightGuard = 1.0 - smoothstep(0.64, 0.88, yVal);
+    float upscaleGate = 1.0 - smoothstep(0.95, 1.35, maxSrcPx);
+    float minifyFade = 1.0 - smoothstep(1.15, 1.85, maxSrcPx);
+    float detailGate = smoothstep(0.008, 0.100, localContrast);
+    float hardEdgeGuard = 1.0 - 0.45 * smoothstep(0.18, 0.42, localContrast);
 
-    // 亮背景上的浅灰小字容易被平滑吃掉，先保护这类暗细节。
-    float darkTextMask = smoothstep(0.54, 0.84, neighborAvg) *
-                         smoothstep(0.010, 0.115, -detail);
-    float textPreserved = yVal - (-detail) * 0.30 * darkTextMask;
-
-    // 采集源被黑边裁剪后再放大时，只对高对比硬边做轻量平滑。
-    float smoothLuma = yVal * 0.42 + neighborAvg * 0.58;
-    float aaStrength = 0.16 * upscaleGate * hardEdgeGate *
-                       (1.0 - darkTextMask);
-    float refined = mix(yVal, smoothLuma, aaStrength);
-    refined = mix(refined, textPreserved, darkTextMask);
-
-    float sharpenStrength = (0.045 + 0.080 * upscaleGate) * minifyFade *
-                            detailGate * highlightGuard * (1.0 - aaStrength);
-    return clamp(refined + (refined - neighborAvg) * sharpenStrength, 0.0, 1.0);
-}
-
-float rollOffCaptureLuma(float yVal) {
-    float knee = smoothstep(0.50, 0.88, yVal);
-    float over = max(yVal - 0.50, 0.0);
-    float compressed = 0.50 + (1.0 - exp(-over * 2.25)) * 0.34;
-    return clamp(mix(yVal, compressed, knee * 0.88), 0.0, 1.0);
-}
-
-float captureSkinMask(float uVal, float vVal) {
-    float cbMask = smoothstep(0.30, 0.37, uVal) *
-                   (1.0 - smoothstep(0.56, 0.64, uVal));
-    float crMask = smoothstep(0.49, 0.56, vVal) *
-                   (1.0 - smoothstep(0.78, 0.86, vVal));
-    return clamp(cbMask * crMask, 0.0, 1.0);
-}
-
-float rollOffCaptureSkinLuma(float yVal, float skinMask) {
-    float knee = smoothstep(0.48, 0.82, yVal) * skinMask;
-    float over = max(yVal - 0.48, 0.0);
-    float compressed = 0.48 + (1.0 - exp(-over * 2.05)) * 0.27;
-    return clamp(mix(yVal, compressed, knee * 0.62), 0.0, 1.0);
-}
-
-vec3 enhanceCaptureLook(vec3 rgb) {
-    const vec3 lumaWeights = vec3(0.2126, 0.7152, 0.0722);
-    float luma = dot(rgb, lumaWeights);
-
-    float highlightProtect = 1.0 - smoothstep(0.46, 0.78, luma);
-    float shadowProtect = smoothstep(0.03, 0.16, luma);
-    float midAmount = highlightProtect * shadowProtect;
-
-    vec3 enhanced = mix(vec3(luma), rgb, 1.04 + 0.03 * midAmount);
-    enhanced = (enhanced - vec3(0.5)) * (1.0 + 0.025 * midAmount) + vec3(0.5);
-
-    float hi = smoothstep(0.58, 0.92, luma);
-    enhanced = mix(enhanced, vec3(luma) + (enhanced - vec3(luma)) * 0.92, hi);
-    enhanced = min(enhanced, rgb + vec3(0.035));
-    enhanced = mix(enhanced, rgb * 0.965, smoothstep(0.72, 1.0, luma));
-
-    float amount = 0.48 * shadowProtect;
-    return clamp(mix(rgb, enhanced, amount), 0.0, 1.0);
-}
-
-vec3 rollOffCaptureHighlights(vec3 rgb) {
-    const vec3 lumaWeights = vec3(0.2126, 0.7152, 0.0722);
-    float luma = dot(rgb, lumaWeights);
-    float peak = max(max(rgb.r, rgb.g), rgb.b);
-    float pressure = max(luma, peak * 0.92);
-    float knee = smoothstep(0.55, 0.90, pressure);
-    vec3 soft = vec3(1.0) - exp(-rgb * 1.60);
-    soft *= 0.86;
-    vec3 compressed = mix(rgb, soft, knee);
-    return clamp(mix(rgb, compressed, 0.82), 0.0, 1.0);
+    float strength = (0.075 + 0.115 * upscaleGate) * minifyFade *
+                     detailGate * hardEdgeGuard;
+    float sharpened = yVal + (yVal - neighborAvg) * strength;
+    float ringGuard = 0.010 + 0.012 * upscaleGate;
+    return clamp(sharpened,
+                 max(0.0, localMin - ringGuard),
+                 min(1.0, localMax + ringGuard));
 }
 
 void main() {
@@ -1269,18 +1198,12 @@ void main() {
     if (singleImageLayout) {
         yVal = sharpenCaptureLuma(texCoord, yVal, visibleWidth, visibleHeight,
                                   stride);
-        yVal = rollOffCaptureSkinLuma(yVal, captureSkinMask(chroma.x, chroma.y));
-        yVal = rollOffCaptureLuma(yVal);
     }
 
     vec3 rgbRaw = hdCaptureLayout
-                    ? yuvToRgbBt709Full(yVal, chroma.x, chroma.y)
-                    : yuvToRgbBt601Full(yVal, chroma.x, chroma.y);
+                    ? yuvToRgbBt709Limited(yVal, chroma.x, chroma.y)
+                    : yuvToRgbBt601Limited(yVal, chroma.x, chroma.y);
     vec3 rgb = clamp(rgbRaw, 0.0, 1.0);
-    if (singleImageLayout) {
-        rgb = rollOffCaptureHighlights(rgb);
-        rgb = enhanceCaptureLook(rgb);
-    }
     // ⭐ Luma Key 必须在 applyColorEffect 之前算（基于原视频内容），
     //   否则 flash_black / curtain / iris 的黑会被 keying 当透明
     float lumaKeyAlpha = 1.0;

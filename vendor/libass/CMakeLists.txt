@@ -9,9 +9,11 @@ message(STATUS "libass CMakeLists.txt IS BEING PROCESSED!")
 message(STATUS "========================================")
 # ====== END DEBUG MESSAGE ======
 
-# 获取项目根目录（使用 CMAKE_SOURCE_DIR 更可靠）
-# CMAKE_SOURCE_DIR 是顶层 CMakeLists.txt 所在的目录
-set(PROJECT_ROOT "${CMAKE_SOURCE_DIR}")
+# 获取项目根目录。Android 工程从 app/src/main/cpp 进入时由顶层脚本
+# 传入 PROJECT_ROOT；保留从项目根目录直接配置时的兼容默认值。
+if(NOT PROJECT_ROOT)
+    set(PROJECT_ROOT "${CMAKE_SOURCE_DIR}")
+endif()
 set(LIBASS_SOURCE_DIR "${PROJECT_ROOT}/vendor/libass/libass/libass")
 
 # 检查源文件目录是否存在
@@ -79,8 +81,7 @@ endif()
 include_directories(
     ${LIBASS_SOURCE_DIR_NORMALIZED}
     ${PROJECT_ROOT}/vendor/freetype-2.8/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/stub_headers
-    # 如果 fribidi 和 harfbuzz 编译成功，占位符头文件将被实际头文件替代
+    ${PROJECT_ROOT}/vendor/harfbuzz/harfbuzz/src
 )
 
 # 检查源文件是否存在

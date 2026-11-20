@@ -1,3 +1,4 @@
+#include "foundation/VideoStorage.h"
 /**
  * @file HttpServer_System.cpp（文件名）
  * @brief 系统管理 API 实现
@@ -6,26 +7,36 @@
  */
 
 #include "HttpServer.h"
+#include "capture/Rk628Edid.h"
 #include "network/DeviceDiscoveryService.h"
 #include "utils/FileUtils.h"
 #include "HttpRequest.h"
 #include "HttpResponse.h"
+#include "DisplayOutputModeClient.h"
 #include "core/CommandRouter.h"
 #include "core/Engine.h"
+#include "core/AudioOutputLayerPolicy.h"
 #include "core/LicenseManager.h"
+#include "core/LicenseVerify.h"
 #include "core/PeripheralManager.h"
-#include "core/PathConfig.h"
+#include "platform/AssociatedDeviceName.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "decoder/core/DecoderCore.h"
 #include "network/NetworkManager.h"
+#include "network/SyncContract.h"
+#include "network/DeviceFileSync.h"
 #include "database/PlaylistDatabase.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
+#include "utils/ProcessRunner.h"
 #include <json/json.h>
 #include "utils/SystemUtils.h"
-#include "utils/HttpClient.h"
+#include "utils/FactorySerial.h"
 #include <cstdlib>
 #include <cstdio>
+#include <cmath>
+#include <string>
 #include <cctype>
 #include <chrono>
 #include <array>
@@ -35,30 +46,56 @@
 #include <sstream>
 #include <algorithm>
 #include <mutex>
+#include <set>
+#include <cstring>
+#include <cerrno>
+#include <ctime>
 #include <thread>
 #include <utility>
 #include <vector>
 #ifndef _WIN32
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #ifdef __ANDROID__
+#include <sys/system_properties.h>
 std::string controlJavaMirrorService(const std::string& action, int layerId);
 std::string controlJavaMirrorService(const std::string& action, int layerId,
                                      const std::string& payload);
-extern "C" void callJavaApplyNetworkIpConfig(const std::string& mode, const std::string& staticIp,
+extern "C" bool callJavaApplyNetworkIpConfig(const std::string& mode, const std::string& staticIp,
                                              const std::string& gateway, const std::string& dns);
-extern "C" void callJavaApplyPowerSchedule(bool scheduleEnabled, bool powerOnEnabled,
+extern "C" bool callJavaApplyPowerSchedule(bool scheduleEnabled, bool powerOnEnabled,
                                            const std::string& powerOnDate, const std::string& powerOnTime,
                                            bool powerOffEnabled, const std::string& powerOffDate,
                                            const std::string& powerOffTime);
 std::string getJavaDeviceHsName();
-bool setJavaDeviceHsName(const std::string& name, std::string& error);
 bool sendJavaBootLogoChange(int slot, std::string& error);
+std::string callJavaDisplayResolution(const std::string& mode);
 #endif
 
 namespace {
 namespace fs = std::filesystem;
+
+static Json::Value displayOutputState(const std::string& mode) {
+  std::string activeMode;
+#ifdef __ANDROID__
+  char value[PROP_VALUE_MAX] = {};
+  __system_property_get("ro.boot.hsvj_output", value);
+  if (hsvj::DisplayOutputModeClient::isValidMode(value)) activeMode = value;
+#endif
+  Json::Value data;
+  data["mode"] = mode;
+  data["active_mode"] = activeMode;
+  data["reboot_required"] = activeMode != mode;
+  return data;
+}
 
 
 static std::string trimCopy(std::string value) {
@@ -80,23 +117,9 @@ static std::string getSystemDeviceHsName() {
 }
 
 static std::string readCommandOutput(const std::string& command) {
-  std::string output;
-#ifdef _WIN32
-  FILE* pipe = _popen(command.c_str(), "r");
-#else
-  FILE* pipe = popen(command.c_str(), "r");
-#endif
-  if (!pipe) return output;
-  char buffer[256];
-  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-    output += buffer;
-  }
-#ifdef _WIN32
-  _pclose(pipe);
-#else
-  pclose(pipe);
-#endif
-  return trimCopy(output);
+  const auto result = hsvj::runShellCommand(command, std::chrono::seconds(3), nullptr,
+                                            64 * 1024);
+  return result.succeeded() ? trimCopy(result.output) : std::string();
 }
 
 static std::string getDisplayIp(hsvj::SystemConfig* systemConfig) {
@@ -107,17 +130,118 @@ static std::string getDisplayIp(hsvj::SystemConfig* systemConfig) {
   return hsvj::SystemUtils::getLocalIp();
 }
 
-static void showNetworkIpHintAfterSave(hsvj::Engine* engine, hsvj::SystemConfig* systemConfig) {
-  if (!engine || !systemConfig) return;
+static void showNetworkIpHintAfterSave(HttpServer* server, hsvj::Engine* engine,
+                                       hsvj::SystemConfig* systemConfig) {
+  if (!server || !engine || !systemConfig) return;
   std::string mode = systemConfig->getNetworkIpMode();
   if (mode == "static") {
     engine->showNetworkIpHint(mode, systemConfig->getNetworkStaticIp());
     return;
   }
-  std::thread([engine, mode]() {
+  server->launchBackgroundTask([engine, mode]() {
     std::this_thread::sleep_for(std::chrono::seconds(3));
     engine->showNetworkIpHint(mode, hsvj::SystemUtils::getLocalIp());
-  }).detach();
+  });
+}
+
+struct PlatformConfigSnapshot {
+  std::string networkMode;
+  std::string networkStaticIp;
+  std::string networkGateway;
+  std::string networkDns;
+  bool powerScheduleEnabled = false;
+  bool powerOnEnabled = false;
+  std::string powerOnDate;
+  std::string powerOnTime;
+  bool powerOffEnabled = false;
+  std::string powerOffDate;
+  std::string powerOffTime;
+};
+
+struct PlatformConfigApplyResult {
+  bool networkChanged = false;
+  bool applied = true;
+};
+
+static PlatformConfigSnapshot capturePlatformConfig(
+    const hsvj::SystemConfig* systemConfig) {
+  PlatformConfigSnapshot snapshot;
+  if (!systemConfig) {
+    return snapshot;
+  }
+
+  snapshot.networkMode = systemConfig->getNetworkIpMode();
+  snapshot.networkStaticIp = systemConfig->getNetworkStaticIp();
+  snapshot.networkGateway = systemConfig->getNetworkGateway();
+  snapshot.networkDns = systemConfig->getNetworkDns();
+  snapshot.powerScheduleEnabled = systemConfig->isPowerScheduleEnabled();
+  snapshot.powerOnEnabled = systemConfig->isPowerOnScheduleEnabled();
+  snapshot.powerOnDate = systemConfig->getPowerOnDate();
+  snapshot.powerOnTime = systemConfig->getPowerOnTime();
+  snapshot.powerOffEnabled = systemConfig->isPowerOffScheduleEnabled();
+  snapshot.powerOffDate = systemConfig->getPowerOffDate();
+  snapshot.powerOffTime = systemConfig->getPowerOffTime();
+  return snapshot;
+}
+
+static bool networkIpConfigEquals(const PlatformConfigSnapshot& lhs,
+                                  const PlatformConfigSnapshot& rhs) {
+  return lhs.networkMode == rhs.networkMode &&
+         lhs.networkStaticIp == rhs.networkStaticIp &&
+         lhs.networkGateway == rhs.networkGateway &&
+         lhs.networkDns == rhs.networkDns;
+}
+
+#ifdef __ANDROID__
+static bool powerScheduleConfigEquals(const PlatformConfigSnapshot& lhs,
+                                      const PlatformConfigSnapshot& rhs) {
+  return lhs.powerScheduleEnabled == rhs.powerScheduleEnabled &&
+         lhs.powerOnEnabled == rhs.powerOnEnabled &&
+         lhs.powerOnDate == rhs.powerOnDate &&
+         lhs.powerOnTime == rhs.powerOnTime &&
+         lhs.powerOffEnabled == rhs.powerOffEnabled &&
+         lhs.powerOffDate == rhs.powerOffDate &&
+         lhs.powerOffTime == rhs.powerOffTime;
+}
+#endif
+
+static PlatformConfigApplyResult applyChangedPlatformConfig(
+    const PlatformConfigSnapshot& previous,
+    const hsvj::SystemConfig* systemConfig) {
+  PlatformConfigApplyResult result;
+  if (!systemConfig) {
+    return result;
+  }
+
+  const PlatformConfigSnapshot current = capturePlatformConfig(systemConfig);
+  result.networkChanged = !networkIpConfigEquals(previous, current);
+
+#ifdef __ANDROID__
+  const bool powerScheduleChanged =
+      !powerScheduleConfigEquals(previous, current);
+  bool networkApplied = true;
+  if (result.networkChanged) {
+    networkApplied = callJavaApplyNetworkIpConfig(
+        current.networkMode, current.networkStaticIp,
+        current.networkGateway, current.networkDns);
+  } else {
+    LOG_INFO("Network IP config unchanged; skip platform reapply");
+  }
+
+  bool powerApplied = true;
+  if (powerScheduleChanged) {
+    powerApplied = callJavaApplyPowerSchedule(
+        current.powerScheduleEnabled, current.powerOnEnabled,
+        current.powerOnDate, current.powerOnTime,
+        current.powerOffEnabled, current.powerOffDate,
+        current.powerOffTime);
+  } else {
+    LOG_INFO("Power schedule config unchanged; skip platform reapply");
+  }
+
+  result.applied = networkApplied && powerApplied;
+#endif
+  return result;
 }
 
 static bool resolveLogFilePath(const std::string& date, const std::string& name,
@@ -154,43 +278,11 @@ static bool resolveLogDatePath(const std::string& date, fs::path& outPath) {
   return true;
 }
 
-// Base64 解码，用于 sync/receive 的 content_base64
-static std::string base64Decode(const std::string &in) {
-  std::string out;
-  std::vector<int> T(256, -1);
-  for (int i = 0; i < 64; i++)
-    T["ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[i]] = i;
-  int val = 0, valb = -8;
-  for (unsigned char c : in) {
-    if (T[c] == -1) break;
-    val = (val << 6) + T[c];
-    valb += 6;
-    if (valb >= 0) {
-      out.push_back(static_cast<char>((val >> valb) & 0xFF));
-      valb -= 8;
-    }
-  }
-  return out;
-}
-
-// 限制：单文件 50MB，单次最多 5000 个文件
-constexpr size_t kSyncMaxFileSize = 50 * 1024 * 1024;
-constexpr size_t kSyncMaxFiles = 5000;
 constexpr const char* kBootLogoPackageName = "com.tyzc.resolutionratio";
 constexpr const char* kBootLogoReceiverName =
     "com.tyzc.resolutionratio.TyzcBroadcastReceiver";
 constexpr const char* kBootLogoActionPrefix = "android.intent.action.logo.change";
 constexpr const char* kBootLogoCustomPath = "/sdcard/bootanimation5.zip";
-
-static bool getNormalizedRootPath(std::string& rootPath, std::string& rootNorm) {
-  rootPath = hsvj::ROOT_PATH;
-  if (rootPath.empty()) return false;
-  if (rootPath.back() != '/') rootPath += '/';
-  rootNorm = hsvj::FileUtils::normalizePath(rootPath);
-  if (rootNorm.empty()) return false;
-  if (rootNorm.back() != '/') rootNorm += '/';
-  return true;
-}
 
 static std::string shellQuote(const std::string& value) {
   std::string quoted = "'";
@@ -270,33 +362,14 @@ static int parseBootLogoSlot(const Json::Value& body) {
 }
 
 static int runSystemShellCommand(const std::string& command, std::string& output) {
-  std::string fullCommand = command + " 2>&1";
-#ifdef _WIN32
-  FILE* pipe = _popen(fullCommand.c_str(), "r");
-#else
-  FILE* pipe = popen(fullCommand.c_str(), "r");
-#endif
-  if (!pipe) {
-    output = "无法启动命令";
-    return -1;
-  }
-  std::array<char, 512> buffer{};
-  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-    output += buffer.data();
-  }
-#ifdef _WIN32
-  int rc = _pclose(pipe);
-#else
-  int rc = pclose(pipe);
-  if (WIFEXITED(rc)) {
-    rc = WEXITSTATUS(rc);
-  }
-#endif
-  output = trimCopy(output);
-  return rc;
+  const auto result = hsvj::runShellCommand(command, std::chrono::seconds(10), nullptr,
+                                            256 * 1024);
+  output = trimCopy(result.output);
+  if (result.timedOut || result.cancelled || result.outputLimitExceeded) return -1;
+  return result.exitCode;
 }
 
-static void scheduleSystemReboot() {
+static bool scheduleSystemReboot() {
   std::string script =
       "log=/data/local/tmp/hsvj_reboot.log\n"
       "(\n"
@@ -314,14 +387,216 @@ static void scheduleSystemReboot() {
 
   std::string output;
   int rc = runSystemShellCommand("su 0 sh -c " + shellQuote(script), output);
-  if (rc == 0) return;
+  if (rc == 0) return true;
 
   std::string fallbackOutput;
-  runSystemShellCommand("sh -c " + shellQuote(script), fallbackOutput);
+  return runSystemShellCommand("sh -c " + shellQuote(script), fallbackOutput) == 0;
 }
 }  // 命名空间
 
-// 从 multipart/form-data 中提取名为 name 的 part 的完整 body（到下一 boundary 或结尾）
+// Discover same-model devices with the existing UDP discovery protocol.
+static bool discoverLanDevicesUdp(const std::string& myIp,
+                                  const std::string& myModel,
+                                  const std::string& mySerial,
+                                  Json::Value& devices,
+                                  std::string& error) {
+  devices = Json::Value(Json::arrayValue);
+#ifdef _WIN32
+  (void)myIp;
+  (void)myModel;
+  (void)mySerial;
+  (void)error;
+  return true;
+#else
+  const int socketFd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (socketFd < 0) {
+    error = std::string("create discovery socket failed: ") + std::strerror(errno);
+    return false;
+  }
+
+  int broadcastEnabled = 1;
+  if (setsockopt(socketFd, SOL_SOCKET, SO_BROADCAST, &broadcastEnabled,
+                 sizeof(broadcastEnabled)) < 0) {
+    error = std::string("enable UDP broadcast failed: ") + std::strerror(errno);
+    close(socketFd);
+    return false;
+  }
+
+  sockaddr_in localAddress{};
+  localAddress.sin_family = AF_INET;
+  if (inet_pton(AF_INET, myIp.c_str(), &localAddress.sin_addr) != 1) {
+    error = "浏览器连接的局域网网卡不可用";
+    close(socketFd); return false;
+  }
+  localAddress.sin_port = htons(0);
+  if (bind(socketFd, reinterpret_cast<sockaddr*>(&localAddress),
+           sizeof(localAddress)) < 0) {
+    error = std::string("bind discovery socket failed: ") + std::strerror(errno);
+    close(socketFd);
+    return false;
+  }
+
+  std::set<std::string> broadcastAddresses{"255.255.255.255"};
+  std::set<std::string> localIps;
+  ifaddrs* interfaces = nullptr;
+  if (getifaddrs(&interfaces) == 0) {
+    for (auto* interface = interfaces; interface; interface = interface->ifa_next) {
+      if (!interface->ifa_addr || interface->ifa_addr->sa_family != AF_INET ||
+          !(interface->ifa_flags & IFF_UP) || (interface->ifa_flags & IFF_LOOPBACK)) continue;
+      auto* address = reinterpret_cast<sockaddr_in*>(interface->ifa_addr);
+      char text[INET_ADDRSTRLEN]{};
+      if (!inet_ntop(AF_INET, &address->sin_addr, text, sizeof(text))) continue;
+      localIps.insert(text);
+      if (myIp != text || !interface->ifa_netmask || !(interface->ifa_flags & IFF_BROADCAST)) continue;
+      in_addr broadcast{};
+      auto* mask = reinterpret_cast<sockaddr_in*>(interface->ifa_netmask);
+      broadcast.s_addr = address->sin_addr.s_addr | ~mask->sin_addr.s_addr;
+      if (inet_ntop(AF_INET, &broadcast, text, sizeof(text))) broadcastAddresses.insert(text);
+    }
+    freeifaddrs(interfaces);
+  }
+  localIps.insert(myIp);
+
+  const std::string challenge =
+      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+      "-" + mySerial;
+  Json::Value query;
+  query["type"] = "discover";
+  query["query"] = "hvideo_player";
+  query["protocol_version"] = "2.0";
+  query["challenge"] = challenge;
+  const std::string payload = hsvj::JsonUtils::toString(query);
+
+  auto sendQuery = [&]() {
+    bool sent = false;
+    for (const std::string& address : broadcastAddresses) {
+      sockaddr_in destination{};
+      destination.sin_family = AF_INET;
+      destination.sin_port = htons(hsvj::DeviceDiscoveryService::DISCOVERY_PORT);
+      if (inet_pton(AF_INET, address.c_str(), &destination.sin_addr) != 1) {
+        continue;
+      }
+      const ssize_t bytes = sendto(
+          socketFd, payload.data(), payload.size(), 0,
+          reinterpret_cast<const sockaddr*>(&destination), sizeof(destination));
+      sent = sent || bytes == static_cast<ssize_t>(payload.size());
+    }
+    return sent;
+  };
+
+  if (!sendQuery()) {
+    error = std::string("send discovery query failed: ") + std::strerror(errno);
+    close(socketFd);
+    return false;
+  }
+
+  constexpr auto kDiscoveryTimeout = std::chrono::milliseconds(1200);
+  constexpr auto kRetryDelay = std::chrono::milliseconds(350);
+  const auto startedAt = std::chrono::steady_clock::now();
+  const auto deadline = startedAt + kDiscoveryTimeout;
+  const auto retryAt = startedAt + kRetryDelay;
+  bool retried = false;
+  std::set<std::string> seenIps;
+  std::array<char, 4096> buffer{};
+
+  while (true) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) break;
+    if (!retried && now >= retryAt) {
+      sendQuery();
+      retried = true;
+      continue;
+    }
+
+    const auto wakeAt = retried ? deadline : std::min(deadline, retryAt);
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::microseconds>(wakeAt - now);
+    timeval timeout{};
+    timeout.tv_sec = static_cast<time_t>(remaining.count() / 1000000);
+    timeout.tv_usec = static_cast<suseconds_t>(remaining.count() % 1000000);
+
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(socketFd, &readSet);
+    const int ready = select(socketFd + 1, &readSet, nullptr, nullptr, &timeout);
+    if (ready == 0) continue;
+    if (ready < 0) {
+      if (errno == EINTR) continue;
+      error = std::string("wait for discovery response failed: ") +
+              std::strerror(errno);
+      close(socketFd);
+      return false;
+    }
+
+    sockaddr_in sender{};
+    socklen_t senderSize = sizeof(sender);
+    const ssize_t bytes = recvfrom(
+        socketFd, buffer.data(), buffer.size() - 1, 0,
+        reinterpret_cast<sockaddr*>(&sender), &senderSize);
+    if (bytes <= 0) continue;
+    buffer[static_cast<size_t>(bytes)] = '\0';
+
+    Json::Value discovery;
+    std::string parseError;
+    if (!hsvj::JsonUtils::parseJson(buffer.data(), discovery, parseError) ||
+        !discovery.isObject() || !discovery.isMember("type") ||
+        !discovery["type"].isString() ||
+        discovery["type"].asString() != "hvideo" ||
+        !discovery.isMember("protocol") ||
+        !discovery["protocol"].isString() ||
+        discovery["protocol"].asString() != "discover" ||
+        !discovery.isMember("protocol_version") ||
+        !discovery["protocol_version"].isString() ||
+        discovery["protocol_version"].asString() != "2.0" ||
+        !discovery.isMember("device_role") ||
+        !discovery["device_role"].isString() ||
+        discovery["device_role"].asString() != "player" ||
+        !discovery.isMember("app_id") || !discovery["app_id"].isString() ||
+        discovery["app_id"].asString() != "com.hsvj.engine" ||
+        !discovery.isMember("challenge") ||
+        !discovery["challenge"].isString() ||
+        discovery["challenge"].asString() != challenge ||
+        !discovery.isMember("model") || !discovery["model"].isString() ||
+        discovery["model"].asString() != myModel) {
+      continue;
+    }
+
+    char senderIpBuffer[INET_ADDRSTRLEN]{};
+    if (!inet_ntop(AF_INET, &sender.sin_addr, senderIpBuffer,
+                   sizeof(senderIpBuffer))) {
+      continue;
+    }
+    const std::string senderIp(senderIpBuffer);
+    const std::string serial =
+        discovery.isMember("serial") && discovery["serial"].isString()
+            ? discovery["serial"].asString()
+            : "";
+    if (!hsvj::sync_contract::isLanIpv4(senderIp) || localIps.count(senderIp) ||
+        !seenIps.insert(senderIp).second) {
+      continue;
+    }
+
+    Json::Value device;
+    device["ip"] = senderIp;
+    device["model"] = discovery["model"].asString();
+    device["name"] =
+        discovery.isMember("device_name") && discovery["device_name"].isString()
+            ? discovery["device_name"].asString()
+            : (serial.empty() ? senderIp : serial);
+    if (!serial.empty()) device["serial"] = serial;
+    if (discovery["config_sync"].isObject()) device["config_sync"] = discovery["config_sync"];
+    if (discovery.isMember("ports") && discovery["ports"].isObject()) {
+      device["ports"] = discovery["ports"];
+    }
+    devices.append(device);
+  }
+
+  close(socketFd);
+  return true;
+#endif
+}
+
+// Extract one named part body from multipart/form-data.
 static std::string extractMultipartPartBody(const std::string& body,
                                             const std::string& contentType,
                                             const std::string& name) {
@@ -369,6 +644,62 @@ static std::string extractMultipartPartBody(const std::string& body,
 }
 
 void HttpServer::registerSystemRoutes() {
+  const auto captureEdidData = [](const hsvj::CaptureEdidState& state) {
+    Json::Value data;
+    data["mode"] = state.custom ? "custom" : "default";
+    data["singleMode"] = state.custom && state.singleMode;
+    data["applied"] = state.applied;
+    const auto modeJson = [](const hsvj::CaptureInputMode& mode) {
+      Json::Value value;
+      value["width"] = mode.width;
+      value["height"] = mode.height;
+      value["refreshRate"] = mode.refreshRate;
+      return value;
+    };
+    data["requested"] = modeJson(state.requested);
+    data["preferred"] = modeJson(state.preferred);
+    data["input"] = modeJson(state.input);
+    return data;
+  };
+  get("/api/v1/system/capture-edid",
+      [this, captureEdidData](const HttpRequest&, HttpResponse& response) {
+        try {
+          setJsonDataResponse(response, captureEdidData(hsvj::Rk628Edid(hsvj::CONFIG_DIR).get()), "ok");
+        } catch (const std::exception& error) {
+          setJsonErrorResponse(response, 503, error.what());
+        }
+      });
+  post("/api/v1/system/capture-edid",
+       [this, captureEdidData](const HttpRequest& request, HttpResponse& response) {
+         Json::Value body;
+         if (!parseJsonBody(request, body, response)) return;
+         if (!body.isObject() || !body["mode"].isString() ||
+             (body["mode"].asString() != "default" && body["mode"].asString() != "custom")) {
+           setJsonErrorResponse(response, 400, "mode 仅支持 default 或 custom");
+           return;
+         }
+         const bool custom = body["mode"].asString() == "custom";
+         const bool hasSingleMode = body.isMember("singleMode");
+         if ((!custom && body.size() != 1) ||
+             (custom && ((body.size() != 4 && body.size() != 5) ||
+                         !body["width"].isInt() || !body["height"].isInt() ||
+                         !body["refreshRate"].isInt() ||
+                         (hasSingleMode && !body["singleMode"].isBool())))) {
+           setJsonErrorResponse(response, 400, "默认仅接受 mode；自定义需 mode、width、height、refreshRate，可选 singleMode");
+           return;
+         }
+         try {
+           const auto state = hsvj::Rk628Edid(hsvj::CONFIG_DIR).set(custom,
+               custom ? body["width"].asInt() : 0, custom ? body["height"].asInt() : 0,
+               custom ? body["refreshRate"].asInt() : 0,
+               custom && hasSingleMode && body["singleMode"].asBool());
+           setJsonDataResponse(response, captureEdidData(state), "ok");
+         } catch (const std::invalid_argument& error) {
+           setJsonErrorResponse(response, 400, error.what());
+         } catch (const std::exception& error) {
+           setJsonErrorResponse(response, 503, error.what());
+         }
+       });
   auto respondMirrorResult = [this](const std::string &rawResult,
                                     HttpResponse &response) {
     Json::Value result;
@@ -403,8 +734,8 @@ void HttpServer::registerSystemRoutes() {
              action == "reset_pin" || action == "android_status" ||
              action == "android_start" || action == "android_stop" ||
              action == "usb_status" || action == "usb_start" ||
-             action == "usb_stop" || action == "usb_autostart_on" ||
-             action == "usb_autostart_off" ||
+             action == "usb_stop" || action == "autostart_status" ||
+             action == "autostart_set" ||
              action == "usb_app_scene_config";
          if (!supported) {
            setJsonErrorResponse(response, 404,
@@ -422,20 +753,134 @@ void HttpServer::registerSystemRoutes() {
                                 "Mirror action request body must be an object");
            return;
          }
-         static const char *kLegacyFields[] = {"type", "code", "param", "action"};
-         for (const char *field : kLegacyFields) {
-           if (body.isMember(field)) {
+
+         auto validateFields = [&](const std::set<std::string>& allowed) {
+           for (const auto& field : body.getMemberNames()) {
+             if (allowed.find(field) == allowed.end()) {
+               setJsonErrorResponse(response, 400,
+                                    "Unsupported mirror action field: " + field);
+               return false;
+             }
+           }
+           return true;
+         };
+
+         int layerId = 0;
+         std::string javaPayload;
+#ifdef __ANDROID__
+         if (action == "autostart_set") {
+           if (!validateFields({"mode"})) {
+             return;
+           }
+           if (!body.isMember("mode") || !body["mode"].isString()) {
+             setJsonErrorResponse(response, 400,
+                                  "autostart_set requires string field: mode");
+             return;
+           }
+           const std::string mode = body["mode"].asString();
+           if (mode != "none" && mode != "usb" && mode != "android" &&
+               mode != "apple") {
              setJsonErrorResponse(
                  response, 400,
-                 std::string("Unsupported protocol field: ") + field);
+                 "mode must be one of: none, usb, android, apple");
              return;
+           }
+           if (!systemConfig_) {
+             setJsonErrorResponse(response, 500, "System config is unavailable");
+             return;
+           }
+
+           const bool oldConfigured = systemConfig_->hasMirrorControlConfig();
+           const std::string oldMode = systemConfig_->getMirrorAutoStartMode();
+           const bool oldEnabled = systemConfig_->isUsbAppSceneEnabled();
+           const std::string oldSceneName = systemConfig_->getUsbAppSceneName();
+           systemConfig_->setMirrorControlConfig(
+               true, mode, oldEnabled, oldSceneName);
+           if (!systemConfig_->save(hsvj::CONFIG_PATH)) {
+             systemConfig_->setMirrorControlConfig(
+                 oldConfigured, oldMode, oldEnabled, oldSceneName);
+             setJsonErrorResponse(
+                 response, 500,
+                 std::string("Failed to save mirror config to ") + hsvj::CONFIG_PATH);
+             return;
+           }
+           Json::Value payload(Json::objectValue);
+           payload["mode"] = mode;
+           javaPayload = hsvj::JsonUtils::toString(payload);
+         } else if (action == "usb_app_scene_config") {
+           if (!validateFields({"layerId", "enabled", "sceneName"})) {
+             return;
+           }
+           if (!body.isMember("layerId") || !body["layerId"].isInt() ||
+               body["layerId"].asInt() <= 0 || !body.isMember("enabled") ||
+               !body["enabled"].isBool() || !body.isMember("sceneName") ||
+               !body["sceneName"].isString()) {
+             setJsonErrorResponse(
+                 response, 400,
+                 "usb_app_scene_config requires layerId(int>0), enabled(bool), "
+                 "sceneName(string)");
+             return;
+           }
+           layerId = body["layerId"].asInt();
+           const bool enabled = body["enabled"].asBool();
+           std::string sceneName = trimCopy(body["sceneName"].asString());
+           if (sceneName.size() > 5 &&
+               sceneName.compare(sceneName.size() - 5, 5, ".json") == 0) {
+             sceneName.resize(sceneName.size() - 5);
+           }
+           if (enabled && sceneName.empty()) {
+             setJsonErrorResponse(response, 400, "请选择电视投屏对应场景");
+             return;
+           }
+           if (enabled && sceneName == "默认配置") {
+             setJsonErrorResponse(response, 400,
+                                  "电视投屏场景不能选择默认配置");
+             return;
+           }
+           if (!systemConfig_) {
+             setJsonErrorResponse(response, 500, "System config is unavailable");
+             return;
+           }
+
+           const bool oldConfigured = systemConfig_->hasMirrorControlConfig();
+           const std::string oldMode = systemConfig_->getMirrorAutoStartMode();
+           const bool oldEnabled = systemConfig_->isUsbAppSceneEnabled();
+           const std::string oldSceneName = systemConfig_->getUsbAppSceneName();
+           systemConfig_->setMirrorControlConfig(
+               true, oldMode, enabled, sceneName);
+           if (!systemConfig_->save(hsvj::CONFIG_PATH)) {
+             systemConfig_->setMirrorControlConfig(
+                 oldConfigured, oldMode, oldEnabled, oldSceneName);
+             setJsonErrorResponse(
+                 response, 500,
+                 std::string("Failed to save mirror config to ") + hsvj::CONFIG_PATH);
+             return;
+           }
+           Json::Value payload(Json::objectValue);
+           payload["layerId"] = layerId;
+           payload["enabled"] = enabled;
+           payload["sceneName"] = sceneName;
+           javaPayload = hsvj::JsonUtils::toString(payload);
+         } else {
+           const std::set<std::string> allowed =
+               action == "autostart_status" ? std::set<std::string>{}
+                                            : std::set<std::string>{"layerId"};
+           if (!validateFields(allowed)) {
+             return;
+           }
+           if (body.isMember("layerId")) {
+             if (!body["layerId"].isInt()) {
+               setJsonErrorResponse(response, 400, "layerId must be an integer");
+               return;
+             }
+             layerId = body["layerId"].asInt();
            }
          }
 
-         const int layerId = body.get("layerId", 0).asInt();
-#ifdef __ANDROID__
-         const std::string rawResult = action == "usb_app_scene_config"
-             ? controlJavaMirrorService(action, layerId, request.getBody())
+         const bool actionUsesPayload = action == "autostart_set" ||
+                                        action == "usb_app_scene_config";
+         const std::string rawResult = actionUsesPayload
+             ? controlJavaMirrorService(action, layerId, javaPayload)
              : controlJavaMirrorService(action, layerId);
          respondMirrorResult(rawResult, response);
 #else
@@ -600,7 +1045,55 @@ void HttpServer::registerSystemRoutes() {
         }
       });
 
-  // 设备名称修改 API：严格读写 Android Settings.System device_hsname
+  // Factory serial always requires a Web session, including on the VOD port.
+  get("/api/v1/system/factory-serial",
+      [this](const HttpRequest &request, HttpResponse &response) {
+        (void)request;
+        response.setHeader("Cache-Control", "no-store");
+        const auto result = hsvj::readFactorySerial();
+        if (result.status != 200) {
+          setJsonErrorResponse(response, result.status, result.error);
+          return;
+        }
+        Json::Value data;
+        data["serial"] = hsvj::SystemUtils::getHardwareSerial();
+        data["stored_serial"] = result.storedSerial;
+        data["reboot_required"] = !result.storedSerial.empty() &&
+            result.storedSerial != data["serial"].asString();
+        setJsonDataResponse(response, data, "读取出厂序列号成功");
+      });
+
+  post("/api/v1/system/factory-serial",
+       [this](const HttpRequest &request, HttpResponse &response) {
+         Json::Value param;
+         if (!parseJsonBody(request, param, response)) return;
+         if (!param.isObject() || param.size() != 2 ||
+             !param["serial"].isString() || !param["expected_serial"].isString() ||
+             param["expected_serial"].asString().size() > 1024) {
+           setJsonErrorResponse(response, 400, "请求仅接受 serial 和 expected_serial 字符串");
+           return;
+         }
+         const auto result = hsvj::writeFactorySerial(
+             param["serial"].asString(), param["expected_serial"].asString());
+         if (result.status != 200) {
+           setJsonErrorResponse(response, result.status, result.error);
+           return;
+         }
+         response.setHeader("Cache-Control", "no-store");
+         Json::Value data;
+         data["serial"] = hsvj::SystemUtils::getHardwareSerial();
+         data["stored_serial"] = result.storedSerial;
+         data["reboot_required"] = result.storedSerial != data["serial"].asString();
+         // Schedule on the device after verified storage, even if the client disconnects.
+         const bool rebootScheduled = scheduleSystemReboot();
+         data["reboot_scheduled"] = rebootScheduled;
+         data["reboot_delay_ms"] = rebootScheduled ? 2000 : 0;
+         setJsonDataResponse(response, data, rebootScheduled
+             ? "出厂序列号写入并回读校验成功，设备即将自动重启"
+             : "出厂序列号写入成功，但无法安排自动重启，请手动重启设备");
+       });
+
+  // 设备名称修改 API：请求和响应只使用 device_hsname，一对一关联所有名称目标。
   post("/api/v1/system/device-alias",
        [this](const HttpRequest &request, HttpResponse &response) {
          Json::Value param;
@@ -609,8 +1102,6 @@ void HttpServer::registerSystemRoutes() {
          std::string name;
          if (param.isMember("device_hsname") && param["device_hsname"].isString()) {
            name = param["device_hsname"].asString();
-         } else if (param.isMember("name") && param["name"].isString()) {
-           name = param["name"].asString();
          }
          name = trimCopy(name);
 
@@ -621,16 +1112,15 @@ void HttpServer::registerSystemRoutes() {
 
 #ifdef __ANDROID__
          std::string error;
-         if (!setJavaDeviceHsName(name, error)) {
+         if (!applyJavaAssociatedDeviceName(name, error)) {
            setJsonErrorResponse(response, 500,
                                 "写入系统设备名称失败: " + (error.empty() ? std::string("unknown") : error));
            return;
          }
 
          Json::Value data;
-         data["name"] = name;
          data["device_hsname"] = name;
-         setJsonDataResponse(response, data, "设备名称已写入系统");
+         setJsonDataResponse(response, data, "设备名称已关联写入系统");
 #else
          setJsonErrorResponse(response, 501, "device_hsname 仅支持 Android 系统接口");
 #endif
@@ -641,7 +1131,6 @@ void HttpServer::registerSystemRoutes() {
         (void)request;
         std::string name = getSystemDeviceHsName();
         Json::Value data;
-        data["name"] = name;
         data["device_hsname"] = name;
         setJsonDataResponse(response, data, "ok");
       });
@@ -676,6 +1165,8 @@ void HttpServer::registerSystemRoutes() {
         int days = lm->getDaysUntilExpiry();
         if (!lm->isLicensed()) {
           result["status"] = "unlicensed";
+        } else if (lm->getLicenseSource() == "server") {
+          result["status"] = lm->shouldBlockVideoPlayback() ? "expired" : "valid";
         } else if (lm->getDaysSource() == "time_invalid" || lm->getDaysSource() == "license_duration") {
           result["status"] = "time_calibrating";
         } else {
@@ -688,6 +1179,8 @@ void HttpServer::registerSystemRoutes() {
         result["expiry_date"] = lm->getExpiryDate();
         result["days_remaining"] = days;
         result["days_source"] = lm->getDaysSource();
+        result["license_source"] = lm->getLicenseSource();
+        result["last_error"] = lm->getLastError();
         result["device_time_valid"] = lm->isDeviceTimeValid();
         result["input_channel_count"] = lm->getInputChannelCount();
         result["arrears_amount"] = lm->getArrearsAmount();
@@ -756,36 +1249,22 @@ void HttpServer::registerSystemRoutes() {
          }
          std::string dir = hsvj::LICENSE_DIR;
          if (!dir.empty() && dir.back() != '/') dir += '/';
-         std::string licensePath = dir + "license.dat";
          if (!hsvj::FileUtils::exists(dir)) {
            hsvj::FileUtils::createDirectory(dir);
          }
-         std::string previousLicense;
-         bool hadPreviousLicense = false;
-         if (hsvj::FileUtils::exists(licensePath)) {
-           previousLicense = hsvj::FileUtils::readTextFile(licensePath);
-           hadPreviousLicense = !previousLicense.empty();
-         }
-         if (!hsvj::FileUtils::writeTextFile(licensePath, licenseContent)) {
-           setJsonErrorResponse(response, 500, "写入授权文件失败");
+         const bool allowCloudSync = !systemConfig_ || !systemConfig_->isNetworkVodEnabled();
+         if (!engine_->getLicenseManager()->importLicense(licenseContent, allowCloudSync)) {
+           setJsonErrorResponse(response, 400, engine_->getLicenseManager()->getLastError());
            return;
          }
-         if (!engine_->getLicenseManager()->reloadLicense()) {
-           std::string reason = engine_->getLicenseManager()->getLastError();
-           if (hadPreviousLicense) {
-             hsvj::FileUtils::writeTextFile(licensePath, previousLicense);
-             engine_->getLicenseManager()->reloadLicense();
-           }
-           std::string message = "授权文件格式无效或验证失败";
-           if (!reason.empty()) {
-             message += "：" + reason;
-           }
-           setJsonErrorResponse(response, 400, message);
-           return;
-         }
+         engine_->refreshLicenseLayers();
          engine_->refreshLicenseScreenHint();
          hsvj::NetworkManager::getInstance().refreshAudioEffectRoutes();
-         setJsonSuccessResponse(response, "授权文件已导入并生效");
+         if (allowCloudSync) {
+           setJsonSuccessResponse(response, "授权文件已导入并生效，云端正在后台同步");
+           return;
+         }
+         setJsonSuccessResponse(response, "授权文件已导入");
        });
 
   // 当前数据根路径（/huoshan 或 /sdcard/huoshan 等），供前端统一构建路径，避免硬编码
@@ -798,6 +1277,101 @@ void HttpServer::registerSystemRoutes() {
         result["root"] = root;
         setJsonDataResponse(response, result, "ok");
       });
+
+  // Report free space on the partition containing the huoshan data root.
+  get("/api/v1/system/storage-space",
+      [this](const HttpRequest &request, HttpResponse &response) {
+        std::string storage = request.getQueryParam("storage");
+        if (storage.empty()) storage = "internal";
+        if (!hsvj::videoStorage::validSelection(storage)) {
+          setJsonErrorResponse(response, 400, "Invalid storage");
+          return;
+        }
+        if (storage == "sata" && !hsvj::videoStorage::sataWritable()) {
+          setJsonErrorResponse(response, 503, "SATA 硬盘未挂载、只读或没有写入权限");
+          return;
+        }
+        try {
+          const fs::space_info spaceInfo = fs::space(fs::path(storage == "sata" ? hsvj::videoStorage::sataMount : hsvj::ROOT_PATH));
+          Json::Value result;
+          result["storage"] = storage;
+          result["path"] = storage == "sata" ? hsvj::videoStorage::sataRoot : hsvj::VIDEO_DIR;
+          result["available_bytes"] = static_cast<Json::UInt64>(spaceInfo.available);
+          result["capacity_bytes"] = static_cast<Json::UInt64>(spaceInfo.capacity);
+          setJsonDataResponse(response, result, "ok");
+        } catch (const fs::filesystem_error &error) {
+          LOG_ERROR("Failed to query huoshan storage space: %s", error.what());
+          setJsonErrorResponse(response, 500,
+                               "Failed to read huoshan storage space");
+        }
+      });
+
+  const auto displayResolution = [this](HttpResponse& response, const std::string& mode) {
+#ifdef __ANDROID__
+    Json::Value result;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    std::istringstream input(callJavaDisplayResolution(mode));
+    if (Json::parseFromStream(builder, input, &result, &errors) && result.isObject()) {
+      if (result["data"].isObject()) {
+        setJsonDataResponse(response, result["data"], "ok");
+        return;
+      }
+      if (result["status"].isInt() && result["message"].isString()) {
+        setJsonErrorResponse(response, result["status"].asInt() == 400 ? 400 : 503,
+                             result["message"].asString());
+        return;
+      }
+    }
+#endif
+    setJsonErrorResponse(response, 503, "无法访问系统显示服务");
+  };
+  get("/api/v1/system/display-resolution",
+      [displayResolution](const HttpRequest&, HttpResponse& response) {
+        displayResolution(response, "");
+      });
+  post("/api/v1/system/display-resolution",
+       [this, displayResolution](const HttpRequest& request, HttpResponse& response) {
+         Json::Value body;
+         if (!parseJsonBody(request, body, response)) return;
+         if (!body.isObject() || body.size() != 1 || !body["mode"].isString() ||
+             body["mode"].asString().empty() || body["mode"].asString().size() > 128 ||
+             body["mode"].asString().find('\0') != std::string::npos) {
+           setJsonErrorResponse(response, 400, "仅接受非空 mode 字段，请使用系统返回的分辨率");
+           return;
+         }
+         displayResolution(response, body["mode"].asString());
+       });
+
+  // One authoritative selector shared with TvSettings; never stored in config.json.
+  get("/api/v1/system/display-output",
+      [this](const HttpRequest &request, HttpResponse &response) {
+        (void)request;
+        try {
+          setJsonDataResponse(response, displayOutputState(hsvj::DisplayOutputModeClient().getMode()), "ok");
+        } catch (const std::exception& error) {
+          LOG_WARN("Display output read failed: %s", error.what());
+          setJsonErrorResponse(response, 503, "无法读取系统输出选择，请确认设备系统支持 HDMI/MIPI 切换");
+        }
+      });
+
+  post("/api/v1/system/display-output",
+       [this](const HttpRequest &request, HttpResponse &response) {
+         Json::Value body;
+         if (!parseJsonBody(request, body, response)) return;
+         if (!body.isObject() || body.size() != 1 || !body["mode"].isString() ||
+             !hsvj::DisplayOutputModeClient::isValidMode(body["mode"].asString())) {
+           setJsonErrorResponse(response, 400, "仅接受 mode 字段，值为 hdmi 或 mipi");
+           return;
+         }
+         try {
+           const auto saved = hsvj::DisplayOutputModeClient().setMode(body["mode"].asString());
+           setJsonDataResponse(response, displayOutputState(saved), "输出选择已保存，重启设备后生效");
+         } catch (const std::exception& error) {
+           LOG_WARN("Display output save failed: %s", error.what());
+           setJsonErrorResponse(response, 503, "系统输出选择保存未确认，请重新读取后重试");
+         }
+       });
 
   // 开机动画候选列表：严格使用系统 com.tyzc.resolutionratio 广播接口
   get("/api/v1/system/boot-animation/list",
@@ -859,7 +1433,10 @@ void HttpServer::registerSystemRoutes() {
          Json::Value result;
          result["reboot"] = true;
          result["reboot_delay_ms"] = 2000;
-         scheduleSystemReboot();
+         if (!scheduleSystemReboot()) {
+           setJsonErrorResponse(response, 500, "无法安排设备重启，请检查系统权限");
+           return;
+         }
          setJsonDataResponse(response, result, "设备即将重启");
        });
 
@@ -946,66 +1523,18 @@ void HttpServer::registerSystemRoutes() {
   // 局域网同型号设备列表（扫描本网段，过滤 model 一致且排除本机）
   get("/api/v1/system/lan-devices",
       [this](const HttpRequest &request, HttpResponse &response) {
-        (void)request;
         try {
-          std::string myIp = hsvj::SystemUtils::getLocalIp();
-          if (myIp.empty()) {
-            Json::Value ifs = hsvj::SystemUtils::getNetworkInterfaces();
-            if (ifs.isArray() && ifs.size() > 0 && ifs[0].isMember("ip")) {
-              myIp = ifs[0]["ip"].asString();
-            }
-          }
-          std::string myModel = hsvj::SystemUtils::getHardwareModel();
-          Json::Value devices(Json::arrayValue);
+          const std::string myIp = request.getLocalIp();
 
-          // 解析本机 IP 得到网段前缀（如 192.168.1）
-          std::string prefix;
-          int lastOctet = -1;
-          if (!myIp.empty()) {
-            size_t lastDot = myIp.rfind('.');
-            if (lastDot != std::string::npos && lastDot > 0) {
-              prefix = myIp.substr(0, lastDot);
-              try {
-                lastOctet = std::stoi(myIp.substr(lastDot + 1));
-              } catch (...) {}
-            }
-          }
-          if (prefix.empty()) {
-            Json::Value result;
-            result["devices"] = devices;
-            setJsonDataResponse(response, result, "ok");
+          Json::Value devices;
+          std::string discoveryError;
+          if (!discoverLanDevicesUdp(
+                  myIp, hsvj::SystemUtils::getHardwareModel(),
+                  hsvj::SystemUtils::getRegistrationSerial(), devices,
+                  discoveryError)) {
+            setJsonErrorResponse(response, 500,
+                                 "LAN device discovery failed: " + discoveryError);
             return;
-          }
-
-          const int kTimeoutSec = 1;
-          const int kPort = 8080;
-          for (int i = 1; i <= 254; i++) {
-            if (i == lastOctet) continue;
-            std::string ip = prefix + "." + std::to_string(i);
-            std::string url = "http://" + ip + ":" + std::to_string(kPort) + "/api/v1/system/device-info";
-            std::string body = hsvj::httpGet(url, kTimeoutSec);
-            if (body.empty()) continue;
-            std::string err;
-            Json::Value root;
-            if (!hsvj::JsonUtils::parseJson(body, root, err)) continue;
-            const std::vector<std::string> members = root.getMemberNames();
-            if (!root.isObject() || members.size() != 3 ||
-                !root.isMember("ok") || !root["ok"].isBool() ||
-                !root["ok"].asBool() || !root.isMember("data") ||
-                !root["data"].isObject() || !root.isMember("error") ||
-                !root["error"].isNull()) {
-              continue;
-            }
-            Json::Value data = root["data"];
-            if (!data.isMember("model") || !data["model"].isString()) continue;
-            if (data["model"].asString() != myModel) continue;
-            Json::Value dev;
-            dev["ip"] = ip;
-            dev["name"] = data.isMember("device_name") && data["device_name"].isString()
-                ? data["device_name"].asString()
-                : (data.isMember("serial") && data["serial"].isString() ? data["serial"].asString() : ip);
-            dev["model"] = data["model"].asString();
-            devices.append(dev);
           }
 
           Json::Value result;
@@ -1013,31 +1542,35 @@ void HttpServer::registerSystemRoutes() {
           setJsonDataResponse(response, result, "ok");
         } catch (const std::exception &e) {
           setJsonErrorResponse(response, 500,
-                              std::string("扫描局域网设备失败: ") + e.what());
+                               std::string("LAN device discovery failed: ") +
+                                   e.what());
         }
       });
 
-  // 设备发现信息 API（与 UDP Beacon 格式一致，缺项不上报）
+  // 设备发现信息 API（与 UDP Beacon 格式一致，使用当前 TCP 连接的网卡）
   get("/api/v1/system/discovery",
       [this](const HttpRequest &request, HttpResponse &response) {
-        (void)request;
         try {
-          Json::Value interfaces = hsvj::SystemUtils::getNetworkInterfaces();
-          std::string deviceName = hsvj::SystemUtils::getDeviceName();
-          std::string primaryIp = "127.0.0.1";
-          if (interfaces.isArray() && interfaces.size() > 0 &&
-              interfaces[0].isMember("ip")) {
-            primaryIp = interfaces[0]["ip"].asString();
-          }
+          const std::string localIp = request.getLocalIp();
+          const Json::Value network = hsvj::SystemUtils::getNetworkReport(localIp);
+          const std::string deviceName = hsvj::SystemUtils::getDeviceName();
           int wsPort = 9898;
-          if (hsvj::NetworkManager::getInstance().getWebSocketServer()) {
-            wsPort = hsvj::NetworkManager::getInstance().getWebSocketPort();
+           if (hsvj::NetworkManager::getInstance().getWebSocketServer()) {
+             wsPort = hsvj::NetworkManager::getInstance().getWebSocketPort();
+           }
+           auto *syncGroup = hsvj::NetworkManager::getInstance().getSyncUdpGroup();
+           const int syncPort = syncGroup && syncGroup->isRunning()
+                                    ? syncGroup->getPort()
+                                    : 0;
+           Json::Value result = hsvj::DeviceDiscoveryService::buildDiscoveryJson(
+              localIp, deviceName, hsvj::SystemUtils::getMacAddress(),
+              hsvj::SystemUtils::getRegistrationSerial(),
+               hsvj::SystemUtils::getHardwareModel(), 8080, 8081, 9898, wsPort,
+               9000, 8000, syncPort, network);
+          if (!result.isObject()) {
+            setJsonErrorResponse(response, 503, "Hardware serial or physical network information is not available");
+            return;
           }
-          Json::Value result = hsvj::DeviceDiscoveryService::buildDiscoveryJson(
-              primaryIp, deviceName, hsvj::SystemUtils::getMacAddress(),
-              hsvj::SystemUtils::getHardwareSerial(),
-              hsvj::SystemUtils::getHardwareModel(), 8080, 8081, 9898, wsPort,
-              9000, 8000);
           setJsonDataResponse(response, result, "ok");
         } catch (const std::exception &e) {
           setJsonErrorResponse(response, 500,
@@ -1051,6 +1584,12 @@ void HttpServer::registerSystemRoutes() {
          if (!checkCommandRouter(response)) return;
          Json::Value body;
          if (!parseJsonBody(request, body, response)) return;
+         if (!body["protocol"].isInt() ||
+             body["protocol"].asInt() != hsvj::sync_contract::kProtocolVersion ||
+             !body["base_path"].isString() || body["base_path"].asString() != "current") {
+           setJsonErrorResponse(response, 400, "同步协议不匹配，请升级双方播放器");
+           return;
+         }
          if (!body.isMember("target_ips") || !body["target_ips"].isArray()) {
            setJsonErrorResponse(response, 400, "Missing or invalid target_ips");
            return;
@@ -1059,96 +1598,41 @@ void HttpServer::registerSystemRoutes() {
            setJsonErrorResponse(response, 400, "Missing or invalid dirs");
            return;
          }
+         if (body["target_ips"].size() != 1 || !body["target_ips"][0].isString() ||
+             body["target_ips"][0].asString() != request.getPeerIp()) {
+           setJsonErrorResponse(response, 400, "拉取目标必须是当前请求设备");
+           return;
+         }
+         if (!body["expected_source_serial"].isString() ||
+             body["expected_source_serial"].asString() != hsvj::SystemUtils::getRegistrationSerial()) {
+           setJsonErrorResponse(response, 409, "来源设备身份已变化，请重新扫描");
+           return;
+         }
          Json::Value param;
          param["action"] = "sync_device";
          Json::Value syncData;
          syncData["target_ips"] = body["target_ips"];
+         syncData["target_serials"] = body["target_serials"];
          syncData["base_path"] = "current";
          syncData["dirs"] = body["dirs"];
-         syncData["timestamp"] = static_cast<Json::Int64>(std::time(nullptr));
-         syncData["sync_mode"] = 0;
          param["sync_data"] = syncData;
          std::string cmd = buildCommandJson(0, 0x06, param);
          executeCommandAndRespond(cmd, response);
        });
 
-  // 局域网配置同步：目标设备接收源设备推送的文件，写入 ROOT_PATH 下
+  // Protocol 2 stages a complete verified transfer; live files remain unchanged.
   post("/api/v1/sync/receive",
        [this](const HttpRequest &request, HttpResponse &response) {
          Json::Value body;
          if (!parseJsonBody(request, body, response)) return;
-         if (!body.isMember("files") || !body["files"].isArray()) {
-           setJsonErrorResponse(response, 400, "Missing or invalid files array");
+         Json::Value result(Json::objectValue);
+         std::string error;
+         if (!hsvj::receiveDeviceFiles(hsvj::ROOT_PATH, body, request.getPeerIp(),
+                                     hsvj::SystemUtils::getRegistrationSerial(),
+                                     hsvj::SystemUtils::getHardwareModel(), result, error)) {
+           setJsonErrorResponse(response, 422, error);
            return;
          }
-         const Json::Value &files = body["files"];
-         if (files.size() > kSyncMaxFiles) {
-           setJsonErrorResponse(response, 400,
-                                "Too many files (max " +
-                                    std::to_string(kSyncMaxFiles) + ")");
-           return;
-         }
-         std::string rootPath;
-         std::string rootNorm;
-         if (!getNormalizedRootPath(rootPath, rootNorm)) {
-           setJsonErrorResponse(response, 500, "ROOT_PATH is not initialized");
-           return;
-         }
-
-         int received = 0;
-         Json::Value errors(Json::arrayValue);
-         for (Json::ArrayIndex i = 0; i < files.size(); i++) {
-           const Json::Value &f = files[i];
-           if (!f.isMember("path") || !f["path"].isString() ||
-               !f.isMember("content_base64") || !f["content_base64"].isString()) {
-             errors.append("file[" + std::to_string(i) + "]: missing path or content_base64");
-             continue;
-           }
-           std::string rel = f["path"].asString();
-           if (rel.empty() || rel.find("..") != std::string::npos ||
-               rel[0] == '/') {
-             errors.append("file[" + std::to_string(i) + "]: invalid path");
-             continue;
-           }
-           std::string fullPath =
-               hsvj::FileUtils::normalizePath(hsvj::FileUtils::joinPath(rootPath, rel));
-           if (fullPath.find(rootNorm) != 0) {
-             errors.append("file[" + std::to_string(i) + "]: path outside ROOT_PATH");
-             continue;
-           }
-           std::string b64 = f["content_base64"].asString();
-           if (b64.size() > kSyncMaxFileSize) {
-             errors.append("file[" + std::to_string(i) + "]: content too large");
-             continue;
-           }
-           std::string content = base64Decode(b64);
-           std::string parentDir = hsvj::FileUtils::getDirectory(fullPath);
-           if (!parentDir.empty() && !hsvj::FileUtils::exists(parentDir)) {
-             if (!hsvj::FileUtils::createDirectory(parentDir)) {
-               errors.append("file[" + std::to_string(i) + "]: failed to create directory");
-               continue;
-             }
-           }
-           std::ofstream ofs(fullPath, std::ios::out | std::ios::binary | std::ios::trunc);
-           if (!ofs.is_open()) {
-             errors.append("file[" + std::to_string(i) + "]: failed to open for write");
-             continue;
-           }
-           if (!content.empty()) {
-             ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-           }
-           ofs.close();
-           if (ofs.fail()) {
-             errors.append("file[" + std::to_string(i) + "]: write failed");
-             continue;
-           }
-           received++;
-         }
-
-         Json::Value result;
-         result["received"] = received;
-         result["errors"] = errors;
-         result["root"] = rootNorm;
          setJsonDataResponse(response, result, "ok");
        });
 
@@ -1247,6 +1731,9 @@ void HttpServer::registerSystemRoutes() {
       return;
     }
 
+    const PlatformConfigSnapshot previousPlatformConfig =
+        capturePlatformConfig(systemConfig_);
+
     // 更新系统配置
     if (param.isMember("resolution") && param["resolution"].isString()) {
       hsvj::Resolution res =
@@ -1301,8 +1788,8 @@ void HttpServer::registerSystemRoutes() {
       systemConfig_->setNetworkDns(param["networkDns"].asString());
     }
 
-    if (param.isMember("debugHotspotEnabled") && param["debugHotspotEnabled"].isBool()) {
-      systemConfig_->setDebugHotspotEnabled(param["debugHotspotEnabled"].asBool());
+    if (param.isMember("fusionDebugEnabled") && param["fusionDebugEnabled"].isBool()) {
+      systemConfig_->setFusionDebugEnabled(param["fusionDebugEnabled"].asBool());
     }
 
     if (param.isMember("powerScheduleEnabled") && param["powerScheduleEnabled"].isBool()) {
@@ -1363,20 +1850,18 @@ void HttpServer::registerSystemRoutes() {
     if (systemConfig_->save(hsvj::CONFIG_PATH)) {
       if (engine_) {
         engine_->applyVodConfigNow();
-        showNetworkIpHintAfterSave(engine_, systemConfig_);
       }
-#ifdef __ANDROID__
-      callJavaApplyNetworkIpConfig(systemConfig_->getNetworkIpMode(), systemConfig_->getNetworkStaticIp(),
-                                   systemConfig_->getNetworkGateway(), systemConfig_->getNetworkDns());
-      callJavaApplyPowerSchedule(systemConfig_->isPowerScheduleEnabled(),
-                                 systemConfig_->isPowerOnScheduleEnabled(),
-                                 systemConfig_->getPowerOnDate(),
-                                 systemConfig_->getPowerOnTime(),
-                                 systemConfig_->isPowerOffScheduleEnabled(),
-                                 systemConfig_->getPowerOffDate(),
-                                 systemConfig_->getPowerOffTime());
-#endif
-      setJsonSuccessResponse(response, "配置保存成功");
+      const PlatformConfigApplyResult platformResult =
+          applyChangedPlatformConfig(previousPlatformConfig, systemConfig_);
+      if (platformResult.networkChanged && engine_) {
+        showNetworkIpHintAfterSave(this, engine_, systemConfig_);
+      }
+      if (platformResult.applied) {
+        setJsonSuccessResponse(response, "Configuration saved and applied");
+      } else {
+        setJsonErrorResponse(response, 503,
+                             "Configuration was saved but platform application failed");
+      }
     } else {
       setJsonErrorResponse(response, 500, "配置保存失败");
     }
@@ -1502,6 +1987,10 @@ void HttpServer::registerSystemRoutes() {
 
   // 保存默认配置 (config.json)
   post("/api/v1/config.json", [this](const HttpRequest &request, HttpResponse &response) {
+      // The save path reloads SystemConfig and applies runtime layers. Serialize
+      // the complete transaction so two HTTP workers cannot mutate Fusion maps
+      // or stop/start VOD while another request is still applying its config.
+      std::unique_lock<std::mutex> configSaveLock(configSaveMutex_);
       Json::Value body;
       if (!parseJsonBody(request, body, response)) {
         return;
@@ -1512,7 +2001,139 @@ void HttpServer::registerSystemRoutes() {
         return;
       }
 
+      if (body.isMember("startupWirelessMode") &&
+          (!body["startupWirelessMode"].isString() ||
+           (body["startupWirelessMode"].asString() != "wifi" &&
+            body["startupWirelessMode"].asString() != "hotspot"))) {
+        setJsonErrorResponse(response, 400,
+                             "startupWirelessMode must be wifi or hotspot");
+        return;
+      }
+
+      if (body.isMember("vodVolumeGainDb") &&
+          (!body["vodVolumeGainDb"].isInt() ||
+           body["vodVolumeGainDb"].asInt() < 0 ||
+           body["vodVolumeGainDb"].asInt() > 10)) {
+        setJsonErrorResponse(response, 400,
+                             "vodVolumeGainDb must be an integer from 0 to 10");
+        return;
+      }
+
+      if (body.isMember("audioOutputLayerId")) {
+        const Json::Value &audioLayerValue = body["audioOutputLayerId"];
+        if (!audioLayerValue.isIntegral()) {
+          setJsonErrorResponse(response, 400,
+                               "audioOutputLayerId must be an integer");
+          return;
+        }
+        const int audioLayerId = audioLayerValue.asInt();
+        const hsvj::Mubu *mubu = engine_ ? &engine_->getMubu() : nullptr;
+        if (!hsvj::AudioOutputLayerPolicy::isValidConfiguredLayer(
+                mubu, audioLayerId)) {
+          setJsonErrorResponse(
+              response, 400,
+              "audioOutputLayerId must be 0 (auto) or a video/mirror layer");
+          return;
+        }
+      }
+
+      if (body.isMember("startupIpHintEnabled") && !body["startupIpHintEnabled"].isBool()) {
+        setJsonErrorResponse(response, 400, "startupIpHintEnabled must be a boolean");
+        return;
+      }
+      if (body.isMember("playbackOperationHintEnabled") &&
+          !body["playbackOperationHintEnabled"].isBool()) {
+        setJsonErrorResponse(response, 400, "playbackOperationHintEnabled must be a boolean");
+        return;
+      }
+      if (body.isMember("lyricHeaderVisible") && !body["lyricHeaderVisible"].isBool()) {
+        setJsonErrorResponse(response, 400, "lyricHeaderVisible must be a boolean");
+        return;
+      }
+      if (body.isMember("lyricBackgroundVisible") && !body["lyricBackgroundVisible"].isBool()) {
+        setJsonErrorResponse(response, 400, "lyricBackgroundVisible must be a boolean");
+        return;
+      }
+      if (body.isMember("lyricDisplayMode") &&
+          (!body["lyricDisplayMode"].isString() ||
+           (body["lyricDisplayMode"].asString() != "original" &&
+            body["lyricDisplayMode"].asString() != "pinyin"))) {
+        setJsonErrorResponse(response, 400,
+                             "lyricDisplayMode must be \"original\" or \"pinyin\"");
+        return;
+      }
+
+      if (body.isMember("lyricProducerText") &&
+          (!body["lyricProducerText"].isString() ||
+           body["lyricProducerText"].asString().size() > 256)) {
+        setJsonErrorResponse(response, 400,
+                             "lyricProducerText must be a string of at most 256 bytes");
+        return;
+      }
+
+      const auto validateLyricNumber = [this, &body, &response](const char *key,
+                                                           double minValue,
+                                                           double maxValue) {
+        if (!body.isMember(key)) return true;
+        const Json::Value &value = body[key];
+        if (!value.isNumeric()) {
+          setJsonErrorResponse(response, 400,
+                               std::string(key) + " must be a number");
+          return false;
+        }
+        const double number = value.asDouble();
+        if (!std::isfinite(number) || number < minValue || number > maxValue) {
+          setJsonErrorResponse(response, 400,
+                               std::string(key) + " is out of range");
+          return false;
+        }
+        return true;
+      };
+      if (!validateLyricNumber("lyricTitleFontSize", 1.0, 300.0) ||
+          !validateLyricNumber("lyricTitleOutlineWidth", 0.0, 20.0) ||
+          !validateLyricNumber("lyricTextFontSize", 1.0, 300.0) ||
+          !validateLyricNumber("lyricTextOutlineWidth", 0.0, 20.0) ||
+          !validateLyricNumber("lyricTextSpacing", -20.0, 100.0)) {
+        return;
+      }
+
+      std::string previousUsbOtgMode;
+      bool usbOtgModeChanged = false;
+      if (body.isMember("usbOtgMode")) {
+        const Json::Value &usbOtgModeValue = body["usbOtgMode"];
+        if (!usbOtgModeValue.isString()) {
+          setJsonErrorResponse(response, 400,
+                               "usbOtgMode must be \"otg\", \"peripheral\" or \"host\"");
+          return;
+        }
+        const std::string usbOtgMode = usbOtgModeValue.asString();
+        if (usbOtgMode != "otg" && usbOtgMode != "peripheral" &&
+            usbOtgMode != "host") {
+          setJsonErrorResponse(response, 400,
+                               "usbOtgMode must be \"otg\", \"peripheral\" or \"host\"");
+          return;
+        }
+        previousUsbOtgMode = hsvj::SystemUtils::getUsbOtgMode();
+        if (previousUsbOtgMode.empty() && systemConfig_ &&
+            systemConfig_->hasUsbOtgModeConfig()) {
+          previousUsbOtgMode = systemConfig_->getUsbOtgMode();
+        }
+        usbOtgModeChanged = previousUsbOtgMode != usbOtgMode;
+        if (usbOtgModeChanged &&
+            !hsvj::SystemUtils::applyUsbOtgMode(usbOtgMode)) {
+          setJsonErrorResponse(response, 503,
+                               "USB OTG mode could not be applied");
+          return;
+        }
+      }
+
       hsvj::SystemConfig::retainOnlyConfigJsonKeys(body);
+      const PlatformConfigSnapshot previousPlatformConfig =
+          capturePlatformConfig(systemConfig_);
+      const bool previousFusionDebugEnabled =
+          systemConfig_ ? systemConfig_->isFusionDebugEnabled() : true;
+      const bool previousStartupIpHintEnabled =
+          systemConfig_ ? systemConfig_->isStartupIpHintEnabled() : true;
       std::string configPath = hsvj::CONFIG_PATH;
       std::string content = jsonToString(body);
 
@@ -1526,7 +2147,7 @@ void HttpServer::registerSystemRoutes() {
               systemConfig_->getAudioLipSyncOffsetMs(), std::memory_order_relaxed);
         }
         // VOD 启用时，清理所有占用 VOD 保留图层的手动播放列表。
-        if (systemConfig_ && systemConfig_->isVodEnabled() && playlistManager_ && playlistManager_->getDatabase()) {
+        if (engine_ && engine_->isVodRuntimeEnabled() && playlistManager_ && playlistManager_->getDatabase()) {
           int vodLayerId = systemConfig_->getVodLayerId();
           int deleted = 0;
           if (vodLayerId > 0) {
@@ -1538,198 +2159,49 @@ void HttpServer::registerSystemRoutes() {
         }
         if (engine_) {
           engine_->applyVodConfigNow();
-          showNetworkIpHintAfterSave(engine_, systemConfig_);
+          if (systemConfig_ &&
+              (systemConfig_->isFusionDebugEnabled() != previousFusionDebugEnabled ||
+               systemConfig_->isStartupIpHintEnabled() != previousStartupIpHintEnabled)) {
+            engine_->refreshLicenseScreenHint();
+          }
         }
-#ifdef __ANDROID__
-        if (systemConfig_) {
-          callJavaApplyNetworkIpConfig(systemConfig_->getNetworkIpMode(), systemConfig_->getNetworkStaticIp(),
-                                       systemConfig_->getNetworkGateway(), systemConfig_->getNetworkDns());
-          callJavaApplyPowerSchedule(systemConfig_->isPowerScheduleEnabled(),
-                                     systemConfig_->isPowerOnScheduleEnabled(),
-                                     systemConfig_->getPowerOnDate(),
-                                     systemConfig_->getPowerOnTime(),
-                                     systemConfig_->isPowerOffScheduleEnabled(),
-                                     systemConfig_->getPowerOffDate(),
-                                     systemConfig_->getPowerOffTime());
+        const PlatformConfigApplyResult platformResult =
+            applyChangedPlatformConfig(previousPlatformConfig, systemConfig_);
+        if (platformResult.networkChanged && engine_) {
+          showNetworkIpHintAfterSave(this, engine_, systemConfig_);
         }
-#endif
-        setJsonSuccessResponse(response, "系统配置保存成功");
+        if (platformResult.applied) {
+          setJsonSuccessResponse(response, "System configuration saved and applied");
+        } else {
+          setJsonErrorResponse(response, 503,
+                               "System configuration was saved but platform application failed");
+        }
       } else {
+        if (usbOtgModeChanged && !previousUsbOtgMode.empty()) {
+          hsvj::SystemUtils::applyUsbOtgMode(previousUsbOtgMode);
+        }
         setJsonErrorResponse(response, 500, "保存系统配置失败");
       }
   });
-  // 上传文件到 huoshan 目录
-  post("/api/v1/system/upload-file",
-       [this](const HttpRequest &request, HttpResponse &response) {
-         try {
-           // 检查是否为 multipart/form-data
-           std::string contentType = request.getHeader("Content-Type");
-           if (contentType.find("multipart/form-data") == std::string::npos) {
-             setJsonErrorResponse(response, 400, "需要 multipart/form-data 格式的请求");
-             return;
-           }
+  get("/api/v1/system/config-backup/status", [this](const HttpRequest&, HttpResponse& response) {
+    const std::string root = hsvj::ROOT_PATH;
+    if (root.empty()) { setJsonErrorResponse(response, 503, "数据目录尚未就绪"); return; }
+    Json::Value data(Json::objectValue);
+    data["restore_pending"] = hsvj::FileUtils::exists(hsvj::FileUtils::joinPath(root, ".hsvj-backup-pending"));
+    std::ifstream input(hsvj::FileUtils::joinPath(root, ".hsvj-backup-result"));
+    std::string message;
+    if (input) std::getline(input, message);
+    data["message"] = message;
+    setJsonDataResponse(response, data, "ok");
+  });
 
-           // 解析 multipart 数据
-           std::string boundary;
-           size_t boundaryPos = contentType.find("boundary=");
-           if (boundaryPos != std::string::npos) {
-             boundary = contentType.substr(boundaryPos + 9);
-             // 去除可能的引号
-             if (!boundary.empty() && boundary.front() == '"') {
-               boundary = boundary.substr(1);
-             }
-             if (!boundary.empty() && boundary.back() == '"') {
-               boundary.pop_back();
-             }
-           } else {
-             setJsonErrorResponse(response, 400, "无法解析 boundary");
-             return;
-           }
+  // Registered once per method for the public contract; socket transfers are
+  // dispatched through the authenticated stream queue before body buffering.
+  get("/api/v1/system/config-backup", [this](const HttpRequest&, HttpResponse& response) {
+    setJsonErrorResponse(response, 503, "Backup stream is unavailable");
+  });
+  post("/api/v1/system/config-backup", [this](const HttpRequest&, HttpResponse& response) {
+    setJsonErrorResponse(response, 503, "Backup stream is unavailable");
+  });
 
-           // 分割 body
-           std::string boundaryMarker = "--" + boundary;
-           std::vector<std::string> parts;
-           size_t pos = 0;
-           std::string body = request.getBody();
-           
-           while ((pos = body.find(boundaryMarker, pos)) != std::string::npos) {
-             pos += boundaryMarker.length();
-             size_t endPos = body.find(boundaryMarker, pos);
-             if (endPos == std::string::npos) {
-               // 最后一部分（可能带 -- 结尾）
-               std::string part = body.substr(pos);
-               // 去除尾部的 \r\n 和 --
-               while (!part.empty() && (part.back() == '\r' || part.back() == '\n' || part.back() == '-')) {
-                 part.pop_back();
-               }
-               if (!part.empty()) {
-                 parts.push_back(part);
-               }
-               break;
-             }
-             std::string part = body.substr(pos, endPos - pos);
-             // 去除首尾的 \r\n
-             while (!part.empty() && (part.front() == '\r' || part.front() == '\n')) {
-               part.erase(part.begin());
-             }
-             while (!part.empty() && (part.back() == '\r' || part.back() == '\n')) {
-               part.pop_back();
-             }
-             if (!part.empty()) {
-               parts.push_back(part);
-             }
-             pos = endPos;
-           }
-
-           // 解析每个 part
-           std::string filePath;
-           std::string fileContent;
-           std::string fileName;
-           bool hasFilePart = false;
-
-           for (const auto &part : parts) {
-             // 查找头部和内容的分隔符（\r\n\r\n）
-             size_t headerEnd = part.find("\r\n\r\n");
-             if (headerEnd == std::string::npos) {
-               headerEnd = part.find("\n\n");
-               if (headerEnd == std::string::npos) continue;
-               headerEnd += 2;
-             } else {
-               headerEnd += 4;
-             }
-
-             std::string headers = part.substr(0, headerEnd);
-             std::string content = part.substr(headerEnd);
-
-             // 解析 Content-Disposition 获取 filename 和 name
-             size_t namePos = headers.find("name=\"");
-             size_t filenamePos = headers.find("filename=\"");
-
-             if (namePos != std::string::npos) {
-               namePos += 6;
-               size_t nameEnd = headers.find("\"", namePos);
-               if (nameEnd != std::string::npos) {
-                 std::string fieldName = headers.substr(namePos, nameEnd - namePos);
-                 
-                 if (fieldName == "path") {
-                   filePath = trimCopy(content);
-                 }
-               }
-             }
-
-             if (filenamePos != std::string::npos) {
-               filenamePos += 10;
-               size_t filenameEnd = headers.find("\"", filenamePos);
-               if (filenameEnd != std::string::npos) {
-                 fileName = headers.substr(filenamePos, filenameEnd - filenamePos);
-                 fileContent = content;
-                 if (fileContent.size() >= 2 && fileContent.compare(fileContent.size() - 2, 2, "\r\n") == 0) {
-                   fileContent.resize(fileContent.size() - 2);
-                 } else if (!fileContent.empty() && fileContent.back() == '\n') {
-                   fileContent.pop_back();
-                 }
-                 hasFilePart = true;
-               }
-             }
-           }
-
-           // 验证参数
-           if (!hasFilePart) {
-             setJsonErrorResponse(response, 400, "未找到文件内容");
-             return;
-           }
-
-           if (filePath.empty()) {
-             setJsonErrorResponse(response, 400, "未指定目标路径");
-             return;
-           }
-
-           if (filePath.find("..") != std::string::npos || filePath[0] == '/' || filePath[0] == '\\') {
-             setJsonErrorResponse(response, 400, "目标路径必须是 ROOT_PATH 下的相对路径");
-             return;
-           }
-
-           std::string rootPath;
-           std::string rootNorm;
-           if (!getNormalizedRootPath(rootPath, rootNorm)) {
-             setJsonErrorResponse(response, 500, "ROOT_PATH is not initialized");
-             return;
-           }
-           std::string fullPath = hsvj::FileUtils::normalizePath(hsvj::FileUtils::joinPath(rootPath, filePath));
-           if (fullPath.find(rootNorm) != 0) {
-             setJsonErrorResponse(response, 400, "目标路径超出 ROOT_PATH");
-             return;
-           }
-           
-           // 确保目录存在
-           std::string dirPath = fullPath.substr(0, fullPath.find_last_of('/'));
-           if (!hsvj::FileUtils::exists(dirPath)) {
-             if (!hsvj::FileUtils::createDirectory(dirPath)) {
-               setJsonErrorResponse(response, 500, "无法创建目录: " + dirPath);
-               return;
-             }
-           }
-
-           // 写入文件
-           std::ofstream outFile(fullPath, std::ios::binary);
-           if (!outFile.is_open()) {
-             setJsonErrorResponse(response, 500, "无法打开文件: " + fullPath);
-             return;
-           }
-
-           outFile.write(fileContent.c_str(), fileContent.size());
-           outFile.close();
-
-           LOG_INFO("[Upload] 文件上传成功: %s (%zu bytes)", fullPath.c_str(), fileContent.size());
-           
-           Json::Value result;
-           result["path"] = filePath;
-           result["size"] = static_cast<Json::UInt64>(fileContent.size());
-           setJsonDataResponse(response, result, "文件上传成功");
-
-         } catch (const std::exception &e) {
-           LOG_ERROR("[Upload] 文件上传失败: %s", e.what());
-           setJsonErrorResponse(response, 500, std::string("上传失败: ") + e.what());
-         }
-       });
 }

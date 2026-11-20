@@ -1,4 +1,4 @@
-import { loadColor, saveColor } from '../api.js?v=2.95';
+import { loadColor, saveColor } from '../api.js?v=2.97';
 import { ensureColorRegion } from '../actions.js?v=2.95';
 
 export async function syncColorRegion(regionId) {

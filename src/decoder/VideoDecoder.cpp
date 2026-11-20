@@ -17,30 +17,35 @@
  */
 
 #include "decoder/VideoDecoder.h"
+#include "decoder/VideoProfile.h"
 #include "decoder/core/DecoderCore.h"
 #include "decoder/core/HardwareManager.h"
 #include "decoder/error/ErrorHandler.h"
 #include "decoder/frame/FramePool.h"
 #include "decoder/sync/FrameSyncManager.h"
 #include "utils/Logger.h"
+#include "utils/AndroidProperty.h"
 #include "utils/MemoryMonitor.h"
 
 namespace hsvj {
 
 namespace {
-bool isWideOrHeavyVideo(int width, int height) {
-  const int64_t pixels = static_cast<int64_t>(width) * static_cast<int64_t>(height);
-  return (width >= 3840 && height >= 720) ||
-         height >= 1800 ||
-         pixels >= static_cast<int64_t>(3000) * 1080;
-}
-
 bool hasRoomForHeavyMultiVideo() {
-  static const bool roomyMemory = [] {
-    const auto info = MemoryMonitor::getMemoryInfo();
-    return info.totalMemory >= 4ULL * 1024ULL * 1024ULL;
-  }();
-  return roomyMemory;
+  // /proc/meminfo may be denied by SELinux on production images, so keep an
+  // explicit property override for device-side A/B tests.
+  const int propertyOverride =
+      getAndroidIntProperty("debug.hsvj.rkmpp_roomy_buffers", -1);
+  if (propertyOverride >= 0) {
+    return propertyOverride != 0;
+  }
+
+  const auto info = MemoryMonitor::getMemoryInfo();
+  // A 4K/ultra-wide NV12 DRM frame can consume several megabytes once decoder
+  // and display buffers are accounted for. Reserve 512 MB for the rest of the
+  // system instead of using total RAM (which says nothing about current
+  // pressure) and avoid treating a failed memory read as roomy.
+  constexpr uint64_t kRoomyFreeMemoryKb = 512ULL * 1024ULL;
+  return info.freeMemory >= kRoomyFreeMemoryKb;
 }
 }
 
@@ -117,10 +122,12 @@ bool VideoDecoder::open(const std::string &path, bool fastOpen) {
   const int videoWidth = decoderCore_->getWidth();
   const int videoHeight = decoderCore_->getHeight();
   const int64_t videoPixels = static_cast<int64_t>(videoWidth) * static_cast<int64_t>(videoHeight);
-  const bool isHeavyVideo = isWideOrHeavyVideo(videoWidth, videoHeight);
+  const bool isHeavyVideo = video_profile::isWideOrHeavyVideo(videoWidth, videoHeight);
   if (isHeavyVideo) {
-    // 4K/超宽视频@60fps: 6帧=96ms 余量不够，解码抖动即丢帧。
-    // 4GB+ 设备初始给 10 帧（160ms@60fps），2GB 设备给 6 帧保安全。
+    // Keep a modest object-pool cushion for 4K/ultra-wide streams. The
+    // roomy decision uses current free memory (with a runtime override), not
+    // the board's total RAM, so a mostly idle 2GB device can use the larger
+    // pool without making low-memory conditions permanent.
     // adjustFramePoolSize 在首帧渲染后根据活跃视频数再动态调整。
     const size_t heavyInitial = hasRoomForHeavyMultiVideo() ? 10 : 6;
     framePool_->resize(heavyInitial);
@@ -209,6 +216,10 @@ bool VideoDecoder::start(double syncStartTime) {
   return true;
 }
 
+bool VideoDecoder::setSyncStartTime(double syncStartTime) {
+  return decoderCore_ && decoderCore_->setSyncStartTime(syncStartTime);
+}
+
 void VideoDecoder::pause() {
   if (!stateMachine_->canTriggerEvent(PlaybackStateMachine::Event::PAUSE)) {
     return;
@@ -228,6 +239,11 @@ void VideoDecoder::resume() {
   stateMachine_->triggerEvent(PlaybackStateMachine::Event::RESUME);
   LOG_INFO("[VideoDecoder] Resumed");
 }
+
+bool VideoDecoder::ensureAudioOutputStarted() {
+  return decoderCore_ && decoderCore_->ensureAudioOutputStarted();
+}
+
 
 void VideoDecoder::stop() {
   if (!stateMachine_->canTriggerEvent(PlaybackStateMachine::Event::STOP)) {
@@ -293,6 +309,10 @@ bool VideoDecoder::replay() {
     return true;
   }
   return false;
+}
+
+bool VideoDecoder::finishPlaybackIfAtEnd(double endTolerance) {
+  return decoderCore_ && decoderCore_->finishPlaybackIfAtEnd(endTolerance);
 }
 
 // ============================================================================
@@ -369,6 +389,10 @@ int VideoDecoder::getWidth() const {
     return 0;
   }
   return decoderCore_->getWidth();
+}
+
+bool VideoDecoder::hasReachedVideoStreamEnd() const {
+  return decoderCore_ && decoderCore_->hasReachedVideoStreamEnd();
 }
 
 int VideoDecoder::getHeight() const {
@@ -527,7 +551,7 @@ void VideoDecoder::adjustFramePoolSize(int activeVideoCount) {
   size_t newPoolSize;
   int width = getWidth();
   int height = getHeight();
-  bool isHeavyVideo = isWideOrHeavyVideo(width, height);
+  bool isHeavyVideo = video_profile::isWideOrHeavyVideo(width, height);
   const bool roomyHeavyBuffers = hasRoomForHeavyMultiVideo();
 
   if (activeVideoCount == 1) {
@@ -584,25 +608,6 @@ void VideoDecoder::setAudioOutputSuppressed(bool suppressed) {
   }
 }
 
-void VideoDecoder::setSwitchWarmupMode(bool enabled) {
-  if (!framePool_ || !frameSyncManager_) {
-    return;
-  }
-
-  if (decoderCore_) {
-    decoderCore_->setSwitchWarmupMode(enabled);
-  }
-
-  if (enabled) {
-    framePool_->resize(3);
-    frameSyncManager_->enterCatchupMode();
-    LOG_INFO("[VideoDecoder] Switch warmup mode enabled: framePool=3");
-  } else {
-    framePool_->resize(8);
-    LOG_INFO("[VideoDecoder] Switch warmup mode disabled: framePool=8");
-  }
-}
-
 // ============================================================================
 // 辅助方法
 // ============================================================================
@@ -614,9 +619,13 @@ VideoDecoder::convertState(PlaybackStateMachine::State state) const {
     return PlayState::PLAYING;
   case PlaybackStateMachine::State::PAUSED:
     return PlayState::PAUSED;
+  case PlaybackStateMachine::State::SEEKING:
+    // Seeking temporarily stops decode workers. Expose it as active playback so
+    // LayerVideo does not mistake the transient state for EOF and freeze video
+    // while the restarted audio pipeline keeps running.
+    return PlayState::PLAYING;
   case PlaybackStateMachine::State::IDLE:
   case PlaybackStateMachine::State::OPENED:
-  case PlaybackStateMachine::State::SEEKING:
   case PlaybackStateMachine::State::STOPPED:
   case PlaybackStateMachine::State::ERROR:
   default:

@@ -84,9 +84,6 @@ public:
    */
   void setLayerId(int layerId);
 
-  /** @brief 双解码切换预热期：压缩资源占用，优先尽快拿到首批可显示帧 */
-  void setSwitchWarmupMode(bool enabled);
-
   /** @brief 切换退场模式：冻结旧解码器，停止继续推进播放，仅保留当前画面 */
   void setSwitchingOut(bool switchingOut);
 
@@ -146,6 +143,8 @@ public:
    * @return 是否开始成功
    */
   bool start(double syncStartTime = 0.0);
+  bool setSyncStartTime(double syncStartTime);
+
 
   /**
    * @brief 暂停播放
@@ -156,6 +155,9 @@ public:
    * @brief 恢复播放
    */
   void resume();
+
+  /** Idempotently start audio after this decoder acquires the route. */
+  bool ensureAudioOutputStarted();
 
   /**
    * @brief 停止播放
@@ -187,6 +189,7 @@ public:
    * @return 是否跳转成功
    */
   bool seek(double position, const std::string &traceId = std::string());
+  bool finishPlaybackIfAtEnd(double endTolerance);
 
   /**
    * @brief 重播：从头开始播放
@@ -260,6 +263,7 @@ public:
    * @return 总时长（秒）
    */
   double getDuration() const;
+  bool hasReachedVideoStreamEnd() const;
 
   /**
    * @brief 获取视频宽度

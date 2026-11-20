@@ -143,8 +143,8 @@ static av_always_inline int wp_exp2(int16_t val)
     val >>= 8;
     if (val > 31U)
         return INT_MIN;
-    res   = (val > 9) (res << (val - 9)) : (res >> (9 - val));
-    return neg -res : res;
+    res   = (val > 9) ? (res << (val - 9)) : (res >> (9 - val));
+    return neg ? -res : res;
 }
 
 static av_always_inline int wp_log2(uint32_t val)

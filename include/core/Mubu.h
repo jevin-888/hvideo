@@ -17,7 +17,7 @@
 #include <vector>
 #include <mutex>
 #include "layer/Layer.h"
-#include "core/Resolution.h"
+#include "foundation/Resolution.h"
 
 namespace hsvj {
 
@@ -51,9 +51,10 @@ public:
      * @param layerId 图层ID
      * @param type 图层类型
      * @param silent 是否静默创建（不输出日志），默认false
+     * @param initiallyVisible Initial visibility before insertion into the layer list.
      * @return 是否创建成功
      */
-    bool createLayer(int layerId, LayerType type, bool silent = false);
+    bool createLayer(int layerId, LayerType type, bool silent = false, bool initiallyVisible = true);
     
     /**
      * @brief 删除图层
@@ -169,17 +170,6 @@ public:
      * @brief 清除全局播放时钟基准
      */
     void clearGlobalPlayClockBase();
-
-    /**
-     * @brief 设置共享 libass 实例（Layer 21 歌词使用，由 Engine 注入）
-     * @param holder SharedLibassHolder 智能指针
-     */
-    void setSharedLibassHolder(std::shared_ptr<SharedLibassHolder> holder);
-
-    /**
-     * @brief 获取共享 libass 实例（创建 Layer 21 时传入）
-     */
-    SharedLibassHolder* getSharedLibassHolder() const;
 
     /**
      * @brief 设置共享文本叠加持有者（Layer 40, 41 共享字体使用，由 Engine 注入）

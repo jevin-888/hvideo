@@ -1,13 +1,12 @@
 // 特效管理页面模块
-import { apiGet, apiPost, apiPut, getLastApiError } from '../core/api.js';
-import { addToCommandLog } from '../core/commandLog.js';
+import { apiGet, apiPost, getLastApiError } from '../core/api.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { clearContainer } from '../utils/domHelpers.js';
 import { toggleButtonGroupActive } from '../components/buttonGroups.js';
 import { showWarning } from '../components/toast.js';
-import { ConnectionState, getConnectionState } from '../core/connectionManager.js';
+import { isModuleLicensed, refreshModuleLicense } from '../core/moduleLicense.js';
 
 // 全局变量
-let selectedEffect = null;
 let selectedLayerId = null;
 let videoLayers = [];
 
@@ -15,30 +14,19 @@ let videoLayers = [];
 // 由 loadEffectConfig 首次探测到 403 时置为 true。
 let effectsLicenseDenied = false;
 
+window.addEventListener('moduleLicenseChanged', () => {
+    effectsLicenseDenied = !isModuleLicensed('effects');
+    if (effectsLicenseDenied) hideEffectsUI();
+    else showEffectsUI();
+});
+
 export function isEffectsLicenseDenied() {
     return effectsLicenseDenied;
 }
 
 export async function syncEffectLicenseVisibility() {
-    try {
-        const license = await apiGet('/system/license');
-        if (!license || license.status === 'unlicensed' || license.status === 'expired') {
-            effectsLicenseDenied = true;
-            hideEffectsUI();
-            return false;
-        }
-        const modules = Array.isArray(license.modules) ? license.modules : [];
-        const enabled = modules.some(module => String(module).toLowerCase() === 'effects');
-        effectsLicenseDenied = !enabled;
-        if (!enabled) {
-            hideEffectsUI();
-        } else {
-            showEffectsUI();
-        }
-        return enabled;
-    } catch (error) {
-        return !effectsLicenseDenied;
-    }
+    await refreshModuleLicense();
+    return !effectsLicenseDenied;
 }
 
 // 本地特效配置（支持每个图层多个特效）
@@ -716,7 +704,6 @@ function selectEffect(effectId) {
     const effectItem = document.querySelector(`[data-effect-id="${effectId}"]`);
     if (effectItem) {
         toggleButtonGroupActive('.effect-item', effectItem);
-        selectedEffect = effectId;
     }
 }
 
@@ -959,53 +946,6 @@ function applyEffect(effectType) {
 // AudioReactiveEngine 面板：控制图层在节拍/瞬态触发时的联动效果。
 // ==========================================================================
 
-/**
- * 渲染"效果关联切片"开关面板到属性区。
- * 节拍/瞬态触发由新的 AudioReactiveEngine 负责（尚未接入），此开关仅
- * 控制每个图层是否响应节拍切换切片。
- */
-async function renderEffectLinkedSlicesPanel() {
-    const container = document.getElementById('effect-properties-container');
-    if (!container) return;
-
-    const panel = document.createElement('div');
-    panel.className = 'effect-linked-slices-panel';
-    panel.innerHTML = `
-        <h4 class="section-title" style="margin-top: 20px; border-top: 1px solid #333; padding-top: 15px;">
-            🔗 效果关联切片
-        </h4>
-        <div style="background: #1a1a1a; padding: 12px; border-radius: 6px;">
-            <div style="display: flex; align-items: center; justify-content: space-between;">
-                <span style="font-size: 12px; color: #888;">开启后，效果触发时自动切换切片</span>
-                <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
-                    <input type="checkbox" id="effect-linked-slices-toggle">
-                    <span style="font-size: 11px;">启用</span>
-                </label>
-            </div>
-            <div style="font-size: 10px; color: #666; margin-top: 8px;">
-                提示：需先在图层矩阵中配置多个切片
-            </div>
-        </div>
-    `;
-    container.appendChild(panel);
-
-    const toggle = document.getElementById('effect-linked-slices-toggle');
-    if (!toggle) return;
-
-    // 初始化时加载当前选中图层的状态
-    updateEffectLinkedSlicesState();
-
-    toggle.addEventListener('change', async () => {
-        const layerId = selectedLayerId || 1;
-        try {
-            await apiPut(`/config/layers/${layerId}`, { effectLinkedSlices: toggle.checked });
-            addToCommandLog('效果关联切片', 'success',
-                `图层${layerId} 效果关联切片已${toggle.checked ? '启用' : '禁用'}（未保存）`);
-        } catch (error) {
-            addToCommandLog('效果关联切片', 'error', '设置失败: ' + error.message);
-        }
-    });
-}
 
 export function stopAudioReactiveRefresh() {
     // 停止 AudioReactiveEngine 轮询（路由切换 / 页面隐藏时调用）
@@ -1022,19 +962,37 @@ export function stopAudioReactiveRefresh() {
 // ==========================================================================
 
 let audioReactivePollTimer = null;
+let audioReactivePollGeneration = 0;
+let audioReactiveLearningActive = false;
 let audioReactiveSpectrumCtx = null;
 let audioReactiveConfigCache = null;
 
+const AUDIO_REACTIVE_POLL_INTERVAL_MS = 250;
+const AUDIO_REACTIVE_REQUEST_OPTIONS = { timeoutMs: 1500, retries: 0, silent: true };
+
 function stopAudioReactivePolling(notifyBackend = true) {
+    audioReactivePollGeneration++;
     if (audioReactivePollTimer) {
-        clearInterval(audioReactivePollTimer);
+        clearTimeout(audioReactivePollTimer);
         audioReactivePollTimer = null;
     }
+    audioReactiveLearningActive = false;
     audioReactiveSpectrumCtx = null;
     // 通知后端卸下 audio callback，避免离开页面后还在跑 FFT 卡音频解码线程
     if (notifyBackend && !effectsLicenseDenied) {
-        try { apiPost('/audio-reactive/engine', { enabled: false }); } catch (e) {}
+        void apiPost('/audio-reactive/engine', { enabled: false }, AUDIO_REACTIVE_REQUEST_OPTIONS);
     }
+}
+
+function startAudioReactivePolling() {
+    const generation = ++audioReactivePollGeneration;
+    const poll = async () => {
+        audioReactivePollTimer = null;
+        await refreshAudioReactiveState();
+        if (generation !== audioReactivePollGeneration) return;
+        audioReactivePollTimer = setTimeout(poll, AUDIO_REACTIVE_POLL_INTERVAL_MS);
+    };
+    audioReactivePollTimer = setTimeout(poll, 0);
 }
 
 async function renderAudioReactivePanel() {
@@ -1161,8 +1119,8 @@ async function renderAudioReactivePanel() {
     // 通知后端挂上 audio callback，开始喂数据给 AudioReactiveEngine
     try { await apiPost('/audio-reactive/engine', { enabled: true }); } catch (e) {}
 
-    // 启动 10Hz 轮询
-    audioReactivePollTimer = setInterval(refreshAudioReactiveState, 100);
+    // 串行轮询，上一轮完成后再调度下一轮，避免慢请求堆积拖垮其他 API。
+    startAudioReactivePolling();
 }
 
 function renderAudioReactiveConfigSliders() {
@@ -1234,12 +1192,12 @@ async function commitAudioReactiveConfig() {
 }
 
 async function refreshAudioReactiveState() {
-    // 拉状态 + 频谱 + 学习进度（按需）
-    let st = null, sp = null;
-    try {
-        st = await apiGet('/audio-reactive/state');
-    } catch (e) { return; /* 服务器没起就静默 */ }
-    try { sp = await apiGet('/audio-reactive/spectrum'); } catch (e) {}
+    // 高频遥测请求并行执行、静默失败；用户操作接口不受轮询日志干扰。
+    const [st, sp, learn] = await Promise.all([
+        apiGet('/audio-reactive/state', AUDIO_REACTIVE_REQUEST_OPTIONS),
+        apiGet('/audio-reactive/spectrum', AUDIO_REACTIVE_REQUEST_OPTIONS),
+        apiGet('/audio-reactive/learn', AUDIO_REACTIVE_REQUEST_OPTIONS)
+    ]);
 
     if (!st) return;
 
@@ -1306,47 +1264,20 @@ async function refreshAudioReactiveState() {
         }
     }
 
-    // 学习进度
-    try {
-        const learn = await apiGet('/audio-reactive/learn');
-        const fill = document.getElementById('ar-learn-fill');
-        const btn = document.getElementById('ar-learn-btn');
-        if (learn && fill) fill.style.width = Math.round((learn.progress || 0) * 100) + '%';
-        if (learn && btn) btn.textContent = learn.learning ? '⏹ 停止学习' : '▶ 学习当前曲风（30s）';
-        // 学习结束后刷新一次配置
-        if (learn && !learn.learning && fill && fill.style.width === '100%') {
-            audioReactiveConfigCache = await apiGet('/audio-reactive/config');
-            renderAudioReactiveConfigSliders();
-        }
-    } catch (e) {}
-}
-
-// 更新效果关联切片开关状态
-async function updateEffectLinkedSlicesState() {
-    const toggle = document.getElementById('effect-linked-slices-toggle');
-    if (!toggle) return;
-
-    // 使用已选择的图层，如果没有则使用 videoLayers 中的第一个
-    const layerId = selectedLayerId || (videoLayers.length > 0 ? videoLayers[0].id : null);
-    if (!layerId) {
-        // 没有可用图层时，禁用开关并显示提示
-        toggle.disabled = true;
-        return;
-    }
-    
-    try {
-        const response = await apiGet(`/layers/${layerId}`);
-        if (response != null) {
-            toggle.disabled = false;
-            toggle.checked = response.effect_linked_slices || false;
-        } else {
-            // 图层不存在时，禁用开关
-            toggle.disabled = true;
-        }
-    } catch (error) {
-        console.error('[EffectControl] 获取效果关联切片状态失败:', error);
-        // 发生错误时，禁用开关
-        toggle.disabled = true;
+    // 学习进度；仅在“学习中 → 已结束”时刷新一次配置。
+    const fill = document.getElementById('ar-learn-fill');
+    const btn = document.getElementById('ar-learn-btn');
+    const wasLearning = audioReactiveLearningActive;
+    audioReactiveLearningActive = Boolean(learn?.learning);
+    if (learn && fill) fill.style.width = Math.round((learn.progress || 0) * 100) + '%';
+    if (learn && btn) btn.textContent = learn.learning ? '⏹ 停止学习' : '▶ 学习当前曲风（30s）';
+    if (learn && wasLearning && !audioReactiveLearningActive && (learn.progress || 0) >= 1) {
+        audioReactiveConfigCache = await apiGet('/audio-reactive/config', {
+            timeoutMs: 3000,
+            retries: 0,
+            silent: true
+        });
+        if (audioReactiveConfigCache) renderAudioReactiveConfigSliders();
     }
 }
 

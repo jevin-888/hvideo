@@ -1,10 +1,11 @@
+#include "foundation/VideoStorage.h"
 #include "HttpServer_Internal.h"
 #include "database/MaterialIndex.h"
 #include "utils/Logger.h"
 #include "utils/FileUtils.h"
 #include "utils/JsonUtils.h"
 #include "utils/SystemUtils.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "database/PlaylistManager.h"
 #include "network/PreviewStreamConverter.h"
 #include "decoder/frame/FrameTypes.h"
@@ -12,6 +13,10 @@
 #include <thread>
 #include <cctype>
 #include <algorithm>
+#include <limits>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -72,16 +77,24 @@ void HttpServer::Impl::handleSSEConnection(int clientSocket) {
     responseHeader << "\r\n";
 
     std::string headerStr = responseHeader.str();
-    ssize_t sent = send(clientSocket, headerStr.c_str(), headerStr.length(), 0);
-    if (sent < 0) {
+    if (!sendResponseData(clientSocket, std::vector<char>(headerStr.begin(), headerStr.end()))) {
       LOG_ERROR("Failed to send SSE header");
-      closeActiveClientSocket(clientSocket);
       return;
     }
 
     // 发送初始连接消息
     std::string initMessage = ": connected\n\n";
-    send(clientSocket, initMessage.c_str(), initMessage.length(), 0);
+    if (!sendResponseData(clientSocket, std::vector<char>(initMessage.begin(), initMessage.end()))) return;
+
+    struct SseRegistration {
+      std::mutex& mutex;
+      std::vector<int>& clients;
+      int socket;
+      ~SseRegistration() {
+        std::lock_guard<std::mutex> lock(mutex);
+        clients.erase(std::remove(clients.begin(), clients.end(), socket), clients.end());
+      }
+    } registration{sseClientsMutex_, sseClients_, clientSocket};
 
     // 将客户端添加到SSE客户端列表
     {
@@ -101,7 +114,8 @@ void HttpServer::Impl::handleSSEConnection(int clientSocket) {
 
     while (isRunning_) {
       int ret = poll(&pfd, 1, pollTimeoutMs);
-      if (ret > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+      if (ret > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) break;
+      if (ret > 0 && (pfd.revents & POLLIN)) {
         // 客户端发数据或断开，尝试读取确认
         char buf[64];
         ssize_t n = recv(clientSocket, buf, sizeof(buf), MSG_DONTWAIT);
@@ -111,6 +125,7 @@ void HttpServer::Impl::handleSSEConnection(int clientSocket) {
         }
         // SSE 是单向的，忽略客户端发来的数据
       } else if (ret < 0) {
+        if (errno == EINTR) continue;
         // poll 出错
         break;
       }
@@ -121,9 +136,10 @@ void HttpServer::Impl::handleSSEConnection(int clientSocket) {
       if (elapsedMs >= heartbeatIntervalSeconds * 1000) {
         elapsedMs = 0;
         std::string heartbeat = ": heartbeat\n\n";
+        std::lock_guard<std::mutex> lock(sseClientsMutex_);
         ssize_t result = send(clientSocket, heartbeat.c_str(),
-                              heartbeat.length(), MSG_NOSIGNAL);
-        if (result < 0) {
+                              heartbeat.length(), MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (result != static_cast<ssize_t>(heartbeat.length())) {
           break;
         }
       }
@@ -131,21 +147,15 @@ void HttpServer::Impl::handleSSEConnection(int clientSocket) {
 
     // 从客户端列表中移除
     size_t remainingClients = 0;
-    bool alreadyClosed = false;
     {
       std::lock_guard<std::mutex> lock(sseClientsMutex_);
       auto it = std::find(sseClients_.begin(), sseClients_.end(), clientSocket);
       if (it != sseClients_.end()) {
         sseClients_.erase(it);
-      } else {
-        alreadyClosed = true;
       }
       remainingClients = sseClients_.size();
     }
 
-    if (!alreadyClosed) {
-      closeActiveClientSocket(clientSocket);
-    }
     LOG_DEBUG("SSE client disconnected, remaining clients: %zu",
              remainingClients);
   }
@@ -274,8 +284,8 @@ void HttpServer::Impl::handleMaterialVideoStream(int clientSocket, const HttpReq
       contentType = "application/octet-stream";
     } else {
       std::string ext = path.substr(path.find_last_of('.'));
-      std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-      if (ext == ".mp4" || ext == ".m4v") {
+      std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (ext == ".hvideo" || ext == ".mp4" || ext == ".m4v") {
         contentType = "video/mp4";
       } else if (ext == ".webm") {
         contentType = "video/webm";
@@ -374,6 +384,15 @@ void HttpServer::Impl::handleMaterialVideoStream(int clientSocket, const HttpReq
 void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest &headerRequest,
                             const std::vector<char> &headerData,
                             size_t headerEndPos) {
+    struct UploadCleanup {
+      std::string path;
+      ~UploadCleanup() {
+        if (!path.empty()) {
+          std::error_code error;
+          fs::remove(path, error);
+        }
+      }
+    } uploadCleanup;
     try {
       // 从查询参数获取文件名和类型
       std::string filename = headerRequest.getQueryParam("filename");
@@ -383,14 +402,24 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
 
       if (filename.empty()) {
         sendErrorResponse(clientSocket, 400, "Missing filename parameter");
-        closeActiveClientSocket(clientSocket);
         return;
       }
       if (!isSafeUploadPathPart(filename, true) ||
           !isSafeUploadPathPart(targetFolder, false) ||
           !isSafeUploadPathPart(folderName, false)) {
         sendErrorResponse(clientSocket, 400, "Invalid upload path");
-        closeActiveClientSocket(clientSocket);
+        return;
+      }
+
+      std::string storage = headerRequest.getQueryParam("storage");
+      if (storage.empty()) storage = "internal";
+      if (!hsvj::videoStorage::validSelection(storage) ||
+          (storage == "sata" && type != "video")) {
+        sendErrorResponse(clientSocket, 400, "无效的存储位置，SATA 仅支持视频上传");
+        return;
+      }
+      if (storage == "sata" && !hsvj::videoStorage::sataWritable()) {
+        sendErrorResponse(clientSocket, 503, "SATA 硬盘未挂载、只读或没有写入权限，请检查硬盘");
         return;
       }
 
@@ -398,28 +427,35 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
       std::string contentLengthStr = headerRequest.getHeader("Content-Length");
       if (contentLengthStr.empty()) {
         sendErrorResponse(clientSocket, 400, "Missing Content-Length header");
-        closeActiveClientSocket(clientSocket);
         return;
       }
 
       size_t contentLength = 0;
-      try {
-        contentLength = std::stoull(contentLengthStr);
-      } catch (const std::exception &e) {
+      if (!headerRequest.getContentLength(contentLength)) {
         sendErrorResponse(clientSocket, 400, "Invalid Content-Length header");
-        closeActiveClientSocket(clientSocket);
         return;
       }
 
-      std::string baseDir = materialUploadBaseDir(type);
+      constexpr uint64_t MAX_UPLOAD_BYTES = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+      constexpr size_t DISK_RESERVE_BYTES = 200ULL * 1024ULL * 1024ULL;
+      if (contentLength > MAX_UPLOAD_BYTES ||
+          contentLength > std::numeric_limits<size_t>::max() - DISK_RESERVE_BYTES) {
+        sendErrorResponse(clientSocket, 413, "Upload body too large");
+        return;
+      }
+      if (headerEndPos > headerData.size() ||
+          headerData.size() - headerEndPos > contentLength) {
+        sendErrorResponse(clientSocket, 400, "Invalid upload body length");
+        return;
+      }
+
+      std::string baseDir = storage == "sata" ? hsvj::videoStorage::sataRoot : materialUploadBaseDir(type);
       if (baseDir.empty()) {
         sendErrorResponse(clientSocket, 500, "ROOT_PATH is not initialized");
-        closeActiveClientSocket(clientSocket);
         return;
       }
 
       // 磁盘容量保护：检查目标分区可用空间是否足够
-      constexpr size_t DISK_RESERVE_BYTES = 200 * 1024 * 1024; // 保留 200MB 安全余量
       try {
         fs::path checkPath(baseDir);
         if (!fs::exists(checkPath)) {
@@ -441,11 +477,12 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
           diskResponse.setJson(apiErrorJson("DISK_SPACE_INSUFFICIENT", msg));
           std::vector<char> respData = diskResponse.build();
           send(clientSocket, respData.data(), respData.size(), 0);
-          closeActiveClientSocket(clientSocket);
           return;
         }
       } catch (const std::exception &e) {
-        LOG_WARN("Failed to check disk space (upload continues): %s", e.what());
+        LOG_WARN("Failed to check disk space: %s", e.what());
+        sendErrorResponse(clientSocket, 507, std::string("无法写入目标存储或读取剩余空间: ") + e.what());
+        return;
       }
 
       // 确定保存路径
@@ -461,6 +498,11 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
       fs::path savePathObj(savePath);
       fs::path normalizedParentDir = savePathObj.parent_path();
 
+      if (storage == "sata" && !hsvj::videoStorage::safeSataPath((fs::path(hsvj::videoStorage::sataRoot) / fs::path(relativePath).parent_path()).string())) {
+        sendErrorResponse(clientSocket, 400, "硬盘已断开或上传目录超出视频目录");
+        return;
+      }
+
       // 确保目录存在（包括所有父目录）
       try {
         if (!fs::exists(normalizedParentDir) ||
@@ -475,31 +517,46 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
         sendErrorResponse(clientSocket, 500,
                           std::string("Failed to create directory: ") +
                               e.what());
-        closeActiveClientSocket(clientSocket);
         return;
       }
 
-      // 检查文件是否存在，如果存在则删除（覆盖）
-      if (fs::exists(savePath)) {
-        try {
-          fs::remove(savePath);
-          LOG_DEBUG("覆盖已存在的文件: %s", savePath.c_str());
-        } catch (const std::exception &e) {
-          LOG_ERROR("删除已存在文件失败: %s: %s", savePath.c_str(), e.what());
-          sendErrorResponse(clientSocket, 500,
-                            std::string("Failed to remove existing file: ") +
-                                e.what());
-          closeActiveClientSocket(clientSocket);
-          return;
-        }
+      // Reject symlinked destination folders that escape the configured root.
+      std::error_code pathError;
+      const fs::path canonicalBase = fs::weakly_canonical(fs::path(baseDir), pathError);
+      if (pathError) throw fs::filesystem_error("Cannot resolve upload root", pathError);
+      const fs::path canonicalParent = fs::weakly_canonical(normalizedParentDir, pathError);
+      if (pathError) throw fs::filesystem_error("Cannot resolve upload parent", pathError);
+      const fs::path relativeParent = canonicalParent.lexically_relative(canonicalBase);
+      const bool escaped = relativeParent.empty() || relativeParent.is_absolute() ||
+                           *relativeParent.begin() == "..";
+      if (canonicalBase.empty() || canonicalParent.empty() || escaped) {
+        sendErrorResponse(clientSocket, 400, "Invalid upload destination");
+        return;
       }
 
-      // 打开文件进行写入（使用trunc标志确保覆盖）
-      std::ofstream outFile(savePath, std::ios::binary | std::ios::trunc);
+      savePath = (canonicalParent / savePathObj.filename()).string();
+      const std::string tempTemplate = savePath + ".uploading.XXXXXX";
+      std::vector<char> tempName(tempTemplate.begin(), tempTemplate.end());
+      tempName.push_back('\0');
+      const int tempFd = mkstemp(tempName.data());
+      if (tempFd < 0) {
+        sendErrorResponse(clientSocket, 500, std::string("无法创建上传文件: ") + strerror(errno));
+        return;
+      }
+      const std::string tempPath(tempName.data());
+      uploadCleanup.path = tempPath;
+
+      // 写入临时文件，完整接收并校验后再原子替换目标，避免中断上传
+      // 删除或破坏之前已经可用的素材。
+      std::unique_ptr<FILE, decltype(&std::fclose)> outFile(fdopen(tempFd, "wb"), &std::fclose);
       if (!outFile) {
-        LOG_ERROR("Failed to create file: %s", savePath.c_str());
+        close(tempFd);
+        LOG_ERROR("Failed to create file: %s", tempPath.c_str());
         sendErrorResponse(clientSocket, 500, "Failed to create file");
-        closeActiveClientSocket(clientSocket);
+        return;
+      }
+      if (fcntl(tempFd, F_SETFD, FD_CLOEXEC) < 0) {
+        sendErrorResponse(clientSocket, 500, "Failed to secure upload file");
         return;
       }
 
@@ -509,13 +566,10 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
 
       // 如果头部数据中已经包含部分请求体，先写入文件
       if (bodyToWrite > 0) {
-        outFile.write(headerData.data() + headerEndPos, bodyToWrite);
-        if (!outFile) {
+        if (std::fwrite(headerData.data() + headerEndPos, 1, bodyToWrite, outFile.get()) != bodyToWrite) {
           LOG_ERROR("Failed to write initial data to file: %s",
-                    savePath.c_str());
-          outFile.close();
+                    tempPath.c_str());
           sendErrorResponse(clientSocket, 500, "Failed to write file");
-          closeActiveClientSocket(clientSocket);
           return;
         }
       }
@@ -531,7 +585,7 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
       tv.tv_usec = 0;
       setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-      while (bodyReceived < contentLength) {
+      while (isRunning_ && bodyReceived < contentLength) {
         size_t remaining = contentLength - bodyReceived;
         size_t toRead = std::min(buffer.size(), remaining);
 
@@ -545,12 +599,11 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
           } else {
             // 读取错误
             int recvErrno = errno;
+            if (recvErrno == EINTR) continue;
             if (recvErrno == EAGAIN || recvErrno == EWOULDBLOCK) {
-              // 超时，继续尝试
               LOG_WARN(
-                  "Upload read timeout, continuing... (received %zu/%zu bytes)",
+                  "Upload read timeout (received %zu/%zu bytes)",
                   bodyReceived, contentLength);
-              continue;
             } else {
               LOG_ERROR("Failed to read upload data: errno=%d (%s)", recvErrno,
                         strerror(recvErrno));
@@ -560,9 +613,9 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
         }
 
         // 写入文件
-        outFile.write(buffer.data(), bytesRead);
-        if (!outFile) {
-          LOG_ERROR("Failed to write data to file: %s", savePath.c_str());
+        if (std::fwrite(buffer.data(), 1, static_cast<size_t>(bytesRead), outFile.get()) !=
+            static_cast<size_t>(bytesRead)) {
+          LOG_ERROR("Failed to write data to file: %s", tempPath.c_str());
           break;
         }
 
@@ -570,19 +623,32 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
         totalWritten += bytesRead;
       }
 
-      outFile.close();
+      bool writeOk = std::fflush(outFile.get()) == 0;
+      int writeError = writeOk ? 0 : errno;
+      if (writeOk && !hsvj::videoStorage::syncUpload(tempFd, storage == "sata")) {
+        writeOk = false;
+        writeError = errno;
+      }
+      if (std::fclose(outFile.release()) != 0) {
+        if (writeOk) writeError = errno;
+        writeOk = false;
+      }
 
       // 检查是否完整接收
-      if (bodyReceived < contentLength) {
+      if (bodyReceived != contentLength || !writeOk) {
         LOG_ERROR("Upload incomplete: received %zu/%zu bytes, file: %s",
-                  bodyReceived, contentLength, savePath.c_str());
+                  bodyReceived, contentLength, tempPath.c_str());
         // 删除不完整的文件
         try {
-          fs::remove(savePath);
+          fs::remove(tempPath);
         } catch (...) {
         }
-        sendErrorResponse(clientSocket, 500, "Upload incomplete");
-        closeActiveClientSocket(clientSocket);
+        sendErrorResponse(clientSocket, 500, writeError ? std::string("保存上传文件失败: ") + strerror(writeError) : "上传未完成，请检查网络后重试");
+        return;
+      }
+
+      if (storage == "sata" && !hsvj::videoStorage::safeSataPath(savePath)) {
+        sendErrorResponse(clientSocket, 503, "上传期间硬盘已断开，请重新连接后重试");
         return;
       }
 
@@ -595,21 +661,21 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
         size_t dotPos = savePath.rfind('.');
         if (dotPos != std::string::npos) {
           ext = savePath.substr(dotPos);
-          std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+          std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         }
 
         // 只检查视频文件扩展名
-        bool isVideoFile = (ext == ".mp4" || ext == ".mkv" || ext == ".avi" ||
+        bool isVideoFile = (ext == ".hvideo" || ext == ".mp4" || ext == ".mkv" || ext == ".avi" ||
                             ext == ".mov" || ext == ".mpg" || ext == ".mpeg" ||
                             ext == ".webm" || ext == ".flv" || ext == ".wmv");
 
         if (isVideoFile) {
-          LOG_DEBUG("检查上传视频的格式支持: %s", savePath.c_str());
+          LOG_DEBUG("检查上传视频的格式支持: %s", tempPath.c_str());
 
           std::string detectedFormat = "";
           std::string errorCode = "";
           bool isFormatSupported = hsvj::MediaUtils::checkVideoFormatSupport(
-              savePath, detectedFormat, errorCode);
+              tempPath, detectedFormat, errorCode);
 
           if (!isFormatSupported) {
             // 格式不兼容：保留文件，但在响应中附带警告信息
@@ -629,8 +695,16 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
             }
 
             LOG_WARN("上传了格式不兼容的视频 (已保留文件): %s (代码: %s, 格式: %s)",
-                      savePath.c_str(), errorCode.c_str(),
+                      tempPath.c_str(), errorCode.c_str(),
                       detectedFormat.c_str());
+            std::error_code renameError;
+            fs::rename(tempPath, savePath, renameError);
+            if (renameError) {
+              fs::remove(tempPath);
+              sendErrorResponse(clientSocket, 500, "Failed to publish uploaded file");
+              return;
+            }
+            uploadCleanup.path.clear();
             if (materialIndex_) materialIndex_->upsertFile(savePath);
 
             // 上传成功但附带警告
@@ -649,12 +723,20 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
             warnResponse.setJson(jsonStr);
 
             std::vector<char> responseData = warnResponse.build();
-            send(clientSocket, responseData.data(), responseData.size(), 0);
-            closeActiveClientSocket(clientSocket);
+            sendResponseData(clientSocket, responseData);
             return;
           }
         }
       }
+
+      std::error_code renameError;
+      fs::rename(tempPath, savePath, renameError);
+      if (renameError) {
+        fs::remove(tempPath);
+        sendErrorResponse(clientSocket, 500, "Failed to publish uploaded file");
+        return;
+      }
+      uploadCleanup.path.clear();
 
       // 上传成功，发送JSON响应
       Json::Value data;
@@ -671,32 +753,7 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
 
       std::vector<char> responseData = response.build();
 
-      // 确保完整发送响应（处理部分发送的情况）
-      size_t totalSent = 0;
-      const char *dataPtr = responseData.data();
-      size_t remaining = responseData.size();
-
-      while (totalSent < responseData.size()) {
-        ssize_t sent = send(clientSocket, dataPtr + totalSent, remaining, 0);
-        if (sent < 0) {
-          int sendErrno = errno;
-          if (sendErrno == EPIPE || sendErrno == ECONNRESET) {
-            LOG_DEBUG("Client disconnected while sending upload response");
-          } else if (sendErrno == EAGAIN || sendErrno == EWOULDBLOCK) {
-            // 临时错误，稍后重试
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
-          } else {
-            LOG_WARN("Failed to send upload response: errno=%d (%s)", sendErrno,
-                     strerror(sendErrno));
-          }
-          break;
-        }
-        totalSent += sent;
-        remaining -= sent;
-      }
-
-      if (totalSent == responseData.size()) {
+      if (sendResponseData(clientSocket, responseData)) {
         LOG_DEBUG("File uploaded successfully: %s (%zu bytes)", savePath.c_str(),
                  totalWritten);
 
@@ -709,9 +766,6 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
                 this->broadcastSSEMessage(event, data);
               });
         }
-      } else {
-        LOG_WARN("Partially sent upload response: %zu/%zu bytes", totalSent,
-                 responseData.size());
       }
 
     } catch (const std::exception &e) {
@@ -731,8 +785,6 @@ void HttpServer::Impl::handleMaterialUpload(int clientSocket, const HttpRequest 
       }
     }
 
-    // 确保关闭连接
-    closeActiveClientSocket(clientSocket);
   }
 
 void HttpServer::Impl::handleRequest(HttpRequest &request, HttpResponse &response) {
@@ -742,6 +794,30 @@ void HttpServer::Impl::handleRequest(HttpRequest &request, HttpResponse &respons
     // 路径无前导 / 时补上，与路由注册格式一致
     if (!path.empty() && path[0] != '/') {
       path = "/" + path;
+    }
+
+    // 默认 HTTP 地址上的手机融合页复用 8081 API；只允许本设备页面跨端口访问。
+    if (port_ == 8081 && path.find("/api/v1/") == 0) {
+      const std::string origin = request.getHeader("Origin");
+      std::string host = request.getHeader("Host");
+      const std::string portSuffix = ":8081";
+      if (host.size() > portSuffix.size() &&
+          host.compare(host.size() - portSuffix.size(), portSuffix.size(), portSuffix) == 0) {
+        host.resize(host.size() - portSuffix.size());
+      }
+      if (!host.empty() &&
+          (origin == "http://" + host || origin == "http://" + host + ":8080")) {
+        response.setHeader("Access-Control-Allow-Origin", origin);
+        response.setHeader("Vary", "Origin");
+        if (method == "OPTIONS") {
+          response.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+          response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+          response.setStatusCode(204);
+          response.setStatusMessage("No Content");
+          response.setBody("");
+          return;
+        }
+      }
     }
 
     // 检查是否是API请求
@@ -808,9 +884,9 @@ void HttpServer::Impl::handleApiRequest(const std::string &method, const std::st
     }
 
     // Web界面认证检查（非9898端口）
-    if (port_ != 9898) {
+    if (port_ != 9898 || normalizedPath == "/api/v1/system/factory-serial") {
       // 登录接口不需要认证
-      if (normalizedPath != "/api/v1/auth/login" && normalizedPath != "/api/v1/auth/logout" && normalizedPath != "/api/v1/auth/validate") {
+      if (normalizedPath != "/api/v1/auth/config" && normalizedPath != "/api/v1/auth/login" && normalizedPath != "/api/v1/auth/logout" && normalizedPath != "/api/v1/auth/validate") {
         if (!isAuthenticated(request)) {
           response.setStatusCode(401);
           response.setStatusMessage("Unauthorized");
@@ -821,10 +897,9 @@ void HttpServer::Impl::handleApiRequest(const std::string &method, const std::st
       }
     }
 
-    // 9898 点歌端口（VOD/KTV）：要求请求头带 _uname、clientId 认证，与前端 auth 一致
+    // 9898 点歌端口（VOD/KTV）：保留现有 pad 协议白名单；其他路由必须
+    // 通过统一的兼容头校验，避免认证规则在不同处理路径重复实现。
     static const int VOD_KTV_PORT = 9898;
-    static const std::string AUTH_UNAME = "5";
-    static const std::string AUTH_CLIENT_ID = "8";
     const bool isPadApi =
         normalizedPath.find("/api/v1/songdb/") == 0 ||
         normalizedPath.find("/api/v1/rooms/") == 0 ||
@@ -847,13 +922,12 @@ void HttpServer::Impl::handleApiRequest(const std::string &method, const std::st
                port_, method.c_str(), normalizedPath.c_str(), body.c_str());
     }
     if (port_ == VOD_KTV_PORT && !isPadApi) {
-      std::string uname = request.getHeader("_uname");
-      std::string clientId = request.getHeader("clientid");
-      if (uname != AUTH_UNAME || clientId != AUTH_CLIENT_ID) {
+      if (!isVodClientAuthenticated(request)) {
         if (!isArtistImageApi) {
           LOG_WARN("[PadAPI] unauthorized port=%d method=%s path=%s uname=%s clientid=%s",
-                   port_, method.c_str(), normalizedPath.c_str(), uname.c_str(),
-                   clientId.c_str());
+                   port_, method.c_str(), normalizedPath.c_str(),
+                   request.getHeader("_uname").c_str(),
+                   request.getHeader("clientid").c_str());
         }
         response.setStatusCode(401);
         response.setStatusMessage("Unauthorized");
@@ -934,6 +1008,11 @@ void HttpServer::Impl::handleApiRequest(const std::string &method, const std::st
 
 void HttpServer::Impl::handleStaticRequest(const std::string &path, HttpResponse &response) {
     std::string pathDecoded = urlDecodePath(path);
+    // 兼容已打开或收藏的旧登录地址，回到手机控制主页。
+    if (port_ == 8081 && pathDecoded == "/login.html") {
+      response.setRedirect("/");
+      return;
+    }
     std::string normalizedPath = pathDecoded;
     std::string baseDir = staticDir_;
 
@@ -1050,6 +1129,7 @@ void HttpServer::Impl::handleStaticRequest(const std::string &path, HttpResponse
            fullPathStr.compare(0, baseDirStr.length(), baseDirStr) == 0);
 
       // Windows 下路径大小写可能不一致，导致误判 403；再做一次不区分大小写的前缀比较
+#ifdef _WIN32
       if (!isWithinBase && fullPathStr.length() >= baseDirStr.length()) {
         auto ciEqual = [](char a, char b) {
           return std::tolower(static_cast<unsigned char>(a)) ==
@@ -1058,6 +1138,7 @@ void HttpServer::Impl::handleStaticRequest(const std::string &path, HttpResponse
         isWithinBase = std::equal(baseDirStr.begin(), baseDirStr.end(),
                                   fullPathStr.begin(), ciEqual);
       }
+#endif
 
       if (!isWithinBase) {
         LOG_DEBUG("Path check failed - baseDir=%s (len=%zu), fullPath=%s "
@@ -1082,41 +1163,11 @@ void HttpServer::Impl::handleStaticRequest(const std::string &path, HttpResponse
         filePath = canonicalFullPath.string();
       }
     } catch (const fs::filesystem_error &e) {
-      // 如果路径处理失败，进行基本的路径安全检查
-      LOG_WARN("Failed to canonicalize path: %s, using original path with "
-               "basic safety check",
-               e.what());
-
-      // 即使规范化失败，也要进行基本的路径检查（使用统一的辅助函数）
-      std::string baseDirStr =
-          fs::absolute(baseDir).lexically_normal().string();
-      std::string fullPathStr =
-          fs::absolute(fullPath).lexically_normal().string();
-
-      // 规范化路径字符串：统一使用正斜杠，目录路径添加末尾斜杠
-      normalizePathStringForDir(baseDirStr);
-      normalizePathString(fullPathStr);
-
-      // 检查路径是否在基础目录内（含不区分大小写回退）
-      bool isWithinBase =
-          (fullPathStr.length() >= baseDirStr.length() &&
-           fullPathStr.compare(0, baseDirStr.length(), baseDirStr) == 0);
-      if (!isWithinBase && fullPathStr.length() >= baseDirStr.length()) {
-        auto ciEqual = [](char a, char b) {
-          return std::tolower(static_cast<unsigned char>(a)) ==
-                 std::tolower(static_cast<unsigned char>(b));
-        };
-        isWithinBase = std::equal(baseDirStr.begin(), baseDirStr.end(),
-                                  fullPathStr.begin(), ciEqual);
-      }
-      if (!isWithinBase) {
-        LOG_WARN("Path traversal attempt detected in exception handler: "
-                 "base=%s, full=%s, normalized=%s",
-                 baseDirStr.c_str(), fullPathStr.c_str(),
-                 normalizedPath.c_str());
-      }
-
-      filePath = fullPath.string();
+      LOG_WARN("Failed to resolve static path: %s", e.what());
+      response.setStatusCode(403);
+      response.setStatusMessage("Forbidden");
+      response.setText("Unable to validate static path");
+      return;
     }
 
     // 检查静态目录是否存在

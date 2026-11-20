@@ -9,7 +9,7 @@
 
 #include "layer/LayerText.h"
 #include "lyric/SharedLibassHolder.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "lyric/LyricRenderer.h"
 #include "renderer/VulkanRenderer.h"
 #include "text/VulkanTextOverlayBridge.h"
@@ -435,8 +435,10 @@ void LayerText::render() {
 
     renderer_->setLayerClipRect(position_.x, position_.y, w, h);
     if (bgColor_.a > 0.01f && layer40BgTextureId_ != 0) {
+      applyContentCrop(layer40BgTextureId_);
       renderer_->renderLayerWithColor(layer40BgTextureId_, position_.x, position_.y, w, h, rot, scl, bgColor_.r, bgColor_.g, bgColor_.b, alpha * bgColor_.a);
     }
+    applyContentCrop(tid);
     renderer_->renderLayer(tid, drawX, drawY, drawW, drawH, rot, scl, alpha);
     renderer_->clearLayerClipRect();
   }
@@ -454,7 +456,7 @@ void LayerText::renderSlice(int sliceX, int sliceY, int sliceWidth, int sliceHei
 
   if (layerId_ == 41 && messageHintRenderer_ && messageHintRenderer_->isInitialized()) {
     messageHintRenderer_->setDisplayAlign(displayAlign_);
-    messageHintRenderer_->render(renderer_, sliceX, sliceY, sliceWidth, sliceHeight, sliceAlpha, displayAlign_);
+    messageHintRenderer_->render(renderer_, sliceX, sliceY, sliceWidth, sliceHeight, sliceAlpha, displayAlign_, true);
     return;
   }
 
@@ -490,8 +492,10 @@ void LayerText::renderSlice(int sliceX, int sliceY, int sliceWidth, int sliceHei
 
     renderer_->setLayerClipRect(sliceX, sliceY, sliceWidth, sliceHeight);
     if (sliceBgColor.a > 0.01f && layer40BgTextureId_ != 0) {
+      applyContentCrop(layer40BgTextureId_);
       renderer_->renderLayerWithColor(layer40BgTextureId_, sliceX, sliceY, sliceWidth, sliceHeight, sliceRotation, sliceScale, sliceBgColor.r, sliceBgColor.g, sliceBgColor.b, sliceAlpha * sliceBgColor.a, sliceShapeType, sliceShapeParam, false, sliceInvert);
     }
+    applyContentCrop(tid);
     renderer_->renderLayer(tid, drawX, drawY, drawW, drawH, sliceRotation, sliceScale, sliceAlpha, nullptr, sliceShapeType, sliceShapeParam, sliceBlackToTransparent, sliceInvert, sliceGaussianBlur);
     renderer_->clearLayerClipRect();
   }

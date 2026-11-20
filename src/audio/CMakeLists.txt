@@ -37,3 +37,8 @@ else()
         ${PROJECT_ROOT}/include
     )
 endif()
+
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_audio PRIVATE
+    hsvj_utils
+)

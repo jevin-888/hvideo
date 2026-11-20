@@ -20,6 +20,43 @@
 
 namespace hsvj {
 
+namespace {
+bool writeAllSerialBytes(int fd, const uint8_t* data, size_t size) {
+    size_t offset = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (offset < size) {
+        const ssize_t written = ::write(fd, data + offset, size - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR) continue;
+        if (written == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return false;
+            const int remainingMs = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+            pollfd pfd{fd, POLLOUT, 0};
+            int pollResult;
+            do {
+                pollResult = poll(&pfd, 1, remainingMs);
+            } while (pollResult < 0 && errno == EINTR);
+            if (pollResult <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+
+    int drainResult;
+    do {
+        drainResult = tcdrain(fd);
+    } while (drainResult < 0 && errno == EINTR);
+    return drainResult == 0;
+}
+} // namespace
+
 // Modbus 自定义功能码：JSON 命令扩展
 constexpr uint8_t MODBUS_FUNC_JSON_COMMAND = 0x64;
 
@@ -32,7 +69,8 @@ Rs485Server::~Rs485Server() {
     stop();
 }
 
-bool Rs485Server::start() {
+bool Rs485Server::start(bool startReader) {
+    std::lock_guard<std::mutex> writeLock(writeMutex_);
     if (isRunning_) return true;
 
     fd_ = open(device_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -92,20 +130,25 @@ bool Rs485Server::start() {
     }
 
     isRunning_ = true;
-    readThread_ = std::thread(rawFrameCallback_ ? &Rs485Server::readRawLoop
-                                                : &Rs485Server::readLoop,
-                              this);
+    if (startReader) {
+        readThread_ = std::thread(rawFrameCallback_ ? &Rs485Server::readRawLoop
+                                                    : &Rs485Server::readLoop,
+                                  this);
+    }
 
     LOG_DEBUG("Rs485Server started on %s @ %d bps (Slave ID: %d)", device_.c_str(), baudRate_, slaveId_);
     return true;
 }
 
 void Rs485Server::stop() {
-    if (!isRunning_) return;
-    isRunning_ = false;
-    if (fd_ >= 0) {
-        close(fd_);
-        fd_ = -1;
+    {
+        std::lock_guard<std::mutex> writeLock(writeMutex_);
+        if (!isRunning_ && fd_ < 0) return;
+        isRunning_ = false;
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
     }
     if (readThread_.joinable()) readThread_.join();
 }
@@ -204,7 +247,11 @@ void Rs485Server::readRawLoop() {
     };
 
     while (isRunning_) {
-        setFdDirection(false);
+        {
+            std::lock_guard<std::mutex> writeLock(writeMutex_);
+            if (fd_ < 0) break;
+            setFdDirection(false);
+        }
         if (fd_ < 0) break;
 
         struct pollfd pfd = {fd_, POLLIN, 0};
@@ -239,14 +286,18 @@ void Rs485Server::readRawLoop() {
 }
 
 bool Rs485Server::writeRaw(const std::vector<uint8_t>& data) {
-    if (fd_ < 0) return false;
-    
-    setFdDirection(true); // 说明：切换到发送模式
-    ssize_t written = ::write(fd_, data.data(), data.size());
-    tcdrain(fd_);          // 等待 for send 缓冲区 to empty
-    setFdDirection(false); // 说明：切回接收模式
-    
-    return written == (ssize_t)data.size();
+    if (data.empty()) return true;
+    std::lock_guard<std::mutex> writeLock(writeMutex_);
+    if (fd_ < 0 || !isRunning_) return false;
+
+    setFdDirection(true);
+    const bool ok = writeAllSerialBytes(fd_, data.data(), data.size());
+    setFdDirection(false);
+    if (!ok) {
+        LOG_WARN("Rs485Server: Failed to write %zu bytes to %s: %s",
+                 data.size(), device_.c_str(), strerror(errno));
+    }
+    return ok;
 }
 
 uint16_t Rs485Server::calculateCRC(const uint8_t* data, size_t len) {

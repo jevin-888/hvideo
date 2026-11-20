@@ -2,6 +2,7 @@
 #define HTTPSERVER_H
 
 #include <functional>
+#include <future>
 #include <json/json.h>
 #include <memory>
 #include <mutex>
@@ -40,6 +41,8 @@ public:
   bool start();
   // 停止服务器
   void stop();
+  // Schedule work whose callbacks access this server; tasks are joined by stop().
+  void launchBackgroundTask(std::function<void()> task);
   // 设置静态文件目录
   void setStaticDir(const std::string &dir);
   /** 设置 /shared/ 路径对应的静态目录（KTV/VOD 共用 web/shared），空则不解析 /shared/ */
@@ -130,7 +133,6 @@ private:
   void registerEffectRoutes();      // 特效管理
   void registerAudioEffectRoutes(); // 音频效果联动
   void registerDmxRoutes();         // DMX512监控
-  void initializeEffectServices();  // 授权就绪后初始化特效服务
 
   // 检查commandRouter是否初始化，如果未初始化则设置错误响应
   bool checkCommandRouter(HttpResponse &response);
@@ -190,6 +192,7 @@ private:
   bool checkPlaylistManager(HttpResponse &response);
   // 检查SystemConfig是否初始化
   bool checkSystemConfig(HttpResponse &response);
+  bool checkModuleLicense(const std::string &module, HttpResponse &response);
   // 确保目录存在
   bool ensureDirectoryExists(const std::string &dir, HttpResponse &response);
 
@@ -200,6 +203,7 @@ private:
   void startVideoProgressBroadcast();
   void stopVideoProgressBroadcast();
   void videoProgressBroadcastLoop();
+  void waitBackgroundTasks();
   Json::Value buildVideoLayerStatus(hsvj::LayerVideo *videoLayer) const;
   Json::Value buildVideoStatusPayload(const std::vector<int> &layerIds,
                                       const std::string &action = "progress") const;
@@ -223,10 +227,16 @@ private:
   hsvj::SystemConfig *systemConfig_ = nullptr;
   hsvj::Engine *engine_ = nullptr;
 
+  // Serializes the full config.json save transaction across HTTP workers.
+  std::mutex configSaveMutex_;
+
   std::atomic<bool> videoProgressBroadcastRunning_{false};
   std::thread videoProgressBroadcastThread_;
   std::mutex videoProgressBroadcastMutex_;
   std::condition_variable videoProgressBroadcastCv_;
+
+  std::mutex backgroundTasksMutex_;
+  std::vector<std::future<void>> backgroundTasks_;
 
   // 转码状态（线程安全）
   std::mutex transcodeMutex_;

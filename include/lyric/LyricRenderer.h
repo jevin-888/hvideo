@@ -6,6 +6,7 @@
 #include "renderer/VulkanRenderer.h"
 #include <ass.h>
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -51,7 +52,7 @@ public:
   bool initialize();
   void shutdown();
 
-  bool load(const std::string &path);
+  bool load(const std::string &path, const std::string &assData = "");
   void loadSubtitle(const std::string &path) { (void)load(path); }
   void unload();
   void dropStaleGpuTextureHandlesAfterDeviceLost();
@@ -67,13 +68,20 @@ public:
   void setSharedLibassHolder(SharedLibassHolder *holder);
   void setLayerId(int layerId);
   void setDisplayMode(DisplayMode mode);
+  void setHeaderVisible(bool visible);
+  void setPinyinEnabled(bool enabled);
+  void setBackgroundVisible(bool visible);
+  void setTypography(double titleFontSize, double titleOutlineWidth,
+                     double textFontSize, double textOutlineWidth,
+                     double textSpacing);
+  void setProducerText(const std::string &text);
   DisplayMode getDisplayMode() const { return displayMode_; }
   void setListeningEffectStyle(ListeningEffectStyle style);
   ListeningEffectStyle getListeningEffectStyle() const { return listeningEffectStyle_; }
   void setDisplayMargin(const DisplayMargin &margin);
   void setDisplayMargin(int left, int right, int top, int bottom);
   DisplayMargin getDisplayMargin() const { return displayMargin_; }
-  void setHasSlices(bool hasSlices) { hasSlices_ = hasSlices; }
+  void setCompositeRequired(bool required);
 
   bool prepareFrame(VulkanRenderer *renderer, double currentTime);
   void renderFrame(VulkanRenderer *renderer, double currentTime,
@@ -83,12 +91,6 @@ public:
 
   uint32_t getCompositeTextureId() const;
   int getSubtitleCount() const;
-
-  void renderCountdownDots(VulkanRenderer *renderer, int x, int y,
-                           int dotWidth, int dotHeight, float alpha);
-  void prepareCountdownDots(VulkanRenderer *renderer, int64_t remainingMs);
-  bool getCountdownPosition(const Region &region, int &countdownX,
-                            int &countdownY, int &dotWidth, int &dotHeight);
 
   int getTopLineY() const { return topY_; }
   int getBottomLineY() const { return bottomY_; }
@@ -154,6 +156,7 @@ private:
   };
 
   int adjustSubtitleTimingAndTracks();
+  void applyHeaderVisibilityToTrack();
   bool rebuildTrackFromSubtitlePath(const StyleOverride *targetOverride = nullptr,
                                     int *targetModifiedCount = nullptr);
   int applyStyleOverridesToTrack(const StyleOverride *targetOverride = nullptr,
@@ -165,7 +168,6 @@ private:
   void resetPreparedFrameState();
   void invalidateTextureState(bool destroyGpuTexture);
   void clearPreparedTexture(VulkanRenderer *renderer, int64_t currentTimeMs);
-  bool updateCountdownState(VulkanRenderer *renderer, int64_t currentTimeMs);
   bool hasRenderableImages(ASS_Image *images) const;
   Region normalizeRegion(const Region &region) const;
   bool isValidImageSelf(ASS_Image *img) const;
@@ -174,7 +176,6 @@ private:
                     uint8_t &a) const;
   ASS_Track *currentTrack() const;
   double getLyricFontSize() const;
-  bool computeCountdownRemainingMs(int64_t currentTimeMs, int64_t &remainingMs);
   void appendMaskDrawsForRegion(const Region &contentRegion,
                                 float alphaMultiplier,
                                 bool useRoundf,
@@ -182,15 +183,14 @@ private:
   void uploadPreparedMaskTexture(VulkanRenderer *renderer) const;
   bool shouldRebuildCachedDraws(const Region &contentRegion, float alpha) const;
   void rebuildCachedDraws(const Region &contentRegion, float alpha);
-  void renderCountdownForRegion(VulkanRenderer *renderer,
-                                const Region &contentRegion,
-                                float alpha);
   void ensureEffectTexture(VulkanRenderer *renderer);
 
   mutable std::recursive_mutex initMutex_;
   std::unique_ptr<ASSRenderer> assRenderer_;
   std::string subtitlePath_;
+  std::string subtitleData_;
   std::string fontDirectory_;
+  std::string fontPath_;
   std::string appFontsDir_;
   VulkanRenderer *cachedRenderer_ = nullptr;
 
@@ -198,22 +198,28 @@ private:
   int height_ = 0;
   int layerId_ = 0;
   bool loaded_ = false;
+  bool headerVisible_ = false;
+  bool pinyinEnabled_ = false;
+  bool backgroundVisible_ = true;
+  double titleFontSize_ = 150.0;
+  double titleOutlineWidth_ = 8.0;
+  double textFontSize_ = 140.0;
+  double textOutlineWidth_ = 10.0;
+  double textSpacing_ = -10.0;
+  std::string producerText_;
   bool initialized_ = false;
   uint32_t textureId_ = 0;
-  uint32_t countdownTextureId_ = 0;
   uint32_t effectTextureId_ = 0;
   DisplayMargin displayMargin_;
   DisplayMode displayMode_ = DisplayMode::KARAOKE;
   ListeningEffectStyle listeningEffectStyle_ = ListeningEffectStyle::CLASSIC;
   bool texturePrepared_ = false;
-  bool countdownPrepared_ = false;
-  int lastCountdownVisibleCount_ = -1;
-  bool countdownUseResImage_ = false;
-  bool countdownImageTried_ = false;
-  int countdownImageWidth_ = 0;
-  int countdownImageHeight_ = 0;
-  std::vector<uint8_t> maskAtlasBuffer_;
-  std::vector<uint8_t> scratchBuffer_;
+  uint32_t maskFrameFailures_ = 0;
+  std::chrono::steady_clock::time_point maskFailureStarted_{};
+  std::unique_ptr<uint8_t[]> maskAtlasBuffer_;
+  std::unique_ptr<uint8_t[]> scratchBuffer_;
+  size_t maskAtlasCapacity_ = 0;
+  size_t scratchCapacity_ = 0;
   std::vector<MaskDraw> preparedMaskDraws_;
   std::vector<AssMaskDrawCmd> cachedDraws_;
   int lastContentX_ = -1;
@@ -224,23 +230,16 @@ private:
   uint32_t maskAtlasWidth_ = 0;
   uint32_t maskAtlasHeight_ = 0;
   bool preparedFrameUsesGpuMask_ = false;
-  std::vector<int64_t> lyricStartTimes_;
   double lyricFontSize_ = 85.0;
   int topY_ = 0;
   int bottomY_ = 0;
   int topX_ = 0;
   int bottomX_ = 0;
-  int karaokeCountdownAnchorX_ = 0;
-  int karaokeCountdownAnchorY_ = 0;
   int centerX_ = 0;
-  int cachedCountdownAnchorX_ = 0;
-  int cachedCountdownTopY_ = 0;
-  int cachedCountdownDotWidth_ = 0;
-  int cachedCountdownDotHeight_ = 0;
   std::vector<StyleOverride> styleOverrides_;
 
   int64_t lastRenderTimeMs_ = -1;
-  bool hasSlices_ = false;
+  bool compositeRequired_ = true;
 };
 
 } // 命名空间 hsvj

@@ -1,9 +1,10 @@
-﻿set(LAYER_SOURCES
+set(LAYER_SOURCES
     Layer.cpp
     LayerVideo.cpp
     LayerVideo_Playback.cpp
     LayerVideo_Render.cpp
     LayerImage.cpp
+    LayerBluetoothAudio.cpp
     LayerText.cpp
     LayerMirror.cpp
     # 说明：强制重新构建对齐修复
@@ -39,6 +40,7 @@ if(ANDROID)
 endif()
 
 target_link_libraries(hsvj_layer PUBLIC
+    hsvj_jsoncpp
     hsvj_utils      # 工具函数（日志、文件操作等）
     hsvj_decoder    # 视频解码（LayerVideo 需要）
     hsvj_capture    # 采集功能（LayerVideo 采集层需要）
@@ -56,3 +58,18 @@ target_link_libraries(hsvj_layer PUBLIC
 #   - LayerText 通过前向声明和指针使用 Lyric渲染器
 #   - 实际的依赖在链接阶段解决
 
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_layer PRIVATE
+    hsvj_audio
+    hsvj_capture
+    hsvj_core
+    hsvj_decoder
+    hsvj_effect
+    hsvj_foundation
+    hsvj_lyric
+    hsvj_playcontrol
+    hsvj_renderer
+    hsvj_text
+    hsvj_utils
+    hsvj_jsoncpp
+)

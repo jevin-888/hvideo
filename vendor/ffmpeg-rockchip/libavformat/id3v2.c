@@ -388,7 +388,7 @@ static void read_uslt(AVFormatContext *s, AVIOContext *pb, int taglen,
         goto error;
 
     // FFmpeg does not support hierarchical metadata, so concatenate the keys.
-    key = av_asprintf("lyrics-%s%s%s", descriptor[0] ? (char *)? descriptor : "",
+    key = av_asprintf("lyrics-%s%s%s", descriptor[0] ? (char *)descriptor : "",
                                        descriptor[0] ? "-" : "",
                                        lang);
     if (!key) {

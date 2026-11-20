@@ -6,16 +6,77 @@
 #include "layer/LayerMirror.h"
 #include "decoder/frame/DecodedFrame.h"
 #include "renderer/VulkanRenderer.h"
-#include "core/PathConfig.h"
+#include "renderer/SideBarDetector.h"
+#include "foundation/PathConfig.h"
 #include "text/VulkanTextOverlayBridge.h"
 #include "text/SharedTextOverlayHolder.h"
 #include "utils/Logger.h"
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
+#include <cstdint>
+#include <limits>
+
+namespace {
+constexpr float kMirrorHintMaxFontSize = 32.0f;
+constexpr float kMirrorHintMinFontSize = 12.0f;
+constexpr int kMirrorHintMultilineWidth = 720;
+
+int mirrorHintPadding(int width, int height) {
+  return std::clamp(std::min(width, height) / 10, 8, 40);
+}
+
+float estimateTextWidthUnits(const std::string& text) {
+  float units = 0.0f;
+  for (std::size_t i = 0; i < text.size();) {
+    const unsigned char ch = static_cast<unsigned char>(text[i]);
+    if (ch < 0x80) {
+      units += 0.6f;
+      ++i;
+      continue;
+    }
+
+    units += 1.0f;
+    if ((ch & 0xE0) == 0xC0) {
+      i += 2;
+    } else if ((ch & 0xF0) == 0xE0) {
+      i += 3;
+    } else if ((ch & 0xF8) == 0xF0) {
+      i += 4;
+    } else {
+      ++i;
+    }
+  }
+  return units;
+}
+
+float fitMirrorHintFontSize(const std::vector<std::string>& lines,
+                            int availableWidth) {
+  float longestLineUnits = 1.0f;
+  for (const std::string& line : lines) {
+    longestLineUnits = std::max(longestLineUnits, estimateTextWidthUnits(line));
+  }
+  return std::clamp(static_cast<float>(availableWidth) / longestLineUnits,
+                    kMirrorHintMinFontSize, kMirrorHintMaxFontSize);
+}
+
+std::string joinMirrorHintLines(const std::vector<std::string>& lines) {
+  std::ostringstream text;
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    if (i != 0) text << '\n';
+    text << lines[i];
+  }
+  return text.str();
+}
+} // namespace
 
 #ifdef __ANDROID__
 #include <android/hardware_buffer.h>
+#include <android/rect.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 extern "C" {
 #include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
@@ -24,10 +85,173 @@ extern "C" {
 
 namespace hsvj {
 
+namespace {
+constexpr uint32_t kMirrorFormatNv12 = 0x3231564E;
+constexpr uint64_t kMirrorCropAnalysisInterval = 3;
+
+#ifdef __ANDROID__
+SideBarCropHint detectMappedSideBars(int fd, size_t offset, int width,
+                                     int height, int stride, uint32_t format) {
+  SideBarCropHint hint;
+  if (fd < 0 || offset > static_cast<size_t>(std::numeric_limits<int32_t>::max()) || width <= 0 ||
+      height <= 0 || stride < width) {
+    return hint;
+  }
+
+  struct stat fdStat {};
+  if (fstat(fd, &fdStat) != 0) {
+    return hint;
+  }
+  const size_t required = offset + static_cast<size_t>(stride) * height;
+  const size_t mapSize = fdStat.st_size > 0
+                             ? static_cast<size_t>(fdStat.st_size)
+                             : required;
+  if (mapSize < required) {
+    return hint;
+  }
+
+  void* mapped = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, fd, 0);
+  if (mapped == MAP_FAILED) {
+    return hint;
+  }
+
+  SideBarFrameView view;
+  view.yPlane = static_cast<const uint8_t*>(mapped) + offset;
+  view.size = mapSize - offset;
+  view.width = width;
+  view.height = height;
+  view.stride = stride;
+  view.format = format;
+  hint = detectNv12SideBars(view);
+  munmap(mapped, mapSize);
+  return hint;
+}
+
+using AhbLockPlanesFn = int (*)(AHardwareBuffer*, uint64_t, int32_t,
+                                const ARect*, AHardwareBuffer_Planes*);
+using AhbGetNativeHandleFn = const void* (*)(const AHardwareBuffer*);
+
+struct NativeHandleHeader {
+  int version;
+  int numFds;
+  int numInts;
+  int data[0];
+};
+
+void* resolveAndroidLibrary() {
+  static void* library = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+  return library;
+}
+
+AhbLockPlanesFn resolveAhbLockPlanes() {
+  static AhbLockPlanesFn function = reinterpret_cast<AhbLockPlanesFn>(
+      dlsym(resolveAndroidLibrary(), "AHardwareBuffer_lockPlanes"));
+  return function;
+}
+
+AhbGetNativeHandleFn resolveAhbGetNativeHandle() {
+  static AhbGetNativeHandleFn function =
+      reinterpret_cast<AhbGetNativeHandleFn>(dlsym(
+          resolveAndroidLibrary(), "AHardwareBuffer_getNativeHandle"));
+  return function;
+}
+
+SideBarCropHint detectHardwareBufferSideBars(AHardwareBuffer* buffer,
+                                              int width, int height) {
+  SideBarCropHint hint;
+  if (!buffer || width <= 0 || height <= 0) {
+    return hint;
+  }
+
+  AHardwareBuffer_Desc desc {};
+  AHardwareBuffer_describe(buffer, &desc);
+  width = std::min(width, static_cast<int>(desc.width));
+  height = std::min(height, static_cast<int>(desc.height));
+  if (width <= 0 || height <= 0) {
+    return hint;
+  }
+
+  if (AhbLockPlanesFn lockPlanes = resolveAhbLockPlanes()) {
+    AHardwareBuffer_Planes planes {};
+    ARect rect {0, 0, width, height};
+    if (lockPlanes(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1, &rect,
+                   &planes) == 0) {
+      if (planes.planeCount > 0 && planes.planes[0].data &&
+          planes.planes[0].pixelStride == 1 &&
+          planes.planes[0].rowStride >= static_cast<uint32_t>(width)) {
+        SideBarFrameView view;
+        view.yPlane = planes.planes[0].data;
+        view.size = static_cast<size_t>(planes.planes[0].rowStride) * height;
+        view.width = width;
+        view.height = height;
+        view.stride = static_cast<int>(planes.planes[0].rowStride);
+        view.format = kMirrorFormatNv12;
+        hint = detectNv12SideBars(view);
+      }
+      AHardwareBuffer_unlock(buffer, nullptr);
+      if (hint.analyzed) {
+        return hint;
+      }
+    }
+  }
+
+  void* lockedData = nullptr;
+  ARect rect {0, 0, width, height};
+  if (AHardwareBuffer_lock(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1,
+                           &rect, &lockedData) == 0) {
+    if (lockedData && desc.stride >= static_cast<uint32_t>(width)) {
+      SideBarFrameView view;
+      view.yPlane = lockedData;
+      view.size = static_cast<size_t>(desc.stride) * height;
+      view.width = width;
+      view.height = height;
+      view.stride = static_cast<int>(desc.stride);
+      view.format = kMirrorFormatNv12;
+      hint = detectNv12SideBars(view);
+    }
+    AHardwareBuffer_unlock(buffer, nullptr);
+    if (hint.analyzed) {
+      return hint;
+    }
+  }
+
+  // Rockchip video decoder PRIVATE buffers expose a linear DMA-BUF handle even
+  // when CPU lock is rejected. Only inspect an fd large enough for the Y plane;
+  // the symmetric/stable detector prevents one-frame vendor metadata matches.
+  const AhbGetNativeHandleFn getNativeHandle = resolveAhbGetNativeHandle();
+  const auto* handle = getNativeHandle
+                           ? static_cast<const NativeHandleHeader*>(
+                                 getNativeHandle(buffer))
+                           : nullptr;
+  const int stride = static_cast<int>(desc.stride);
+  const size_t required = stride > 0
+                              ? static_cast<size_t>(stride) * height
+                              : 0;
+  if (!handle || handle->numFds <= 0 || handle->numFds > 16 ||
+      stride < width || required == 0) {
+    return hint;
+  }
+  for (int index = 0; index < handle->numFds; ++index) {
+    const int fd = handle->data[index];
+    struct stat fdStat {};
+    if (fd >= 0 && fstat(fd, &fdStat) == 0 && fdStat.st_size > 0 &&
+        static_cast<size_t>(fdStat.st_size) >= required) {
+      hint = detectMappedSideBars(fd, 0, width, height, stride,
+                                  kMirrorFormatNv12);
+      if (hint.analyzed) {
+        return hint;
+      }
+    }
+  }
+  return hint;
+}
+#endif
+} // namespace
+
 LayerMirror::LayerMirror(int layerId, SharedTextOverlayHolder* sharedText) 
     : LayerVideo(layerId), sharedTextOverlay_(sharedText) {
   type_ = LayerType::MIRROR;
-  fitMode_ = 1; // 默认等比缩放，适应手机横竖屏切换
+  fitMode_ = 0; // TV crop only; never apply secondary aspect-ratio crop.
 }
 
 LayerMirror::~LayerMirror() {
@@ -116,21 +340,21 @@ bool LayerMirror::needsTextureUpdate() const {
 
   if (!vtoBridge_) return false;
   
-  std::string text;
-  if (!isConnected_ && readyHintVisible_) {
-    std::stringstream ss;
-    ss << "投屏准备就绪\n"
-       << "名称: " << mirrorName_ << " | 码: " << std::setfill('0') << std::setw(4) << pinCode_;
-    text = ss.str();
-  } else {
-    text.clear();
-  }
-  
-  return textNeedsUpdate_ || text != lastText_;
+  const std::string text =
+      (!isConnected_ && readyHintVisible_) ? buildReadyHintText() : std::string();
+  return textNeedsUpdate_.load(std::memory_order_acquire) || text != lastText_;
 }
 
 void LayerMirror::updateTexture() {
   if (!renderer_) return;
+
+  if (sideBarResetRequested_.exchange(false, std::memory_order_acq_rel)) {
+    sideBarCropDetector_.reset();
+    lastAppliedSideCropEnabled_ = false;
+    lastAppliedSideCropLeft_ = -1;
+    lastAppliedSideCropRight_ = -1;
+    lastAppliedSideCropFrameWidth_ = 0;
+  }
 
   // 1. 处理镜像画面更新（零拷贝 HardwareBuffer）
   // 复用 LayerVideo 的双缓冲逻辑 (textureIds_[0/1])
@@ -162,14 +386,16 @@ void LayerMirror::updateTexture() {
     }
 
     // 导入 HardwareBuffer 到该纹理槽位
+    updateSideBarCropFromHardwareBuffer(bufferToUse, visibleW, visibleH);
+
     if (renderer_->createTextureFromHardwareBuffer(
             (AHardwareBuffer*)bufferToUse, w, h, targetId, visibleW, visibleH)) {
-      applyTvVerticalCrop(targetId, visibleH);
+      applyMirrorContentCrop(targetId, visibleH);
       lastUploadedFrameNumber_ = ++textureImportSuccessCount_;
       // 记录连接状态
       if (!isConnected_) {
         isConnected_ = true;
-        textNeedsUpdate_ = true;
+        textNeedsUpdate_.store(true, std::memory_order_release);
         LOG_INFO("LayerMirror %d: First frame imported into standard pipeline", layerId_);
       }
 
@@ -211,6 +437,9 @@ void LayerMirror::updateTexture() {
       textureIds_[currentTextureIndex_] = targetId;
     }
 
+    updateSideBarCropFromDecodedFrame(decodedFrame, decodedOriginalW,
+                                      decodedOriginalH);
+
     bool imported = false;
     if (decodedFrame->avFrame &&
         decodedFrame->avFrame->format == AV_PIX_FMT_DRM_PRIME) {
@@ -220,11 +449,11 @@ void LayerMirror::updateTexture() {
     }
 
     if (imported) {
-      applyTvVerticalCrop(targetId, decodedOriginalH);
+      applyMirrorContentCrop(targetId, decodedOriginalH);
       lastUploadedFrameNumber_ = ++textureImportSuccessCount_;
       if (!isConnected_) {
         isConnected_ = true;
-        textNeedsUpdate_ = true;
+        textNeedsUpdate_.store(true, std::memory_order_release);
         LOG_INFO("LayerMirror %d: First RKMPP frame imported into standard pipeline", layerId_);
       }
       DecodedFrame* oldFrame = decodedFrameSlots_[currentTextureIndex_];
@@ -248,21 +477,36 @@ void LayerMirror::updateTexture() {
   // 2. 更新文字叠加内容
   if (!vtoBridge_) return;
 
-  std::string text;
-  float fontSize = 32.0f;
-  if (!isConnected_ && readyHintVisible_) {
-    std::stringstream ss;
-    ss << "投屏就绪 | 名称: " << mirrorName_ << " | 密码: " << std::setfill('0') << std::setw(4) << pinCode_;
-    text = ss.str();
-  } else {
-    text.clear();
-  }
+  const bool showReadyHint = !isConnected_ && readyHintVisible_;
+  const std::vector<std::string> lines =
+      showReadyHint ? buildReadyHintLines() : std::vector<std::string>();
+  const std::string text = joinMirrorHintLines(lines);
 
-  if (!text.empty()) {
-    vtoBridge_->prepareText(renderer_, text, 1.0f, 1.0f, 1.0f, 1.0f, fontSize, 0.0f, 0.0f, 0.0f, 0.5f);
+  if (!lines.empty()) {
+    const int layerWidth = std::max(1, size_.width);
+    const int layerHeight = std::max(1, size_.height);
+    const int padding = mirrorHintPadding(layerWidth, layerHeight);
+    const int availableWidth = std::max(1, layerWidth - padding * 2);
+    const float fontSize = fitMirrorHintFontSize(lines, availableWidth);
+    const float lineHeight = fontSize * 1.25f;
+    vtoBridge_->prepareTextLines(
+        renderer_, lines, 1.0f, 1.0f, 1.0f, 1.0f, fontSize, lineHeight,
+        0.0f, 0.0f, 0.0f, 0.5f, 0, 0, availableWidth, false, 0, -1);
   }
   lastText_ = text;
-  textNeedsUpdate_ = false;
+  textNeedsUpdate_.store(false, std::memory_order_release);
+}
+
+void LayerMirror::setFitMode(int mode) {
+  // Layer size and fill policy are user-configurable. Source-content crop is
+  // applied independently in applyMirrorContentCrop().
+  Layer::setFitMode(mode);
+}
+
+void LayerMirror::setSize(const Size& size) {
+  if (size_.width == size.width && size_.height == size.height) return;
+  Layer::setSize(size);
+  textNeedsUpdate_.store(true, std::memory_order_release);
 }
 
 void LayerMirror::render() {
@@ -273,71 +517,265 @@ void LayerMirror::render() {
 
   // 未显示投屏画面时才渲染提示；首帧成功后不再覆盖画面。
   if (!isConnected_ && readyHintVisible_ && vtoBridge_ && renderer_) {
-    int drawX = position_.x + 40;
-    int drawY = position_.y + 40;
-
-    uint32_t tid = vtoBridge_->getTextureId();
-    if (tid != 0) {
-      renderer_->renderLayer(tid, drawX, drawY, vtoBridge_->getTextureWidth(), vtoBridge_->getTextureHeight(), 0, 1.0f, alpha_);
+    const uint32_t textureId = vtoBridge_->getTextureId();
+    const int textureWidth = vtoBridge_->getTextureWidth();
+    const int textureHeight = vtoBridge_->getTextureHeight();
+    if (textureId != 0 && textureWidth > 0 && textureHeight > 0) {
+      const int layerWidth = std::max(1, size_.width);
+      const int layerHeight = std::max(1, size_.height);
+      const int padding = mirrorHintPadding(layerWidth, layerHeight);
+      const int availableWidth = std::max(1, layerWidth - padding * 2);
+      const int availableHeight = std::max(1, layerHeight - padding * 2);
+      const float renderScale = std::min(
+          {1.0f, static_cast<float>(availableWidth) / textureWidth,
+           static_cast<float>(availableHeight) / textureHeight});
+      const int drawWidth =
+          std::max(1, static_cast<int>(textureWidth * renderScale));
+      const int drawHeight =
+          std::max(1, static_cast<int>(textureHeight * renderScale));
+      applyContentCrop(textureId);
+      renderer_->renderLayer(textureId, position_.x + padding,
+                             position_.y + padding, drawWidth, drawHeight, 0,
+                             1.0f, alpha_);
     }
   }
 }
 
+std::vector<std::string> LayerMirror::buildReadyHintLines() const {
+  std::lock_guard<std::mutex> lock(readyStateMutex_);
+  if (!serviceStarted_) {
+    return {"投屏就绪 | 服务未启动"};
+  }
+
+  const bool useMultipleLines = size_.width < kMirrorHintMultilineWidth;
+  if (serviceName_ == "USB") {
+    if (useMultipleLines) {
+      return {"USB投屏就绪", "请链接USB数据线", "手机上接受投屏请求"};
+    }
+    return {"USB投屏就绪 | 请链接USB数据线，手机上接受投屏请求"};
+  }
+
+  std::ostringstream pin;
+  pin << "PIN码: " << std::setfill('0') << std::setw(4) << pinCode_;
+  if (useMultipleLines) {
+    return {serviceName_ + "投屏就绪", "名称: " + mirrorName_, pin.str()};
+  }
+
+  return {serviceName_ + "投屏就绪 | 名称: " + mirrorName_ + " | " +
+          pin.str()};
+}
+
+std::string LayerMirror::buildReadyHintText() const {
+  return joinMirrorHintLines(buildReadyHintLines());
+}
+
+void LayerMirror::setMirrorName(const std::string& name) {
+  std::lock_guard<std::mutex> lock(readyStateMutex_);
+  if (mirrorName_ == name) return;
+  mirrorName_ = name;
+  textNeedsUpdate_.store(true, std::memory_order_release);
+}
+
+std::string LayerMirror::getMirrorName() const {
+  std::lock_guard<std::mutex> lock(readyStateMutex_);
+  return mirrorName_;
+}
+
+void LayerMirror::setPinCode(int pin) {
+  std::lock_guard<std::mutex> lock(readyStateMutex_);
+  if (pinCode_ == pin) return;
+  pinCode_ = pin;
+  textNeedsUpdate_.store(true, std::memory_order_release);
+}
+
+int LayerMirror::getPinCode() const {
+  std::lock_guard<std::mutex> lock(readyStateMutex_);
+  return pinCode_;
+}
+
+void LayerMirror::setServiceState(bool started, const std::string& serviceName,
+                                  bool connected, const std::string& deviceName,
+                                  int pin) {
+  bool resetSideBarState = false;
+  {
+    std::lock_guard<std::mutex> lock(readyStateMutex_);
+    const std::string nextServiceName = started ? serviceName : std::string();
+    resetSideBarState = serviceName_ != nextServiceName || !started;
+    serviceStarted_ = started;
+    serviceName_ = nextServiceName;
+    if (!deviceName.empty()) {
+      mirrorName_ = deviceName;
+    }
+    pinCode_ = pin;
+    textNeedsUpdate_.store(true, std::memory_order_release);
+  }
+  if (resetSideBarState) {
+    sideBarResetRequested_.store(true, std::memory_order_release);
+  }
+  setConnected(started && connected);
+}
+
 void LayerMirror::setConnected(bool connected) {
-  if (isConnected_ == connected) return;
-  isConnected_ = connected;
-  textNeedsUpdate_ = true;
+  const bool previous = isConnected_.exchange(connected, std::memory_order_acq_rel);
+  if (previous == connected) return;
+  textNeedsUpdate_.store(true, std::memory_order_release);
 }
 
 void LayerMirror::setReadyHintVisible(bool visible) {
   if (readyHintVisible_ == visible) return;
   readyHintVisible_ = visible;
-  textNeedsUpdate_ = true;
+  textNeedsUpdate_.store(true, std::memory_order_release);
 }
 
 void LayerMirror::setTvVerticalCropPx(int px) {
   tvVerticalCropPx_.store(std::clamp(px, 0, 4000), std::memory_order_release);
 }
 
-void LayerMirror::applyTvVerticalCrop(uint32_t textureId, int contentHeight) {
-  if (!renderer_ || textureId == 0) {
-    return;
+void LayerMirror::setTvModeActive(bool active) {
+  const bool previous =
+      tvModeActive_.exchange(active, std::memory_order_acq_rel);
+  if (previous != active) {
+    lastAppliedTvVerticalCropPx_ = -1;
+    LOG_INFO("[LayerMirror] SUB-TV vertical crop mode layer=%d active=%d",
+             layerId_, active ? 1 : 0);
   }
-  const int requestedCropPx =
-      tvVerticalCropPx_.load(std::memory_order_acquire);
-  if (requestedCropPx <= 0 || contentHeight <= 2) {
-    renderer_->setTextureContentCrop(textureId, false, 0.0f, 0.0f, 1.0f, 1.0f,
-                                     true);
-    if (lastAppliedTvVerticalCropPx_ != 0) {
-      lastAppliedTvVerticalCropPx_ = 0;
-      lastAppliedTvVerticalCropHeight_ = contentHeight;
-      LOG_INFO("[LayerMirror] TV vertical crop disabled layer=%d", layerId_);
+}
+
+void LayerMirror::updateSideBarCrop(const SideBarCropHint& hint,
+                                    int contentWidth, const char* source) {
+  if (!hint.analyzed || contentWidth <= 0) {
+    ++sideBarAnalysisFailureCount_;
+    if ((sideBarAnalysisFailureCount_ % 600) == 1) {
+      LOG_WARN("[LayerMirror] side-bar analysis unavailable layer=%d source=%s failures=%llu",
+               layerId_, source ? source : "unknown",
+               static_cast<unsigned long long>(sideBarAnalysisFailureCount_));
     }
     return;
   }
 
-  const int maxCropPx = std::max(0, (contentHeight - 2) / 2);
-  const int cropPx = std::min(requestedCropPx, maxCropPx);
-  if (cropPx <= 0) {
-    renderer_->setTextureContentCrop(textureId, false, 0.0f, 0.0f, 1.0f, 1.0f,
-                                     true);
+  sideBarAnalysisFailureCount_ = 0;
+  const SideBarCropState crop =
+      sideBarCropDetector_.update(hint, contentWidth);
+  if (!crop.changed) {
+    return;
+  }
+  if (crop.enabled) {
+    LOG_INFO("[LayerMirror] side-bars crop enabled layer=%d source=%s frameW=%d left=%d right=%d active=%d stable=%d dark(L=%d R=%d)",
+             layerId_, source ? source : "unknown", contentWidth, crop.left,
+             contentWidth - crop.right, crop.right - crop.left,
+             crop.stableFrames, hint.darkLeftPermille,
+             hint.darkRightPermille);
+  } else {
+    LOG_INFO("[LayerMirror] side-bars crop disabled layer=%d source=%s frameW=%d stable=%d",
+             layerId_, source ? source : "unknown", contentWidth,
+             crop.stableFrames);
+  }
+}
+
+void LayerMirror::updateSideBarCropFromHardwareBuffer(void* buffer,
+                                                       int contentWidth,
+                                                       int contentHeight) {
+#ifdef __ANDROID__
+  if ((++sideBarAnalysisFrameCounter_ % kMirrorCropAnalysisInterval) != 1) {
+    return;
+  }
+  const SideBarCropHint hint = detectHardwareBufferSideBars(
+      static_cast<AHardwareBuffer*>(buffer), contentWidth, contentHeight);
+  updateSideBarCrop(hint, contentWidth, "surface");
+#else
+  (void)buffer;
+  (void)contentWidth;
+  (void)contentHeight;
+#endif
+}
+
+void LayerMirror::updateSideBarCropFromDecodedFrame(DecodedFrame* frame,
+                                                     int contentWidth,
+                                                     int contentHeight) {
+#ifdef __ANDROID__
+  if (!frame || (++sideBarAnalysisFrameCounter_ % kMirrorCropAnalysisInterval) != 1) {
     return;
   }
 
-  const float cropY = static_cast<float>(cropPx) /
-                      static_cast<float>(contentHeight);
-  const float cropH =
-      1.0f - (static_cast<float>(cropPx * 2) /
-              static_cast<float>(contentHeight));
-  renderer_->setTextureContentCrop(textureId, true, 0.0f, cropY, 1.0f, cropH,
-                                   true);
+  int fd = -1;
+  size_t offset = 0;
+  int stride = 0;
+  uint32_t format = 0;
+  if (frame->drmData.isValid() && frame->drmData.isLinear()) {
+    // CPU mapping is only valid for linear objects. AFBC/tiled DMA-BUFs must
+    // stay on the GPU path; treating an unknown modifier as NV12 corrupts the
+    // layout and can read outside the visible plane.
+    fd = frame->drmData.planeFd(0);
+    offset = frame->drmData.planes[0].offset;
+    stride = static_cast<int>(frame->drmData.planes[0].pitch);
+    format = frame->drmData.format;
+  }
+  if (fd < 0 || stride <= 0 || format == 0) {
+    return;
+  }
 
-  if (lastAppliedTvVerticalCropPx_ != cropPx ||
-      lastAppliedTvVerticalCropHeight_ != contentHeight) {
-    lastAppliedTvVerticalCropPx_ = cropPx;
+  const SideBarCropHint hint = detectMappedSideBars(
+      fd, offset, contentWidth, contentHeight, stride, format);
+  updateSideBarCrop(hint, contentWidth, "rkmpp-decoded");
+#else
+  (void)frame;
+  (void)contentWidth;
+  (void)contentHeight;
+#endif
+}
+
+void LayerMirror::applyMirrorContentCrop(uint32_t textureId,
+                                         int contentHeight) {
+  if (!renderer_ || textureId == 0) {
+    return;
+  }
+
+  const SideBarCropState sideCrop = sideBarCropDetector_.current();
+  const bool sideEnabled = sideCrop.enabled;
+  const float cropX = sideEnabled ? sideCrop.normalizedX() : 0.0f;
+  const float cropW = sideEnabled ? sideCrop.normalizedWidth() : 1.0f;
+
+  const bool tvModeActive =
+      tvModeActive_.load(std::memory_order_acquire);
+  const int requestedCropPx = tvModeActive
+                                  ? tvVerticalCropPx_.load(std::memory_order_acquire)
+                                  : 0;
+  const int maxCropPx = contentHeight > 2
+                            ? std::max(0, (contentHeight - 2) / 2)
+                            : 0;
+  const int verticalCropPx = std::min(requestedCropPx, maxCropPx);
+  const bool verticalEnabled = verticalCropPx > 0 && contentHeight > 2;
+  const float cropY = verticalEnabled
+                          ? static_cast<float>(verticalCropPx) /
+                                static_cast<float>(contentHeight)
+                          : 0.0f;
+  const float cropH = verticalEnabled
+                          ? 1.0f - (static_cast<float>(verticalCropPx * 2) /
+                                    static_cast<float>(contentHeight))
+                          : 1.0f;
+
+  renderer_->setTextureContentCrop(textureId, sideEnabled || verticalEnabled,
+                                   cropX, cropY, cropW, cropH, true);
+
+  const bool cropChanged =
+      lastAppliedTvVerticalCropPx_ != verticalCropPx ||
+      lastAppliedTvVerticalCropHeight_ != contentHeight ||
+      lastAppliedTvModeActive_ != tvModeActive ||
+      lastAppliedSideCropEnabled_ != sideEnabled ||
+      lastAppliedSideCropLeft_ != sideCrop.left ||
+      lastAppliedSideCropRight_ != sideCrop.right ||
+      lastAppliedSideCropFrameWidth_ != sideCrop.frameWidth;
+  if (cropChanged) {
+    lastAppliedTvVerticalCropPx_ = verticalCropPx;
     lastAppliedTvVerticalCropHeight_ = contentHeight;
-    LOG_INFO("[LayerMirror] TV vertical crop layer=%d cropEach=%dpx sourceH=%d",
-             layerId_, cropPx, contentHeight);
+    lastAppliedTvModeActive_ = tvModeActive;
+    lastAppliedSideCropEnabled_ = sideEnabled;
+    lastAppliedSideCropLeft_ = sideCrop.left;
+    lastAppliedSideCropRight_ = sideCrop.right;
+    lastAppliedSideCropFrameWidth_ = sideCrop.frameWidth;
+    LOG_INFO("[LayerMirror] content crop layer=%d side=%d x=%.5f w=%.5f subTv=%d verticalEach=%dpx sourceH=%d",
+             layerId_, sideEnabled ? 1 : 0, cropX, cropW,
+             tvModeActive ? 1 : 0, verticalCropPx, contentHeight);
   }
 }
 
@@ -362,7 +800,7 @@ void LayerMirror::updateFrame(void* buffer, int bufferWidth, int bufferHeight,
   lastBufferHeight_ = bufferHeight;
   lastVisibleWidth_ = visibleWidth;
   lastVisibleHeight_ = visibleHeight;
-  textNeedsUpdate_ = true;
+  textNeedsUpdate_.store(true, std::memory_order_release);
 #endif
 }
 
@@ -382,7 +820,7 @@ void LayerMirror::updateDecodedFrame(DecodedFrame* frame, int originalWidth,
   pendingDecodedOriginalWidth_ = originalWidth;
   pendingDecodedOriginalHeight_ = originalHeight;
   pendingDecodedCropOffsetY_ = cropOffsetY;
-  textNeedsUpdate_ = true;
+  textNeedsUpdate_.store(true, std::memory_order_release);
 #else
   (void)frame;
   (void)originalWidth;
@@ -407,6 +845,6 @@ void LayerMirror::updateSourceInfo(int physicalWidth, int physicalHeight,
     sourceStreamWidth_ = streamWidth;
     sourceStreamHeight_ = streamHeight;
   }
-  textNeedsUpdate_ = true;
+  textNeedsUpdate_.store(true, std::memory_order_release);
 }
 } // 命名空间 hsvj

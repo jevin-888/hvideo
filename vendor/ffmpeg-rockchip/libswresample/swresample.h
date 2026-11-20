@@ -141,8 +141,10 @@
  */
 
 #define SWR_FLAG_RESAMPLE 1 ///< Force resampling even if equal sample rate
-//TODO use 
-  int resample //long term TODO can we enable this dynamically/** Dithering algorithms */
+//TODO use int resample ?
+//long term TODO can we enable this dynamically?
+
+/** Dithering algorithms */
 enum SwrDitherType {
     SWR_DITHER_NONE = 0,
     SWR_DITHER_RECTANGULAR,

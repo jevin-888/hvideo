@@ -1,0 +1,37 @@
+diff --git a/vendor/chuangwei-minimal-perf/H66_BOOTCHAIN_POLICY.env b/vendor/chuangwei-minimal-perf/H66_BOOTCHAIN_POLICY.env
+--- a/vendor/chuangwei-minimal-perf/H66_BOOTCHAIN_POLICY.env
++++ b/vendor/chuangwei-minimal-perf/H66_BOOTCHAIN_POLICY.env
+@@ -2,1 +2,2 @@
+-H66_POLICY_VERSION=22
++H66_POLICY_VERSION=23
++H66_RECOVERY_MODE=protected_internal_v1
+@@ -11,2 +12,2 @@
+-H66_RELEASE_VERSION=v22
+-H66_DELIVERY=/mnt/d/HVIDEO/HSVJ/update_v22.img
++H66_RELEASE_VERSION=v32
++H66_DELIVERY=/mnt/d/HVIDEO/HSVJ/update_v32.img
+diff --git a/vendor/chuangwei-minimal-perf/build_h66_por_update.sh b/vendor/chuangwei-minimal-perf/build_h66_por_update.sh
+--- a/vendor/chuangwei-minimal-perf/build_h66_por_update.sh
++++ b/vendor/chuangwei-minimal-perf/build_h66_por_update.sh
+@@ -165,1 +165,2 @@
+-    require_policy_value H66_POLICY_VERSION 22
++    require_policy_value H66_POLICY_VERSION 23
++    require_policy_value H66_RECOVERY_MODE protected_internal_v1
+@@ -2445,1 +2446,2 @@
+ m bootimage recoveryimage systemimage productimage systemextimage vendorimage superimage userdataimage -j"$JOBS"
++python3 -B "$ENGINE_PROJECT_ROOT/system-integration/hsvj-rom-update/verify_recovery.py" "$ROOT_DIR" "$RECOVERY_IMG"
+diff --git a/vendor/chuangwei-minimal-perf/H66_BOOTCHAIN_REFERENCE.md b/vendor/chuangwei-minimal-perf/H66_BOOTCHAIN_REFERENCE.md
+--- a/vendor/chuangwei-minimal-perf/H66_BOOTCHAIN_REFERENCE.md
++++ b/vendor/chuangwei-minimal-perf/H66_BOOTCHAIN_REFERENCE.md
+@@ -1,1 +1,11 @@
+ # H66_POR HSVJ startup and packaging policy
++
++## Internal ROM updates (policy 23, v32 onward)
++
++Recovery is now built from source with the protected HSVJ internal installer.
++The immutable reference Recovery hash below remains a reference-input check;
++it is no longer the Recovery packaged in new images. The stable kernel, fixed
++partition table and protected hardware/huoshan partitions remain unchanged.
++The canonical build validates the new ramdisk entry, shared dependencies and
++ext4 mounts. Source and verification tools live in
++`D:/HVIDEO/Hplayer/system-integration/hsvj-rom-update`.

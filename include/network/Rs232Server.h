@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,7 +50,7 @@ public:
     /**
      * @brief 启动监听
      */
-    bool start();
+    bool start(bool startReader = true);
 
     /**
      * @brief 停止监听
@@ -60,6 +61,8 @@ public:
      * @brief 检查是否运行中
      */
     bool isRunning() const { return isRunning_.load(); }
+    const std::string& getDevice() const { return device_; }
+    int getBaudRate() const { return baudRate_; }
 
     /**
      * @brief 设置流控模式
@@ -122,6 +125,7 @@ private:
     FlowControl flowControl_;
     std::atomic<bool> isRunning_;
     std::thread readThread_;
+    std::mutex writeMutex_;
     
     CommandRouter* commandRouter_ = nullptr;
     std::function<std::string(const std::string&)> messageCallback_;

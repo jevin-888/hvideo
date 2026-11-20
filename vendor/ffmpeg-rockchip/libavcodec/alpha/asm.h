@@ -114,7 +114,7 @@ struct unaligned_long { uint64_t l; } __attribute__((packed));
 #define implver()    ({ uint64_t __r; __asm__ ("implver %0"         : "=r" (__r));                       __r; })
 #define rpcc()       ({ uint64_t __r; __asm__ volatile ("rpcc %0"   : "=r" (__r));                       __r; })
 #endif
-#define wh64(p) __asm__ volatile("wh64 (%0)? " : : "r"(p) : "memory")
+#define wh64(p) __asm__ volatile("wh64 (%0)" : : "r"(p) : "memory")
 
 #if AV_GCC_VERSION_AT_LEAST(3,3) && defined(__alpha_max__)
 #define minub8  __builtin_alpha_minub8

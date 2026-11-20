@@ -718,6 +718,7 @@ static bool check_glyph(ASS_FontInfo *fi, uint32_t code)
 static char *
 find_font(ASS_FontSelector *priv,
           ASS_FontProviderMetaData meta, bool match_extended_family,
+          bool embedded_fallback,
           unsigned bold, unsigned italic,
           int *index, char **postscript_name, int *uid, ASS_FontStream *stream,
           uint32_t code, bool *name_match)
@@ -743,12 +744,15 @@ find_font(ASS_FontSelector *priv,
             ASS_FontInfo *font = &priv->font_infos[x];
             unsigned score = UINT_MAX;
 
-            if (matches_family_name(font, fullname, match_extended_family)) {
+            if ((embedded_fallback && font->provider == priv->embedded_provider) ||
+                    (!embedded_fallback &&
+                     matches_family_name(font, fullname, match_extended_family))) {
                 // If there's a family match, compare font attributes
                 // to determine best match in that particular family
                 score = font_attributes_similarity(font, &req);
                 *name_match = true;
-            } else if (matches_full_or_postscript_name(font, fullname)) {
+            } else if (!embedded_fallback &&
+                       matches_full_or_postscript_name(font, fullname)) {
                 // If we don't have any match, compare fullnames against request
                 // if there is a match now, assign lowest score possible. This means
                 // the font should be chosen instantly, without further search.
@@ -850,7 +854,7 @@ static char *select_font(ASS_FontSelector *priv,
         meta = default_meta;
     }
 
-    result = find_font(priv, meta, match_extended_family,
+    result = find_font(priv, meta, match_extended_family, false,
                        bold, italic, index, postscript_name, uid,
                        stream, code, &name_match);
 
@@ -866,7 +870,7 @@ static char *select_font(ASS_FontSelector *priv,
                                                 priv->library, default_provider,
                                                 meta.fullnames[i]);
         }
-        result = find_font(priv, meta, match_extended_family,
+        result = find_font(priv, meta, match_extended_family, false,
                            bold, italic, index, postscript_name, uid,
                            stream, code, &name_match);
     }
@@ -928,6 +932,19 @@ char *ass_font_select(ASS_FontSelector *priv,
                     index, postscript_name, uid, data, code);
             free(fallback_family);
         }
+    }
+
+    // With no system provider, search application fonts for missing glyphs.
+    // Keep normal family matching and the default face for code == 0.
+    if (!res && code && !default_provider) {
+        char *fallback_name = "";
+        ASS_FontProviderMetaData meta = {
+            .n_fullname = 1,
+            .fullnames = &fallback_name,
+        };
+        bool name_match = false;
+        res = find_font(priv, meta, false, true, bold, italic,
+                        index, postscript_name, uid, data, code, &name_match);
     }
 
     if (!res && priv->path_default) {

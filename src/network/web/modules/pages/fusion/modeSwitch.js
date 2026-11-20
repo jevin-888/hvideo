@@ -9,12 +9,12 @@ import {
 import {
     hydrateBlendRegionsFromResponse,
     syncBlendManagerMode
-} from './sync/syncBlend.js?v=2.95';
+} from './sync/syncBlend.js?v=2.96';
 import { syncMaskGuideVisibility } from './sync/syncMask.js?v=2.95';
 import { setMaskGridVisible } from './mask/actions.js?v=2.95';
 import { setActiveBlendCorner, setBlendAutoEdges, setBlendManagerMode, setBlendMasterEnabled } from './blend/actions.js?v=2.95';
-import { setBlendMaster } from './api.js?v=2.95';
-import { switchTab, renderFusionUi } from './ui/panel.js?v=2.100';
+import { setBlendMaster } from './api.js?v=2.97';
+import { switchTab, renderFusionUi } from './ui/panel.js?v=2.103';
 
 function setDebugBackgroundActive(active, traceId = '') {
     const controller = window.FusionBackground;

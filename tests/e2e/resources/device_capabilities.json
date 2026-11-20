@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "capabilities": {
+    "player_http": {"required": true, "evidence": ["heartbeat", "system_status"]},
+    "player_adb": {"required": true, "evidence": ["adb_devices", "pidof", "screenshot"]},
+    "server_http": {"required": true, "evidence": ["pad_list", "song_list", "service_types"]},
+    "media_fixture": {"required": true, "evidence": ["selected_song", "video_file_type"]},
+    "pad_control": {"required": false, "evidence": ["pad_package", "pad_apk"]},
+    "serial": {"required": false, "evidence": ["serial_ports"]},
+    "dmx": {"required": false, "evidence": ["peripheral_config"]},
+    "projector": {"required": false, "evidence": ["stage_control_config"]},
+    "audio_output": {"required": true, "evidence": ["system_volume"]},
+    "hdmi_capture": {"required": false, "evidence": ["video_status"]}
+  },
+  "policy": {
+    "missing_optional_hardware": "blocked",
+    "missing_pad": "blocked",
+    "unsupported_media_codec": "blocked",
+    "missing_evidence": "failed"
+  }
+}

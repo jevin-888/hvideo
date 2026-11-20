@@ -28,6 +28,34 @@ constexpr float kGridHotspotOutlineScale = 1.4166667f;
 
 class SystemConfig;
 
+enum class DirectSwapchainBlockReason : uint8_t {
+    NONE = 0,
+    MANAGER_MODE,
+    LICENSE_WARNING,
+    DMX_OVERLAY,
+    ROTATION,
+    INVALID_CANVAS,
+    INVALID_GRID,
+    GRID_MISMATCH,
+    REGION_CELL_OUT_OF_RANGE,
+    REGION_MAPPING_MISMATCH,
+    REGION_SOURCE_MISMATCH,
+    REGION_MESH,
+    REGION_CORRECTION,
+    REGION_GRID_OVERLAY,
+    REGION_MASK,
+    REGION_COLOR,
+    REGION_BLEND,
+    REGION_COUNT_MISMATCH,
+};
+
+struct DirectSwapchainEligibility {
+    DirectSwapchainBlockReason reason = DirectSwapchainBlockReason::NONE;
+    int regionId = 0;
+
+    bool eligible() const { return reason == DirectSwapchainBlockReason::NONE; }
+};
+
 /**
  * @brief 替代 GLM 依赖的简易数学类型
  */
@@ -161,13 +189,6 @@ struct RegionConfig {
     VkBuffer gridVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory gridVertexMemory = VK_NULL_HANDLE;
 
-    VkImage blendTextureImage = VK_NULL_HANDLE;
-    VkDeviceMemory blendTextureMemory = VK_NULL_HANDLE;
-    VkImageView blendTextureView = VK_NULL_HANDLE;
-    uint32_t blendTextureWidth = 0;
-    uint32_t blendTextureHeight = 0;
-    bool blendTextureInitialized = false;
-
     VkBuffer gridLineVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory gridLineVertexMemory = VK_NULL_HANDLE;
     uint32_t gridLineVertexCount = 0;
@@ -228,7 +249,7 @@ public:
     // 渲染流程控制（清晰的职责分离）
     bool beginCanvasRenderPass();  // 开始 canvas render pass
     void endCanvasRenderPass();    // 结束 canvas render pass
-    bool beginQrOverlayRenderPass(); // 开始二维码叠加 pass（透明底，仅画 Layer71，排除 DMX）
+    bool beginQrOverlayRenderPass(); // 开始二维码叠加 pass（透明底，仅画当前二维码覆盖层，排除 DMX）
     void endQrOverlayRenderPass();   // 结束二维码叠加 pass
     /**
      * @brief 判定本帧是否需要执行 QR overlay pass
@@ -237,7 +258,7 @@ public:
      * @note 静态 QR 内容下，大部分帧返回 false，能省 ~2ms GPU（~8MB DDR tile store）
      * @note 内部会更新缓存签名；调用方只需在返回 true 时执行 begin/draw/end 三连即可
      */
-    bool needsQrOverlayRender(class Layer* layer71);
+    bool needsQrOverlayRender(class Layer* qrLayer);
     /** 强制使 QR overlay 缓存失效（Layer 71 配置外部改动时调用） */
     void invalidateQrOverlayCache() { qrOverlayCacheSignature_ = 0; }
     bool beginSwapchainRenderPass(); // 开始 swapchain render pass（用于合成）
@@ -295,7 +316,6 @@ public:
                                 const char *label);
     
     bool updateRegionMesh(int idx);  // 更新几何网格 (基于 rows/cols/controlPoints)
-    bool updateBlendTexture(int idx);
     bool createRegionBuffer(int idx);
     bool createGridLineGeometry(int idx);  // 生成网格线几何（CPU 端，固定宽度）
     bool createMaskGridLineGeometry();  // 生成全局遮罩网格线几何（CPU 端，固定宽度）
@@ -311,7 +331,7 @@ public:
     int getOutputHeight() const { return outputHeight_; }
     int getOutputGridCols() const { return outputGridCols_; }
     int getOutputGridRows() const { return outputGridRows_; }
-    bool canDirectRenderToSwapchain() const;
+    DirectSwapchainEligibility checkDirectSwapchainEligibility() const;
 
     /**
      * @brief 设置授权警告阶段（用于控制水印显隐和强制黑屏）
@@ -320,7 +340,7 @@ public:
      *              1: BEFORE_EXPIRY (到期前)
      *              2: EXPIRED_1_15 (过期1-15天，仅水印)
      *              3: EXPIRED_15_PLUS (过期>15天，黑屏+水印)
-     *              4: UNLICENSED (未授权，黑屏+水印)
+     *              4: UNLICENSED (未授权，保留连接提示+水印)
      */
     void setLicenseWarningStage(uint32_t stage) {
         licenseWarningStage_ = stage;
@@ -423,7 +443,7 @@ private:
     int outputGridCols_, outputGridRows_;  // 显示/日志统一写 rows×cols，变量名仍明确区分行列
     int inputGridCols_, inputGridRows_;  // 输入（幕布）布局，与 region_grid 对应
     float rotationAngle_;
-    uint32_t licenseWarningStage_ = 0; // 授权警告阶段 (0:正常, 1:前, 2:过1-15, 3:15+, 4:未)
+    uint32_t licenseWarningStage_ = 0; // 授权警告阶段 (3:强制黑屏, 4:未授权连接提示+水印)
     float dmxOverlayR_ = 1.0f;
     float dmxOverlayG_ = 1.0f;
     float dmxOverlayB_ = 1.0f;
@@ -463,7 +483,7 @@ private:
     VkImageView canvasMSAAAttachmentView_ = VK_NULL_HANDLE;
     VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_4_BIT;
 
-    // 二维码叠加（Layer71 单独渲染，DMX 不作用于此层）
+    // 二维码叠加（当前二维码覆盖层单独渲染，DMX 不作用于此层）
     VkImage qrOverlayBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory qrOverlayMemory_ = VK_NULL_HANDLE;
     VkImageView qrOverlayView_ = VK_NULL_HANDLE;
@@ -519,12 +539,12 @@ private:
     bool globalMaskTextureContentValid_ = false;
     uint64_t globalMaskTextureSignature_ = 0;
 
-    VkImage outputBlendTextureImage_ = VK_NULL_HANDLE;
-    VkDeviceMemory outputBlendTextureMemory_ = VK_NULL_HANDLE;
-    VkImageView outputBlendTextureView_ = VK_NULL_HANDLE;
-    uint32_t outputBlendTextureWidth_ = 0;
-    uint32_t outputBlendTextureHeight_ = 0;
-    bool outputBlendTextureInitialized_ = false;
+    VkImage neutralMaskTextureImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory neutralMaskTextureMemory_ = VK_NULL_HANDLE;
+    VkImageView neutralMaskTextureView_ = VK_NULL_HANDLE;
+    uint32_t neutralMaskTextureWidth_ = 0;
+    uint32_t neutralMaskTextureHeight_ = 0;
+    bool neutralMaskTextureInitialized_ = false;
     // CAVE 离轴投影 uniform（view+proj+4 corners，192 字节）
     VkBuffer caveUniformBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory caveUniformMemory_ = VK_NULL_HANDLE;
@@ -577,7 +597,7 @@ private:
 
     bool createResources();
     bool recreateCanvasBuffer();
-    bool ensureNeutralBlendTexture();
+    bool ensureNeutralMaskTexture();
     bool updateGlobalMaskTexture();
     bool createRegionPipeline();
     bool createGridLinePipeline();

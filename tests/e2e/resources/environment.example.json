@@ -1,0 +1,19 @@
+{
+  "adb": "adb",
+  "serial": "",
+  "player_url": "http://192.168.2.101:8080",
+  "server_url": "http://192.168.2.105:9898",
+  "username": "admin",
+  "password_env": "HPLAYER_PASSWORD",
+  "pad_serial": "",
+  "pad_apk_control": "D:/HVIDEO/Fultter_pad/build/app/outputs/flutter-apk/app-release.apk",
+  "pad_apk_vod": "D:/HVIDEO/Fultter_pad_vod/build/app/outputs/flutter-apk/app-release.apk",
+  "include_destructive": false,
+  "hardware_overrides": {
+    "serial": false,
+    "dmx": false,
+    "projector": false,
+    "audio_output": true,
+    "hdmi_capture": false
+  }
+}

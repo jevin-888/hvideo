@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "source_projects": [
+    "D:/HVIDEO/Fultter_pad",
+    "D:/HVIDEO/Fultter_pad_vod"
+  ],
+  "flows": [
+    {
+      "id": "pad-startup-and-discovery",
+      "app": "vod",
+      "destructive": false,
+      "steps": [
+        {"action": "launch", "evidence": "pad_screenshot"},
+        {"action": "configure_server", "resource": "server_url"},
+        {"action": "discover_terminal", "endpoint": "GET /api/v1/terminals/pad-list", "assert": "selected player is online"}
+      ]
+    },
+    {
+      "id": "pad-song-search-and-queue",
+      "app": "vod",
+      "destructive": true,
+      "test_data": "selected_song",
+      "steps": [
+        {"action": "search_song", "endpoint": "GET /api/v1/songdb/songs"},
+        {"action": "select_song", "endpoint": "POST /api/v1/rooms/${room_id}/queue", "body": {"songNo": "${song_no}"}},
+        {"action": "read_queue", "endpoint": "GET /api/v1/rooms/${room_id}/queue", "assert": "songNo exists"},
+        {"action": "prioritize", "endpoint": "POST /api/v1/rooms/${room_id}/queue/prioritize", "body": {"songNo": "${song_no}"}},
+        {"action": "remove_song", "endpoint": "DELETE /api/v1/rooms/${room_id}/queue/${song_no}"}
+      ],
+      "cleanup": [
+        {"action": "clear_queue", "endpoint": "POST /api/v1/rooms/${room_id}/clear"}
+      ]
+    },
+    {
+      "id": "pad-playback-controls",
+      "app": "control",
+      "destructive": true,
+      "steps": [
+        {"action": "pause", "endpoint": "POST /api/v1/video/pause", "body": {"layerId": 1}},
+        {"action": "resume", "endpoint": "POST /api/v1/video/resume", "body": {"layerId": 1}},
+        {"action": "volume_down", "endpoint": "POST /api/v1/video/volume/down", "body": {"layerId": 1}},
+        {"action": "volume_up", "endpoint": "POST /api/v1/video/volume/up", "body": {"layerId": 1}},
+        {"action": "mute_toggle", "endpoint": "POST /api/v1/video/mute/toggle", "body": {"layerId": 1}},
+        {"action": "replay", "endpoint": "POST /api/v1/video/replay", "body": {"layerId": 1}}
+      ],
+      "cleanup": [
+        {"action": "restore_volume_and_unmute", "evidence": "system_volume"}
+      ]
+    },
+    {
+      "id": "pad-service-call",
+      "app": "vod",
+      "destructive": true,
+      "steps": [
+        {"action": "load_service_types", "endpoint": "GET /api/v1/service-types"},
+        {"action": "send_service_call", "endpoint": "POST /api/v1/rooms/${room_id}/peripheral/call", "body": {"callType": "${service_type}", "callNote": "自动化测试"}}
+      ],
+      "cleanup": [
+        {"action": "complete_service_call", "owner": "server-admin", "required": true}
+      ]
+    }
+  ],
+  "policy": {
+    "missing_pad_device": "blocked",
+    "missing_room_id": "blocked",
+    "destructive_without_include_flag": "skipped",
+    "service_call_without_cleanup_confirmation": "blocked"
+  }
+}

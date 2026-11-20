@@ -262,7 +262,6 @@ def export_cpp(model, out_path):
     def arr4_to_cpp(name, arr, dims):
         """把多维 float 数组展平为 C++ 初始化列表"""
         flat = arr.reshape(-1)
-        lines = [f"// 形状：{dims}"]
         items_per_line = 8
         chunks = []
         for i in range(0, len(flat), items_per_line):

@@ -25,6 +25,7 @@ public:
   void setMirrorPlaybackBlocked(bool blocked);
   bool isMirrorPlaybackBlocked() const;
   PlaybackResult requestPlay(PlaybackRequest request);
+  size_t resumeBluetoothDeferredRequests();
   PlaybackResult stopLayer(int layerId);
   std::string dumpDiagnostics() const;
 
@@ -36,6 +37,7 @@ private:
   mutable std::mutex mutex_;
   LayerResolver layerResolver_;
   std::atomic<bool> mirrorPlaybackBlocked_{false};
+  std::map<int, PlaybackRequest> bluetoothDeferredRequests_;
   std::map<int, std::unique_ptr<LayerPlaybackController>> controllers_;
 };
 

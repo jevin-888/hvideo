@@ -293,7 +293,9 @@ bool VulkanRenderer::createYcbcrPipelineLayoutWithDescriptor(
 
 bool VulkanRenderer::createYcbcrGraphicsPipeline(
 
-    VkPipelineLayout pipelineLayout, VkPipeline &pipeline) {
+    VkPipelineLayout pipelineLayout, VkPipeline &pipeline,
+
+    const char *fragmentShader, bool blendEnabled) {
 
 
 
@@ -322,7 +324,8 @@ bool VulkanRenderer::createYcbcrGraphicsPipeline(
   };
 
   std::vector<uint32_t> vertSpirv, fragSpirv;
-  if (!loadShaderPair("texture.vert.spv", "texture.frag.spv", vertSpirv, fragSpirv, "texture pipeline")) {
+  if (!loadShaderPair("texture.vert.spv", fragmentShader, vertSpirv, fragSpirv,
+                      "YCbCr pipeline")) {
     return false;
   }
 
@@ -474,7 +477,7 @@ bool VulkanRenderer::createYcbcrGraphicsPipeline(
 
       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
-  colorBlendAttachment.blendEnable = VK_TRUE;
+  colorBlendAttachment.blendEnable = blendEnabled ? VK_TRUE : VK_FALSE;
 
   colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
 
@@ -574,7 +577,8 @@ void VulkanRenderer::cleanupYcbcrPipelineResources(
 
     YcbcrPipelineResources &resources) {
 
-  const bool hasResources = resources.pipeline != VK_NULL_HANDLE ||
+  const bool hasResources = resources.fastPipeline != VK_NULL_HANDLE ||
+                            resources.pipeline != VK_NULL_HANDLE ||
                             resources.pipelineLayout != VK_NULL_HANDLE ||
                             resources.descriptorSetLayout != VK_NULL_HANDLE ||
                             resources.sampler != VK_NULL_HANDLE ||
@@ -594,6 +598,14 @@ void VulkanRenderer::cleanupYcbcrPipelineResources(
 
 
 
+  if (resources.fastPipeline) {
+
+    vkDestroyPipeline(device_, resources.fastPipeline, nullptr);
+
+    resources.fastPipeline = VK_NULL_HANDLE;
+
+  }
+
   if (resources.pipeline) {
 
     vkDestroyPipeline(device_, resources.pipeline, nullptr);
@@ -603,6 +615,12 @@ void VulkanRenderer::cleanupYcbcrPipelineResources(
   }
 
   if (resources.pipelineLayout) {
+
+    auto blurPipeline = kawaseConvertPipelines_.find(resources.pipelineLayout);
+    if (blurPipeline != kawaseConvertPipelines_.end()) {
+      vkDestroyPipeline(device_, blurPipeline->second, nullptr);
+      kawaseConvertPipelines_.erase(blurPipeline);
+    }
 
     vkDestroyPipelineLayout(device_, resources.pipelineLayout, nullptr);
 
@@ -710,7 +728,9 @@ bool VulkanRenderer::initializeYcbcrPipelineCommon(
   stageStart = std::chrono::steady_clock::now();
   if (!createYcbcrGraphicsPipeline(resources.pipelineLayout,
 
-                                   resources.pipeline)) {
+                                   resources.pipeline,
+
+                                   "texture.frag.spv", true)) {
 
     cleanupYcbcrPipelineResources(resources);
 
@@ -738,7 +758,6 @@ void VulkanRenderer::warmUpCommonYcbcrPipelines() {
   const bool drmPrimeReady = initializeDrmPrimeYcbcrPipeline(commonNv12Format);
   const bool v4l2Ready = initializeV4L2YcbcrPipeline(commonNv12Format);
   const bool nv12ShaderReady = createNV12Pipeline();
-  const bool nv16ShaderReady = createNV16Pipeline();
   const bool nv24ShaderReady = createNV24Pipeline();
   const bool yuyvShaderReady = createYUYVPipeline();
   const bool bgr3ShaderReady = createBGR3Pipeline();
@@ -746,16 +765,16 @@ void VulkanRenderer::warmUpCommonYcbcrPipelines() {
 
   const long long costMs = elapsedMillisSince(warmupStart);
   if (costMs >= 16 || !drmPrimeReady || !v4l2Ready || !nv12ShaderReady ||
-      !nv16ShaderReady || !nv24ShaderReady || !yuyvShaderReady ||
+      !nv24ShaderReady || !yuyvShaderReady ||
       !bgr3ShaderReady || !captureShaderReady) {
     LOG_WARN("[SwitchStall] stage=ycbcr_pipeline_warmup cost=%lldms "
              "threshold=16ms format=%d drmPrime=%d v4l2=%d "
-             "nv12Shader=%d nv16Shader=%d nv24Shader=%d yuyvShader=%d "
+             "nv12Shader=%d nv24Shader=%d yuyvShader=%d "
              "bgr3Shader=%d captureShader=%d",
              costMs, static_cast<int>(commonNv12Format),
              drmPrimeReady ? 1 : 0, v4l2Ready ? 1 : 0,
-             nv12ShaderReady ? 1 : 0, nv16ShaderReady ? 1 : 0,
-             nv24ShaderReady ? 1 : 0, yuyvShaderReady ? 1 : 0,
+             nv12ShaderReady ? 1 : 0, nv24ShaderReady ? 1 : 0,
+             yuyvShaderReady ? 1 : 0,
              bgr3ShaderReady ? 1 : 0, captureShaderReady ? 1 : 0);
   }
   savePipelineCacheData();
@@ -1625,277 +1644,6 @@ bool VulkanRenderer::createDescriptorSetNV24(Texture &texture) {
 
 // ============================================================================
 
-// NV16 管线
-
-// ============================================================================
-
-
-
-bool VulkanRenderer::createNV16DescriptorSetLayout() {
-  std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
-
-  bindings[0].binding = 0;
-  bindings[0].descriptorCount = 1;
-  bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  bindings[0].pImmutableSamplers = nullptr;
-  bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-  bindings[1].binding = 1;
-  bindings[1].descriptorCount = 1;
-  bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  bindings[1].pImmutableSamplers = nullptr;
-  bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-  VkDescriptorSetLayoutCreateInfo layoutInfo{};
-  layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-  layoutInfo.pBindings = bindings.data();
-
-  return vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr,
-                                     &nv16DescriptorSetLayout_) == VK_SUCCESS;
-
-}
-
-
-
-bool VulkanRenderer::createNV16Pipeline() {
-
-  if (nv16PipelineInitialized_)
-
-    return true;
-
-  if (nv16DescriptorSetLayout_ == VK_NULL_HANDLE &&
-
-      !createNV16DescriptorSetLayout())
-
-    return false;
-
-
-
-  // 优先使用运行时编
-
-  std::vector<uint32_t> vertSpirv, fragSpirv;
-  if (!loadShaderPair("texture.vert.spv", "nv16_texture.frag.spv", vertSpirv, fragSpirv, "NV16 pipeline")) {
-    return false;
-  }
-
-
-
-  VkShaderModuleCreateInfo vertModuleInfo{
-
-      VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
-
-      vertSpirv.size() * sizeof(uint32_t), vertSpirv.data()};
-
-  VkShaderModule vertModule;
-
-  if (vkCreateShaderModule(device_, &vertModuleInfo, nullptr, &vertModule) !=
-
-      VK_SUCCESS)
-
-    return false;
-
-
-
-  VkShaderModuleCreateInfo fragModuleInfo{
-
-      VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, nullptr, 0,
-
-      fragSpirv.size() * sizeof(uint32_t), fragSpirv.data()};
-
-  VkShaderModule fragModule;
-
-  if (vkCreateShaderModule(device_, &fragModuleInfo, nullptr, &fragModule) !=
-
-      VK_SUCCESS) {
-
-    vkDestroyShaderModule(device_, vertModule, nullptr);
-
-    return false;
-
-  }
-
-
-
-  PipelineStateHelper ps;
-
-  ps.init();
-
-
-
-  VkPipelineLayoutCreateInfo layoutInfo{
-
-      VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-
-      nullptr,
-
-      0,
-
-      1,
-
-      &nv16DescriptorSetLayout_,
-
-      1,
-
-      &ps.pushConstantRange};
-
-  if (vkCreatePipelineLayout(device_, &layoutInfo, nullptr,
-
-                             &nv16PipelineLayout_) != VK_SUCCESS) {
-
-    vkDestroyShaderModule(device_, fragModule, nullptr);
-
-    vkDestroyShaderModule(device_, vertModule, nullptr);
-
-    return false;
-
-  }
-
-
-
-  VkPipelineShaderStageCreateInfo shaderStages[2] = {
-
-      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-
-       VK_SHADER_STAGE_VERTEX_BIT, vertModule, "main", nullptr},
-
-      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-
-       VK_SHADER_STAGE_FRAGMENT_BIT, fragModule, "main", nullptr}};
-
-
-
-  VkGraphicsPipelineCreateInfo pipelineInfo{
-
-      VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-
-      nullptr,
-
-      0,
-
-      2,
-
-      shaderStages,
-
-      &ps.vertexInput,
-
-      &ps.inputAssembly,
-
-      nullptr,
-
-      &ps.viewportState,
-
-      &ps.rasterizer,
-
-      &ps.multisampling,
-
-      nullptr,
-
-      &ps.colorBlending,
-
-      &ps.dynamicState,
-
-      nv16PipelineLayout_,
-
-      renderPass_,
-
-      0,
-
-      VK_NULL_HANDLE,
-
-      -1};
-
-
-
-  VkResult res = vkCreateGraphicsPipelines(
-
-      device_, pipelineCache_, 1, &pipelineInfo, nullptr, &nv16Pipeline_);
-
-  vkDestroyShaderModule(device_, fragModule, nullptr);
-
-  vkDestroyShaderModule(device_, vertModule, nullptr);
-
-
-
-  if (res != VK_SUCCESS)
-
-    return false;
-
-
-
-  nv16PipelineInitialized_ = true;
-
-  return true;
-
-}
-
-
-
-bool VulkanRenderer::createDescriptorSetNV16(Texture &texture) {
-  if (nv16DescriptorSetLayout_ == VK_NULL_HANDLE ||
-      texture.imageView == VK_NULL_HANDLE ||
-      texture.uvImageView == VK_NULL_HANDLE ||
-      texture.sampler == VK_NULL_HANDLE) {
-    LOG_ERROR("[Vulkan] Invalid NV16 descriptor resources");
-    return false;
-  }
-
-  VkDescriptorSetAllocateInfo allocInfo{};
-  allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  allocInfo.descriptorPool = descriptorPool_;
-  allocInfo.descriptorSetCount = 1;
-  allocInfo.pSetLayouts = &nv16DescriptorSetLayout_;
-
-  VkResult allocResult =
-      vkAllocateDescriptorSets(device_, &allocInfo, &texture.descriptorSet);
-  if (allocResult != VK_SUCCESS) {
-    LOG_ERROR("[Vulkan] Failed to allocate NV16 descriptor set (result=%d)",
-              allocResult);
-    return false;
-  }
-
-  VkDescriptorImageInfo yImageInfo{};
-  yImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-  yImageInfo.imageView = texture.imageView;
-  yImageInfo.sampler = texture.sampler;
-
-  VkDescriptorImageInfo uvImageInfo{};
-  uvImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-  uvImageInfo.imageView = texture.uvImageView;
-  uvImageInfo.sampler = texture.sampler;
-
-  std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
-
-  descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  descriptorWrites[0].dstSet = texture.descriptorSet;
-  descriptorWrites[0].dstBinding = 0;
-  descriptorWrites[0].dstArrayElement = 0;
-  descriptorWrites[0].descriptorType =
-      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  descriptorWrites[0].descriptorCount = 1;
-  descriptorWrites[0].pImageInfo = &yImageInfo;
-
-  descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  descriptorWrites[1].dstSet = texture.descriptorSet;
-  descriptorWrites[1].dstBinding = 1;
-  descriptorWrites[1].dstArrayElement = 0;
-  descriptorWrites[1].descriptorType =
-      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  descriptorWrites[1].descriptorCount = 1;
-  descriptorWrites[1].pImageInfo = &uvImageInfo;
-
-  vkUpdateDescriptorSets(device_,
-                         static_cast<uint32_t>(descriptorWrites.size()),
-                         descriptorWrites.data(), 0, nullptr);
-
-  return true;
-
-}
-
-
-
-// ============================================================================
-
 // YUYV 管线
 
 // ============================================================================
@@ -2202,7 +1950,8 @@ bool VulkanRenderer::initializeDrmPrimeYcbcrPipeline(VkFormat format) {
       drmPrimeYcbcrSampler_ != VK_NULL_HANDLE ||
       drmPrimeDescriptorSetLayout_ != VK_NULL_HANDLE ||
       drmPrimePipelineLayout_ != VK_NULL_HANDLE ||
-      drmPrimePipeline_ != VK_NULL_HANDLE;
+      drmPrimePipeline_ != VK_NULL_HANDLE ||
+      drmPrimeFastPipeline_ != VK_NULL_HANDLE;
   if (hasOldDrmPrimeResources) {
     YcbcrPipelineResources oldRes;
 
@@ -2216,6 +1965,8 @@ bool VulkanRenderer::initializeDrmPrimeYcbcrPipeline(VkFormat format) {
 
     oldRes.pipeline = drmPrimePipeline_;
 
+    oldRes.fastPipeline = drmPrimeFastPipeline_;
+
     oldRes.initialized = drmPrimePipelineInitialized_;
     oldRes.currentFormat = drmPrimePipelineFormat_;
 
@@ -2226,6 +1977,7 @@ bool VulkanRenderer::initializeDrmPrimeYcbcrPipeline(VkFormat format) {
     drmPrimeDescriptorSetLayout_ = VK_NULL_HANDLE;
     drmPrimePipelineLayout_ = VK_NULL_HANDLE;
     drmPrimePipeline_ = VK_NULL_HANDLE;
+    drmPrimeFastPipeline_ = VK_NULL_HANDLE;
     drmPrimePipelineInitialized_ = false;
     drmPrimePipelineFormat_ = VK_FORMAT_UNDEFINED;
   }
@@ -2266,6 +2018,13 @@ bool VulkanRenderer::initializeDrmPrimeYcbcrPipeline(VkFormat format) {
 
     return false;
 
+  if (!createYcbcrGraphicsPipeline(res.pipelineLayout, res.fastPipeline,
+                                   "ycbcr_fast.frag.spv", false)) {
+    LOG_WARN("[Vulkan] DRM PRIME fast YCbCr pipeline unavailable; "
+             "falling back to the full shader");
+    res.fastPipeline = VK_NULL_HANDLE;
+  }
+
 
 
   drmPrimeYcbcrConversion_ = res.conversion;
@@ -2277,6 +2036,8 @@ bool VulkanRenderer::initializeDrmPrimeYcbcrPipeline(VkFormat format) {
   drmPrimePipelineLayout_ = res.pipelineLayout;
 
   drmPrimePipeline_ = res.pipeline;
+
+  drmPrimeFastPipeline_ = res.fastPipeline;
 
   drmPrimePipelineInitialized_ = true;
 
@@ -2337,7 +2098,8 @@ bool VulkanRenderer::initializeV4L2YcbcrPipeline(VkFormat format) {
       v4l2YcbcrSampler_ != VK_NULL_HANDLE ||
       v4l2DescriptorSetLayout_ != VK_NULL_HANDLE ||
       v4l2PipelineLayout_ != VK_NULL_HANDLE ||
-      v4l2Pipeline_ != VK_NULL_HANDLE;
+      v4l2Pipeline_ != VK_NULL_HANDLE ||
+      v4l2FastPipeline_ != VK_NULL_HANDLE;
   if (hasOldV4l2Resources) {
     YcbcrPipelineResources oldRes;
 
@@ -2351,6 +2113,8 @@ bool VulkanRenderer::initializeV4L2YcbcrPipeline(VkFormat format) {
 
     oldRes.pipeline = v4l2Pipeline_;
 
+    oldRes.fastPipeline = v4l2FastPipeline_;
+
     oldRes.initialized = v4l2PipelineInitialized_;
     oldRes.currentFormat = v4l2PipelineFormat_;
 
@@ -2361,6 +2125,7 @@ bool VulkanRenderer::initializeV4L2YcbcrPipeline(VkFormat format) {
     v4l2DescriptorSetLayout_ = VK_NULL_HANDLE;
     v4l2PipelineLayout_ = VK_NULL_HANDLE;
     v4l2Pipeline_ = VK_NULL_HANDLE;
+    v4l2FastPipeline_ = VK_NULL_HANDLE;
     v4l2PipelineInitialized_ = false;
     v4l2PipelineFormat_ = VK_FORMAT_UNDEFINED;
   }
@@ -2371,7 +2136,9 @@ bool VulkanRenderer::initializeV4L2YcbcrPipeline(VkFormat format) {
 
   config.format = format;
 
-  config.ycbcrModel = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601;
+  // HDMI/MIPI HD capture normally uses BT.709 limited range. Expanding
+  // 16..235 through the YCbCr conversion restores black and white levels.
+  config.ycbcrModel = VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_709;
 
   config.ycbcrRange = VK_SAMPLER_YCBCR_RANGE_ITU_NARROW;
 
@@ -2401,6 +2168,13 @@ bool VulkanRenderer::initializeV4L2YcbcrPipeline(VkFormat format) {
 
     return false;
 
+  if (!createYcbcrGraphicsPipeline(res.pipelineLayout, res.fastPipeline,
+                                   "ycbcr_fast.frag.spv", false)) {
+    LOG_WARN("[Vulkan] V4L2 fast YCbCr pipeline unavailable; "
+             "falling back to the full shader");
+    res.fastPipeline = VK_NULL_HANDLE;
+  }
+
 
 
   v4l2YcbcrConversion_ = res.conversion;
@@ -2412,6 +2186,8 @@ bool VulkanRenderer::initializeV4L2YcbcrPipeline(VkFormat format) {
   v4l2PipelineLayout_ = res.pipelineLayout;
 
   v4l2Pipeline_ = res.pipeline;
+
+  v4l2FastPipeline_ = res.fastPipeline;
 
   v4l2PipelineInitialized_ = true;
 

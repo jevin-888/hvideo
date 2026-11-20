@@ -54,7 +54,7 @@
  
  static void fillRoomStateFromJson(const Json::Value& dataObj, int64_t nowMs, VodDatabase::OnlineVodState& st) {
    st.roomId = dataObj.get("roomId", "").asString();
-   st.name = dataObj.get("roomName", dataObj.get("name", "")).asString();
+   st.name = dataObj.get("roomName", "").asString();
  
    st.status = dataObj.get("status", 0).asInt();
    st.playState = dataObj.get("playState", 0).asInt();
@@ -66,8 +66,24 @@
  
    if (dataObj.isMember("mute") && dataObj["mute"].isBool()) st.muteStatus = dataObj["mute"].asBool() ? 1 : 0;
  
-   st.currentSongId = dataObj.get("currentSongId", "").asString();
-   st.currentSongTitle = dataObj.get("currentSongTitle", "").asString();
+   const Json::Value playingNow =
+       dataObj.isMember("playingNow") && dataObj["playingNow"].isObject()
+           ? dataObj["playingNow"]
+           : Json::Value(Json::nullValue);
+   st.currentSongId = !playingNow.isNull()
+                          ? playingNow.get("songId", dataObj.get("currentSongId", "")).asString()
+                          : dataObj.get("currentSongId", "").asString();
+   st.currentQueueItemId = !playingNow.isNull()
+                               ? playingNow.get("queueItemId", "").asString()
+                               : "";
+   st.currentSongTitle = !playingNow.isNull()
+                             ? playingNow
+                                   .get("songName",
+                                        playingNow.get("songTitle", dataObj.get("currentSongTitle", "")))
+                                   .asString()
+                             : dataObj.get("currentSongTitle", "").asString();
+   st.currentSongLightCode = !playingNow.isNull() ? playingNow.get("lightCode", "").asString() : "";
+   st.currentSongCategoryCode = !playingNow.isNull() ? playingNow.get("categoryCode", "").asString() : "";
  
    if (dataObj.isMember("ac") && dataObj["ac"].isObject()) st.acStateJson = JsonUtils::toString(dataObj["ac"]);
  
@@ -95,22 +111,28 @@
      VodDatabase::OnlineVodQueueItem q;
      q.id = it.get("id", "").asString();
      q.roomId = it.get("roomId", "").asString();
-     q.songId = it.get("songId", "").asString();
-     q.songTitle = it.get("songTitle", "").asString();
-     q.artistName = it.get("artistName", "").asString();
+     q.songId = it.get("songId", it.get("songNo", "")).asString();
+     q.songTitle = it.get("songName", it.get("songTitle", "")).asString();
+     q.artistName =
+         it.get("singerNames",
+                it.get("singerName", it.get("artistName", "")))
+             .asString();
      q.position = it.get("position", 0).asInt();
      q.status = it.get("status", 0).asInt();
      q.isPriority = it.get("isPriority", 0).asInt();
      q.addedAt = it.get("addedAt", "").asString();
-     q.songNo = it.get("songNo", "").asString();
+     q.songNo = it.get("songNo", it.get("songId", "")).asString();
      q.languageCode = it.get("languageCode", "").asString();
-     q.classifyCode = it.get("classifyCode", "").asString();
+     q.classifyCode =
+         it.get("categoryCode", it.get("classifyCode", "")).asString();
      q.lightCode = it.get("lightCode", "").asString();
-     q.songPath = it.get("songPath", "").asString();
+     q.songPath =
+         it.get("relativePath", it.get("songPath", "")).asString();
      q.videoFileType = it.get("videoFileType", "").asString();
      q.track = it.get("track", 0).asInt();
      q.scoreEnabled = it.get("scoreEnabled", 0).asInt();
-     q.singerNo = it.get("singerNo", "").asString();
+     q.singerNo =
+         it.get("primarySingerNo", it.get("singerNo", "")).asString();
      q.updatedAtEpochMs = nowMs;
      q.rawJson = JsonUtils::toString(it);
      out.push_back(std::move(q));
@@ -125,6 +147,7 @@
  }
  
  bool OnlineVodHttpSyncClient::start(const std::string& host, int port, const std::string& roomId, VodDatabase* db, int pollIntervalMs) {
+   std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
    if (running_.load()) return true;
    if (!db) return false;
    if (host.empty() || port <= 0) return false;
@@ -142,6 +165,7 @@
  }
  
  void OnlineVodHttpSyncClient::stop() {
+   std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
    stopRequested_.store(true);
    if (worker_.joinable()) worker_.join();
    running_.store(false);
@@ -212,6 +236,7 @@
        st.roomId = roomId_;
      }
      db_->upsertOnlineVodState(st);
+     if (onRoomStateChanged_) onRoomStateChanged_(st);
      db_->setOnlineVodSyncMeta("online_vod_roomId", st.roomId);
      db_->setOnlineVodSyncMeta("online_vod_http_last_state_at_ms", std::to_string(nowMs));
    }

@@ -1,22 +1,23 @@
 /**
- * @file PreviewStreamConverter.cpp（文件名）
- * @brief 预览流转换器实现
+ * @file PreviewStreamConverter.cpp
+ * @brief DRM_PRIME 预览帧转换实现
  *
- * 本文件实现了预览流转换器类，负责：
- * - 视频帧格式转换（NV12/NV16等转RGB）
- * - 视频帧缩放（缩放到预览尺寸）
- * - JPEG编码（用于HTTP预览流）
- * - 零拷贝优化
+ * 仅处理可由 CPU 映射的 linear NV12：按描述符提供的 object、offset 和
+ * pitch 缩放到预览尺寸，再编码为 HTTP 预览使用的 JPEG。其他格式或布局
+ * 会被明确拒绝，不进行隐式格式猜测。
  */
 
 #include "PreviewStreamConverter.h"
+#include "decoder/frame/DecodedFrame.h"
 #include "utils/Logger.h"
 
 #include <sys/mman.h>
+#include <algorithm>
 #include <unistd.h>
 #include <cstring>
 #include <cerrno>
 #include <jpeglib.h>
+#include <drm_fourcc.h>
 
 #ifdef HAVE_LIBYUV
 #include <libyuv.h>
@@ -46,8 +47,6 @@ bool PreviewStreamConverter::ensureBuffers(int width, int height) {
     size_t nv12Size = width * height * 3 / 2;
     size_t rgbSize = width * height * 3;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    
     if (!scaledNv12Buffer_ || scaledNv12Size_ < nv12Size) {
         if (scaledNv12Buffer_) {
             free(scaledNv12Buffer_);
@@ -96,71 +95,94 @@ bool PreviewStreamConverter::initialize() {
 #endif
 }
 
-// ... encodeRgbToJpeg (保持不变，已JDCT_FASTEST) ...
 
-bool PreviewStreamConverter::convertFrame(int drmPrimeFd, int width, int height,
-                                         uint8_t** outJpegData, size_t* outJpegSize) {
-    if (!initialized_) return false;
-    if (drmPrimeFd < 0) return false;
+bool PreviewStreamConverter::convertFrame(const DrmPrimeData& drmData,
+                                          uint8_t** outJpegData,
+                                          size_t* outJpegSize) {
+    if (!outJpegData || !outJpegSize) {
+        return false;
+    }
+    *outJpegData = nullptr;
+    *outJpegSize = 0;
+    if (!drmData.isValid()) {
+        return false;
+    }
+    if (!drmData.isLinear() || drmData.format != DRM_FORMAT_NV12 ||
+        drmData.numPlanes < 2) {
+        return false;
+    }
 
-    // 整个处理过程加锁，保护成员缓冲区
+    const auto& yPlane = drmData.planes[0];
+    const auto& uvPlane = drmData.planes[1];
+    if (yPlane.objectIndex != uvPlane.objectIndex || yPlane.pitch == 0 ||
+        uvPlane.pitch == 0 || uvPlane.offset <= yPlane.offset) {
+        return false;
+    }
+
+    const int objectIndex = yPlane.objectIndex;
+    const int drmPrimeFd = drmData.objects[objectIndex].fd;
+    const int width = static_cast<int>(drmData.visibleWidth);
+    const int height = static_cast<int>(drmData.visibleHeight);
+    const int yStride = static_cast<int>(yPlane.pitch);
+    const int uvStride = static_cast<int>(uvPlane.pitch);
+    if (drmPrimeFd < 0 || width <= 0 || height <= 0 || yStride < width ||
+        uvStride < width) {
+        return false;
+    }
+
+    const size_t yEnd = static_cast<size_t>(yPlane.offset) +
+                        static_cast<size_t>(yStride) * height;
+    const size_t uvEnd = static_cast<size_t>(uvPlane.offset) +
+                         static_cast<size_t>(uvStride) * ((height + 1) / 2);
+    const size_t requiredSize = std::max(yEnd, uvEnd);
+    const size_t objectSize =
+        static_cast<size_t>(drmData.objects[objectIndex].size);
+    if (objectSize == 0 || requiredSize > objectSize) {
+        LOG_WARN("[PreviewConverter] Invalid NV12 plane extent: required=%zu "
+                 "object=%zu", requiredSize, objectSize);
+        return false;
+    }
+    const size_t mapSize = objectSize;
+
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) {
+        return false;
+    }
 
 #ifdef HAVE_LIBYUV
-    // 物理对齐步长计算
-    uint32_t stride = (width + 15) & ~15;
-    uint32_t v_stride = (height + 15) & ~15;
-    size_t srcSize = stride * v_stride * 3 / 2;
-
-    // 直接映射共享内存
-    void* srcPtr = mmap(nullptr, srcSize, PROT_READ, MAP_SHARED, drmPrimeFd, 0);
+    void* srcPtr = mmap(nullptr, mapSize, PROT_READ, MAP_SHARED, drmPrimeFd, 0);
     if (srcPtr == MAP_FAILED) {
         return false;
     }
 
-    const uint8_t* srcY = (const uint8_t*)srcPtr;
-    const uint8_t* srcUV = srcY + stride * v_stride;
-
+    const uint8_t* base = static_cast<const uint8_t*>(srcPtr);
+    const uint8_t* srcY = base + yPlane.offset;
+    const uint8_t* srcUV = base + uvPlane.offset;
     uint8_t* scaledY = scaledNv12Buffer_;
     uint8_t* scaledUV = scaledY + PREVIEW_WIDTH * PREVIEW_HEIGHT;
 
-    // 1. 缩放
     int ret = libyuv::NV12Scale(
-        srcY, stride,
-        srcUV, stride,
-        width, height,
-        scaledY, PREVIEW_WIDTH,
-        scaledUV, PREVIEW_WIDTH,
-        PREVIEW_WIDTH, PREVIEW_HEIGHT,
-        libyuv::kFilterBox
-    );
+        srcY, yStride, srcUV, uvStride, width, height,
+        scaledY, PREVIEW_WIDTH, scaledUV, PREVIEW_WIDTH,
+        PREVIEW_WIDTH, PREVIEW_HEIGHT, libyuv::kFilterBox);
 
-    munmap(srcPtr, srcSize);
-
+    munmap(srcPtr, mapSize);
     if (ret != 0) return false;
 
-    // 2. 转换颜色
     ret = libyuv::NV12ToRAWMatrix(
-        scaledY, PREVIEW_WIDTH,
-        scaledUV, PREVIEW_WIDTH,
-        rgbBuffer_, PREVIEW_WIDTH * 3,
-        &libyuv::kYuvH709Constants,
-        PREVIEW_WIDTH, PREVIEW_HEIGHT
-    );
-
+        scaledY, PREVIEW_WIDTH, scaledUV, PREVIEW_WIDTH,
+        rgbBuffer_, PREVIEW_WIDTH * 3, &libyuv::kYuvH709Constants,
+        PREVIEW_WIDTH, PREVIEW_HEIGHT);
     if (ret != 0) return false;
 
-    // 3. JPEG编码
-    return encodeRgbToJpeg(rgbBuffer_, PREVIEW_WIDTH, PREVIEW_HEIGHT, outJpegData, outJpegSize);
+    return encodeRgbToJpeg(rgbBuffer_, PREVIEW_WIDTH, PREVIEW_HEIGHT,
+                           outJpegData, outJpegSize);
 #else
+    (void)mapSize;
     return false;
 #endif
 }
 
-// ... encodeRgbToJpeg 实现部分 ... 
-// (由于 replace_file_content 需要完整的 TargetContent)
-// 我会通过下个调用补全实现逻辑，或者直接在这个 block 写入
-// 为保证原子性，我直接在这里写完关键部分
 
 bool PreviewStreamConverter::encodeRgbToJpeg(uint8_t* rgbData, int width, int height,
                                               uint8_t** outData, size_t* outSize) {

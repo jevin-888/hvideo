@@ -7,6 +7,7 @@
 #include "HttpRequest.h"
 #include "HttpResponse.h"
 #include "core/CommandRouter.h"
+#include "core/PeripheralManager.h"
 #include "vod/LocalVodManager.h"
 #include "vod/LocalVodPlayer.h"
 #include "vod/LocalVodDatabase.h"
@@ -14,7 +15,7 @@
 #include "database/PlaylistManager.h"
 #include "database/VodDatabase.h"
 #include "core/Mubu.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "layer/Layer.h"
 #include "layer/LayerVideo.h"
 #include "network/NetworkManager.h"
@@ -28,6 +29,7 @@
 #include "playcontrol/PlaybackResult.h"
 #include "text/MessageHintRenderer.h"
 #include <json/json.h>
+#include <cctype>
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
@@ -87,12 +89,28 @@ void setVodProxyResponse(HttpResponse &response, const std::string &payload) {
                  message, Json::Value(Json::nullValue));
 }
 
+std::string percentEncodeUriComponent(const std::string& value) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string encoded;
+  encoded.reserve(value.size() * 3);
+  for (unsigned char ch : value) {
+    if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+      encoded.push_back(static_cast<char>(ch));
+    } else {
+      encoded.push_back('%');
+      encoded.push_back(hex[(ch >> 4) & 0x0F]);
+      encoded.push_back(hex[ch & 0x0F]);
+    }
+  }
+  return encoded;
+}
+
 bool isLocalVodMode(hsvj::Engine* engine) {
   return engine && engine->getSystemConfig().getVodMode() == 1 && engine->getSystemConfig().isLocalVodEnabled();
 }
 
 bool isNetworkVodMode(hsvj::Engine* engine) {
-  return engine && engine->getSystemConfig().isNetworkVodEnabled();
+  return engine && engine->isOnlineVodRuntimeEnabled();
 }
 
 hsvj::LocalVodManager* getLocalVodManager(hsvj::Engine* engine) {
@@ -353,17 +371,23 @@ void HttpServer::registerVodRoutes() {
   // =============================================
 
   // 辅助 lambda：从 Vod数据库 读取服务器地址，构造 OnlineVod API 地址
-  auto buildOnlineVodUrl = [this](const std::string& roomId, const std::string& action) -> std::string {
+  auto buildOnlineVodApiUrl = [this](const std::string& apiPath) -> std::string {
     std::string host = engine_ ? engine_->getSystemConfig().getOnlineVodHost() : "";
-    int port = 9898;
+    int port = engine_ ? engine_->getSystemConfig().getOnlineVodPort() : 9898;
     if (host.empty() && vodDatabase_ && vodDatabase_->isOpen()) {
       host = vodDatabase_->getOnlineVodSyncMeta("online_vod_server_host", "");
     }
     if (host.empty()) return "";
     std::string url = "http://" + host;
     if (port != 80 && port > 0) url += ":" + std::to_string(port);
-    url += "/api/v1/rooms/" + roomId + "/" + action;
+    url += "/api/v1/";
+    url += !apiPath.empty() && apiPath.front() == '/' ? apiPath.substr(1) : apiPath;
     return url;
+  };
+
+  auto buildOnlineVodUrl = [buildOnlineVodApiUrl](const std::string& roomId,
+                                                   const std::string& action) -> std::string {
+    return buildOnlineVodApiUrl("rooms/" + percentEncodeUriComponent(roomId) + "/" + action);
   };
 
   // 辅助 lambda：转发请求到 OnlineVod 服务器并返回结果
@@ -448,7 +472,8 @@ void HttpServer::registerVodRoutes() {
         std::string replayPath = videoLayer->getCurrentPath();
         hsvj::Mubu* targetMubu = mubu_ ? mubu_ : (engine_ ? &engine_->getMubu() : nullptr);
         hsvj::PlaybackResult playResult = hsvj::PlaybackRequestDispatcher::requestPlay(
-            targetMubu, layerId, replayPath, videoLayer->getLoop(), hsvj::PlaybackSource::LocalVod, true);
+            targetMubu, layerId, replayPath, videoLayer->getLoop(), hsvj::PlaybackSource::LocalVod, true,
+            0.0, true);
         if (!playResult.isSuccess()) {
           setVodResponse(response, 500, false,
                          std::string("Replay failed: ") + hsvj::toString(playResult.code),
@@ -612,6 +637,80 @@ void HttpServer::registerVodRoutes() {
       if (hsvj::JsonUtils::parseJson(body, param, parseErr)) {
         engine_->handleOnlineVodPlaybackCommand("SwitchTrack", param, request.getBody());
       }
+    }
+    setVodProxyResponse(response, result);
+  };
+
+  auto forwardYoutubeGet = [this, buildOnlineVodApiUrl](
+                               const std::string& endpoint,
+                               const std::string& queryName,
+                               const HttpRequest& request,
+                               HttpResponse& response) {
+    if (!isNetworkVodMode(engine_)) {
+      setVodResponse(response, isLocalVodMode(engine_) ? 501 : 403, false,
+                     isLocalVodMode(engine_)
+                         ? "YouTube is only available in online VOD mode"
+                         : "VOD is disabled",
+                     Json::Value(Json::nullValue));
+      return;
+    }
+
+    std::string url = buildOnlineVodApiUrl("youtube/" + endpoint);
+    if (url.empty()) {
+      setVodResponse(response, 503, false, "OnlineVod server not configured",
+                     Json::Value(Json::nullValue));
+      return;
+    }
+    if (!queryName.empty()) {
+      const std::string value = request.getQueryParam(queryName);
+      if (value.empty()) {
+        setVodResponse(response, 400, false, "Missing " + queryName,
+                       Json::Value(Json::nullValue));
+        return;
+      }
+      url += "?" + queryName + "=" + percentEncodeUriComponent(value);
+    }
+
+    LOG_INFO("[VOD] YouTube proxy GET %s", url.c_str());
+    const std::string result = hsvj::httpGet(url, 30);
+    if (result.empty()) {
+      setVodResponse(response, 502, false, "OnlineVod server no response",
+                     Json::Value(Json::nullValue));
+      return;
+    }
+    setVodProxyResponse(response, result);
+  };
+
+  auto queueYoutube = [this, buildOnlineVodApiUrl](const HttpRequest& request,
+                                                   HttpResponse& response) {
+    if (!isNetworkVodMode(engine_)) {
+      setVodResponse(response, isLocalVodMode(engine_) ? 501 : 403, false,
+                     isLocalVodMode(engine_)
+                         ? "YouTube is only available in online VOD mode"
+                         : "VOD is disabled",
+                     Json::Value(Json::nullValue));
+      return;
+    }
+    std::string roomId = request.getUrlParam("id");
+    if (roomId.empty() && engine_) {
+      roomId = engine_->getSystemConfig().getOnlineVodRoomId();
+    }
+    if (roomId.empty()) roomId = "current";
+
+    const std::string url = buildOnlineVodApiUrl(
+        "rooms/" + percentEncodeUriComponent(roomId) + "/youtube/queue");
+    if (url.empty()) {
+      setVodResponse(response, 503, false, "OnlineVod server not configured",
+                     Json::Value(Json::nullValue));
+      return;
+    }
+    const std::string body = request.getBody().empty() ? "{}" : request.getBody();
+    LOG_INFO("[VOD] YouTube proxy POST %s body=%s", url.c_str(), body.c_str());
+    const std::string result = hsvj::httpPostJson(url, body, 30);
+    if (result.empty()) {
+      setVodResponse(response, 502, false, "OnlineVod server no response",
+                     Json::Value(Json::nullValue));
+      return;
     }
     setVodProxyResponse(response, result);
   };
@@ -1010,6 +1109,19 @@ void HttpServer::registerVodRoutes() {
     setVodResponse(response, 0, true, "", Json::Value(Json::objectValue));
   };
 
+  auto localPeripheral = [this](const std::string& event, const HttpRequest& request, HttpResponse& response) {
+    if (!isLocalVodMode(engine_)) {
+      setJsonErrorResponse(response, 409, "仅本地VOD在此处理外设命令；在线VOD请通过点歌服务器发送");
+      return;
+    }
+    Json::Value param;
+    if (!parseJsonBody(request, param, response)) return;
+    if (!param.isObject()) { setJsonErrorResponse(response, 400, "外设参数必须为对象"); return; }
+    const auto result = hsvj::PeripheralManager::getInstance().dispatchVodEvent(event, param);
+    const bool ok = result.get("ok", false).asBool();
+    setVodResponse(response, ok ? 0 : 500, ok, result.get("message", "").asString(), result);
+  };
+
   auto emptyListResponse = [](const HttpRequest& request, HttpResponse& response) {
     (void)request;
     setVodResponse(response, 0, true, "", Json::Value(Json::arrayValue));
@@ -1099,11 +1211,11 @@ void HttpServer::registerVodRoutes() {
   post("/api/v1/rooms/{id}/peripheral/call",
       peripheralNoop);
   post("/api/v1/rooms/{id}/peripheral/light",
-      peripheralNoop);
+      [localPeripheral](const HttpRequest& req, HttpResponse& res) { localPeripheral("SetLight", req, res); });
   post("/api/v1/rooms/{id}/peripheral/ac",
-      peripheralNoop);
+      [localPeripheral](const HttpRequest& req, HttpResponse& res) { localPeripheral("SetAC", req, res); });
   post("/api/v1/rooms/{id}/peripheral/effect",
-      peripheralNoop);
+      [localPeripheral](const HttpRequest& req, HttpResponse& res) { localPeripheral("SetEffect", req, res); });
   post("/api/v1/rooms/{id}/peripheral/ambiance",
       peripheralNoop);
   post("/api/v1/rooms/{id}/peripheral/button",
@@ -1128,14 +1240,19 @@ void HttpServer::registerVodRoutes() {
   post("/api/v1/orders", orderAcceptResponse);
   get("/api/v1/materials/categories", emptyListResponse);
   get("/api/v1/streams", emptyListResponse);
-  get("/api/v1/youtube/search", emptyListResponse);
-  get("/api/v1/youtube/parse",
-      [](const HttpRequest& request, HttpResponse& response) {
-        (void)request;
-        setVodResponse(response, 501, false,
-                       "YouTube parse is not available in local VOD mode",
-                       Json::Value(Json::nullValue));
+  get("/api/v1/youtube/hot",
+      [forwardYoutubeGet](const HttpRequest& request, HttpResponse& response) {
+        forwardYoutubeGet("hot", "", request, response);
       });
+  get("/api/v1/youtube/search",
+      [forwardYoutubeGet](const HttpRequest& request, HttpResponse& response) {
+        forwardYoutubeGet("search", "q", request, response);
+      });
+  get("/api/v1/youtube/parse",
+      [forwardYoutubeGet](const HttpRequest& request, HttpResponse& response) {
+        forwardYoutubeGet("parse", "videoId", request, response);
+      });
+  post("/api/v1/rooms/{id}/youtube/queue", queueYoutube);
 
   // GET /api/v1/singerimg?singerNo=xxx — 歌星图片服务
   get("/api/v1/singerimg",

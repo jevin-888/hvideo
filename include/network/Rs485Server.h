@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -50,12 +51,16 @@ public:
     /**
      * @brief 启动监听
      */
-    bool start();
+    bool start(bool startReader = true);
 
     /**
      * @brief 停止监听
      */
     void stop();
+
+    bool isRunning() const { return isRunning_.load(); }
+    const std::string& getDevice() const { return device_; }
+    int getBaudRate() const { return baudRate_; }
 
     /**
      * @brief 设置方向控制模式
@@ -71,12 +76,6 @@ public:
      * @brief 发送原始二进制数据 (自动处理方向切换)
      */
     bool writeRaw(const std::vector<uint8_t>& data);
-
-    /**
-     * @brief 发送十六进制字符串
-     */
-    bool writeHex(const std::string& hexStr);
-
     /**
      * @brief 设置命令路由器
      */
@@ -115,6 +114,7 @@ private:
     DirectionMode directionMode_;
     std::atomic<bool> isRunning_;
     std::thread readThread_;
+    std::mutex writeMutex_;
     
     CommandRouter* commandRouter_ = nullptr;
     std::function<std::vector<uint8_t>(uint8_t, uint8_t, const std::vector<uint8_t>&)> rawCallback_;

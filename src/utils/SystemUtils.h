@@ -48,6 +48,8 @@ public:
      * @return 包含网络接口信息的 Json::Value 数组
      */
     static Json::Value getNetworkInterfaces();
+    /** Physical interface owning this actual socket IP; null when unavailable. */
+    static Json::Value getNetworkReport(const std::string& localIp);
 
     /**
      * @brief 获取设备名称 (Hostname)
@@ -79,11 +81,18 @@ public:
      */
     static std::string getLocalIp();
 
+    /** USB OTG port mode: peripheral for flashing, host for mouse/USB devices. */
+    static std::string getUsbOtgMode();
+    static bool applyUsbOtgMode(const std::string& mode);
+
     // 设备信息（文档 A1，用于授权/设备信息导出）
     static std::string getHardwareModel();
     static std::string getHardwareSerial();
+    /** Valid hardware serial for admission, never an IP/MAC/generated fallback. */
+    static std::string getRegistrationSerial();
     static std::string getCpuSerial();
     static std::string getStorageSerial();
+    /** Built-in Ethernet (eth0) MAC only; empty while unavailable, never Wi-Fi. */
     static std::string getMacAddress();
     /**
      * @brief 设备指纹：基于型号/CPU/存储等稳定硬件信息的哈希
@@ -92,7 +101,7 @@ public:
      */
     static std::string generateDeviceFingerprint();
 
-    /** 由 Java 经 JNI 注入（绕过 SELinux 对 sysfs 的限制），设备上报时优先使用 */
+    /** Java/JNI supplies serial, model and eth0 MAC (empty if unavailable). */
     static void setDeviceInfoFromJava(const std::string& serial, const std::string& model, const std::string& mac);
 };
 

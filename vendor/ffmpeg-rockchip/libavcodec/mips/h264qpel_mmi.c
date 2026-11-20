@@ -45,7 +45,7 @@ static inline void copy_block4_mmi(uint8_t *dst, const uint8_t *src,
           RESTRICT_ASM_LOW32
           [h]"+&r"(h)
         : [dstStride]"r"((mips_reg)dstStride),
-          [srcStride]"r"((mips_reg)? srcStride)
+          [srcStride]"r"((mips_reg)srcStride)
         : "memory"
     );
 }
@@ -69,7 +69,7 @@ static inline void copy_block8_mmi(uint8_t *dst, const uint8_t *src,
           [dst]"+&r"(dst),                  [src]"+&r"(src),
           [h]"+&r"(h)
         : [dstStride]"r"((mips_reg)dstStride),
-          [srcStride]"r"((mips_reg)? srcStride)
+          [srcStride]"r"((mips_reg)srcStride)
         : "memory"
     );
 }
@@ -99,7 +99,7 @@ static inline void copy_block16_mmi(uint8_t *dst, const uint8_t *src,
           [dst]"+&r"(dst),                  [src]"+&r"(src),
           [h]"+&r"(h)
         : [dstStride]"r"((mips_reg)dstStride),
-          [srcStride]"r"((mips_reg)? srcStride)
+          [srcStride]"r"((mips_reg)srcStride)
         : "memory"
     );
 }
@@ -1638,7 +1638,7 @@ static void put_h264_qpel8or16_hv2_lowpass_mmi(uint8_t *dst,
               RESTRICT_ASM_ALL64
               [tmp]"+&r"(tmp),              [dst]"+&r"(dst),
               [h]"+&r"(h)
-            : [dstStride]"r"((mips_reg)? dstStride)
+            : [dstStride]"r"((mips_reg)dstStride)
             : "memory"
         );
 
@@ -1785,7 +1785,7 @@ static void put_pixels8_l2_shift5_mmi(uint8_t *dst, int16_t *src16,
             : [src8]"r"(src8),              [src16]"r"(src16),
               [dst]"r"(dst),
               [src8Stride]"r"((mips_reg)src8Stride),
-              [dstStride]"r"((mips_reg)? dstStride)
+              [dstStride]"r"((mips_reg)dstStride)
             : "memory"
         );
 
@@ -1959,7 +1959,7 @@ static void avg_h264_qpel8or16_hv2_lowpass_mmi(uint8_t *dst,
               RESTRICT_ASM_ALL64
               [tmp]"+&r"(tmp),              [dst]"+&r"(dst),
               [h]"+&r"(h)
-            : [dstStride]"r"((mips_reg)? dstStride)
+            : [dstStride]"r"((mips_reg)dstStride)
             : "memory"
         );
 
@@ -2128,7 +2128,7 @@ static void avg_pixels8_l2_shift5_mmi(uint8_t *dst, int16_t *src16,
             : [src8]"r"(src8),              [src16]"r"(src16),
               [dst]"r"(dst),
               [src8Stride]"r"((mips_reg)src8Stride),
-              [dstStride]"r"((mips_reg)? dstStride)
+              [dstStride]"r"((mips_reg)dstStride)
             : "memory"
         );
 

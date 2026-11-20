@@ -1,0 +1,6 @@
+/vendor/lib64/libmpp\.so           u:object_r:same_process_hal_file:s0
+/vendor/lib64/libavcodec\.so       u:object_r:same_process_hal_file:s0
+/vendor/lib64/libavformat\.so      u:object_r:same_process_hal_file:s0
+/vendor/lib64/libavutil\.so        u:object_r:same_process_hal_file:s0
+/vendor/lib64/libswscale\.so       u:object_r:same_process_hal_file:s0
+/vendor/lib64/libswresample\.so    u:object_r:same_process_hal_file:s0

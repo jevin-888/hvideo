@@ -6,6 +6,7 @@
 #include "database/PlaylistManager.h"
 #include "network/PreviewStreamConverter.h"
 #include "network/NetworkManager.h"
+#include "network/SyncContract.h"
 #include "decoder/frame/FrameTypes.h"
 #include <algorithm>
 #include <cctype>
@@ -16,6 +17,7 @@
 #include <thread>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <json/json.h>
 
 #ifndef PRIO_PROCESS
@@ -28,6 +30,8 @@ extern "C" {
 }
 
 namespace {
+constexpr size_t kMaxHttpHeaderBytes = 64 * 1024;
+constexpr size_t kMaxHttpBodyBytes = 16 * 1024 * 1024;
 bool startsWith(const std::string &value, const char *prefix) {
   return value.rfind(prefix, 0) == 0;
 }
@@ -40,6 +44,8 @@ bool shouldUseStreamWorkerForRoutedRequest(const HttpRequest &request) {
   return startsWith(path, "/api/v1/materials") ||
          startsWith(path, "/api/v1/filesystem") ||
          startsWith(path, "/api/v1/peripherals/command-lists") ||
+         path == "/api/v1/peripherals/actions/delay" ||
+         path == "/api/v1/peripherals/actions/execute_function_button" ||
          startsWith(path, "/api/v1/scenes") ||
          startsWith(path, "/api/v1/logs") ||
          startsWith(path, "/api/v1/songdb") ||
@@ -70,7 +76,10 @@ public:
 
   void unregisterActive() {
     std::lock_guard<std::mutex> lock(activeMutex_);
-    activeSockets_.erase(socket_);
+    if (socket_ >= 0) {
+      activeSockets_.erase(socket_);
+      socket_ = -1;
+    }
   }
 
 private:
@@ -165,16 +174,6 @@ void HttpServer::Impl::shutdownActiveClients() {
     }
 }
 
-void HttpServer::Impl::unregisterActiveClient(int clientSocket) {
-    std::lock_guard<std::mutex> lock(activeClientSocketsMutex_);
-    activeClientSockets_.erase(clientSocket);
-}
-
-void HttpServer::Impl::closeActiveClientSocket(int clientSocket) {
-    unregisterActiveClient(clientSocket);
-    close(clientSocket);
-}
-
 bool HttpServer::Impl::sendResponseData(
     int clientSocket, const std::vector<char> &responseData) {
     size_t totalSent = 0;
@@ -182,10 +181,12 @@ bool HttpServer::Impl::sendResponseData(
     size_t remaining = responseData.size();
     const int maxRetries = 3;
     int retryCount = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
 
     while (totalSent < responseData.size()) {
+      if (std::chrono::steady_clock::now() >= deadline) break;
       ssize_t sentBytes =
-          send(clientSocket, dataPtr + totalSent, remaining, 0);
+          send(clientSocket, dataPtr + totalSent, remaining, MSG_NOSIGNAL | MSG_DONTWAIT);
       if (sentBytes < 0) {
         int sendErrno = errno;
         if ((sendErrno == EAGAIN || sendErrno == EWOULDBLOCK ||
@@ -204,6 +205,7 @@ bool HttpServer::Impl::sendResponseData(
                   responseData.size());
         break;
       }
+      if (sentBytes == 0) break;
       retryCount = 0;
       totalSent += sentBytes;
       remaining -= sentBytes;
@@ -264,15 +266,21 @@ void HttpServer::Impl::streamWorkerLoop(int workerIndex) {
                                 activeClientSockets_, task.socket);
       int clientSocket = task.socket;
       try {
+        if (!isRunning_) {
+          guard.unregisterActive();
+          close(clientSocket);
+          continue;
+        }
         switch (task.type) {
         case StreamTaskType::Sse:
           handleSSEConnection(clientSocket);
-          clientSocket = -1;
           break;
         case StreamTaskType::Upload:
           handleMaterialUpload(clientSocket, task.request, task.initialData,
                                task.headerEndPos);
-          clientSocket = -1;
+          break;
+        case StreamTaskType::ConfigBackup:
+          handleConfigBackup(clientSocket, task.request, task.initialData, task.headerEndPos);
           break;
         case StreamTaskType::MaterialVideo:
           handleMaterialVideoStream(clientSocket, task.request);
@@ -362,12 +370,12 @@ void HttpServer::Impl::handleClient(ClientConnection &conn) {
     auto handoffStreamTask = [&](StreamTask task) {
       int rejectStatus = 503;
       std::string rejectMessage;
+      guard.unregisterActive();
       if (!enqueueStreamTask(std::move(task), rejectStatus, rejectMessage)) {
         sendErrorResponse(clientSocket, rejectStatus, rejectMessage);
         closeClientSocket();
         return false;
       }
-      guard.unregisterActive();
       clientSocket = -1;
       conn.socket = -1;
       return true;
@@ -425,9 +433,9 @@ void HttpServer::Impl::handleClient(ClientConnection &conn) {
               (requestData.size() > static_cast<size_t>(bytesRead) + 3)
                   ? requestData.size() - bytesRead - 3
                   : 0;
-          for (size_t i = searchStart; i + 3 < requestData.size(); ++i) {
+          for (size_t i = searchStart; i + 1 < requestData.size(); ++i) {
             // 检查 \r\n\r\n (标准格式)
-            if (requestData[i] == '\r' && requestData[i + 1] == '\n' &&
+            if (i + 3 < requestData.size() && requestData[i] == '\r' && requestData[i + 1] == '\n' &&
                 requestData[i + 2] == '\r' && requestData[i + 3] == '\n') {
               headersComplete = true;
               headerEndPos = i + 4;
@@ -441,6 +449,11 @@ void HttpServer::Impl::handleClient(ClientConnection &conn) {
               break;
             }
           }
+        }
+        if ((headersComplete ? headerEndPos : requestData.size()) > kMaxHttpHeaderBytes) {
+          sendErrorResponse(clientSocket, 431, "Request Header Fields Too Large");
+          closeClientSocket();
+          return;
         }
       }
 
@@ -517,12 +530,27 @@ void HttpServer::Impl::handleClient(ClientConnection &conn) {
         closeClientSocket();
         return;
       }
+      tempRequest.setPeerIp(conn.peerIp);
+
+      // Stream handoffs happen before the normal routed-request handler. They
+      // must use the same session gate, otherwise SSE/uploads/downloads would
+      // bypass the API authentication check by choosing a streaming path.
+      auto rejectUnauthenticatedStream = [&]() -> bool {
+        const bool authenticated = port_ == 9898
+                                        ? isVodClientAuthenticated(tempRequest)
+                                        : isAuthenticated(tempRequest);
+        if (authenticated) return false;
+        sendErrorResponse(clientSocket, 401, "Unauthorized");
+        closeClientSocket();
+        return true;
+      };
 
       std::string upgradeHeader = tempRequest.getHeader("Upgrade");
       std::transform(upgradeHeader.begin(), upgradeHeader.end(), upgradeHeader.begin(),
                      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
       if (tempRequest.getPath() == "/ws" && tempRequest.getMethod() == "GET" &&
           upgradeHeader == "websocket") {
+        if (rejectUnauthenticatedStream()) return;
         auto* ws = hsvj::NetworkManager::getInstance().getWebSocketServer();
         if (!ws) {
           sendErrorResponse(clientSocket, 503, "WebSocket unavailable");
@@ -530,15 +558,18 @@ void HttpServer::Impl::handleClient(ClientConnection &conn) {
           return;
         }
         LOG_INFO("HttpServer:%d handoff /ws client to WebSocketServer", port_);
-        unregisterActiveClient(clientSocket);
+        // Keep the fd in HttpServer's active set while the synchronous
+        // WebSocket handoff runs. stop() uses shutdown() on that set to wake
+        // the external client loop before joining worker threads.
         ws->handleExternalClient(clientSocket, headerData);
-        clientSocket = -1;
+        closeClientSocket();
         return;
       }
 
       // 提前检查是否是SSE请求，如果是则保持连接打开
       if (tempRequest.getPath() == "/api/v1/events" &&
           tempRequest.getMethod() == "GET") {
+        if (rejectUnauthenticatedStream()) return;
         StreamTask task;
         task.type = StreamTaskType::Sse;
         task.socket = clientSocket;
@@ -553,6 +584,7 @@ void HttpServer::Impl::handleClient(ClientConnection &conn) {
       // 提前检查是否是文件上传请求，如果是则立即进行流式处理（避免将大文件加载到内存）
       if (tempRequest.getPath() == "/api/v1/materials/upload" &&
           tempRequest.getMethod() == "POST") {
+        if (rejectUnauthenticatedStream()) return;
         StreamTask task;
         task.type = StreamTaskType::Upload;
         task.socket = clientSocket;
@@ -564,11 +596,46 @@ void HttpServer::Impl::handleClient(ClientConnection &conn) {
         return;
       }
 
+      // ZIP transfer uses the authenticated stream queue, never buffers the archive in RAM.
+      if (tempRequest.getPath() == "/api/v1/system/config-backup" &&
+          (tempRequest.getMethod() == "GET" || tempRequest.getMethod() == "POST")) {
+        if (rejectUnauthenticatedStream()) return;
+        StreamTask task;
+        task.type = StreamTaskType::ConfigBackup;
+        task.socket = clientSocket;
+        task.peerIp = conn.peerIp;
+        task.request = tempRequest;
+        task.initialData = std::move(requestData);
+        task.headerEndPos = headerEndPos;
+        handoffStreamTask(std::move(task));
+        return;
+      }
+
       // 读取请求体（如果有）- 仅对非上传请求读取完整请求体
       std::string contentLengthStr = tempRequest.getHeader("Content-Length");
       if (!contentLengthStr.empty()) {
         try {
-          size_t contentLength = std::stoul(contentLengthStr);
+          size_t contentLength = 0;
+          if (!tempRequest.getContentLength(contentLength)) {
+            sendErrorResponse(clientSocket, 400, "Invalid Content-Length");
+            closeClientSocket();
+            return;
+          }
+          if (contentLength > kMaxHttpBodyBytes &&
+              !(tempRequest.getMethod() == "POST" &&
+                tempRequest.getPath() == "/api/v1/sync/receive")) {
+            sendErrorResponse(clientSocket, 413, "Request body too large");
+            closeClientSocket();
+            return;
+          }
+          if (tempRequest.getMethod() == "POST" &&
+              tempRequest.getPath() == "/api/v1/sync/receive" &&
+              contentLength > hsvj::sync_contract::kMaxReceiveBodyBytes) {
+            sendErrorResponse(clientSocket, 413,
+                              "Sync request exceeds 16MB limit");
+            closeClientSocket();
+            return;
+          }
           size_t bodyReceived = requestData.size() - headerEndPos;
 
           // 继续读取请求体直到达到Content-Length
@@ -586,9 +653,17 @@ void HttpServer::Impl::handleClient(ClientConnection &conn) {
                                buffer.begin() + bytesRead);
             bodyReceived += bytesRead;
           }
+          if (bodyReceived != contentLength) {
+            sendErrorResponse(clientSocket, 400, "Incomplete request body");
+            closeClientSocket();
+            return;
+          }
         } catch (const std::exception &e) {
           LOG_WARN("Invalid Content-Length header: %s",
                    contentLengthStr.c_str());
+          sendErrorResponse(clientSocket, 400, "Invalid request body");
+          closeClientSocket();
+          return;
         }
       }
 
@@ -603,6 +678,24 @@ void HttpServer::Impl::handleClient(ClientConnection &conn) {
         return;
       }
       request.setPeerIp(conn.peerIp);
+      sockaddr_in localAddress = {};
+      socklen_t localAddressLength = sizeof(localAddress);
+      char localIp[INET_ADDRSTRLEN] = {};
+      if (getsockname(clientSocket, reinterpret_cast<sockaddr*>(&localAddress), &localAddressLength) == 0 &&
+          localAddress.sin_family == AF_INET &&
+          inet_ntop(AF_INET, &localAddress.sin_addr, localIp, sizeof(localIp))) {
+        request.setLocalIp(localIp);
+      }
+
+      if (port_ != 9898 &&
+          (request.getPath() == "/api/v1/materials/video_stream" ||
+           request.getPath() == "/api/v1/materials/download_file" ||
+           request.getPath() == "/api/v1/materials/preview_stream") &&
+          !isAuthenticated(request)) {
+        sendErrorResponse(clientSocket, 401, "Unauthorized");
+        closeClientSocket();
+        return;
+      }
 
       // 检查是否是素材视频流或下载请求（支持流式传输，避免内存暴涨）
       if ((request.getPath() == "/api/v1/materials/video_stream" ||
@@ -810,8 +903,10 @@ void HttpServer::Impl::handleLayerPreviewStream(int clientSocket,
             if (frameCheckCount - lastLogFrameCount >= 25) {
               LOG_WARN("[PreviewStream] Layer %d: DRM数据无效 - fd=%d, "
                        "width=%u, height=%u, numPlanes=%d",
-                       layerId, frame->drmData.fd, frame->drmData.width,
-                       frame->drmData.height, frame->drmData.numPlanes);
+                       layerId, frame->drmData.planeFd(0),
+                       frame->drmData.visibleWidth,
+                       frame->drmData.visibleHeight,
+                       frame->drmData.numPlanes);
               lastLogFrameCount = frameCheckCount;
             }
             videoLayer->releaseFrame(frame);
@@ -824,8 +919,7 @@ void HttpServer::Impl::handleLayerPreviewStream(int clientSocket,
           size_t jpegSize = 0;
 
           bool success = converter->convertFrame(
-              frame->drmData.fd, frame->drmData.width, frame->drmData.height,
-              &jpegData, &jpegSize);
+              frame->drmData, &jpegData, &jpegSize);
 
           if (success && jpegData && jpegSize > 0) {
             // 发送MJPEG帧

@@ -51,7 +51,8 @@ typedef struct TpelDSPContext {
      * @param h height
      */
     tpel_mc_func put_tpel_pixels_tab[11]; // FIXME individual func ptr per width?
-    tpel_mc_func avg_tpel_pixels_tab[11]; // FIXME individual func ptr per width} TpelDSPContext;
+    tpel_mc_func avg_tpel_pixels_tab[11]; // FIXME individual func ptr per width?
+} TpelDSPContext;
 
 void ff_tpeldsp_init(TpelDSPContext *c);
 

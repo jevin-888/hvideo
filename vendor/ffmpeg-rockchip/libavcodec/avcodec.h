@@ -317,7 +317,7 @@ typedef struct RcOverride{
  */
 #define AV_CODEC_FLAG_GRAY            (1 << 13)
 /**
- * error[] variables will be set during encoding.
+ * error[?] variables will be set during encoding.
  */
 #define AV_CODEC_FLAG_PSNR            (1 << 15)
 /**

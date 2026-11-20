@@ -17,6 +17,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace hsvj {
@@ -73,7 +74,8 @@ public:
    * @brief 广播消息给所有客户端
    * @param message 消息内容
    */
-  void broadcast(const std::string& message);
+  size_t broadcast(const std::string& message);
+  size_t broadcastBinary(const std::string& payload);
 
   /**
    * @brief 发送消息给指定客户端
@@ -82,6 +84,8 @@ public:
    * @return 是否发送成功
    */
   bool sendToClient(int clientId, const std::string& message);
+  bool sendBinaryToClient(int clientId, const std::string& payload);
+  // Synchronous borrowed connection; the HTTP caller owns its final close.
   void handleExternalClient(int clientFd, const std::string& handshakeHeaders);
 
   /**
@@ -112,26 +116,31 @@ private:
    */
   void handleClient(int clientFd);
 
-  int port_;                                    // 端口
-    int serverFd_;                                // 服务器 Socket
-    std::atomic<bool> isRunning_;                 // 运行状态
-    std::thread acceptThread_;                    // 接受连接线程
-  
-  mutable std::mutex clientsMutex_;             // 客户端列表锁
-    std::unordered_map<int, std::thread> clientThreads_; // 客户端线程
-    std::vector<int> externalClients_;
-  
+  int port_;                                    // 监听端口
+  int serverFd_;                                // 服务端 Socket
+  std::atomic<bool> isRunning_;                 // 运行状态
+  std::thread acceptThread_;                    // 接受连接的线程
+
+  mutable std::mutex clientsMutex_;             // 客户端集合互斥锁
+  std::mutex sendMutex_;
+  std::unordered_set<int> activeClients_;
+  std::unordered_map<int, std::thread> clientThreads_; // 客户端工作线程
+  std::vector<int> externalClients_;
+
   CommandRouter* commandRouter_ = nullptr;      // 命令路由器
-    std::function<void(int, bool)> connectionCallback_;
+  std::function<void(int, bool)> connectionCallback_;
   std::function<std::string(int, const std::string&)> messageCallback_;
 
   // 辅助函数：WebSocket 握手
-    bool performHandshake(int fd);
-    bool performHandshakeFromHeaders(int fd, const std::string& headers);
+  bool performHandshake(int fd);
+  bool performHandshakeFromHeaders(int fd, const std::string& headers);
   // 辅助函数：WS 帧装饰
-    std::string frameMessage(const std::string& message);
+  bool sendFrameToClient(int clientId, const std::string& payload,
+                         unsigned char opcode);
+  size_t broadcastFrame(const std::string& payload, unsigned char opcode);
+  std::string frameMessage(const std::string& payload, unsigned char opcode);
   // 辅助函数：WS 帧解析
-    bool unframeMessage(int fd, std::string& outMessage);
+  bool unframeMessage(int fd, std::string& outMessage);
 };
 
 } // 命名空间 hsvj

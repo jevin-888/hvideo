@@ -6,7 +6,7 @@
  * 负责区域配置的管理和基础访问接口
  */
 #include "renderer/RegionRotationRenderer.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "utils/Logger.h"
 #include <algorithm>
@@ -90,62 +90,109 @@ int RegionRotationRenderer::getRegionIndexById(int regionId) const {
   return -1;
 }
 
-bool RegionRotationRenderer::canDirectRenderToSwapchain() const {
+DirectSwapchainEligibility
+RegionRotationRenderer::checkDirectSwapchainEligibility() const {
   std::lock_guard<std::recursive_mutex> lock(regionsMutex_);
+  auto blocked = [](DirectSwapchainBlockReason reason, int regionId = 0) {
+    return DirectSwapchainEligibility{reason, regionId};
+  };
   if (systemConfig_ && systemConfig_->getManagerMode()) {
-    return false;
+    return blocked(DirectSwapchainBlockReason::MANAGER_MODE);
   }
-  if (licenseWarningStage_ != 0 || dmxOverlayEnabled_) {
-    return false;
+  if (licenseWarningStage_ != 0) {
+    return blocked(DirectSwapchainBlockReason::LICENSE_WARNING);
+  }
+  if (dmxOverlayEnabled_) {
+    return blocked(DirectSwapchainBlockReason::DMX_OVERLAY);
   }
   if (std::fabs(rotationAngle_) > 0.001f) {
-    return false;
+    return blocked(DirectSwapchainBlockReason::ROTATION);
   }
-  if (outputGridCols_ != 1 || outputGridRows_ != 1 ||
-      inputGridCols_ != 1 || inputGridRows_ != 1) {
-    return false;
+  if (canvasWidth_ <= 0 || canvasHeight_ <= 0) {
+    return blocked(DirectSwapchainBlockReason::INVALID_CANVAS);
+  }
+  if (outputGridCols_ <= 0 || outputGridRows_ <= 0 || inputGridCols_ <= 0 ||
+      inputGridRows_ <= 0) {
+    return blocked(DirectSwapchainBlockReason::INVALID_GRID);
+  }
+  if (inputGridCols_ != outputGridCols_ || inputGridRows_ != outputGridRows_) {
+    return blocked(DirectSwapchainBlockReason::GRID_MISMATCH);
   }
 
-  const RegionConfig *active = nullptr;
-  for (const auto &reg : regions_) {
+  auto checkNeutralRegion = [&blocked](const RegionConfig &reg) {
+    if (!isDefaultRectMeshForDirect(reg)) {
+      return blocked(DirectSwapchainBlockReason::REGION_MESH, reg.id);
+    }
+    if (reg.useMatrixCorrection || reg.useCaveProjection) {
+      return blocked(DirectSwapchainBlockReason::REGION_CORRECTION, reg.id);
+    }
+    if (reg.showGrid || reg.maskShowGrid) {
+      return blocked(DirectSwapchainBlockReason::REGION_GRID_OVERLAY, reg.id);
+    }
+    if (reg.maskEnabled) {
+      return blocked(DirectSwapchainBlockReason::REGION_MASK, reg.id);
+    }
+    if (std::fabs(reg.luminance - 1.0f) > 0.001f ||
+        std::fabs(reg.contrast - 1.0f) > 0.001f ||
+        std::fabs(reg.saturation - 1.0f) > 0.001f) {
+      return blocked(DirectSwapchainBlockReason::REGION_COLOR, reg.id);
+    }
+    constexpr float blendEps = 1e-6f;
+    if ((reg.blendLeftEnabled && reg.blendLeft > blendEps) ||
+        (reg.blendRightEnabled && reg.blendRight > blendEps) ||
+        (reg.blendTopEnabled && reg.blendTop > blendEps) ||
+        (reg.blendBottomEnabled && reg.blendBottom > blendEps)) {
+      return blocked(DirectSwapchainBlockReason::REGION_BLEND, reg.id);
+    }
+    return DirectSwapchainEligibility{};
+  };
+
+  const int cellCount = outputGridCols_ * outputGridRows_;
+  std::vector<bool> mapped(static_cast<size_t>(cellCount), false);
+  int activeCount = 0;
+  for (const RegionConfig &reg : regions_) {
     if (reg.outputIndex < 0) {
       continue;
     }
-    if (active != nullptr) {
-      return false;
+    if (reg.outputCol < 0 || reg.outputCol >= outputGridCols_ ||
+        reg.outputRow < 0 || reg.outputRow >= outputGridRows_) {
+      return blocked(DirectSwapchainBlockReason::REGION_CELL_OUT_OF_RANGE,
+                     reg.id);
     }
-    active = &reg;
-  }
-  if (!active) {
-    return false;
-  }
 
-  const RegionConfig &reg = *active;
-  if (reg.outputIndex != 0 || reg.outputCol != 0 || reg.outputRow != 0) {
-    return false;
+    const int cellIndex = reg.outputRow * outputGridCols_ + reg.outputCol;
+    if (reg.outputIndex != cellIndex || mapped[static_cast<size_t>(cellIndex)]) {
+      return blocked(DirectSwapchainBlockReason::REGION_MAPPING_MISMATCH,
+                     reg.id);
+    }
+    const int srcLeft = static_cast<int>(
+        (static_cast<int64_t>(reg.outputCol) * canvasWidth_) /
+        inputGridCols_);
+    const int srcRight = static_cast<int>(
+        (static_cast<int64_t>(reg.outputCol + 1) * canvasWidth_) /
+        inputGridCols_);
+    const int srcTop = static_cast<int>(
+        (static_cast<int64_t>(reg.outputRow) * canvasHeight_) /
+        inputGridRows_);
+    const int srcBottom = static_cast<int>(
+        (static_cast<int64_t>(reg.outputRow + 1) * canvasHeight_) /
+        inputGridRows_);
+    if (reg.srcX != srcLeft || reg.srcY != srcTop ||
+        reg.srcWidth != srcRight - srcLeft ||
+        reg.srcHeight != srcBottom - srcTop) {
+      return blocked(DirectSwapchainBlockReason::REGION_SOURCE_MISMATCH,
+                     reg.id);
+    }
+    const DirectSwapchainEligibility neutral = checkNeutralRegion(reg);
+    if (!neutral.eligible()) {
+      return neutral;
+    }
+    mapped[static_cast<size_t>(cellIndex)] = true;
+    ++activeCount;
   }
-  if (reg.srcX != 0 || reg.srcY != 0 ||
-      reg.srcWidth != canvasWidth_ || reg.srcHeight != canvasHeight_) {
-    return false;
-  }
-  if (!isDefaultRectMeshForDirect(reg) || reg.useMatrixCorrection ||
-      reg.useCaveProjection || reg.showGrid || reg.maskShowGrid ||
-      reg.maskEnabled) {
-    return false;
-  }
-  if (std::fabs(reg.luminance - 1.0f) > 0.001f ||
-      std::fabs(reg.contrast - 1.0f) > 0.001f ||
-      std::fabs(reg.saturation - 1.0f) > 0.001f) {
-    return false;
-  }
-  const float blendEps = 1e-6f;
-  if ((reg.blendLeftEnabled && reg.blendLeft > blendEps) ||
-      (reg.blendRightEnabled && reg.blendRight > blendEps) ||
-      (reg.blendTopEnabled && reg.blendTop > blendEps) ||
-      (reg.blendBottomEnabled && reg.blendBottom > blendEps)) {
-    return false;
-  }
-  return true;
+  return activeCount == cellCount
+             ? DirectSwapchainEligibility{}
+             : blocked(DirectSwapchainBlockReason::REGION_COUNT_MISMATCH);
 }
 
 RegionRotationRenderer::RegionOutputRect

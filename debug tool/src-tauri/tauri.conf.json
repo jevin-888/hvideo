@@ -1,0 +1,68 @@
+{
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "devPath": "../public",
+    "distDir": "../public",
+    "withGlobalTauri": true
+  },
+  "package": {
+    "productName": "HVIDEO局域网调试工具",
+    "version": "1.0.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false
+    },
+    "bundle": {
+      "active": true,
+      "category": "Utility",
+      "copyright": "",
+      "deb": {
+        "depends": []
+      },
+      "externalBin": [],
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.ico"
+      ],
+      "identifier": "com.hvideo.debug-tool",
+      "longDescription": "扫描局域网 HVIDEO 设备，在主窗口内登录并使用设备调试端。",
+      "macOS": {
+        "entitlements": null,
+        "exceptionDomain": "",
+        "frameworks": [],
+        "providerShortName": null,
+        "signingIdentity": null
+      },
+      "resources": [],
+      "shortDescription": "HVIDEO 局域网调试工具",
+      "targets": [
+        "nsis"
+      ],
+      "windows": {
+        "certificateThumbprint": null,
+        "digestAlgorithm": "sha256",
+        "timestampUrl": "",
+        "wix": null
+      }
+    },
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; frame-src http:; connect-src ipc: http://ipc.localhost"
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "maximized": true,
+        "height": 820,
+        "resizable": true,
+        "title": "HVIDEO 局域网调试工具",
+        "width": 1120,
+        "minWidth": 820,
+        "minHeight": 600
+      }
+    ]
+  }
+}

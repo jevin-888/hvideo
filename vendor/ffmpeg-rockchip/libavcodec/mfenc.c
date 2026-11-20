@@ -75,7 +75,7 @@ static int mf_wait_events(AVCodecContext *avctx)
         MediaEventType ev_id = 0;
         HRESULT hr = IMFMediaEventGenerator_GetEvent(c->async_events, 0, &ev);
         if (FAILED(hr)) {
-            av_log(avctx, AV_LOG_ERROR, "IMFMediaEventGenerator_GetEvent() ? failed: %s\n",
+            av_log(avctx, AV_LOG_ERROR, "IMFMediaEventGenerator_GetEvent() failed: %s\n",
                    ff_hr_str(hr));
             return AVERROR_EXTERNAL;
         }

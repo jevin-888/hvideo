@@ -3,6 +3,15 @@ plugins {
     id 'com.android.application'
 }
 
+// AndroidX Core 使用 Kotlin 1.8.22；统一旧协程传递进来的 jdk7/jdk8 模块，
+// 避免同一标准库 API 同时打入 1.6.0 与 1.8.22 两套实现。
+configurations.configureEach {
+    resolutionStrategy.force(
+            'org.jetbrains.kotlin:kotlin-stdlib:1.8.22',
+            'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22',
+            'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22')
+}
+
 def loadRootProperties = { String fileName ->
     def props = new Properties()
     def propsFile = rootProject.file(fileName)
@@ -34,8 +43,24 @@ def signingFileProp = { String key, String fallback ->
     candidate.isAbsolute() ? candidate : rootProject.file(path)
 }
 
+// 两个硬件版本使用各自的正式 platform key，APK 文件名和实际证书必须一一对应。
+def hw81PlatformStoreFile = signingFileProp('hw81.platform.storeFile', 'vendor/security8.1/platform.keystore')
+def hw81PlatformStorePassword = signingProp('hw81.platform.storePassword', '')
+def hw81PlatformKeyAlias = signingProp('hw81.platform.keyAlias', 'android')
+def hw81PlatformKeyPassword = signingProp('hw81.platform.keyPassword', '')
+def hw82PlatformStoreFile = signingFileProp('hw82.platform.storeFile', 'vendor/security8.2/platform.keystore')
+def hw82PlatformStorePassword = signingProp('hw82.platform.storePassword', '')
+def hw82PlatformKeyAlias = signingProp('hw82.platform.keyAlias', 'platform')
+def hw82PlatformKeyPassword = signingProp('hw82.platform.keyPassword', '')
+
 def licenseHmacKey = localProp(licenseProps, 'LICENSE_HMAC_KEY', 'LICENSE_HMAC_KEY', '')
-def escapedLicenseHmacKey = licenseHmacKey.replace('\\', '\\\\').replace('"', '\\"')
+gradle.taskGraph.whenReady { graph ->
+    if (licenseHmacKey.isEmpty() && graph.allTasks.any {
+        it.project == project && (it.name.contains('Release') || it.name.startsWith('buildCMake'))
+    }) {
+        throw new GradleException('LICENSE_HMAC_KEY is required. Restore the existing issuer key in license.properties or the environment.')
+    }
+}
 def useSystemCodecStack = (project.findProperty('useSystemCodecStack') ?: 'false').toString().toBoolean()
 def useSystemMpp = useSystemCodecStack || (project.findProperty('useSystemMpp') ?: 'false').toString().toBoolean()
 def useSystemFfmpeg = useSystemCodecStack || (project.findProperty('useSystemFfmpeg') ?: 'false').toString().toBoolean()
@@ -53,22 +78,20 @@ android {
     ndkVersion '26.1.10909125'
 
     // ======================= 签名配置 =======================
-    // hw81 → vendor/security8.1/platform.keystore（硬件版本一）
-    // hw82 → vendor/security8.2/platform.keystore（硬件版本二）
     signingConfigs {
-        hw81 {
-            storeFile signingFileProp('hw81.storeFile', 'vendor/security8.1/platform.keystore')
-            storePassword signingProp('hw81.storePassword', '')
-            keyAlias signingProp('hw81.keyAlias', 'android')
-            keyPassword signingProp('hw81.keyPassword', '')
+        hw81Platform {
+            storeFile hw81PlatformStoreFile
+            storePassword hw81PlatformStorePassword
+            keyAlias hw81PlatformKeyAlias
+            keyPassword hw81PlatformKeyPassword
             v1SigningEnabled true
             v2SigningEnabled true
         }
-        hw82 {
-            storeFile signingFileProp('hw82.storeFile', 'vendor/security8.2/platform.keystore')
-            storePassword signingProp('hw82.storePassword', '')
-            keyAlias signingProp('hw82.keyAlias', 'platform')
-            keyPassword signingProp('hw82.keyPassword', '')
+        hw82Platform {
+            storeFile hw82PlatformStoreFile
+            storePassword hw82PlatformStorePassword
+            keyAlias hw82PlatformKeyAlias
+            keyPassword hw82PlatformKeyPassword
             v1SigningEnabled true
             v2SigningEnabled true
         }
@@ -79,10 +102,10 @@ android {
     //   hardware（hw81 / hw82） 通道（stable / beta） buildType（释放 / debug）
     //
     // 仅保留有效组合：
-    //   hw81BetaDebug       硬件v1 调试版  签名:security8.1  versionName:"1.0.0-beta-debug"
-    //   hw82BetaDebug       硬件v2 调试版  签名:security8.2  versionName:"1.0.0-beta-debug"
-    //   hw81StableRelease   硬件v1 正式版  签名:security8.1  versionName:"1.0.0"
-    //   hw82StableRelease   硬件v2 正式版  签名:security8.2  versionName:"1.0.0"
+    //   hw81BetaDebug       硬件v1 调试版  签名:hw81 platform key  versionName:"1.0.0-beta-debug"
+    //   hw82BetaDebug       硬件v2 调试版  签名:hw82 platform key  versionName:"1.0.0-beta-debug"
+    //   hw81StableRelease   硬件v1 正式版  签名:hw81 platform key  versionName:"1.0.0"
+    //   hw82StableRelease   硬件v2 正式版  签名:hw82 platform key  versionName:"1.0.0"
     //
     // 已过滤无用组合：stableDebug、betaRelease
     // Android Studio：右侧 Build Variants 面板选择
@@ -96,13 +119,15 @@ android {
         // ---- 硬件维度 ----
         hw81 {
             dimension "hardware"
-            signingConfig signingConfigs.hw81
+            manifestPlaceholders = [playerHardware: "hw81"]
+            signingConfig signingConfigs.hw81Platform
             // 在 BuildConfig 中暴露硬件型号，方便代码里按需适配
             buildConfigField "String", "HARDWARE", '"hw81"'
         }
         hw82 {
             dimension "hardware"
-            signingConfig signingConfigs.hw82
+            manifestPlaceholders = [playerHardware: "hw82"]
+            signingConfig signingConfigs.hw82Platform
             buildConfigField "String", "HARDWARE", '"hw82"'
         }
 
@@ -141,28 +166,55 @@ android {
         def versionMinor = (versionProps['VERSION_MINOR'] ?: '0').toInteger()
         def versionPatch = (versionProps['VERSION_PATCH'] ?: '0').toInteger()
 
-        def isReleaseBuild = gradle.startParameter.taskNames.any { taskName ->
-            def lowerTaskName = taskName.toLowerCase()
-            (lowerTaskName.contains('assemble') || lowerTaskName.contains('bundle')) &&
-                    lowerTaskName.contains('release')
+        if (versionMajor < 0 || !(versionMinor in 0..9) || !(versionPatch in 0..9)) {
+            throw new GradleException('Version must use non-negative major and single-digit minor/patch.')
         }
 
-        if (isReleaseBuild && !gradle.startParameter.taskNames.any { it.toLowerCase().contains('clean') }) {
-            versionPatch += 1
-            versionProps['VERSION_MAJOR'] = versionMajor.toString()
-            versionProps['VERSION_MINOR'] = versionMinor.toString()
-            versionProps['VERSION_PATCH'] = versionPatch.toString()
-            versionPropsFile.parentFile.mkdirs()
-            versionPropsFile.withOutputStream { versionProps.store(it, null) }
+        // 文件记录上一次成功打包的版本；本次所有硬件/通道共用下一个版本。
+        def previousVersionCode = (versionProps['VERSION_CODE'] ?:
+                (versionMajor * 100 + versionMinor * 10 + versionPatch).toString()).toInteger()
+        versionPatch += 1
+        if (versionPatch == 10) {
+            versionPatch = 0
+            versionMinor += 1
         }
-
-        def computedVersionName = "${versionMajor}.${versionMinor}.${versionPatch}"
+        if (versionMinor == 10) {
+            versionMinor = 0
+            versionMajor += 1
+        }
+        def pinnedVersionName = project.findProperty('engineVersionName')?.toString()
+        def pinnedVersionCode = project.findProperty('engineVersionCode')?.toString()
+        if ((pinnedVersionName == null) != (pinnedVersionCode == null)) {
+            throw new GradleException('engineVersionName and engineVersionCode must be supplied together.')
+        }
+        if (pinnedVersionName != null &&
+                (!(pinnedVersionName ==~ /\d+\.[0-9]\.[0-9]/) || !(pinnedVersionCode ==~ /[1-9]\d*/))) {
+            throw new GradleException('Invalid pinned Engine version.')
+        }
+        def computedVersionName = pinnedVersionName ?: "${versionMajor}.${versionMinor}.${versionPatch}"
         versionName computedVersionName
 
-        def computedVersionCode = versionMajor * 100 + versionMinor * 10 + versionPatch
+        // 安装编号独立递增，显示版本重置后仍可覆盖已安装的旧版。
+        def computedVersionCode = pinnedVersionCode != null ? pinnedVersionCode.toInteger() : Math.addExact(previousVersionCode, 1)
         versionCode computedVersionCode
 
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        gradle.buildFinished { result ->
+            def packagedApp = gradle.taskGraph.allTasks.any { task ->
+                task.project == project &&
+                        task.name ==~ /(?:package|bundle)Hw(?:81|82)(?:StableRelease|BetaDebug)/
+            }
+            if (result.failure == null && !gradle.startParameter.dryRun && packagedApp && pinnedVersionName == null) {
+                versionProps['VERSION_MAJOR'] = versionMajor.toString()
+                versionProps['VERSION_MINOR'] = versionMinor.toString()
+                versionProps['VERSION_PATCH'] = versionPatch.toString()
+                versionProps['VERSION_CODE'] = computedVersionCode.toString()
+                versionPropsFile.parentFile.mkdirs()
+                versionPropsFile.withOutputStream {
+                    versionProps.store(it, 'Last successful APK/AAB build; incremented once per build invocation')
+                }
+                logger.lifecycle("Saved build version ${computedVersionName} (${computedVersionCode})")
+            }
+        }
 
         externalNativeBuild {
             cmake {
@@ -171,7 +223,7 @@ android {
                 arguments "-DANDROID_STL=c++_shared"
                 arguments "-DANDROID_PLATFORM=android-27"  // Mirror SDK 需要 API 27+
                 arguments "-DUSE_LIBYUV=ON"  // 启用 libyuv 优化
-                arguments "-DHVIDEO_LICENSE_HMAC_KEY=${escapedLicenseHmacKey}"
+                arguments "-DHVIDEO_LICENSE_HMAC_KEY=${licenseHmacKey}"
                 // 注：原 RKNN 节拍/人声分离子系统已在 2026-05 整体下线，
                 //    此处不再注入 -DRKNN_SDK_PATH 与 librknnrt.so 链接。
             }
@@ -213,7 +265,7 @@ android {
 
     externalNativeBuild {
         cmake {
-            path file('../CMakeLists.txt')
+            path file('src/main/cpp/CMakeLists.txt')
             version '3.22.1'
         }
     }
@@ -223,10 +275,10 @@ android {
             jniLibs.srcDirs = useSystemMpp
                     ? ['src/main/jniLibs']
                     : ['src/main/jniLibs', '../vendor/rkmpp/android_lib/system-stub']
-            // web 复制到 build/generated/assets/web 参与打包，源码 assets 目录不再被构建任务修改
+            // Package src/main/assets plus generated web/shader assets into the APK.
             assets.srcDirs = [
                     'src/main/assets',
-                    layout.buildDirectory.dir('generated/assets/web').get().asFile.absolutePath
+                    layout.buildDirectory.dir('generated/assets').get().asFile.absolutePath
             ]
         }
     }
@@ -243,18 +295,14 @@ android {
                     ? ['**/libmpp.so', '**/librockchip_mpp.so']
                     : ['**/librockchip_mpp.so']
             // ROM 内置 FFmpeg 时可传 -PuseSystemFfmpeg=true，APK 只保留链接依赖名，
-            // 运行时由系统/vendor namespace 提供 libav*/libsw*/libffmpeg_58。
+            // 运行时由系统/vendor namespace 提供拆分的 libav*/libsw*。
             if (useSystemFfmpeg) {
                 excludes += [
                         '**/libavcodec.so',
-                        '**/libavdevice.so',
-                        '**/libavfilter.so',
                         '**/libavformat.so',
                         '**/libavutil.so',
-                        '**/libpostproc.so',
                         '**/libswresample.so',
-                        '**/libswscale.so',
-                        '**/libffmpeg_58.so'
+                        '**/libswscale.so'
                 ]
             }
         }
@@ -268,69 +316,101 @@ android {
     }
 
     applicationVariants.all { variant ->
+        def hardwareName = variant.productFlavors.find { it.dimension == 'hardware' }.name
         variant.outputs.all { output ->
-            def variantName = variant.name.replaceAll(/([a-z])([A-Z])/, '$1-$2').toLowerCase()
-            // 保持 APK 文件名稳定，避免 Android Studio 部署阶段拿到已变化的产物路径。
-            outputFileName = "hsvj-engine-${variantName}.apk"
+            // 文件名使用本次构建的实际版本和硬件，和 APK 元数据保持一致。
+            outputFileName = "hsvj-engine-${variant.versionName}-${hardwareName}.apk"
         }
     }
 }
 
-// 复制 shader .spv 到 assets（在 CMake 编译之后执行，确保 .frag/.vert 增量编译结果被复制）
-tasks.register('copyShaders', Copy) {
-    into 'src/main/assets'
-    inputs.files(fileTree('../shaders') {
-        include '*.frag', '*.vert', 'effects/*.frag', 'effects/*.vert'
-    })
-    from('../shaders') {
-        include '*.spv'
-        into 'shaders'
-    }
-    from('../shaders/effects') {
-        include '*.spv'
-        into 'shaders/effects'
-    }
-    // [HSVJ_Fix] 移除 upToDateWhen 限制，让 Gradle 自动基于文件时间戳进行增量更新
-    // 否则每次都需要手动传 -PforceShaderCopy 才能生效
+// 用当前 NDK 编译 shader 并复制到 generated assets，避免修改源码 assets 目录。
+// APK 内路径保持为 assets/shaders/*.spv。
+def compiledShaderDir = layout.buildDirectory.dir('generated/shaders')
+def generatedShaderAssetDir = layout.buildDirectory.dir('generated/assets/shaders')
+def generatedWebAssetDir = layout.buildDirectory.dir('generated/assets/web')
 
-    doFirst {
-        println '📂 正在同步 Shader 资源: ../shaders -> src/main/assets/shaders'
-    }
+def compileAppShaders = tasks.register('compileAppShaders') {
+    def shaderSourceDir = rootProject.file('shaders')
+    inputs.files(fileTree(shaderSourceDir) { include '**/*.vert', '**/*.frag', '**/*.glslinc' })
+    outputs.dir(compiledShaderDir)
     doLast {
-        def dest = file("${destinationDir}/shaders")
-        def count = dest.exists() ? fileTree(dest).include('**/*.spv').files.size() : 0
-        println "✅ Shaders 同步完成: 已同步 ${count} 个 .spv 文件到 Assets (未变化时 CMake/Ninja 不会重复编译)"
+        def host = System.getProperty('os.name').toLowerCase()
+        def hostDir = host.contains('windows') ? 'windows-x86_64' : (host.contains('mac') ? 'darwin-x86_64' : 'linux-x86_64')
+        def compiler = new File(android.sdkDirectory,
+                "ndk/${android.ndkVersion}/shader-tools/${hostDir}/glslc${host.contains('windows') ? '.exe' : ''}")
+        if (!compiler.isFile()) throw new GradleException("Shader compiler not found: ${compiler}")
+        def sources = fileTree(shaderSourceDir) { include '**/*.vert', '**/*.frag' }.files
+        if (sources.isEmpty()) throw new GradleException('No application shader sources found')
+        sources.sort().each { source ->
+            def relative = shaderSourceDir.toPath().relativize(source.toPath()).toString()
+            def output = new File(compiledShaderDir.get().asFile, relative + '.spv')
+            output.parentFile.mkdirs()
+            project.exec {
+                commandLine compiler.absolutePath, '-I', shaderSourceDir.absolutePath,
+                        source.absolutePath, '-o', output.absolutePath
+            }
+        }
     }
 }
 
-// 复制 Web 界面文件到 assets（用于首次安装时释放到 /sdcard/huoshan/web/）
-tasks.register('copyWeb', Copy) {
-    into layout.buildDirectory.dir('generated/assets/web')
+def registerShaderSyncTask = { String taskName, String nativeTaskName ->
+    tasks.register(taskName, Sync) {
+        dependsOn nativeTaskName, compileAppShaders
+        into generatedShaderAssetDir
+        from(compiledShaderDir) {
+            include '**/*.spv'
+        }
+
+        doFirst {
+            def compiled = compiledShaderDir.get().asFile
+            if (!compiled.exists() || fileTree(compiled).include('**/*.spv').isEmpty()) {
+                throw new GradleException("No generated SPIR-V files found under ${compiled}. Native shader build did not run.")
+            }
+            println 'Syncing generated SPIR-V assets after native shader compilation'
+        }
+        doLast {
+            def count = destinationDir.exists() ? fileTree(destinationDir).include('**/*.spv').files.size() : 0
+            println "Synced ${count} SPIR-V files into APK assets/shaders"
+        }
+    }
+}
+def copyReleaseShaders = registerShaderSyncTask(
+        'copyReleaseShaders', 'buildCMakeRelWithDebInfo[arm64-v8a]')
+def copyDebugShaders = registerShaderSyncTask(
+        'copyDebugShaders', 'buildCMakeDebug[arm64-v8a]')
+// 复制 Web 界面文件到 generated assets，APK 内路径保持为 assets/web/*。
+def checkSourceEncoding = tasks.register('checkSourceEncoding', Exec) {
+    group = 'verification'
+    description = 'Reject invalid UTF-8 and damaged application text before packaging.'
+    workingDir rootProject.projectDir
+    commandLine(System.getProperty('os.name').toLowerCase().contains('windows') ? 'python' : 'python3',
+            'scripts/check_source_encoding.py')
+}
+tasks.register('copyWeb', Sync) {
+    dependsOn checkSourceEncoding
+    into generatedWebAssetDir
     from('../src/network/web') {
         exclude '**/node_modules', '**/.git', '**/.DS_Store'
-        into 'web'
     }
 
     doFirst {
-        println ' 正在同步 Web 界面资源: ../src/network/web -> build/generated/assets/web/web'
+        println '正在同步 Web 界面资源: ../src/network/web -> build/generated/assets/web'
     }
     doLast {
-        def dest = file("${destinationDir}/web")
-        def count = dest.exists() ? fileTree(dest).files.size() : 0
-        println "✅ Web 界面同步完成: 已更新 ${count} 个文件到 Assets (待打包入 APK)"
+        def count = destinationDir.exists() ? fileTree(destinationDir).files.size() : 0
+        println "Web 界面同步完成: 已更新 ${count} 个文件到 APK assets/web"
     }
 }
-
 // copyShaders 在 CMake 编译之后执行（.spv 由 CMake 增量生成），再参与 mergeDebugAssets
 afterEvaluate {
 
     tasks.matching { it.name ==~ /merge(Hw81|Hw82)(Stable|Beta)(Debug|Release)Assets/ }.configureEach {
         def variantPart = (it.name =~ /^merge(.+)Assets$/)[0][1]
-        def nativeTask = tasks.findByName("externalNativeBuild${variantPart}")
-        if (nativeTask != null) {
-            copyShaders.dependsOn nativeTask
-        }
-        it.dependsOn copyShaders
+        def shaderSyncTask = variantPart.endsWith('Release')
+                ? copyReleaseShaders
+                : copyDebugShaders
+        it.dependsOn shaderSyncTask
         it.dependsOn copyWeb
     }
 
@@ -346,14 +426,10 @@ afterEvaluate {
         task.name ==~ /generate.*LintVitalReportModel/ ||
         task.name ==~ /lintVital.*/
     }.configureEach {
-        it.dependsOn copyShaders
-    }
-
-    // 无修改时也给出提示：copyShaders 为 UP-TO-DATE 时打印
-    gradle.taskGraph.afterTask { Task task, TaskState state ->
-        if (task.name == 'copyShaders' && state.upToDate) {
-            println "✅ Shaders: 无变更，使用已有 .spv（未重新编译）"
-        }
+        def shaderSyncTask = it.name.toLowerCase().contains('release')
+                ? copyReleaseShaders
+                : copyDebugShaders
+        it.dependsOn shaderSyncTask
     }
 }
 
@@ -633,9 +709,4 @@ dependencies {
     // WFD Sink 已改造为 AOSP 系统服务，通过 Service管理器.getService("wfd_sink") 调用
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.core:core:1.12.0'
-    implementation 'com.google.android.material:material:1.10.0'
-    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
-
-    // SQLCipher for Android - 提供预编译的 libsqlcipher.so
-    implementation 'net.zetetic:android-database-sqlcipher:4.5.4'
 }

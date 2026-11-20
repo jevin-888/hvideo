@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
+#include <limits>
 
 HttpRequest::HttpRequest() {
 }
@@ -22,13 +23,20 @@ HttpRequest::~HttpRequest() {
 }
 
 bool HttpRequest::parse(const std::vector<char>& data) {
+    method_.clear();
+    path_.clear();
+    version_.clear();
+    body_.clear();
+    headers_.clear();
+    query_params_.clear();
+    url_params_.clear();
+    peerIp_.clear();
+    localIp_.clear();
     std::string request(data.begin(), data.end());
     std::istringstream iss(request);
     std::string line;
     bool parsedRequestLine = false;
     bool parsingHeaders = true;
-    std::string headers;
-    std::string body;
 
     // 解析请求行和请求头
     while (std::getline(iss, line)) {
@@ -64,7 +72,23 @@ bool HttpRequest::parse(const std::vector<char>& data) {
         body_ = bodyStream.str();
     }
 
-    return parsedRequestLine;
+    size_t length = 0;
+    return parsedRequestLine && !parsingHeaders &&
+           headers_.count("transfer-encoding") == 0 && getContentLength(length);
+}
+
+bool HttpRequest::getContentLength(size_t& length) const {
+    length = 0;
+    const auto it = headers_.find("content-length");
+    if (it == headers_.end()) return true;
+    if (it->second.empty()) return false;
+    for (unsigned char c : it->second) {
+        if (c < '0' || c > '9') return false;
+        const size_t digit = c - '0';
+        if (length > (std::numeric_limits<size_t>::max() - digit) / 10) return false;
+        length = length * 10 + digit;
+    }
+    return true;
 }
 
 const std::string& HttpRequest::getMethod() const {
@@ -82,7 +106,7 @@ const std::string& HttpRequest::getVersion() const {
 const std::string& HttpRequest::getHeader(const std::string& key) const {
     static const std::string empty;
     std::string lowerKey = key;
-    std::transform(lowerKey.begin(), lowerKey.end(), lowerKey.begin(), ::tolower);
+    std::transform(lowerKey.begin(), lowerKey.end(), lowerKey.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     auto it = headers_.find(lowerKey);
     return it != headers_.end() ? it->second : empty;
 }
@@ -124,7 +148,8 @@ bool HttpRequest::parseRequestLine(const std::string& line) {
     iss >> method_ >> path_ >> version_;
 
     // 转换方法为大写
-    std::transform(method_.begin(), method_.end(), method_.begin(), ::toupper);
+    std::transform(method_.begin(), method_.end(), method_.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
 
     // 处理查询参数
     size_t queryPos = path_.find('?');
@@ -134,7 +159,9 @@ bool HttpRequest::parseRequestLine(const std::string& line) {
         parseQueryParams(query);
     }
 
-    return !method_.empty() && !path_.empty() && !version_.empty();
+    std::string extra;
+    return !method_.empty() && !path_.empty() &&
+           (version_ == "HTTP/1.1" || version_ == "HTTP/1.0") && !(iss >> extra);
 }
 
 bool HttpRequest::parseHeader(const std::string& line) {
@@ -145,6 +172,15 @@ bool HttpRequest::parseHeader(const std::string& line) {
 
     std::string key = line.substr(0, colonPos);
     std::string value = line.substr(colonPos + 1);
+    if (key.empty()) return false;
+    for (unsigned char c : key) {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') ||
+              std::string("!#$%&'*+-.^_`|~").find(c) != std::string::npos)) return false;
+    }
+    for (unsigned char c : value) {
+        if ((c < 32 && c != '\t') || c == 127) return false;
+    }
 
     // 移除key和value的前后空格
     key.erase(0, key.find_first_not_of(" \t"));
@@ -153,8 +189,10 @@ bool HttpRequest::parseHeader(const std::string& line) {
     value.erase(value.find_last_not_of(" \t") + 1);
 
     // 转换key为小写
-    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
+    if ((key == "content-length" || key == "authorization" ||
+         key == "transfer-encoding") && headers_.count(key)) return false;
     headers_[key] = value;
     return true;
 }

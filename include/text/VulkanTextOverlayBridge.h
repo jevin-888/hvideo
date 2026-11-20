@@ -63,7 +63,8 @@ public:
                        float bgR = 0.0f, float bgG = 0.0f, float bgB = 0.0f, float bgA = 0.0f,
                        int paddingH = 0, int paddingV = 0, int maxLineWidth = 0,
                        bool centerFirstLine = false, int cornerRadius = 0,
-                       int rightAlignFromLineIndex = -1);
+                       int rightAlignFromLineIndex = -1,
+                       bool fitToContentWidth = false);
 
   uint32_t getTextureId() const;
   int getTextureWidth() const { return textureWidth_; }
@@ -77,6 +78,9 @@ public:
   bool rasterizeText(const std::string& text, float fontSize,
                      float r, float g, float b, float a,
                      std::vector<uint8_t>& outRgba, int& outWidth, int& outHeight);
+
+  /** 使用 FreeType 字形前进量计算文本宽度。 */
+  float measureTextWidth(const std::string& text, float fontSize = 0.0f);
 
   /**
    * 使缓存失效，下次 prepareText 将强制重新生成纹理（用于颜色等变更后立即生效）

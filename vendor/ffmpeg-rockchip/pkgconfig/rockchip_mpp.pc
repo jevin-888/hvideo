@@ -1,7 +1,7 @@
-prefix=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/../rkmpp/android_lib
+prefix=/mnt/d/HVIDEO/Hplayer/vendor/ffmpeg-rockchip/../rkmpp/android_lib
 exec_prefix=${prefix}
-libdir=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/../rkmpp/android_lib/system-stub/arm64-v8a
-includedir=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/../rkmpp/android_lib/include
+libdir=/mnt/d/HVIDEO/Hplayer/vendor/ffmpeg-rockchip/../rkmpp/android_lib/system-stub/arm64-v8a
+includedir=/mnt/d/HVIDEO/Hplayer/vendor/ffmpeg-rockchip/../rkmpp/android_lib/include
 
 Name: rockchip_mpp
 Description: Rockchip Media Process Platform

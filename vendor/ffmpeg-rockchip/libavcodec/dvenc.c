@@ -1033,7 +1033,7 @@ static inline int dv_write_pack(enum DVPackType pack_id, DVEncContext *c,
      *             001, AP2n = 001, AP3n = 001), if the source signal
      *             comes from a digital VCR. If the signal source is
      *             unknown, all bits for these data shall be set to 1.
-     *    (page 12) ? STYPE: STYPE defines a signal type of video signal
+     *    (page 12) STYPE: STYPE defines a signal type of video signal
      *                     00000b = 4:1:1 compression
      *                     00100b = 4:2:2 compression
      *                     XXXXXX = Reserved

@@ -1,5 +1,5 @@
-import '../core/interactionGuards.js';
-import { initializeFusion } from './fusion/index.js?v=2.100';
+import '/shared/interactionGuards.js';
+import { initializeFusion } from './fusion/index.js?v=2.104';
 
 let fusionControlInitialized = false;
 let fusionControlBooting = null;
@@ -158,10 +158,12 @@ function ensureFusionPageShell() {
                                         </div>
                                     </label>
                                     <label class="field fusion-gain-field">
-                                        <span class="field__label" title="融合曲线中点增益（0~1），默认 0.5；过低会让曲线中段贴底。">Gain</span>
+                                        <span class="field__label" title="融合曲线锚点（0~1），默认 0.5；数值越大，中段融合权重越低。">Anchor</span>
                                         <div class="field__input-group">
                                             <button class="btn" type="button" id="fusionGainDecrease">−</button>
-                                            <input id="fusionGainInput" class="field__control" type="number" min="0" max="1" step="0.05" value="0.5">
+                                            <div class="horizontal-drag-field anchor-drag-field" data-horizontal-input="fusionGainInput">
+                                                <output id="fusionGainInput" class="field__control" data-min="0" data-max="1" data-step="0.05" for="fusionGainDecrease fusionGainIncrease">0.5</output>
+                                            </div>
                                             <button class="btn" type="button" id="fusionGainIncrease">+</button>
                                             <button class="btn btn--icon" type="button" id="fusionGainReset" title="重置">↻</button>
                                         </div>
@@ -175,7 +177,7 @@ function ensureFusionPageShell() {
                                         <span class="field__label">R (红)</span>
                                         <div class="field__input-group">
                                             <button class="btn" type="button" id="fusionBrightRDecrease">−</button>
-                                            <div class="brightness-drag-field" data-bright-input="fusionBrightRInput">
+                                            <div class="horizontal-drag-field brightness-drag-field" data-bright-input="fusionBrightRInput">
                                                 <output id="fusionBrightRInput" class="field__control" for="fusionBrightRDecrease fusionBrightRIncrease">128</output>
                                             </div>
                                             <button class="btn" type="button" id="fusionBrightRIncrease">+</button>
@@ -186,7 +188,7 @@ function ensureFusionPageShell() {
                                         <span class="field__label">G (绿)</span>
                                         <div class="field__input-group">
                                             <button class="btn" type="button" id="fusionBrightGDecrease">−</button>
-                                            <div class="brightness-drag-field" data-bright-input="fusionBrightGInput">
+                                            <div class="horizontal-drag-field brightness-drag-field" data-bright-input="fusionBrightGInput">
                                                 <output id="fusionBrightGInput" class="field__control" for="fusionBrightGDecrease fusionBrightGIncrease">128</output>
                                             </div>
                                             <button class="btn" type="button" id="fusionBrightGIncrease">+</button>
@@ -197,7 +199,7 @@ function ensureFusionPageShell() {
                                         <span class="field__label">B (蓝)</span>
                                         <div class="field__input-group">
                                             <button class="btn" type="button" id="fusionBrightBDecrease">−</button>
-                                            <div class="brightness-drag-field" data-bright-input="fusionBrightBInput">
+                                            <div class="horizontal-drag-field brightness-drag-field" data-bright-input="fusionBrightBInput">
                                                 <output id="fusionBrightBInput" class="field__control" for="fusionBrightBDecrease fusionBrightBIncrease">128</output>
                                             </div>
                                             <button class="btn" type="button" id="fusionBrightBIncrease">+</button>
@@ -210,7 +212,7 @@ function ensureFusionPageShell() {
                                 <div class="control-group__title">5. 手机调试</div>
                                 <div class="fusion-mobile-debug">
                                     <a id="fusionMobileDebugLink" class="fusion-mobile-debug__qr" href="/fusion-mobile/" target="_blank" rel="noopener" aria-label="打开手机调试端">
-                                        <canvas id="fusionMobileDebugQr" width="180" height="180"></canvas>
+                                        <canvas id="fusionMobileDebugQr"></canvas>
                                         <span id="fusionMobileDebugFallback" class="fusion-mobile-debug__fallback">二维码</span>
                                     </a>
                                     <div class="fusion-mobile-debug__meta">

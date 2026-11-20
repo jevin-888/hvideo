@@ -2,7 +2,7 @@
 #include "HttpRequest.h"
 #include "HttpResponse.h"
 #include "core/Mubu.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "layer/Layer.h"
 #include "layer/LayerMirror.h"
@@ -10,7 +10,7 @@
 #include "layer/LayerVideo.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
-#include "utils/SliceConfigJson.h"
+#include "core/SliceConfigJson.h"
 #include <algorithm>
 #include <json/json.h>
 #include <string>
@@ -38,6 +38,12 @@ Json::Value layerConfigToJson(const hsvj::LayerConfigData &config) {
   layer["scale"] = hsvj::roundFloat2(config.scale);
   layer["alpha"] = hsvj::roundVolume01(config.alpha);
   layer["priority"] = config.priority;
+  layer["cropLeft"] = std::clamp(config.cropLeft, 0.0f, 1.0f);
+  layer["cropTop"] = std::clamp(config.cropTop, 0.0f, 1.0f);
+  layer["cropRight"] = std::clamp(config.cropRight, 0.0f,
+                                   1.0f - std::clamp(config.cropLeft, 0.0f, 1.0f));
+  layer["cropBottom"] = std::clamp(config.cropBottom, 0.0f,
+                                    1.0f - std::clamp(config.cropTop, 0.0f, 1.0f));
 
   if (!config.roamConfig.empty()) layer["roamConfig"] = config.roamConfig;
 
@@ -54,6 +60,9 @@ Json::Value layerConfigToJson(const hsvj::LayerConfigData &config) {
       layer["captureRotation"] = hsvj::LayerVideo::normalizeCaptureRotation(
           config.captureRotation);
       if (config.captureIndex != 0) layer["captureIndex"] = config.captureIndex;
+      layer["captureWidth"] = config.captureWidth;
+      layer["captureHeight"] = config.captureHeight;
+      layer["captureResolutionLocked"] = config.captureResolutionLocked;
     } else {
       layer["playbackRate"] = hsvj::roundFloat2(config.playbackRate);
       layer["volume"] = hsvj::roundVolume01(config.volume);
@@ -104,7 +113,6 @@ Json::Value layerConfigToJson(const hsvj::LayerConfigData &config) {
     if (layerId == 71) {
       layer["qrContent"] = config.qrContent;
       layer["qrSize"] = config.qrSize;
-      layer["qrLogoSize"] = config.qrLogoSize;
       layer["qrText"] = config.qrText;
       layer["qrTextColor"] = config.qrTextColor;
       layer["qrBgColor"] = config.qrBgColor;
@@ -115,7 +123,7 @@ Json::Value layerConfigToJson(const hsvj::LayerConfigData &config) {
 
   if (isText) {
     layer["text"] = config.text;
-    if (!config.fontPath.empty()) {
+    if (layerId != 21 && !config.fontPath.empty()) {
       std::string fontFile = config.fontPath;
       size_t lastSlash = fontFile.find_last_of("/\\");
       if (lastSlash != std::string::npos) fontFile = fontFile.substr(lastSlash + 1);
@@ -163,14 +171,18 @@ Json::Value configLayerPatchToParseInput(const Json::Value &patch, const hsvj::L
   return merged;
 }
 
-void applyTextConfigToRuntimeLayer(const hsvj::LayerConfigData &config, hsvj::Layer *runtimeLayer) {
+void applyTextConfigToRuntimeLayer(const hsvj::LayerConfigData &config, hsvj::Layer *runtimeLayer,
+                                   const hsvj::SystemConfig &systemConfig) {
   if (!runtimeLayer || runtimeLayer->getType() != hsvj::LayerType::TEXT) return;
 
   hsvj::LayerText *textLayer = static_cast<hsvj::LayerText *>(runtimeLayer);
   const int layerId = config.layerId;
 
   textLayer->setText(config.text);
-  if (config.fontPath.empty()) {
+  if (layerId == 21) {
+    const std::string &font = systemConfig.getLyricFont();
+    textLayer->setFontPath(font.empty() ? "" : hsvj::FONT_DIR + font);
+  } else if (config.fontPath.empty()) {
     if (layerId == 40) {
       textLayer->setFontPath("");
     }
@@ -290,12 +302,14 @@ void HttpServer::registerConfigRoutes() {
       runtimeLayer->setInvert(updated->invert);
       runtimeLayer->setGaussianBlur(updated->gaussianBlur);
       runtimeLayer->setFitMode(std::clamp(updated->fitMode, 0, 1));
+      runtimeLayer->setContentCrop(updated->cropLeft, updated->cropTop,
+                                   updated->cropRight, updated->cropBottom);
       if (runtimeLayer->getType() == hsvj::LayerType::MIRROR) {
         auto *mirrorLayer = static_cast<hsvj::LayerMirror *>(runtimeLayer);
         mirrorLayer->setReadyHintVisible(updated->mirrorReadyHintVisible);
         mirrorLayer->setTvVerticalCropPx(updated->tvVerticalCropPx);
       }
-      applyTextConfigToRuntimeLayer(*updated, runtimeLayer);
+      applyTextConfigToRuntimeLayer(*updated, runtimeLayer, *systemConfig_);
       if (mubu_) mubu_->sortLayersByPriority();
     }
 #ifdef __ANDROID__

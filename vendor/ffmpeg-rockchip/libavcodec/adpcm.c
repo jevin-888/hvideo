@@ -55,7 +55,7 @@
  * http://www.pcisys.net/~melanson/codecs/simpleaudio.html [dead]
  * http://www.geocities.com/SiliconValley/8682/aud3.txt [dead]
  * http://openquicktime.sourceforge.net/
- * XAnim sources (xa_codec.c) ? http://xanim.polter.net/
+ * XAnim sources (xa_codec.c) http://xanim.polter.net/
  * http://www.cs.ucla.edu/~leec/mediabench/applications.html [dead]
  * SoX source code http://sox.sourceforge.net/
  *

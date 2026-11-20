@@ -10,6 +10,8 @@ namespace hsvj::fusion {
 
 constexpr int kMaskMinGrid = 2;
 constexpr int kMaskMaxGrid = 128;
+constexpr float kMinBlendGamma = 0.1f;
+constexpr float kMinBlendSlope = 0.01f;
 
 enum class FusionSide {
   Left = 0,
@@ -82,7 +84,7 @@ struct GeometryCorrectionState {
 struct CaveWallState {
   bool enabled = false;
   int wallType = 0;
-  float eyeDistance = 0.065f;
+  float eyeDistance = 2.0f;
   float nearPlane = 0.1f;
   float farPlane = 100.0f;
   float llx = 0.0f;
@@ -115,6 +117,7 @@ struct FusionProjectState {
 const char *sideName(FusionSide side);
 char sideShortName(FusionSide side);
 bool parseSide(const std::string &value, FusionSide &side);
+void normalizeBlendSide(BlendSideState &side);
 BlendSideState &sideState(BlendRegionState &region, FusionSide side);
 const BlendSideState &sideState(const BlendRegionState &region, FusionSide side);
 

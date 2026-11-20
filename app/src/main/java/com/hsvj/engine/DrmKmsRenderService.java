@@ -1,17 +1,21 @@
 package com.hsvj.engine;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
 import android.os.IBinder;
 import android.util.Log;
 
 import com.hsvj.engine.resource.EmbeddedResourceManager;
-import com.hsvj.engine.resource.IncrementalUpdater;
-import com.hsvj.engine.resource.ResourceClassifier;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.Locale;
 import java.util.concurrent.locks.LockSupport;
 
@@ -19,20 +23,55 @@ import java.util.concurrent.locks.LockSupport;
 public final class DrmKmsRenderService extends Service {
     private static final String TAG = "DrmKmsRenderService";
     private static final long FRAME_PERIOD_NS = 33_333_333L;
+    private static final long TAKEOVER_WAIT_TIMEOUT_NS = 120_000_000_000L;
+    private static final long FIRST_PRESENT_TIMEOUT_NS = 20_000_000_000L;
+    private static final String TAKEOVER_COMMAND = "acquire";
+    private static final String FOREGROUND_CHANNEL_ID = "hsvj_drm_engine";
+    private static final int FOREGROUND_NOTIFICATION_ID = 0x4853564A;
 
     private final Object lifecycleLock = new Object();
     private volatile boolean running;
     private Thread renderThread;
     private HSVJEngine engine;
+    private BluetoothAudioModeController bluetoothAudioController;
     private File statusFile;
+    private File commandFile;
 
     @Override
     public void onCreate() {
         super.onCreate();
+        PlatformControlGateway.initialize(this);
+        DSPControl.initialize(this);
+        bluetoothAudioController = new BluetoothAudioModeController(this, "drm-kms");
+        bluetoothAudioController.start("service_create");
+        promoteToForeground();
         statusFile = new File(getFilesDir(), "drm_kms_engine.status");
+        commandFile = new File(getFilesDir(), "drm_kms_engine.command");
+        deleteCommandFile();
         writeStatus("created", 0, "");
     }
 
+    private void promoteToForeground() {
+        NotificationManager notificationManager =
+                (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        NotificationChannel channel = new NotificationChannel(
+                FOREGROUND_CHANNEL_ID,
+                "HSVJ Engine",
+                NotificationManager.IMPORTANCE_MIN);
+        channel.setDescription("Direct DRM/KMS output");
+        channel.setShowBadge(false);
+        notificationManager.createNotificationChannel(channel);
+
+        Notification notification = new Notification.Builder(this, FOREGROUND_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentTitle("HSVJ Engine")
+                .setContentText("Direct DRM/KMS output")
+                .setOngoing(true)
+                .setShowWhen(false)
+                .setCategory(Notification.CATEGORY_SERVICE)
+                .build();
+        startForeground(FOREGROUND_NOTIFICATION_ID, notification);
+    }
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (!OutputBackendController.isDrmKmsSelected()) {
@@ -53,29 +92,39 @@ public final class DrmKmsRenderService extends Service {
     private void runEngine() {
         long frame = 0;
         try {
-            writeStatus("starting", frame, "");
+            writeStatus("preparing", frame, "");
             if (!HSVJEngine.ensureNativeLibraryLoaded()) {
                 throw new IllegalStateException("native_library_load_failed");
             }
 
             String rootPath = PathConfig.getRootPath(getApplicationContext());
-            prepareResources(rootPath);
+            EmbeddedResourceManager.prepareForEngine(getApplicationContext(), rootPath);
 
             MemoryMonitor memoryMonitor = new MemoryMonitor(getApplicationContext());
             boolean lowMemoryMode = memoryMonitor.checkMemoryStatus();
             engine = new HSVJEngine();
             String[] deviceInfo = MainActivity.getDeviceInfoForReport();
             HSVJEngine.setDeviceInfoForReport(deviceInfo[0], deviceInfo[1], deviceInfo[2]);
+
+            writeStatus("ready_for_takeover", frame, "resources_ready");
+            waitForTakeoverCommand();
+            writeStatus("acquiring_drm", frame, "takeover_requested");
+
+            PlatformControlGateway.prepareOnboardSerialAccess();
             boolean initialized = engine.initializeHeadless(
                     getAssets(), getFilesDir().getAbsolutePath(), rootPath,
                     lowMemoryMode, BuildConfig.VERSION_NAME);
             if (!initialized) {
                 throw new IllegalStateException("native_engine_initialize_failed");
             }
+            if (bluetoothAudioController != null) {
+                bluetoothAudioController.setNativeEngineReady(true, "engine_ready");
+            }
 
-            writeStatus("running", frame, "");
             long previousNs = System.nanoTime();
             long nextFrameNs = previousNs;
+            long firstPresentDeadlineNs = previousNs + FIRST_PRESENT_TIMEOUT_NS;
+            boolean firstPresentConfirmed = false;
             while (running) {
                 long nowNs = System.nanoTime();
                 float deltaSeconds = Math.min(0.1f, Math.max(0.0f,
@@ -84,10 +133,22 @@ public final class DrmKmsRenderService extends Service {
                 engine.update(deltaSeconds);
                 frame++;
 
+                long presentCount = engine.getSuccessfulPresentCount();
+                if (!firstPresentConfirmed && presentCount > 0) {
+                    firstPresentConfirmed = true;
+                    writeStatus("running", frame, "first_present_confirmed");
+                } else if (!firstPresentConfirmed
+                        && System.nanoTime() >= firstPresentDeadlineNs) {
+                    throw new IllegalStateException("first_drm_present_timeout");
+                }
+
                 if ((frame % 30) == 0) {
-                    writeStatus("running", frame, String.format(Locale.US,
-                            "frameMs=%.2f,presentMs=%.2f",
-                            engine.getLastFrameTotalMs(), engine.getLastPresentMs()));
+                    writeStatus(firstPresentConfirmed ? "running" : "acquiring_drm",
+                            frame, String.format(Locale.US,
+                                    "frameMs=%.2f,presentMs=%.2f,presents=%d",
+                                    engine.getLastFrameTotalMs(),
+                                    engine.getLastPresentMs(),
+                                    presentCount));
                 }
 
                 nextFrameNs += FRAME_PERIOD_NS;
@@ -104,6 +165,9 @@ public final class DrmKmsRenderService extends Service {
                     + ":" + String.valueOf(error.getMessage()));
             stopSelf();
         } finally {
+            if (bluetoothAudioController != null) {
+                bluetoothAudioController.setNativeEngineReady(false, "engine_stopped");
+            }
             HSVJEngine localEngine = engine;
             engine = null;
             if (localEngine != null) {
@@ -120,32 +184,49 @@ public final class DrmKmsRenderService extends Service {
         }
     }
 
-    private void prepareResources(String rootPath) throws Exception {
-        EmbeddedResourceManager embedded =
-                new EmbeddedResourceManager(getApplicationContext(), false);
-        IncrementalUpdater updater =
-                new IncrementalUpdater(getApplicationContext(), rootPath);
-        boolean needsUpdate = updater.needsIncrementalUpdate();
-        boolean criticalReady = embedded.areCriticalResourcesExtracted(rootPath);
-        if (needsUpdate || !criticalReady) {
-            embedded.extractCriticalResources(rootPath);
-            if (needsUpdate) {
-                ResourceClassifier classifier =
-                        new ResourceClassifier(getApplicationContext());
-                classifier.scanAndClassifyResources();
-                IncrementalUpdater.UpdateResult result =
-                        updater.performIncrementalUpdate(classifier);
-                if (!result.success) {
-                    throw new IllegalStateException("resource_update_failed");
-                }
+    private void waitForTakeoverCommand() {
+        long deadlineNs = System.nanoTime() + TAKEOVER_WAIT_TIMEOUT_NS;
+        while (running && System.nanoTime() < deadlineNs) {
+            if (!OutputBackendController.isDrmKmsSelected()) {
+                throw new IllegalStateException("backend_changed_before_takeover");
+            }
+            if (TAKEOVER_COMMAND.equals(readCommand())) {
+                deleteCommandFile();
+                return;
+            }
+            LockSupport.parkNanos(50_000_000L);
+            if (Thread.interrupted() && !running) {
+                break;
             }
         }
-        if (!embedded.areCriticalResourcesExtracted(rootPath)) {
-            throw new IllegalStateException("critical_resources_missing");
+        throw new IllegalStateException(running
+                ? "takeover_command_timeout"
+                : "service_stopped_before_takeover");
+    }
+
+    private String readCommand() {
+        if (commandFile == null || !commandFile.isFile()) {
+            return "";
+        }
+        try {
+            return new String(
+                    java.nio.file.Files.readAllBytes(commandFile.toPath()),
+                    StandardCharsets.UTF_8).trim();
+        } catch (Exception error) {
+            Log.w(TAG, "Takeover command read failed", error);
+            return "";
         }
     }
 
-    private void writeStatus(String state, long frame, String detail) {
+    private void deleteCommandFile() {
+        if (commandFile != null
+                && commandFile.exists()
+                && !commandFile.delete()) {
+            Log.w(TAG, "Failed to delete stale takeover command");
+        }
+    }
+
+    private synchronized void writeStatus(String state, long frame, String detail) {
         if (statusFile == null) {
             return;
         }
@@ -157,13 +238,23 @@ public final class DrmKmsRenderService extends Service {
         try (FileOutputStream output = new FileOutputStream(temporary, false)) {
             output.write(body.getBytes(StandardCharsets.UTF_8));
             output.flush();
-            if (!temporary.renameTo(statusFile)) {
-                try (FileOutputStream direct = new FileOutputStream(statusFile, false)) {
-                    direct.write(body.getBytes(StandardCharsets.UTF_8));
-                }
+        } catch (Exception error) {
+            Log.w(TAG, "Temporary status write failed", error);
+            return;
+        }
+        try {
+            Files.move(temporary.toPath(), statusFile.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException unsupported) {
+            try {
+                Files.move(temporary.toPath(), statusFile.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (Exception error) {
+                Log.w(TAG, "Status replace failed", error);
             }
         } catch (Exception error) {
-            Log.w(TAG, "Status write failed", error);
+            Log.w(TAG, "Atomic status replace failed", error);
         }
     }
 
@@ -187,10 +278,26 @@ public final class DrmKmsRenderService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        if (bluetoothAudioController != null) {
+            bluetoothAudioController.stop("service_destroy");
+            bluetoothAudioController = null;
+        }
+        deleteCommandFile();
         Thread localThread = renderThread;
         if (localThread != null) {
             localThread.interrupt();
+            // 等待渲染线程完成 native shutdown，避免 Service 销毁后仍访问
+            // 已释放的 Context/Engine；超时后保留中断状态并继续系统回收。
+            if (localThread != Thread.currentThread()) {
+                try {
+                    localThread.join(5000L);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            renderThread = null;
         }
+        stopForeground(STOP_FOREGROUND_REMOVE);
         super.onDestroy();
     }
 

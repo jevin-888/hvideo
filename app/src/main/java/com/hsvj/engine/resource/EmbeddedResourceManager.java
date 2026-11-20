@@ -13,14 +13,13 @@ import android.content.Context;
 import android.content.res.AssetManager;
 import android.util.Log;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.Locale;
 
 /**
  * 嵌入式资源管理器
@@ -32,15 +31,6 @@ public class EmbeddedResourceManager {
     private final Context context;
     private final AssetManager assetManager;
     
-    // 内存缓存，避免重复读取
-    private final Map<String, byte[]> memoryCache;
-    
-    // 关键资源映射表
-    private static final Map<String, String> CRITICAL_RESOURCES = new HashMap<String, String>() {{
-        // com.json 已废弃并删除，不再加载
-        // 示例/字段：put("com.json", "config/com.json");
-    }};
-    
     // 必须存在的关键着色器列表（用于完整性检查）
     private static final String[] CRITICAL_SHADERS = {
         "shaders/texture.vert.spv",
@@ -50,79 +40,56 @@ public class EmbeddedResourceManager {
         "shaders/region.frag.spv"
     };
     
-    public EmbeddedResourceManager(Context context) {
-        this(context, true);
-    }
-
-    public EmbeddedResourceManager(Context context, boolean preloadFonts) {
-        // preloadFonts 保留在构造签名中兼容旧调用；字体复制由增量同步统一处理。
+    private EmbeddedResourceManager(Context context) {
         this.context = context;
         this.assetManager = context.getAssets();
-        this.memoryCache = new ConcurrentHashMap<>();
-        // 关键资源预加载：仅加载极少量的关键配置，Shaders 之后走动态流式提取
-        preloadCriticalResources();
     }
-    
-    private void preloadCriticalResources() {
-        for (Map.Entry<String, String> entry : CRITICAL_RESOURCES.entrySet()) {
-            byte[] data = loadAssetToMemory(entry.getValue());
-            if (data != null) {
-                memoryCache.put(entry.getKey(), data);
+
+    public static void prepareForEngine(Context context, String rootPath) {
+        EmbeddedResourceManager embedded = new EmbeddedResourceManager(context);
+        IncrementalUpdater updater = new IncrementalUpdater(context, rootPath);
+        boolean needsUpdate = updater.needsIncrementalUpdate();
+        boolean criticalReady = embedded.areCriticalResourcesExtracted(rootPath);
+        if (!needsUpdate && criticalReady) {
+            Log.i(TAG, "资源清单未变化且关键资源完整，跳过同步");
+            return;
+        }
+
+        embedded.extractCriticalResources(rootPath);
+        if (needsUpdate) {
+            ResourceClassifier classifier = new ResourceClassifier(context);
+            classifier.scanAndClassifyResources();
+            IncrementalUpdater.UpdateResult result = updater.performIncrementalUpdate(classifier);
+            Log.i(TAG, String.format(Locale.ROOT,
+                    "增量同步完成 success=%b added=%d updated=%d deleted=%d failed=%d cost=%dms",
+                    result.success, result.addedFiles, result.updatedFiles,
+                    result.deletedFiles, result.failedFiles, result.totalTime));
+            if (!result.success) {
+                Log.e(TAG, "资源同步失败: " + result.errorMessage);
+                throw new IllegalStateException("resource_update_failed");
             }
+        }
+        if (!embedded.areCriticalResourcesExtracted(rootPath)) {
+            throw new IllegalStateException("critical_resources_missing");
         }
     }
 
-    /**
-     * 从Asset加载文件到内存
-     */
-    private byte[] loadAssetToMemory(String assetPath) {
-        try (InputStream inputStream = assetManager.open(assetPath);
-             ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = inputStream.read(buffer)) != -1) {
-                outputStream.write(buffer, 0, bytesRead);
-            }
-            return outputStream.toByteArray();
-            
-        } catch (IOException e) {
-            Log.w(TAG, "加载Asset文件失败: " + assetPath, e);
-            return null;
-        }
-    }
-    
     /**
      * 快速提取关键资源到目标路径。自动扫描并提取整个 shaders 目录，确保新加入的 shader 也能同步。
      */
-    public boolean extractCriticalResources(String targetRootPath) {
+    private void extractCriticalResources(String targetRootPath) {
         Log.i(TAG, "开始提取关键资源到: " + targetRootPath);
         
         long startTime = System.currentTimeMillis();
-        int extractedCount = 0;
-        
         try {
-            // 确保目标目录存在
             createDirectories(targetRootPath);
-            
-            // 1. 提取预加载的关键配置
-            for (Map.Entry<String, String> entry : CRITICAL_RESOURCES.entrySet()) {
-                String key = entry.getKey();
-                String targetPath = targetRootPath + entry.getValue();
-                if (extractResourceFromCache(key, targetPath)) {
-                    extractedCount++;
-                }
-            }
-            
-            // 2. 动态扫描并提取所有 Shader 文件 (含子目录)
-            extractedCount += extractAssetDirectory("shaders", targetRootPath + "shaders");
+            int extractedCount = extractAssetDirectory("shaders", targetRootPath + "shaders");
             
             long duration = System.currentTimeMillis() - startTime;
-            Log.i(TAG, String.format("关键资源提取完成: %d 个文件, 耗时 %d ms", extractedCount, duration));
-            return extractedCount > 0;
+            Log.i(TAG, String.format(Locale.ROOT, "关键资源提取完成: %d 个文件, 耗时 %d ms", extractedCount, duration));
             
         } catch (Exception e) {
             Log.e(TAG, "提取关键资源失败", e);
-            return false;
         }
     }
 
@@ -189,46 +156,6 @@ public class EmbeddedResourceManager {
     }
 
     /**
-     * 从缓存提取资源到文件
-     * [[Sync_Fix]] 禁止在启动时盲目覆盖已存在的关键配置文件，否则用户调试的所有参数（几何、遮罩等）都会在重启后丢失。
-     */
-    private boolean extractResourceFromCache(String key, String targetPath) {
-        try {
-            File targetFile = new File(targetPath);
-            
-            // 保护策略：如果文件已存在且属于关键配置类资源，则跳过提取以保留用户数据
-            if (shouldSkipExtraction(targetFile, key, targetPath)) {
-                Log.i(TAG, "检测到已存在的配置文件，跳过覆盖以保留用户调试数据: " + targetPath);
-                return true;
-            }
-
-            byte[] data = memoryCache.get(key);
-            if (data == null) {
-                Log.w(TAG, "缓存中未找到资源: " + key);
-                return false;
-            }
-            
-            // 确保目标目录存在
-            ensureParentDirectory(targetFile);
-
-            try {
-                writeBytesToFile(data, targetFile);
-            } catch (IOException firstError) {
-                if (!repairWritableTarget(targetFile)) {
-                    throw firstError;
-                }
-                writeBytesToFile(data, targetFile);
-                Log.i(TAG, "权限修复后提取缓存资源成功: " + key);
-            }
-            return true;
-            
-        } catch (IOException e) {
-            Log.e(TAG, "提取资源失败: " + key + " -> " + targetPath, e);
-            return false;
-        }
-    }
-    
-    /**
      * 创建必要的目录结构
      */
     private void createDirectories(String rootPath) {
@@ -285,23 +212,10 @@ public class EmbeddedResourceManager {
         }
     }
 
-    private void writeBytesToFile(byte[] data, File targetFile) throws IOException {
-        try (FileOutputStream fos = new FileOutputStream(targetFile)) {
-            fos.write(data);
-        }
-    }
-    
     /**
      * 检查关键资源是否已存在
      */
-    public boolean areCriticalResourcesExtracted(String targetRootPath) {
-        for (String relativePath : CRITICAL_RESOURCES.values()) {
-            File file = new File(targetRootPath + relativePath);
-            if (!file.exists() || file.length() <= 0) {
-                return false;
-            }
-        }
-
+    private boolean areCriticalResourcesExtracted(String targetRootPath) {
         for (String relativePath : CRITICAL_SHADERS) {
             File file = new File(targetRootPath + relativePath);
             if (!file.exists() || file.length() <= 0) {
@@ -313,45 +227,6 @@ public class EmbeddedResourceManager {
         return true;
     }
     
-    /**
-     * 获取资源内容（从内存缓存）
-     */
-    public byte[] getResourceContent(String key) {
-        return memoryCache.get(key);
-    }
-    
-    /**
-     * 获取资源内容（作为字符串）
-     */
-    public String getResourceContentAsString(String key) {
-        byte[] data = memoryCache.get(key);
-        return data != null ? new String(data) : null;
-    }
-    
-    /**
-     * 检查资源是否在缓存中
-     */
-    public boolean hasResource(String key) {
-        return memoryCache.containsKey(key);
-    }
-    
-    /**
-     * 获取缓存统计信息
-     */
-    public String getCacheStats() {
-        int totalResources = memoryCache.size();
-        long totalSize = 0;
-        
-        for (byte[] data : memoryCache.values()) {
-            totalSize += data.length;
-        }
-        
-        return String.format("嵌入式资源缓存: %d 个文件, 总大小 %d 字节", totalResources, totalSize);
-    }
-
-    /**
-     * 判断是否应跳过文件提取（保护已存在的配置文件不被覆盖）
-     */
     private boolean shouldSkipExtraction(File targetFile, String resourceKey, String targetPath) {
         return targetFile.exists()
                 && (resourceKey.endsWith(".json") || targetPath.contains("/config/"))
@@ -359,61 +234,13 @@ public class EmbeddedResourceManager {
     }
 
     private boolean isEmptyJsonArrayFile(File file) {
-        if (!file.exists() || !file.isFile()) {
-            return false;
-        }
-        if (file.length() == 0) {
-            return true;
-        }
-        try (InputStream in = new java.io.FileInputStream(file);
-             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] buf = new byte[1024];
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                out.write(buf, 0, n);
-            }
-            String content = out.toString("UTF-8").trim();
-            return content.equals("[]");
+        if (!file.isFile()) return false;
+        if (file.length() == 0) return true;
+        try {
+            String content = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+            return content.trim().equals("[]");
         } catch (IOException e) {
             return false;
         }
-    }
-    
-    /**
-     * 清理内存缓存
-     */
-    public void clearCache() {
-        memoryCache.clear();
-        Log.i(TAG, "嵌入式资源缓存已清理");
-    }
-    
-    /**
-     * 验证关键资源完整性
-     */
-    public boolean validateCriticalResources() {
-        Log.i(TAG, "验证关键资源完整性");
-        
-        for (String key : CRITICAL_RESOURCES.keySet()) {
-            if (!memoryCache.containsKey(key)) {
-                Log.e(TAG, "缺少关键资源: " + key);
-                return false;
-            }
-            
-            byte[] data = memoryCache.get(key);
-            if (data == null || data.length == 0) {
-                Log.e(TAG, "关键资源为空: " + key);
-                return false;
-            }
-        }
-        
-        Log.i(TAG, "关键资源完整性验证通过");
-        return true;
-    }
-    
-    /**
-     * 获取关键资源列表
-     */
-    public String[] getCriticalResourceKeys() {
-        return CRITICAL_RESOURCES.keySet().toArray(new String[0]);
     }
 }

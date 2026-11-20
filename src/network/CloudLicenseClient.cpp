@@ -3,7 +3,9 @@
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
 #include "utils/SystemUtils.h"
+#include "utils/ProcessRunner.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -13,10 +15,24 @@
 #include <random>
 #include <sstream>
 #include <thread>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#include "platform/NetworkHttpBridge.h"
+#endif
 
 namespace hsvj {
 
 namespace {
+bool isSafeFrpToken(const std::string &token) {
+    if (token.size() < 16 || token.size() > 256) return false;
+    for (unsigned char c : token) {
+        if (!std::isalnum(c) && c != '.' && c != '_' && c != '~' && c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string urlEncode(const std::string& value) {
     std::ostringstream escaped;
     escaped.fill('0');
@@ -34,7 +50,22 @@ std::string urlEncode(const std::string& value) {
 }
 
 bool writeFrpcConfig(int remotePort) {
-    if (remotePort <= 0) return false;
+    if (remotePort <= 0 || remotePort > 65535) return false;
+    std::string frpToken;
+#ifdef __ANDROID__
+    char propertyValue[PROP_VALUE_MAX] = {};
+    if (__system_property_get("persist.hsvj.frp_token", propertyValue) > 0) {
+        frpToken = propertyValue;
+    }
+#endif
+    if (frpToken.empty()) {
+        const char *environmentValue = std::getenv("HSVJ_FRP_TOKEN");
+        if (environmentValue) frpToken = environmentValue;
+    }
+    if (!isSafeFrpToken(frpToken)) {
+        LOG_WARN("CloudLicenseClient: persist.hsvj.frp_token is not provisioned; skip frpc");
+        return false;
+    }
     const std::string configPath = "/data/local/tmp/frp/frpc.toml";
     const std::string tmpPath = "/data/data/com.hsvj.engine/cache/frpc.toml.tmp";
     const std::string connectServerLocalIp = SystemUtils::getLocalIp();
@@ -45,7 +76,8 @@ bool writeFrpcConfig(int remotePort) {
     }
     out << "serverAddr = \"60.205.127.117\"\n";
     out << "serverPort = 7000\n\n";
-    out << "auth.token = \"HvideoFrpTest2026_ChangeMe\"\n\n";
+    out << "auth.method = \"token\"\n";
+    out << "auth.token = \"" << frpToken << "\"\n\n";
     if (!connectServerLocalIp.empty()) {
         out << "[transport]\n";
         out << "connectServerLocalIP = \"" << connectServerLocalIp << "\"\n\n";
@@ -57,13 +89,16 @@ bool writeFrpcConfig(int remotePort) {
     out << "localPort = 8080\n";
     out << "remotePort = " << remotePort << "\n";
     out.close();
+    if (!out) return false;
     std::string cmd = "su 0 sh -c 'mkdir -p /data/local/tmp/frp && "
                       "mv " + tmpPath + " " + configPath + " && "
-                      "chmod 644 " + configPath + " && "
-                      "pkill -f /data/local/tmp/frp/frpc; "
-                      "chmod 755 /data/local/tmp/frp/frpc 2>/dev/null; "
-                      "setsid /data/local/tmp/frp/frpc -c " + configPath + " >> /data/local/tmp/frp/frpc.log 2>&1 < /dev/null &'";
-    int rc = std::system(cmd.c_str());
+                      "chmod 600 " + configPath + " && "
+                      "chmod 755 /data/local/tmp/frp/frpc && "
+                      "/data/local/tmp/frp/frpc verify -c " + configPath + " && "
+                      "{ pkill -x frpc 2>/dev/null || :; "
+                      "setsid /data/local/tmp/frp/frpc -c " + configPath + " >> /data/local/tmp/frp/frpc.log 2>&1 < /dev/null & }'";
+    const auto result = runShellCommand(cmd, std::chrono::seconds(10));
+    const int rc = result.succeeded() ? 0 : -1;
     LOG_INFO("CloudLicenseClient: update frpc config remotePort=%d localIp=%s rc=%d",
              remotePort, connectServerLocalIp.c_str(), rc);
     return rc == 0;
@@ -116,7 +151,7 @@ void CloudLicenseClient::threadMain() {
              host_.c_str(), port_, intervalSeconds_);
 
     int failureCount = 0;
-    int nextWaitSeconds = randomJitterSeconds(300);
+    int nextWaitSeconds = 0;
 
     while (!stopRequested_.load()) {
         if (nextWaitSeconds > 0) {
@@ -128,20 +163,26 @@ void CloudLicenseClient::threadMain() {
         }
 
         bool triggered = triggerRequested_.exchange(false);
-        bool ok = syncOnce();
+        bool ok = false;
+        try {
+            ok = syncOnce();
+        } catch (const std::exception& error) {
+            LOG_WARN("CloudLicenseClient: invalid response: %s", error.what());
+        }
         if (ok) {
             LOG_DEBUG("CloudLicenseClient: periodic sync OK");
             failureCount = 0;
-            nextWaitSeconds = intervalSeconds_ + randomJitterSeconds(300);
+            nextWaitSeconds = intervalSeconds_ + randomJitterSeconds(15);
         } else {
             LOG_WARN("CloudLicenseClient: periodic sync failed");
+            if (callback_ && !stopRequested_.load()) callback_(LicenseState{});
             failureCount = std::min(failureCount + 1, 4);
-            int backoff = 300 * (1 << (failureCount - 1));
-            nextWaitSeconds = std::min(backoff, 3600) + randomJitterSeconds(60);
+            int backoff = 15 * (1 << (failureCount - 1));
+            nextWaitSeconds = std::min(backoff, 120) + randomJitterSeconds(15);
         }
 
         if (triggered) {
-            nextWaitSeconds = ok ? intervalSeconds_ + randomJitterSeconds(300) : nextWaitSeconds;
+            nextWaitSeconds = ok ? intervalSeconds_ + randomJitterSeconds(15) : nextWaitSeconds;
         }
     }
 
@@ -154,13 +195,32 @@ bool CloudLicenseClient::syncOnce() {
     std::string localIp = SystemUtils::getLocalIp();
     std::string deviceName = SystemUtils::getDeviceName();
     std::string url = "http://" + host_ + ":" + std::to_string(port_) +
-                      "/api/device/license-status?fingerprint=" + urlEncode(fingerprint_) +
+                      "/api/player-license/resolve?fingerprint=" + urlEncode(fingerprint_) +
                       "&lan_ip=" + urlEncode(localIp) +
                       "&web_port=" + std::to_string(webPort_) +
                       "&device_name=" + urlEncode(deviceName) +
                       "&frp_dynamic=1";
     
-    std::string response = httpGet(url, 5);
+    std::string response;
+    int status = 0;
+#ifdef __ANDROID__
+    // Bind each request to a connected Network, so an isolated Ethernet LAN
+    // cannot hide the Wi-Fi internet connection. Never bind the whole process.
+    Json::Value envelope;
+    std::string transportError;
+    if (JsonUtils::parseJson(callJavaHttpRequestAcrossNetworks("GET", url, "", "", 5000),
+                             envelope, transportError) &&
+        envelope["status"].isInt() && envelope["body"].isString()) {
+        status = envelope["status"].asInt();
+        response = envelope["body"].asString();
+    }
+#else
+    response = httpGet(url, 5, "", &status);
+#endif
+    if (status < 200 || status >= 300) {
+        LOG_WARN("CloudLicenseClient: resolve HTTP=%d failed", status);
+        return false;
+    }
     if (response.empty()) {
         LOG_WARN("CloudLicenseClient: GET %s failed (empty response)", url.c_str());
         return false;
@@ -179,7 +239,9 @@ bool CloudLicenseClient::syncOnce() {
     }
 
     Json::Value data = root["data"];
-    if (!data.isObject()) return false;
+    if (!data.isObject() || !data["server_time"].isInt64() ||
+        data["server_time"].asInt64() <= 0 ||
+        (!data["content"].isNull() && !data["content"].isString())) return false;
 
     int remotePort = data.get("remote_port", 0).asInt();
     if (remotePort > 0) {
@@ -188,14 +250,13 @@ bool CloudLicenseClient::syncOnce() {
 
     LicenseState state;
     state.success = true;
-    state.status = data.get("status", "").asString();
-    state.license_expiry = data.get("license_expiry", 0).asInt64();
     state.server_time = data.get("server_time", 0).asInt64();
-    state.serial = data.get("serial", "").asString();
+    state.content = data.get("content", "").asString();
 
     if (callback_) {
         callback_(state);
     }
+    LOG_INFO("CloudLicenseClient: resolve succeeded HTTP=%d contentBytes=%zu", status, state.content.size());
     return true;
 }
 

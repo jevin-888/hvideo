@@ -45,6 +45,7 @@ public:
 
   bool tryBeginOpen(int layerId, const DecoderAdmissionInfo &info,
                     std::string *rejectReason = nullptr);
+  bool requiresAdmissionProbe(int layerId) const;
   void onDecoderOpenFinished(int layerId, const DecoderAdmissionInfo &info,
                              bool success);
   void onLayerStopped(int layerId);

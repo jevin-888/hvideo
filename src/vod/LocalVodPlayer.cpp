@@ -6,7 +6,8 @@
 #include "vod/LocalVodPlayer.h"
 #include "vod/LocalVodManager.h"
 #include "core/Mubu.h"
-#include "core/PathConfig.h"
+#include "core/PeripheralManager.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "layer/Layer.h"
 #include "layer/LayerVideo.h"
@@ -260,7 +261,7 @@ std::vector<std::string> LocalVodPlayer::listIdleVideos() const {
                 return lower.size() >= suffixLen &&
                        lower.compare(lower.size() - suffixLen, suffixLen, suffix) == 0;
             };
-            if (hasVideoSuffix(".mp4") || hasVideoSuffix(".mov") ||
+            if (hasVideoSuffix(".hvideo") || hasVideoSuffix(".mp4") || hasVideoSuffix(".mov") ||
                 hasVideoSuffix(".mkv") || hasVideoSuffix(".avi")) {
                 std::string normalized = FileUtils::normalizePath(file);
                 if (FileUtils::isFile(normalized)) videos.push_back(normalized);
@@ -377,6 +378,15 @@ bool LocalVodPlayer::tryPlay(const LocalVodDatabase::QueueItem& item) {
                   normalizedPath.c_str(), toString(playResult.code));
         return false;
     }
+
+    LocalSongDatabase::SongInfo song;
+    Json::Value fields(Json::objectValue);
+    fields["songNo"] = item.songNo;
+    if (manager_->getSongInfo(item.songNo, song)) {
+        fields["categoryCode"] = song.categoryCode;
+        fields["lightCode"] = song.lightCode;
+    }
+    PeripheralManager::getInstance().dispatchVodEvent("Song", fields);
 
     musicVolume_.store(1.0f);
     videoLayer->setVolume(1.0f);

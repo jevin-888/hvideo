@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "foundation/CloudMaterialMetadata.h"
 
 struct sqlite3;
 
@@ -20,8 +21,9 @@ public:
     bool initialize(const std::string& dbPath, const std::string& materialRootPath);
     void shutdown();
 
-    Json::Value listMaterials(const std::string& type, const std::string& folder, int limit = 500);
-    Json::Value listFolders(const std::string& type);
+    Json::Value listMaterials(const std::string& type, const std::string& folder, int limit = 500, const std::string& storage = "", const std::string& source = "all", const std::string& categoryId = "");
+    Json::Value listFolders(const std::string& type, const std::string& storage = "", const std::string& source = "all");
+    void refreshStorageState();
     Json::Value getStatus() const;
 
     void requestFullScan();
@@ -29,6 +31,7 @@ public:
     bool isScanning() const;
 
     bool upsertFile(const std::string& path);
+    bool upsertCloudFile(const std::string& path, const std::string& displayName, const CloudMaterialMetadata& metadata = {});
     bool removeFile(const std::string& path);
     bool renameFile(const std::string& oldPath, const std::string& newPath);
 
@@ -56,6 +59,8 @@ private:
     void fullScanWorker();
     void scanType(const std::string& type, const std::string& root);
     std::string rootForType(const std::string& type) const;
+    std::string rootForPath(const std::string& type, const std::string& path) const;
+    std::atomic<bool> sataMounted_{false};
 
     sqlite3* db_ = nullptr;
     std::string dbPath_;

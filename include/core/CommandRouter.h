@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 
 namespace hsvj {
@@ -36,23 +37,24 @@ class RegionRotationRenderer;
  * @brief 命令请求结构
  */
 struct CommandRequest {
-  int type;              // 命令类型
-  int code;              // 命令代码
+  int type = 0;          // 命令类型
+  int code = 0;          // 命令代码
   std::string requestId; // 请求ID
-  int64_t timestamp;     // 时间戳
+  int64_t timestamp = 0; // 时间戳
   std::string paramJson; // 参数JSON字符串
+  bool fromSyncGroup = false; // 从 4322 同步组收到，禁止再次转发
 };
 
 /**
  * @brief 命令响应结构
  */
 struct CommandResponse {
-  int code;              // 响应代码
+  int code = 0;          // 响应代码
   std::string requestId; // 请求ID
-  int64_t timestamp;     // 时间戳
+  int64_t timestamp = 0; // 时间戳
   std::string traceId;   // 追踪ID
-  bool ok;               // 是否成功
-  int error;             // 错误代码
+  bool ok = false;       // 是否成功
+  int error = 0;         // 错误代码
   std::string message;   // 消息
   std::string dataJson;  // 数据JSON字符串
 
@@ -70,8 +72,17 @@ struct CommandResponse {
  */
 class CommandRouter {
 public:
+  using CommandObserver =
+      std::function<void(const CommandRequest &, const CommandResponse &)>;
+
   CommandRouter();
   ~CommandRouter();
+
+  /** 设置成功命令观察器（用于主设备向同步组发布命令）。 */
+  void setCommandObserver(CommandObserver observer) {
+    std::lock_guard<std::mutex> lock(commandObserverMutex_);
+    commandObserver_ = std::move(observer);
+  }
 
   /**
    * @brief 设置图层管理器
@@ -167,6 +178,9 @@ public:
 
   bool isPlaybackLocked(int layerId) const;
   void setPlaybackLocked(int layerId, bool locked);
+  bool isGlobalPlaybackLocked() const;
+  void setGlobalPlaybackLocked(bool locked);
+  Json::Value playbackLockState(int layerId) const;
   void setMirroringCommandBlocked(bool blocked, const std::string &mode = "");
   bool isMirroringCommandBlocked() const;
   CommandResponse buildMirroringBlockedResponse(
@@ -191,6 +205,8 @@ public:
    * @return 是否应用成功（SystemConfig 为空或配置无效时返回 false）
    */
   bool applyRegionsFromConfig(bool deferToFrameFence = false);
+  // Shared persistence queue for command changes and Engine-derived addresses.
+  void requestSystemConfigSave(const char *reason, int debounceMs = 500);
 
 private:
   /**
@@ -294,6 +310,7 @@ private:
    * @return 命令响应
    */
   CommandResponse handlePeripheral(int paramCode, const std::string &paramJson);
+  CommandResponse handleStageControl(const std::string &paramJson);
 
 
   // ============================================================================
@@ -348,7 +365,6 @@ private:
   bool rejectIfPlaybackLocked(int layerId, const std::string& action,
                               CommandResponse& response) const;
 
-  void requestSystemConfigSave(const char *reason, int debounceMs = 500);
   void stopSystemConfigSaveWorker();
   void systemConfigSaveWorkerLoop();
 
@@ -365,10 +381,13 @@ private:
   std::mutex regionConfigMutex_;  // 串行化区域配置（0x0C）处理，避免多线程并发导致 Scudo 崩溃
   mutable std::mutex playbackLockMutex_;
   std::unordered_map<int, bool> playbackLocks_;
+  bool globalPlaybackLocked_ = false; // 与图层锁共用 playbackLockMutex_
   mutable std::mutex commandDispatchMutex_;
   std::atomic<bool> mirroringCommandBlocked_{false};
   mutable std::mutex mirroringCommandBlockMutex_;
   std::string mirroringCommandBlockMode_;
+  mutable std::mutex commandObserverMutex_;
+  CommandObserver commandObserver_;
 
   std::mutex systemConfigSaveMutex_;
   std::condition_variable systemConfigSaveCv_;

@@ -65,11 +65,10 @@ public:
     static bool isBlackFrame(AVFrame *frame, int threshold = 16, int sampleRatio = 8);
 
     /**
-     * @brief 根据视频路径获取缩略图缓存目录
-     * @param videoPath 视频路径
+     * @brief 获取缩略图缓存目录
      * @return 缓存目录路径
      */
-    static std::string getThumbnailCacheDir(const std::string &videoPath);
+    static std::string getThumbnailCacheDir();
 
     /**
      * @brief 从帧生成并保存缩略图

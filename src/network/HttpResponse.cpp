@@ -250,7 +250,7 @@ std::vector<char> HttpResponse::readFile(const std::string &path) const {
 std::string HttpResponse::getMimeType(const std::string &path) const {
   std::string extension = path.substr(path.find_last_of(".") + 1);
   std::transform(extension.begin(), extension.end(), extension.begin(),
-                 ::tolower);
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
   if (extension == "html" || extension == "htm")
     return "text/html; charset=utf-8";
@@ -274,7 +274,7 @@ std::string HttpResponse::getMimeType(const std::string &path) const {
     return "application/pdf";
   if (extension == "txt")
     return "text/plain; charset=utf-8";
-  if (extension == "mp4")
+  if (extension == "hvideo" || extension == "mp4")
     return "video/mp4";
   if (extension == "mp3")
     return "audio/mpeg";

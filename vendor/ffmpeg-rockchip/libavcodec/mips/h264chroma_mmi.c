@@ -64,7 +64,7 @@ void ff_put_h264_chroma_mc8_mmi(uint8_t *dst, const uint8_t *src, ptrdiff_t stri
               [ftmp2]"=&f"(ftmp[2]),        [ftmp3]"=&f"(ftmp[3]),
               [dst]"+&r"(dst),              [src]"+&r"(src),
               [h]"+&r"(h)
-            : [stride]"r"((mips_reg)? stride)
+            : [stride]"r"((mips_reg)stride)
             : "memory"
         );
     } else if (x && y) {
@@ -323,7 +323,7 @@ void ff_avg_h264_chroma_mc8_mmi(uint8_t *dst, const uint8_t *src, ptrdiff_t stri
               [ftmp2]"=&f"(ftmp[2]),        [ftmp3]"=&f"(ftmp[3]),
               [dst]"+&r"(dst),              [src]"+&r"(src),
               [h]"+&r"(h)
-            : [stride]"r"((mips_reg)? stride)
+            : [stride]"r"((mips_reg)stride)
             : "memory"
         );
     } else if (x && y) {
@@ -612,7 +612,7 @@ void ff_put_h264_chroma_mc4_mmi(uint8_t *dst, const uint8_t *src, ptrdiff_t stri
               [dst]"+&r"(dst),              [src]"+&r"(src),
               RESTRICT_ASM_LOW32
               [h]"+&r"(h)
-            : [stride]"r"((mips_reg)? stride)
+            : [stride]"r"((mips_reg)stride)
             : "memory"
         );
     }
@@ -742,7 +742,7 @@ void ff_avg_h264_chroma_mc4_mmi(uint8_t *dst, const uint8_t *src, ptrdiff_t stri
               [dst]"+&r"(dst),              [src]"+&r"(src),
               RESTRICT_ASM_LOW32
               [h]"+&r"(h)
-            : [stride]"r"((mips_reg)? stride)
+            : [stride]"r"((mips_reg)stride)
             : "memory"
         );
     }

@@ -12,6 +12,7 @@
 
 #include "utils/FileUtils.h"
 #include "utils/Logger.h"
+#include "utils/ProcessRunner.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -22,10 +23,18 @@
 #include <cstring>
 #include <fcntl.h>
 #include <cctype>
-#include <cstdio>
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <iomanip>
+#ifdef __ANDROID__
+extern "C" {
+#include <libavutil/md5.h>
+#include <libavutil/mem.h>
+}
+#elif defined(HAVE_OPENSSL_CRYPTO)
+#include <openssl/md5.h>
+#endif
 
 namespace hsvj {
 
@@ -300,6 +309,22 @@ bool FileUtils::writeTextFile(const std::string& path, const std::string& conten
         return false;
     }
     chmod(path.c_str(), 0666);
+
+    // Sync directory metadata so the atomic rename also survives sudden power loss.
+    if (!parentDir.empty() && parentDir != ".") {
+        int dirFlags = O_RDONLY;
+#ifdef O_DIRECTORY
+        dirFlags |= O_DIRECTORY;
+#endif
+        int dirFd = open(parentDir.c_str(), dirFlags);
+        if (dirFd >= 0) {
+            if (fsync(dirFd) != 0 && errno != EINVAL && errno != ENOTSUP) {
+                LOG_WARN("Failed to fsync parent directory: %s, errno: %d (%s)",
+                         parentDir.c_str(), errno, strerror(errno));
+            }
+            close(dirFd);
+        }
+    }
     return true;
 }
 
@@ -433,34 +458,45 @@ std::string FileUtils::toSemanticPath(const std::string& path, const std::string
 }
 
 std::string FileUtils::executeCommand(const std::string& command) {
-    std::string result;
-    FILE* pipe = popen(command.c_str(), "r");
-    if (pipe == nullptr) {
-        return result;
+    const auto result = runShellCommand(command, std::chrono::seconds(10), nullptr,
+                                        256 * 1024);
+    if (!result.succeeded()) return {};
+    std::string output = result.output;
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+        output.pop_back();
     }
-    
-    char buffer[128];
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        result += buffer;
-    }
-    
-    pclose(pipe);
-    
-    // 去除末尾的换行符
-    if (!result.empty() && result.back() == '\n') {
-        result.pop_back();
-    }
-    
-    return result;
+    return output;
 }
 
-#ifdef HAVE_OPENSSL_CRYPTO
-#include <openssl/md5.h>
-#include <iomanip>
-#endif
-
 std::string FileUtils::calculateMD5(const std::string& path) {
-#ifndef HAVE_OPENSSL_CRYPTO
+#ifdef __ANDROID__
+    // libavutil is present in both standalone and system-codec APKs. Do not
+    // silently disable verification when optional OpenSSL is unavailable.
+    FILE* input = fopen(path.c_str(), "rb");
+    if (!input) return {};
+    AVMD5* context = av_md5_alloc();
+    if (!context) {
+        fclose(input);
+        return {};
+    }
+    av_md5_init(context);
+    unsigned char buffer[64 * 1024];
+    size_t count;
+    while ((count = fread(buffer, 1, sizeof(buffer), input)) > 0) {
+        av_md5_update(context, buffer, count);
+    }
+    const bool readFailed = ferror(input) != 0;
+    fclose(input);
+    unsigned char digest[16];
+    av_md5_final(context, digest);
+    av_free(context);
+    if (readFailed) return {};
+    std::ostringstream hex;
+    for (unsigned char byte : digest) {
+        hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    }
+    return hex.str();
+#elif !defined(HAVE_OPENSSL_CRYPTO)
     LOG_WARN("calculateMD5: OpenSSL not available, skipping MD5 check for %s", path.c_str());
     return "";
 #else

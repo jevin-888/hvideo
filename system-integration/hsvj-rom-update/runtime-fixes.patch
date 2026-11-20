@@ -1,0 +1,46 @@
+diff --git a/vendor/chuangwei-minimal-perf/hsvj_perf_tune.sh b/vendor/chuangwei-minimal-perf/hsvj_perf_tune.sh
+--- a/vendor/chuangwei-minimal-perf/hsvj_perf_tune.sh
++++ b/vendor/chuangwei-minimal-perf/hsvj_perf_tune.sh
+@@ -126,12 +126,13 @@
+ logi "start mode=$MODE lock_max=$LOCK_MAX"
+ 
+ if [ -d /huoshan ]; then
+-    chown -R system:system /huoshan 2>/dev/null
+-    chmod 0777 /huoshan 2>/dev/null
+-    find /huoshan -type d -exec chmod 0777 {} + 2>/dev/null
+-    find /huoshan -type f -exec chmod 0666 {} + 2>/dev/null
+-    restorecon -RF /huoshan 2>/dev/null
+-    logi "fixed /huoshan permissions"
++    # The signed ROM transaction belongs to root, including across reboots.
++    # Do not follow links or recursively relabel the protected staging tree.
++    find /huoshan -path /huoshan/.rom-update -prune -o -type d \
++        -exec chown system:system {} + -exec chmod 0777 {} + -exec restorecon -F {} + 2>/dev/null
++    find /huoshan -path /huoshan/.rom-update -prune -o -type f \
++        -exec chown system:system {} + -exec chmod 0666 {} + -exec restorecon -F {} + 2>/dev/null
++    logi "fixed /huoshan permissions; protected ROM staging excluded"
+ fi
+ 
+ setprop service.adb.tcp.port 5555
+diff --git a/vendor/chuangwei-minimal-perf/chuangwei_minimal_perf.mk b/vendor/chuangwei-minimal-perf/chuangwei_minimal_perf.mk
+--- a/vendor/chuangwei-minimal-perf/chuangwei_minimal_perf.mk
++++ b/vendor/chuangwei-minimal-perf/chuangwei_minimal_perf.mk
+@@ -1,6 +1,8 @@
+ # Internal ROM protocol is supported only by the matching protected Recovery.
+ PRODUCT_PACKAGES += hsvj-rom-update
+ PRODUCT_SYSTEM_DEFAULT_PROPERTIES += ro.hsvj.rom_update.protocol=1 ro.hsvj.rom.version=$(HSVJ_ROM_VERSION)
++# This arm64-only ART APEX ships dex2oat64, not dex2oat32.
++PRODUCT_SYSTEM_DEFAULT_PROPERTIES += dalvik.vm.dex2oat64.enabled=true
+ 
+ # CHUANGWEI dedicated minimal/performance ROM overlay.
+ # Include near the end of the product makefile:
+diff --git a/vendor/chuangwei-minimal-perf/build_h66_por_update.sh b/vendor/chuangwei-minimal-perf/build_h66_por_update.sh
+--- a/vendor/chuangwei-minimal-perf/build_h66_por_update.sh
++++ b/vendor/chuangwei-minimal-perf/build_h66_por_update.sh
+@@ -2445,6 +2445,7 @@
+ echo "[H66_POR] building Android boot image and dynamic partitions with -j$JOBS"
+ m bootimage recoveryimage systemimage productimage systemextimage vendorimage superimage userdataimage -j"$JOBS"
+ python3 -B "$ENGINE_PROJECT_ROOT/system-integration/hsvj-rom-update/verify_recovery.py" "$ROOT_DIR" "$RECOVERY_IMG"
++python3 -B "$ENGINE_PROJECT_ROOT/system-integration/hsvj-rom-update/verify_runtime.py" "$ROOT_DIR"
+ 
+ validate_hsvj_engine_input_consistency
+ validate_images

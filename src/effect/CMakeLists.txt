@@ -21,3 +21,9 @@ target_link_libraries(hsvj_effect PUBLIC
     # Android平台需要链接android库以支持线程
     $<$<BOOL:${ANDROID}>:android>
 )
+
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_effect PRIVATE
+    hsvj_audio
+    hsvj_utils
+)

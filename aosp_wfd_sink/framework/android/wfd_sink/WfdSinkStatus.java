@@ -7,6 +7,8 @@ import android.os.Parcelable;
 
 /**
  * WFD Sink 服务运行状态快照。
+ *
+ * @hide
  * 字段与原 com.hsvj.wfd.WfdMiracast管理器.Status 对齐，新增 deviceName。
  */
 public final class WfdSinkStatus implements Parcelable {

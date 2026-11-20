@@ -78,9 +78,26 @@ static void frustum(float left, float right, float bottom, float top,
 bool computeCaveProjection(const CaveWallConfig& wallConfig,
                            float defaultEyeDistance,
                            CaveProjectionResult& result) {
+  if (!std::isfinite(defaultEyeDistance) ||
+      !std::isfinite(wallConfig.nearPlane) ||
+      !std::isfinite(wallConfig.farPlane) ||
+      wallConfig.nearPlane < 0.001f ||
+      wallConfig.farPlane <= wallConfig.nearPlane) {
+    return false;
+  }
+
   CaveVec3 rightV, upV;
   vec3Sub(wallConfig.cornerLR, wallConfig.cornerLL, rightV);
   vec3Sub(wallConfig.cornerUL, wallConfig.cornerLL, upV);
+
+  const CaveVec3 corners[] = {wallConfig.cornerLL, wallConfig.cornerUL,
+                              wallConfig.cornerLR};
+  for (const CaveVec3& corner : corners) {
+    if (!std::isfinite(corner.x) || !std::isfinite(corner.y) ||
+        !std::isfinite(corner.z)) {
+      return false;
+    }
+  }
 
   float width = vec3Len(rightV);
   float height = vec3Len(upV);
@@ -115,16 +132,23 @@ bool computeCaveProjection(const CaveWallConfig& wallConfig,
   float R = width - L;
   float B = vec3Dot(eyes, Ys);
   float T = height - B;
-  float distance = vec3Dot(eyes, Zs);
-  if (std::fabs(distance) < 1e-8f)
-    return false;
-
   float near = wallConfig.nearPlane;
   float far = wallConfig.farPlane;
+  float distance = vec3Dot(eyes, Zs);
+  if (!std::isfinite(distance) || distance <= near + 1e-6f ||
+      distance >= far - 1e-6f)
+    return false;
+
   float left = -L * near / distance;
   float right = R * near / distance;
   float bottom = -B * near / distance;
   float top = T * near / distance;
+
+  if (!std::isfinite(left) || !std::isfinite(right) ||
+      !std::isfinite(bottom) || !std::isfinite(top) ||
+      right - left < 1e-8f || top - bottom < 1e-8f) {
+    return false;
+  }
 
   frustum(left, right, bottom, top, near, far, result.projectionMatrix);
 

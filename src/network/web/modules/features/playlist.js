@@ -1,6 +1,6 @@
 // 节目列表模块
 import { apiGet, apiPost, apiPut, apiDelete, apiAction } from '../core/api.js';
-import { addToCommandLog } from '../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { handleApiOperation } from '../utils/apiHelpers.js';
 import { getButtonGroupValue, updateButtonGroupState, setImageOnlyLoopOptionVisible } from '../components/buttonGroups.js';
 import { showConfirm, showWarning, escapeHtml } from '../components/toast.js';
@@ -14,8 +14,11 @@ import { openVideoPreview } from './videoPreview.js';
 let currentPlaylistId = null;
 let currentPlaylistName = '';
 let playlistsCache = []; // 播放列表数据缓存，用于下拉框
+let playlistListRefreshSerial = 0;
+let playlistContentRefreshSerial = 0;
 const PLAYLIST_DMX_STEP = 10;
 const IMAGE_FIXED_LOOP_MODE = 4;
+const PLAYLIST_LAYER_IDS = [1, 2, 3, 4, 60];
 
 function normalizePlaylistDmxId(value) {
     const numericValue = Math.max(0, Math.min(255, parseInt(value, 10) || 0));
@@ -56,10 +59,6 @@ export function getCurrentPlaylistId() {
     return currentPlaylistId;
 }
 
-// 获取当前播放列表名称（供其他模块使用）
-function getCurrentPlaylistName() {
-    return currentPlaylistName;
-}
 
 // 获取播放列表绑定的图层（返回 null 而不是硬编码默认值，让调用方处理）
 export function getPlaylistTargetLayer(playlistId) {
@@ -97,32 +96,38 @@ export function initializePlaylist() {
     const confirmCreateBtn = document.getElementById('confirm-create-playlist-btn');
     if (confirmCreateBtn) {
         confirmCreateBtn.addEventListener('click', async () => {
-            const nameInput = document.getElementById('new-playlist-name');
-            const targetLayerSelect = document.getElementById('new-playlist-target-layer');
-            const dmxIdInput = document.getElementById('new-playlist-dmx-id');
-            const name = nameInput ? nameInput.value : '';
-            const targetLayerId = targetLayerSelect ? parseInt(targetLayerSelect.value) : 1;
-            const loopMode = parseInt(getButtonGroupValue('new-playlist-loop-mode')) || 0;
-            const dmxId = dmxIdInput ? normalizePlaylistDmxId(dmxIdInput.value) : 0;
-            if (dmxIdInput) {
-                dmxIdInput.value = String(dmxId);
-            }
-
-            if (!targetLayerId || Number.isNaN(targetLayerId)) {
-                addToCommandLog('创建播放列表', 'error', '没有可用的授权播放图层');
-                return;
-            }
-
-            if (name) {
-                const createdPlaylist = await createPlaylist(name, targetLayerId, loopMode, dmxId);
-                if (createdPlaylist && createdPlaylist.id) {
-                    hideDialog('create-playlist-dialog');
-                    await updatePlaylistList();
-                    createdPlaylist.targetLayerId = targetLayerId;
-                    selectPlaylist(createdPlaylist.id, createdPlaylist.name || name, createdPlaylist);
+            if (confirmCreateBtn.disabled) return;
+            confirmCreateBtn.disabled = true;
+            try {
+                const nameInput = document.getElementById('new-playlist-name');
+                const targetLayerSelect = document.getElementById('new-playlist-target-layer');
+                const dmxIdInput = document.getElementById('new-playlist-dmx-id');
+                const name = nameInput ? nameInput.value : '';
+                const targetLayerId = targetLayerSelect ? parseInt(targetLayerSelect.value) : 1;
+                const loopMode = parseInt(getButtonGroupValue('new-playlist-loop-mode')) || 0;
+                const dmxId = dmxIdInput ? normalizePlaylistDmxId(dmxIdInput.value) : 0;
+                if (dmxIdInput) {
+                    dmxIdInput.value = String(dmxId);
                 }
-            } else {
-                addToCommandLog('创建播放列表', 'error', '请输入播放列表名称');
+
+                if (!targetLayerId || Number.isNaN(targetLayerId)) {
+                    addToCommandLog('创建播放列表', 'error', '没有可用的授权播放图层');
+                    return;
+                }
+
+                if (name) {
+                    const createdPlaylist = await createPlaylist(name, targetLayerId, loopMode, dmxId);
+                    if (createdPlaylist && createdPlaylist.id) {
+                        hideDialog('create-playlist-dialog');
+                        await updatePlaylistList();
+                        createdPlaylist.targetLayerId = targetLayerId;
+                        selectPlaylist(createdPlaylist.id, createdPlaylist.name || name, createdPlaylist);
+                    }
+                } else {
+                    addToCommandLog('创建播放列表', 'error', '请输入播放列表名称');
+                }
+            } finally {
+                confirmCreateBtn.disabled = false;
             }
         });
     }
@@ -169,8 +174,14 @@ export function initializePlaylist() {
             );
 
             if (confirmed) {
-                await clearPlaylist(currentPlaylistId);
-                await updatePlaylistContent(currentPlaylistId);
+                const playlistId = currentPlaylistId;
+                clearPlaylistBtn.disabled = true;
+                try {
+                    const success = await clearPlaylist(playlistId);
+                    if (success) await updatePlaylistContent(playlistId);
+                } finally {
+                    clearPlaylistBtn.disabled = false;
+                }
             }
         });
     }
@@ -190,20 +201,22 @@ export function initializePlaylist() {
             );
 
             if (confirmed) {
-                const success = await deletePlaylist(currentPlaylistId);
-                if (success) {
-                    // 重置当前选择
-                    currentPlaylistId = null;
-                    currentPlaylistName = '';
-                    // 隐藏数量徽章
-                    updatePlaylistItemCount(0);
-                    // 刷新播放列表
-                    await updatePlaylistList();
-                    // 使用工具函数清空显示
-                    const container = document.getElementById('playlist-items');
-                    if (container) {
-                        clearContainer(container);
+                const playlistId = currentPlaylistId;
+                removePlaylistBtn.disabled = true;
+                try {
+                    const success = await deletePlaylist(playlistId);
+                    if (success) {
+                        if (String(currentPlaylistId) === String(playlistId)) {
+                            currentPlaylistId = null;
+                            currentPlaylistName = '';
+                            updatePlaylistItemCount(0);
+                            clearContainer(document.getElementById('playlist-items'));
+                        }
+                        // Refresh the selector even if the user switched playlists while deletion was pending.
+                        await updatePlaylistList();
                     }
+                } finally {
+                    removePlaylistBtn.disabled = false;
                 }
             }
         });
@@ -346,22 +359,19 @@ async function refreshCreatePlaylistLayerOptions() {
 
 // 更新播放列表列表
 export async function updatePlaylistList() {
+    const refreshSerial = ++playlistListRefreshSerial;
     try {
         const response = await apiGet('/playlists');
+        if (refreshSerial !== playlistListRefreshSerial || !Array.isArray(response)) {
+            return false;
+        }
 
-        // apiGet 已解包统一 envelope；该端点的 data 固定为数组。
-        const playlists = Array.isArray(response) ? response : null;
-
-        // 更新缓存
-        playlistsCache = playlists || [];
-
-        // 更新下拉选择框
-        updatePlaylistSelect(playlists);
+        // 只有完整成功的响应才能替换缓存，避免瞬时超时把现有列表清空。
+        playlistsCache = response;
+        updatePlaylistSelect(response);
+        return true;
     } catch (error) {
-        // 更新缓存为空
-        playlistsCache = [];
-        // 即使出错也尝试更新下拉框（可能为空）
-        updatePlaylistSelect(null);
+        return false;
     }
 }
 
@@ -390,6 +400,7 @@ function updatePlaylistSelect(playlists) {
             const option = document.createElement('option');
             option.value = String(playlist.id);
             // 如果是默认播放列表，添加星号标记
+            option.setAttribute('translate', 'no');
             option.textContent = playlist.isDefault ? `★ ${playlist.name}` : playlist.name;
             select.appendChild(option);
         });
@@ -456,6 +467,7 @@ export function selectPlaylist(playlistId, playlistName) {
         if (!optionExists) {
             const option = document.createElement('option');
             option.value = playlistValue;
+            option.setAttribute('translate', 'no');
             option.textContent = playlistName;
             addItemSelect.appendChild(option);
         }
@@ -591,43 +603,49 @@ async function previewPlaylistItem(itemPath, playlistId, itemLayerId) {
 // 更新播放列表内容
 export async function updatePlaylistContent(playlistId) {
     const container = document.getElementById('playlist-items');
-    clearContainer(container);
+    const refreshSerial = ++playlistContentRefreshSerial;
 
-    // 如果没有选中播放列表，隐藏数量徽章
     if (!playlistId) {
+        clearContainer(container);
         updatePlaylistItemCount(0);
-        return;
+        return true;
     }
 
-    // 获取所有图层的播放列表项（视频图层 1-4 + 图片图层 60）
-    let allItems = [];
-    const layerIds = [1, 2, 3, 4, 60];
-    for (const layerId of layerIds) {
-        const items = await apiGet(`/playlists/${playlistId}/items?layerId=${layerId}`);
-        if (items && Array.isArray(items)) {
-            items.forEach((item, index) => {
-                allItems.push({
-                    ...item,
-                    layerId: layerId,
-                    originalIndex: index
-                });
-            });
-        }
+    const layerResults = await Promise.all(
+        PLAYLIST_LAYER_IDS.map(async layerId => ({
+            layerId,
+            items: await apiGet(`/playlists/${playlistId}/items?layerId=${layerId}`)
+        }))
+    );
+
+    // 用户已经切换列表或有更新的刷新请求时，丢弃旧响应，防止旧数据覆盖新数据。
+    if (refreshSerial !== playlistContentRefreshSerial ||
+        String(playlistId) !== String(currentPlaylistId)) {
+        return false;
     }
 
-    // 按图层和索引排序
+    // 任一图层读取失败都保留当前 UI，不渲染残缺列表。
+    if (layerResults.some(result => !Array.isArray(result.items))) {
+        return false;
+    }
+
+    const allItems = layerResults.flatMap(({ layerId, items }) =>
+        items.map((item, originalIndex) => ({
+            ...item,
+            layerId,
+            originalIndex
+        }))
+    );
+
     allItems.sort((a, b) => {
-        if (a.layerId !== b.layerId) {
-            return a.layerId - b.layerId;
-        }
+        if (a.layerId !== b.layerId) return a.layerId - b.layerId;
         return a.originalIndex - b.originalIndex;
     });
 
-    // 更新素材数量统计
+    clearContainer(container);
     updatePlaylistItemCount(allItems.length);
 
-    // 显示所有项
-    allItems.forEach((item, globalIndex) => {
+    allItems.forEach(item => {
         const fileName = escapeHtml(extractFileName(item.path));
         const folderPath = escapeHtml(getFolderFromPath(item.path));
         const playlistItem = document.createElement('div');
@@ -648,31 +666,35 @@ export async function updatePlaylistContent(playlistId) {
             </div>
         `;
 
-        // 预览按钮事件：使用当前播放列表的图层播放，预览窗口显示该图层
         const previewBtn = playlistItem.querySelector('.preview-playlist-item');
-        previewBtn.addEventListener('click', async (e) => {
-            e.stopPropagation();
+        previewBtn.addEventListener('click', async event => {
+            event.stopPropagation();
             const previewSucceeded = await previewPlaylistItem(item.path, playlistId, item.layerId);
-            if (!previewSucceeded) {
-                return;
-            }
+            if (!previewSucceeded) return;
+
             const previewSwitch = document.getElementById('video-preview-switch');
-            if (previewSwitch && previewSwitch.checked && item.layerId !== IMAGE_PLAYLIST_LAYER_ID) {
+            if (previewSwitch?.checked && item.layerId !== IMAGE_PLAYLIST_LAYER_ID) {
                 const targetLayer = getPlaylistTargetLayer(playlistId) || 1;
                 openVideoPreview(item.path, extractFileName(item.path), targetLayer);
             }
         });
 
-        // 删除按钮事件
         const deleteBtn = playlistItem.querySelector('.delete-playlist-item');
-        deleteBtn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            await deletePlaylistItem(playlistId, item.originalIndex, item.layerId);
-            await updatePlaylistContent(playlistId);
+        deleteBtn.addEventListener('click', async event => {
+            event.stopPropagation();
+            if (deleteBtn.disabled) return;
+            deleteBtn.disabled = true;
+            const success = await deletePlaylistItem(playlistId, item.originalIndex, item.layerId);
+            if (success) {
+                await updatePlaylistContent(playlistId);
+            } else {
+                deleteBtn.disabled = false;
+            }
         });
 
         container.appendChild(playlistItem);
     });
+    return true;
 }
 
 // 创建播放列表
@@ -712,7 +734,7 @@ async function createPlaylist(name, targetLayerId = 1, loopMode = 0, dmxId = 0) 
 // 删除播放列表项
 async function deletePlaylistItem(playlistId, index, layerId = 1) {
     const url = `/playlists/${playlistId}/items/${index}${layerId ? `?layerId=${layerId}` : ''}`;
-    await handleApiOperation(
+    return await handleApiOperation(
         apiDelete(url),
         '删除播放列表项',
         '成功删除播放列表项',
@@ -765,26 +787,40 @@ async function setDefaultPlaylist(playlistId) {
 
 // 清空播放列表
 export async function clearPlaylist(playlistId) {
-    // 获取所有图层（1-4）的播放列表项并删除
     let totalDeleted = 0;
+    let failedCount = 0;
 
-    const layerIds = [1, 2, 3, 4, 60];
-    for (const layerId of layerIds) {
-        const items = await apiGet(`/playlists/${playlistId}/items?layerId=${layerId}`);
-        if (items && Array.isArray(items) && items.length > 0) {
-            for (let i = items.length - 1; i >= 0; i--) {
-                const url = `/playlists/${playlistId}/items/${i}?layerId=${layerId}`;
-                await apiDelete(url);
+    const layerResults = await Promise.all(
+        PLAYLIST_LAYER_IDS.map(async layerId => ({
+            layerId,
+            items: await apiGet(`/playlists/${playlistId}/items?layerId=${layerId}`)
+        }))
+    );
+    if (layerResults.some(result => !Array.isArray(result.items))) {
+        addToCommandLog('清空播放列表', 'error', '读取播放列表内容失败，未执行清空');
+        return false;
+    }
+
+    // 同一图层必须倒序删除，避免删除后显示索引发生变化。
+    for (const { layerId, items } of layerResults) {
+        for (let index = items.length - 1; index >= 0; index--) {
+            const result = await apiDelete(`/playlists/${playlistId}/items/${index}?layerId=${layerId}`);
+            if (result == null) {
+                failedCount++;
+            } else {
                 totalDeleted++;
             }
         }
     }
 
-    if (totalDeleted > 0) {
-        addToCommandLog('清空播放列表', 'success', `成功清空播放列表，删除了 ${totalDeleted} 个项目`);
-    } else {
-        addToCommandLog('清空播放列表', 'info', `播放列表已为空`);
+    if (failedCount > 0) {
+        addToCommandLog('清空播放列表', 'error',
+            `已删除 ${totalDeleted} 个项目，另有 ${failedCount} 个删除失败`);
+        return false;
     }
+    addToCommandLog('清空播放列表', totalDeleted > 0 ? 'success' : 'info',
+        totalDeleted > 0 ? `成功清空播放列表，删除了 ${totalDeleted} 个项目` : '播放列表已为空');
+    return true;
 }
 
 // 删除播放列表

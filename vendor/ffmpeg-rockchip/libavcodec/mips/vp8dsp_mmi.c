@@ -837,7 +837,7 @@ static av_always_inline void vp8_v_loop_filter8_mmi(uint8_t *dst,
           RESTRICT_ASM_DOUBLE_1,    RESTRICT_ASM_DOUBLE_2,
           RESTRICT_ASM_UINT32_T
         : [e]"r"((mips_reg)flim_E), [thresh]"r"((mips_reg)hev_thresh),
-          [i]"r"((mips_reg)flim_I), [stride]"r"((mips_reg)? stride)
+          [i]"r"((mips_reg)flim_I), [stride]"r"((mips_reg)stride)
         : "memory"
     );
 }
@@ -923,7 +923,7 @@ static av_always_inline void vp8_h_loop_filter8_mmi(uint8_t *dst,
           RESTRICT_ASM_DOUBLE_1,    RESTRICT_ASM_DOUBLE_2,
           RESTRICT_ASM_UINT32_T
         : [e]"r"((mips_reg)flim_E), [thresh]"r"((mips_reg)hev_thresh),
-          [i]"r"((mips_reg)flim_I), [stride]"r"((mips_reg)? stride)
+          [i]"r"((mips_reg)flim_I), [stride]"r"((mips_reg)stride)
         : "memory"
     );
 }
@@ -972,7 +972,7 @@ void ff_vp8_luma_dc_wht_mmi(int16_t block[4][4][16], int16_t dc[16])
           [ftmp6]"=&f"(ftmp[6]),
           RESTRICT_ASM_ALL64
           [ftmp7]"=&f"(ftmp[7])
-        : [dc]"r"((uint8_t*)? dc)
+        : [dc]"r"((uint8_t*)dc)
         : "memory"
     );
 
@@ -1004,7 +1004,7 @@ void ff_vp8_luma_dc_wht_mmi(int16_t block[4][4][16], int16_t dc[16])
         MMI_SDC1(%[ftmp0], %[dc], 0x18)
         : RESTRICT_ASM_ALL64
           [ftmp0]"=&f"(ftmp[0])
-        : [dc]"r"((uint8_t *)? dc)
+        : [dc]"r"((uint8_t *)dc)
         : "memory"
     );
 #else
@@ -1475,7 +1475,7 @@ void ff_put_vp8_pixels16_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [dst]"+&r"(dst),                  [src]"+&r"(src),
           [h]"+&r"(h)
         : [dststride]"r"((mips_reg)dststride),
-          [srcstride]"r"((mips_reg)? srcstride)
+          [srcstride]"r"((mips_reg)srcstride)
         : "memory"
     );
 #else
@@ -1515,7 +1515,7 @@ void ff_put_vp8_pixels8_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [dst]"+&r"(dst),                  [src]"+&r"(src),
           [h]"+&r"(h)
         : [dststride]"r"((mips_reg)dststride),
-          [srcstride]"r"((mips_reg)? srcstride)
+          [srcstride]"r"((mips_reg)srcstride)
         : "memory"
     );
 #else
@@ -1555,7 +1555,7 @@ void ff_put_vp8_pixels4_mmi(uint8_t *dst, ptrdiff_t dststride, uint8_t *src,
           [dst]"+&r"(dst),                  [src]"+&r"(src),
           [h]"+&r"(h)
         : [dststride]"r"((mips_reg)dststride),
-          [srcstride]"r"((mips_reg)? srcstride)
+          [srcstride]"r"((mips_reg)srcstride)
         : "memory"
     );
 #else

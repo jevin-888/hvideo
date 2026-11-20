@@ -2,7 +2,7 @@
  * @file SharedLibassHolder.h（文件名）
  * @brief 全局共享 libass 实例（ASS_Library + ASS_渲染器），仅 Layer 21 歌词使用
  *
- * 由 Engine 创建并注入 Mubu，Mubu 在创建 Layer 21 时传给 LayerText。
+ * 由 Mubu 在创建 Layer 21 时按需创建并传给 LayerText，生命周期覆盖歌词层。
  * 字体仅加载 lyric.ttf、lyric-Pinyin.ttf，降低内存占用。
  */
 
@@ -38,6 +38,8 @@ public:
   bool ensureAppFontsLoaded(const std::string &fontDir,
                            const std::string &appFontsDir  = "");
 
+  const std::string &getDefaultFontPath() const { return defaultFontPath_; }
+
   /** 获取渲染互斥锁，ass_render_frame 前后必须加锁 */
   std::mutex &getRenderMutex() { return renderMutex_; }
 
@@ -50,6 +52,7 @@ private:
   struct ass_renderer *renderer_ = nullptr;
   std::mutex renderMutex_;
   bool fontsLoaded_ = false;
+  std::string defaultFontPath_;
   std::vector<std::vector<char>> appFontDataBuffers_;
   int lastFrameWidth_ = 0;
   int lastFrameHeight_ = 0;

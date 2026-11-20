@@ -37,9 +37,11 @@ public:
      * 遍历配置中的所有图层，为每个图层找到合适的初始化器并执行。
      *
      * @param context 初始化上下文
+     * @param preservedLayerIds 保留运行状态、不重新初始化的已有图层
      * @return 成功初始化的图层数量
      */
-    int initializeAllLayers(const LayerInitContext& context);
+    int initializeAllLayers(const LayerInitContext& context,
+                            const std::vector<int>& preservedLayerIds = {});
 
     /**
      * @brief 初始化单个图层

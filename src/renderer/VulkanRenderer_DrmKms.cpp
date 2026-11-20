@@ -15,7 +15,7 @@
 #include <vector>
 
 extern "C" {
-#include <drm/drm_fourcc.h>
+#include <drm_fourcc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 }
@@ -28,6 +28,12 @@ extern "C" {
 #endif
 #ifndef DRM_CLIENT_CAP_ATOMIC
 #define DRM_CLIENT_CAP_ATOMIC 3
+#endif
+#ifndef DRM_MODE_FLAG_INTERLACE
+#define DRM_MODE_FLAG_INTERLACE (1 << 4)
+#endif
+#ifndef DRM_MODE_FLAG_DBLSCAN
+#define DRM_MODE_FLAG_DBLSCAN (1 << 5)
 #endif
 #ifndef DRM_IOCTL_MODE_CREATE_DUMB
 struct drm_mode_create_dumb {
@@ -84,6 +90,12 @@ struct DrmObjectProp {
   uint64_t value = 0;
 };
 
+struct DrmObjectPropEnum {
+  uint32_t id = 0;
+  uint64_t value = 0;
+  bool found = false;
+};
+
 bool propEnabled(const char *name) {
   char value[PROP_VALUE_MAX] = {};
   const int len = __system_property_get(name, value);
@@ -98,7 +110,7 @@ bool drmKmsPresenterRequested() {
   char value[PROP_VALUE_MAX] = {};
   const int len =
       __system_property_get("persist.hsvj.output.backend", value);
-  return len <= 0 || strcmp(value, "drm-kms") == 0;
+  return len > 0 && strcmp(value, "drm-kms") == 0;
 }
 
 bool drmGetCapValue(int fd, uint64_t capability, uint64_t *value) {
@@ -140,6 +152,40 @@ DrmObjectProp getDrmObjectProp(int fd, uint32_t objectId, uint32_t objectType,
     if (strcmp(prop->name, name) == 0) {
       result.id = prop->prop_id;
       result.value = props->prop_values[i];
+      drmModeFreeProperty(prop);
+      break;
+    }
+    drmModeFreeProperty(prop);
+  }
+  drmModeFreeObjectProperties(props);
+  return result;
+}
+
+DrmObjectPropEnum getDrmObjectPropEnum(int fd, uint32_t objectId,
+                                       uint32_t objectType,
+                                       const char *propertyName,
+                                       const char *enumName) {
+  DrmObjectPropEnum result{};
+  drmModeObjectPropertiesPtr props =
+      drmModeObjectGetProperties(fd, objectId, objectType);
+  if (!props) {
+    return result;
+  }
+  for (uint32_t i = 0; i < props->count_props; ++i) {
+    drmModePropertyPtr prop = drmModeGetProperty(fd, props->props[i]);
+    if (!prop) {
+      continue;
+    }
+    if (strcmp(prop->name, propertyName) == 0) {
+      result.id = prop->prop_id;
+      for (int enumIndex = 0; enumIndex < prop->count_enums; ++enumIndex) {
+        if (prop->enums != nullptr &&
+            strcmp(prop->enums[enumIndex].name, enumName) == 0) {
+          result.value = prop->enums[enumIndex].value;
+          result.found = true;
+          break;
+        }
+      }
       drmModeFreeProperty(prop);
       break;
     }
@@ -302,7 +348,10 @@ uint32_t findDrmPrimaryPlane(int fd, int crtcIndex, uint32_t requiredFormat) {
     drmModeFreePlane(plane);
   }
   drmModeFreePlaneResources(planeRes);
-  return overlay != 0 ? overlay : (primary != 0 ? primary : fallback);
+  // Direct scanout owns the complete CRTC, so use its primary plane first.
+  // Overlay sub-windows (for example Smart0-win1) may commit successfully while
+  // producing no visible output when their parent hardware window is disabled.
+  return primary != 0 ? primary : (overlay != 0 ? overlay : fallback);
 }
 
 void cleanupDrmFb(int drmFd, uint32_t fbId, uint32_t gemHandle) {
@@ -334,8 +383,8 @@ VkRenderPass createProbeRenderPass(VkDevice device, VkFormat format) {
   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  color.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+  color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
   VkAttachmentReference colorRef{};
   colorRef.attachment = 0;
@@ -1326,48 +1375,146 @@ bool VulkanRenderer::initializeDrmKmsPresenterIfRequested() {
     return false;
   }
 
+  constexpr int kTargetRefreshHz = 30;
+  auto modeRefreshHz = [](const drmModeModeInfo &mode) -> int {
+    if (mode.vrefresh > 0) {
+      return static_cast<int>(mode.vrefresh);
+    }
+    if (mode.clock == 0 || mode.htotal == 0 || mode.vtotal == 0) {
+      return 0;
+    }
+    uint64_t numerator = static_cast<uint64_t>(mode.clock) * 1000ULL;
+    uint64_t denominator =
+        static_cast<uint64_t>(mode.htotal) * mode.vtotal;
+    if ((mode.flags & DRM_MODE_FLAG_INTERLACE) != 0) {
+      numerator *= 2;
+    }
+    if ((mode.flags & DRM_MODE_FLAG_DBLSCAN) != 0) {
+      denominator *= 2;
+    }
+    if (mode.vscan > 1) {
+      denominator *= mode.vscan;
+    }
+    return denominator == 0
+               ? 0
+               : static_cast<int>((numerator + denominator / 2) / denominator);
+  };
+
   drmModeConnectorPtr selectedConnector = nullptr;
   drmModeModeInfo selectedMode{};
+  int selectedRefreshHz = 0;
+  int bestRefreshDelta = 1 << 30;
+  bool selectedPreferred = false;
+  bool selectedExactSize = false;
+  bool selectedSameAspect = false;
+  uint64_t selectedArea = 0;
   for (int i = 0; i < res->count_connectors; ++i) {
     drmModeConnectorPtr connector =
         drmModeGetConnector(state.drmFd, res->connectors[i]);
     if (!connector) {
       continue;
     }
-    if (connector->connection == DRM_MODE_CONNECTED &&
-        connector->count_modes > 0) {
-      selectedConnector = connector;
-      selectedMode = connector->modes[0];
+    if (connector->connection == DRM_MODE_CONNECTED) {
+      LOG_INFO("[DrmKmsPresenter] connector=%u connected modes=%d canvas=%ux%u",
+               connector->connector_id, connector->count_modes, state.width,
+               state.height);
       for (int m = 0; m < connector->count_modes; ++m) {
         const drmModeModeInfo &mode = connector->modes[m];
-        if (mode.hdisplay == state.width && mode.vdisplay == state.height) {
-          selectedMode = mode;
-          break;
+        if (mode.hdisplay <= 0 || mode.vdisplay <= 0) {
+          continue;
         }
+        const bool exactSize =
+            static_cast<uint32_t>(mode.hdisplay) == state.width &&
+            static_cast<uint32_t>(mode.vdisplay) == state.height;
+        const uint64_t aspectLeft =
+            static_cast<uint64_t>(mode.hdisplay) * state.height;
+        const uint64_t aspectRight =
+            static_cast<uint64_t>(mode.vdisplay) * state.width;
+        const uint64_t aspectDifference =
+            aspectLeft > aspectRight ? aspectLeft - aspectRight
+                                     : aspectRight - aspectLeft;
+        const uint64_t aspectReference =
+            aspectLeft > aspectRight ? aspectLeft : aspectRight;
+        const bool sameAspect =
+            aspectReference == 0 || aspectDifference * 100 <= aspectReference;
+        const uint64_t area = static_cast<uint64_t>(mode.hdisplay) *
+                              static_cast<uint64_t>(mode.vdisplay);
+        const int refreshHz = modeRefreshHz(mode);
+        const int refreshDelta = refreshHz >= kTargetRefreshHz
+                                     ? refreshHz - kTargetRefreshHz
+                                     : kTargetRefreshHz - refreshHz;
+        const bool preferred = (mode.type & DRM_MODE_TYPE_PREFERRED) != 0;
+        LOG_INFO("[DrmKmsPresenter] candidate connector=%u mode=%s %dx%d@%d "
+                 "preferred=%d exact=%d sameAspect=%d",
+                 connector->connector_id, mode.name, mode.hdisplay,
+                 mode.vdisplay, refreshHz, preferred ? 1 : 0,
+                 exactSize ? 1 : 0, sameAspect ? 1 : 0);
+        bool better = selectedConnector == nullptr;
+        if (!better && exactSize != selectedExactSize) {
+          better = exactSize;
+        } else if (!better && sameAspect != selectedSameAspect) {
+          better = sameAspect;
+        } else if (!better && exactSize) {
+          better = refreshDelta < bestRefreshDelta ||
+                   (refreshDelta == bestRefreshDelta && preferred &&
+                    !selectedPreferred);
+        } else if (!better) {
+          better = area > selectedArea ||
+                   (area == selectedArea &&
+                    (refreshDelta < bestRefreshDelta ||
+                     (refreshDelta == bestRefreshDelta && preferred &&
+                      !selectedPreferred)));
+        }
+        if (!better) {
+          continue;
+        }
+        if (selectedConnector != nullptr && selectedConnector != connector) {
+          drmModeFreeConnector(selectedConnector);
+        }
+        selectedConnector = connector;
+        selectedMode = mode;
+        selectedRefreshHz = refreshHz;
+        bestRefreshDelta = refreshDelta;
+        selectedPreferred = preferred;
+        selectedExactSize = exactSize;
+        selectedSameAspect = sameAspect;
+        selectedArea = area;
       }
-      break;
     }
-    drmModeFreeConnector(connector);
+    if (selectedConnector != connector) {
+      drmModeFreeConnector(connector);
+    }
   }
   if (!selectedConnector) {
-    LOG_WARN("[DrmKmsPresenter] no connected connector");
+    LOG_WARN("[DrmKmsPresenter] no output mode fits canvas=%ux%u "
+             "targetRefresh=%dHz",
+             state.width, state.height, kTargetRefreshHz);
     drmModeFreeResources(res);
     close(state.drmFd);
     return false;
   }
 
-  // The DRM mode is the physical output size. The logical canvas remains
-  // controlled by SystemConfig; only the final composed image uses this size.
-  state.width = selectedMode.hdisplay;
-  state.height = selectedMode.vdisplay;
-  swapchainExtent_.width = state.width;
-  swapchainExtent_.height = state.height;
+  state.outputWidth = static_cast<uint32_t>(selectedMode.hdisplay);
+  state.outputHeight = static_cast<uint32_t>(selectedMode.vdisplay);
+  LOG_INFO("[DrmKmsPresenter] %s mode selected canvas/source=%ux%u "
+           "output/crtc=%ux%u mode=%s@%dHz preferred=%d",
+           selectedExactSize ? "native" : "scaled", state.width, state.height,
+           state.outputWidth, state.outputHeight, selectedMode.name,
+           selectedRefreshHz, selectedPreferred ? 1 : 0);
 
   state.connectorId = selectedConnector->connector_id;
   state.crtcId = findDrmCrtcForConnector(state.drmFd, res, selectedConnector);
   state.crtcIndex = findDrmCrtcIndex(res, state.crtcId);
+  uint32_t selectedAhbFormat = AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
+  uint32_t selectedDrmFormat = DRM_FORMAT_XBGR8888;
   state.planeId =
-      findDrmPrimaryPlane(state.drmFd, state.crtcIndex, DRM_FORMAT_ABGR8888);
+      findDrmPrimaryPlane(state.drmFd, state.crtcIndex, selectedDrmFormat);
+  if (state.planeId == 0) {
+    selectedAhbFormat = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    selectedDrmFormat = DRM_FORMAT_ABGR8888;
+    state.planeId =
+        findDrmPrimaryPlane(state.drmFd, state.crtcIndex, selectedDrmFormat);
+  }
   if (state.crtcId == 0 || state.crtcIndex < 0 || state.planeId == 0) {
     LOG_WARN("[DrmKmsPresenter] missing crtc/plane connector=%u crtc=%u "
              "crtcIndex=%d plane=%u",
@@ -1448,6 +1595,21 @@ bool VulkanRenderer::initializeDrmKmsPresenterIfRequested() {
                                      DRM_MODE_OBJECT_PLANE, "zpos",
                                      zposProp.value)
           : 0;
+  const DrmObjectPropEnum noBlendProp = getDrmObjectPropEnum(
+      state.drmFd, state.planeId, DRM_MODE_OBJECT_PLANE, "pixel blend mode",
+      "None");
+  if (noBlendProp.found) {
+    state.propPlanePixelBlendMode = noBlendProp.id;
+    state.planePixelBlendMode = noBlendProp.value;
+  }
+  const DrmObjectProp alphaProp = getDrmObjectProp(
+      state.drmFd, state.planeId, DRM_MODE_OBJECT_PLANE, "alpha");
+  if (alphaProp.id != 0) {
+    state.propPlaneAlpha = alphaProp.id;
+    state.planeAlpha = getDrmObjectPropRangeMax(
+        state.drmFd, state.planeId, DRM_MODE_OBJECT_PLANE, "alpha",
+        alphaProp.value);
+  }
 
   const bool propsOk =
       state.propCrtcActive && state.propCrtcModeId &&
@@ -1472,10 +1634,17 @@ bool VulkanRenderer::initializeDrmKmsPresenterIfRequested() {
     desc.width = state.width;
     desc.height = state.height;
     desc.layers = 1;
-    desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    desc.format = selectedAhbFormat;
+    // Direct KMS currently registers the dma-buf as DRM_FORMAT_MOD_LINEAR.
+    // Mali gralloc otherwise prefers AFBC for GPU/composer-only allocations,
+    // which makes a successful atomic commit scan compressed bytes as linear
+    // pixels and produces a black screen. CPU access is the public AHB contract
+    // that requests a linear, CPU-mappable allocation from this gralloc.
     desc.usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
                  AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-                 AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY;
+                 AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
+                 AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                 AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
     if (AHardwareBuffer_allocate(&desc, &out.buffer) != 0 || !out.buffer) {
       LOG_WARN("[DrmKmsPresenter] AHardwareBuffer_allocate failed index=%zu",
                i);
@@ -1488,6 +1657,21 @@ bool VulkanRenderer::initializeDrmKmsPresenterIfRequested() {
 
     AHardwareBuffer_Desc actualDesc{};
     AHardwareBuffer_describe(out.buffer, &actualDesc);
+    void *cpuAddress = nullptr;
+    const int lockResult = AHardwareBuffer_lock(
+        out.buffer, AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, nullptr,
+        &cpuAddress);
+    if (lockResult != 0 || cpuAddress == nullptr) {
+      LOG_WARN("[DrmKmsPresenter] output AHB is not linear CPU-mappable "
+               "index=%zu lock=%d address=%p; keep Surface presenter",
+               i, lockResult, cpuAddress);
+      drmKmsPresenter_ = std::move(state);
+      shutdownDrmKmsPresenter();
+      drmModeFreeConnector(selectedConnector);
+      drmModeFreeResources(res);
+      return false;
+    }
+    AHardwareBuffer_unlock(out.buffer, nullptr);
     VkAndroidHardwareBufferFormatPropertiesANDROID formatProps{
         VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID};
     VkAndroidHardwareBufferPropertiesANDROID props{
@@ -1511,6 +1695,18 @@ bool VulkanRenderer::initializeDrmKmsPresenterIfRequested() {
         actualDesc.format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM
             ? DRM_FORMAT_XBGR8888
             : DRM_FORMAT_ABGR8888;
+    if (actualDesc.format != selectedAhbFormat ||
+        drmFormat != selectedDrmFormat) {
+      LOG_WARN("[DrmKmsPresenter] AHB/DRM format mismatch index=%zu "
+               "requestedAhb=%u actualAhb=%u requestedDrm=0x%x actualDrm=0x%x",
+               i, selectedAhbFormat, actualDesc.format, selectedDrmFormat,
+               drmFormat);
+      drmKmsPresenter_ = std::move(state);
+      shutdownDrmKmsPresenter();
+      drmModeFreeConnector(selectedConnector);
+      drmModeFreeResources(res);
+      return false;
+    }
     if (formatProps.format != swapchainImageFormat_) {
       LOG_WARN("[DrmKmsPresenter] AHB vkFormat=%d is incompatible with "
                "swapchain vkFormat=%d; keep Surface presenter",
@@ -1671,12 +1867,16 @@ bool VulkanRenderer::initializeDrmKmsPresenterIfRequested() {
   state.initialized = true;
   const std::string planeType = getDrmPlaneType(state.drmFd, state.planeId);
   LOG_WARN("[DrmKmsPresenter] initialized connector=%u crtc=%u plane=%u "
-           "type=%s zpos=%llu mode=%ux%u buffers=%zu vkFormat=%d "
-           "drmFourcc=0x%x",
+           "type=%s zpos=%llu source=%ux%u output=%ux%u buffers=%zu vkFormat=%d "
+           "drmFourcc=0x%x blendProp=%u blend=%llu alphaProp=%u alpha=%llu",
            state.connectorId, state.crtcId, state.planeId, planeType.c_str(),
            static_cast<unsigned long long>(state.planeZpos), state.width,
-           state.height, state.buffers.size(), static_cast<int>(state.vkFormat),
-           state.drmFormat);
+           state.height, state.outputWidth, state.outputHeight,
+           state.buffers.size(), static_cast<int>(state.vkFormat), state.drmFormat,
+           state.propPlanePixelBlendMode,
+           static_cast<unsigned long long>(state.planePixelBlendMode),
+           state.propPlaneAlpha,
+           static_cast<unsigned long long>(state.planeAlpha));
 
   drmModeFreeConnector(selectedConnector);
   drmModeFreeResources(res);
@@ -1766,26 +1966,18 @@ bool VulkanRenderer::commitReadyDrmKmsBuffer() {
   uint64_t readySequence = 0;
   for (size_t i = 0; i < state.buffers.size(); ++i) {
     DrmKmsOutputBuffer &candidate = state.buffers[i];
-    if (!candidate.renderPending || candidate.renderFence == VK_NULL_HANDLE) {
+    if (!candidate.renderPending ||
+        candidate.renderSubmissionSerial == 0) {
       continue;
     }
-    const VkResult status = vkGetFenceStatus(device_, candidate.renderFence);
-    if (status == VK_SUCCESS) {
+    if (waitForSubmissionCompletion(candidate.renderSubmissionSerial, 0,
+                                    false, "drm-kms render completion")) {
       if (candidate.sequence >= readySequence) {
         readySequence = candidate.sequence;
         readyBufferIndex = static_cast<int>(i);
       }
-    } else if (status == VK_ERROR_DEVICE_LOST) {
-      markDeviceLostFatal("vkGetFenceStatus(drm-kms)", status);
+    } else if (deviceLostFatal_.load(std::memory_order_acquire)) {
       return false;
-    } else if (status != VK_NOT_READY) {
-      static int fenceStatusWarnCount = 0;
-      if (++fenceStatusWarnCount <= 10) {
-        LOG_WARN("[DrmKmsPresenter] fence status failed buffer=%zu result=%d",
-                 i, status);
-      }
-      candidate.renderPending = false;
-      candidate.renderFence = VK_NULL_HANDLE;
     }
   }
 
@@ -1795,10 +1987,11 @@ bool VulkanRenderer::commitReadyDrmKmsBuffer() {
 
   DrmKmsOutputBuffer &buffer =
       state.buffers[static_cast<size_t>(readyBufferIndex)];
+
   for (DrmKmsOutputBuffer &candidate : state.buffers) {
     if (candidate.renderPending && candidate.sequence <= readySequence) {
       candidate.renderPending = false;
-      candidate.renderFence = VK_NULL_HANDLE;
+      candidate.renderSubmissionSerial = 0;
     }
   }
 
@@ -1865,11 +2058,19 @@ bool VulkanRenderer::commitDrmKmsBufferBlocking(size_t bufferIndex,
       static_cast<uint64_t>(state.height) << 16,
       0,
       0,
-      state.width,
-      state.height};
+      state.outputWidth,
+      state.outputHeight};
   if (state.propPlaneZpos != 0) {
     planePropIds.push_back(state.propPlaneZpos);
     planePropValues.push_back(state.planeZpos);
+  }
+  if (state.propPlanePixelBlendMode != 0) {
+    planePropIds.push_back(state.propPlanePixelBlendMode);
+    planePropValues.push_back(state.planePixelBlendMode);
+  }
+  if (state.propPlaneAlpha != 0) {
+    planePropIds.push_back(state.propPlaneAlpha);
+    planePropValues.push_back(state.planeAlpha);
   }
   addObject(state.planeId, planePropIds, planePropValues);
 
@@ -1903,9 +2104,10 @@ bool VulkanRenderer::commitDrmKmsBufferBlocking(size_t bufferIndex,
   }
 
   state.modeSetCommitted = true;
+  successfulPresentCount_.fetch_add(1, std::memory_order_relaxed);
 
   static int commitLogCount = 0;
-  if (++commitLogCount <= 8 || commitMs >= 8 || commitLogCount % 120 == 0) {
+  if (++commitLogCount <= 8 || commitMs >= 45 || commitLogCount % 120 == 0) {
     LOG_INFO("[DrmKmsPresenter] present ok fb=%u buffer=%zu atomic=%lldms "
              "sequence=%llu count=%d",
              buffer.fbId, bufferIndex, commitMs,
@@ -1994,6 +2196,11 @@ bool VulkanRenderer::acquireDrmKmsImageForCurrentFrame() {
   if (!isDrmKmsPresentActive() || drmKmsPresenter_.buffers.empty()) {
     return false;
   }
+  if (!commandBufferRecording_ || currentFrame_ >= commandBuffers_.size() ||
+      commandBuffers_[currentFrame_] == VK_NULL_HANDLE) {
+    LOG_ERROR("[DrmKmsPresenter] cannot acquire output image without an active command buffer");
+    return false;
+  }
   (void)commitReadyDrmKmsBuffer();
   DrmKmsPresenterState &state = drmKmsPresenter_;
   const size_t count = state.buffers.size();
@@ -2011,6 +2218,29 @@ bool VulkanRenderer::acquireDrmKmsImageForCurrentFrame() {
     if (state.buffers[candidate].renderPending) {
       continue;
     }
+    DrmKmsOutputBuffer &buffer = state.buffers[candidate];
+    if (buffer.vulkanOwned) {
+      continue;
+    }
+
+    VkImageMemoryBarrier acquireBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    acquireBarrier.srcAccessMask = 0;
+    acquireBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    acquireBarrier.oldLayout = buffer.externalLayoutInitialized
+                                   ? VK_IMAGE_LAYOUT_GENERAL
+                                   : VK_IMAGE_LAYOUT_UNDEFINED;
+    acquireBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    acquireBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    acquireBarrier.dstQueueFamilyIndex = graphicsQueueFamilyIndex_;
+    acquireBarrier.image = buffer.image;
+    acquireBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(commandBuffers_[currentFrame_],
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &acquireBarrier);
+
+    buffer.vulkanOwned = true;
     state.currentBuffer = candidate;
     return true;
   }
@@ -2021,6 +2251,37 @@ bool VulkanRenderer::acquireDrmKmsImageForCurrentFrame() {
              "still render-pending");
   }
   return false;
+}
+
+void VulkanRenderer::releaseDrmKmsImageForCurrentFrame() {
+  if (!isDrmKmsPresentActive() || drmKmsPresenter_.buffers.empty() ||
+      currentFrame_ >= commandBuffers_.size() ||
+      commandBuffers_[currentFrame_] == VK_NULL_HANDLE) {
+    return;
+  }
+
+  DrmKmsOutputBuffer &buffer =
+      drmKmsPresenter_.buffers[drmKmsPresenter_.currentBuffer];
+  if (!buffer.vulkanOwned) {
+    return;
+  }
+
+  VkImageMemoryBarrier releaseBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  releaseBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  releaseBarrier.dstAccessMask = 0;
+  releaseBarrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  releaseBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  releaseBarrier.srcQueueFamilyIndex = graphicsQueueFamilyIndex_;
+  releaseBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+  releaseBarrier.image = buffer.image;
+  releaseBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  vkCmdPipelineBarrier(commandBuffers_[currentFrame_],
+                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &releaseBarrier);
+
+  buffer.vulkanOwned = false;
+  buffer.externalLayoutInitialized = true;
 }
 
 VkFramebuffer VulkanRenderer::getDrmKmsFramebuffer() const {
@@ -2071,7 +2332,8 @@ bool VulkanRenderer::submitAndPresentDrmKmsFrame() {
   auto submitEnd = std::chrono::steady_clock::now();
   DrmKmsPresenterState &state = drmKmsPresenter_;
   DrmKmsOutputBuffer &submittedBuffer = state.buffers[state.currentBuffer];
-  submittedBuffer.renderFence = inFlightFences_[frameIndex];
+  submittedBuffer.renderSubmissionSerial =
+      registerSuccessfulSubmission(frameIndex);
   submittedBuffer.sequence = state.nextSequence++;
   submittedBuffer.renderPending = true;
 

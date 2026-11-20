@@ -1,8 +1,10 @@
+import { initializeVodForward, refreshVodForward } from './vodForward.js';
 // 中控配置页面模块
-import { apiGet, apiPost, apiAction } from '../core/api.js';
-import { addToCommandLog } from '../core/commandLog.js';
+import { apiGet, apiAction } from '../core/api.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { subscribeSSEEvent } from '../core/connectionManager.js';
 import { showConfirm, showPrompt, escapeHtml } from '../components/toast.js';
+import { initSerialTemplateImport } from '../../shared/serialTemplateImport.js';
 
 // SSE事件订阅（用于接收TCP/UDP/串口数据）
 let peripheralSSEUnsubscribers = [];
@@ -13,6 +15,9 @@ const FORWARD_FUNCTION_ID = 'forward_payload';
 let serialPortOptions = [];
 let rs232SerialPortOptions = [];
 let rs485SerialPortOptions = [];
+const serialConfigs = {};
+const defaultSerialPorts = { rs485: '/dev/ttyS7', rs232: '/dev/ttyS5' };
+let displayedSerialType = 'rs485';
 
 const DEFAULT_FUNCTION_CONFIG = {
     hvac: {
@@ -47,6 +52,14 @@ const DEFAULT_FUNCTION_CONFIG = {
             { id: 'floor', label: '地台灯', enabled: true, default_on: false, functions: [] },
             { id: 'flood', label: '聚光灯', enabled: true, default_on: false, functions: [] }
         ]
+    },
+    projector: {
+        enabled: true,
+        title: '投影',
+        items: [
+            { id: 'power_on', label: '开', kind: 'power_on', enabled: true, functions: [] },
+            { id: 'power_off', label: '关', kind: 'power_off', enabled: true, functions: [] }
+        ]
     }
 };
 
@@ -70,6 +83,7 @@ function normalizeFunctionConfig(config = {}) {
     const incoming = config && typeof config === 'object' ? config : {};
     const incomingHvac = incoming.hvac && typeof incoming.hvac === 'object' ? incoming.hvac : {};
     const incomingLighting = incoming.lighting && typeof incoming.lighting === 'object' ? incoming.lighting : {};
+    const incomingProjector = incoming.projector && typeof incoming.projector === 'object' ? incoming.projector : {};
 
     normalized.hvac.enabled = incomingHvac.enabled !== false;
     normalized.hvac.title = String(incomingHvac.title || normalized.hvac.title);
@@ -125,6 +139,23 @@ function normalizeFunctionConfig(config = {}) {
             label: String(incomingItem.label || item.label),
             enabled: incomingItem.enabled !== false,
             default_on: incomingItem.default_on === true,
+            functions: Array.isArray(incomingItem.functions)
+                ? incomingItem.functions
+                : (Array.isArray(item.functions) ? item.functions : [])
+        };
+    });
+
+    normalized.projector.enabled = incomingProjector.enabled !== false;
+    normalized.projector.title = String(incomingProjector.title || normalized.projector.title);
+    const projectorItemsById = new Map((Array.isArray(incomingProjector.items) ? incomingProjector.items : [])
+        .filter(item => item && typeof item === 'object')
+        .map(item => [String(item.id || ''), item]));
+    normalized.projector.items = normalized.projector.items.map(item => {
+        const incomingItem = projectorItemsById.get(item.id) || {};
+        return {
+            ...item,
+            label: String(incomingItem.label || item.label),
+            enabled: incomingItem.enabled !== false,
             functions: Array.isArray(incomingItem.functions)
                 ? incomingItem.functions
                 : (Array.isArray(item.functions) ? item.functions : [])
@@ -190,24 +221,22 @@ function forwardCommandMappingSignature(mappings) {
 }
 
 function forwardFunctionIdentity(config) {
-    const fixedType = config?.fixed_payload_type || config?.payload_type || '';
-    const fixedPayload = config?.payload || '';
-    const fixedHex = config?.hex || '';
+    const normalized = normalizeForwardConfig(config);
     return [
         FORWARD_FUNCTION_ID,
-        config?.forward_target || '',
-        config?.forward_port || '',
-        config?.forward_baudrate || '',
-        config?.forward_address || '',
-        config?.forward_mode || '',
-        config?.multicast_group || '',
-        config?.broadcast ? 'broadcast' : '',
-        config?.multicast ? 'multicast' : '',
-        config?.fixed_send ? 'fixed' : '',
-        fixedType,
-        fixedPayload,
-        fixedHex,
-        forwardCommandMappingSignature(config?.command_mappings)
+        normalized.forward_target || '',
+        normalized.forward_port || '',
+        normalized.forward_baudrate || '',
+        normalized.forward_address || '',
+        normalized.forward_mode || '',
+        normalized.multicast_group || '',
+        normalized.broadcast ? 'broadcast' : '',
+        normalized.multicast ? 'multicast' : '',
+        normalized.fixed_send ? 'fixed' : '',
+        normalized.fixed_payload_type || '',
+        normalized.payload || '',
+        normalized.hex || '',
+        forwardCommandMappingSignature(normalized.command_mappings)
     ].join(':');
 }
 
@@ -284,6 +313,40 @@ function buildFixedSendFunctionEntry() {
     };
 }
 
+function initializeDelayChip(chip) {
+    if (chip.dataset.action !== 'delay') return;
+    const updateLabel = () => {
+        const milliseconds = Number(chip.dataset.delayMs ?? 1000);
+        chip.dataset.delayMs = String(milliseconds);
+        const label = chip.querySelector('span');
+        if (label) label.textContent = `延时 ${milliseconds} 毫秒`;
+        chip.title = '双击修改延时（0–60000 毫秒）';
+    };
+    updateLabel();
+    if (chip.dataset.delayBound) return;
+    chip.dataset.delayBound = 'true';
+    chip.addEventListener('dblclick', async () => {
+        const value = await showPrompt('等待时长（0–60000 毫秒）', '延时执行', chip.dataset.delayMs, 'number');
+        if (value === null) return;
+        const milliseconds = Number(value);
+        if (!value.trim() || !Number.isInteger(milliseconds) || milliseconds < 0 || milliseconds > 60000) {
+            addToCommandLog('延时配置', 'error', '请输入 0 到 60000 的整数毫秒');
+            return;
+        }
+        chip.dataset.delayMs = String(milliseconds);
+        updateLabel();
+        const sectionId = chip.closest('[id^="config-"]')?.id;
+        if (sectionId === 'config-udp' || sectionId === 'config-tcp') {
+            const type = sectionId.slice(7);
+            commit工作区ToActiveTrigger(type);
+            scheduleNetworkConfigAutosave(type);
+        } else if (chip.closest('#function-button-workspace')) {
+            commitFunctionWorkspaceToActiveButton();
+            renderFunctionButtons();
+        }
+    });
+}
+
 function isForwardFunctionLike(func) {
     return !!func && (func.id === FORWARD_FUNCTION_ID || func.action === 'forward_payload');
 }
@@ -346,6 +409,8 @@ function initializePeripheralSSE() {
                 const preview = data.preview || '';
                 const serialType = data.serial_type || (isRs485Port(port) ? 'rs485' : 'rs232');
                 appendLog('RECV', `[${serialType.toUpperCase()} ${port}] ${preview} | hex: ${hex}`);
+                const direction = serialType === 'rs485' ? '484RX' : '232RX';
+                addToCommandLog(direction, 'info', hex || '(empty)');
             }
         } catch (e) {
             console.error('Error handling serial_recv SSE:', e);
@@ -369,6 +434,19 @@ function initializePeripheralSSE() {
                     ? 'SYSTEM'
                     : (status === 'miss' || status === 'empty' || status === 'failed' || status === 'error' ? 'ERROR' : 'SYSTEM');
                 appendLog(logType, `[${source}] ${status}${trigger}${hex} ${detail}${configured}${param}`);
+                const commandType = status === 'success'
+                    ? 'success'
+                    : (status === 'failed' || status === 'error' || status === 'miss' || status === 'empty' ? 'error' : 'info');
+                const commandAction = data.action === 'forward_payload' ? '固定指令' : '外设功能';
+                const target = data.target ? ` ${String(data.target).toUpperCase()}` : '';
+                const receivedHex = data.received_hex ? ` RX:${data.received_hex}` : '';
+                const sentHex = data.sent_hex ? ` TX:${data.sent_hex}` : '';
+                const serialPort = data.forward_port ? ` ${data.forward_port}@${data.forward_baudrate || '?'}` : '';
+                if (data.sent_hex && (data.target === 'rs232' || data.target === 'rs485') && status !== 'executing') {
+                    addToCommandLog(data.target === 'rs485' ? '485TX' : '232TX', commandType, data.sent_hex);
+                } else if (!(data.target === 'rs232' || data.target === 'rs485')) {
+                    addToCommandLog(commandAction, commandType, `[${source}]${trigger}${target}${serialPort}${receivedHex}${sentHex}${hex} ${detail}`.trim());
+                }
                 if (status === 'miss') {
                     autosaveLocalNetworkConfigIfMissed(data);
                 }
@@ -765,6 +843,9 @@ function hideDmxChannelHelpSoon() {
 function updateDmxInputModeUI() {
     const mode = document.getElementById('dmx-input-mode')?.value || 'local';
     const isExternal = mode === 'external';
+    document.querySelectorAll('.dmx-local-only').forEach(el => {
+        el.style.display = isExternal ? 'none' : '';
+    });
     document.querySelectorAll('.dmx-external-only').forEach(el => {
         el.style.display = isExternal ? '' : 'none';
     });
@@ -862,7 +943,8 @@ export function initializePeripheralManagement() {
                 serial: '串口',
                 udp: 'UDP',
                 tcp: 'TCP',
-                'function-config': '功能配置'
+                'function-config': '功能配置',
+                'vod-forward': 'VOD转发'
             };
             if (badge) badge.textContent = targetLabels[peripheral] || peripheral.toUpperCase();
 
@@ -883,8 +965,10 @@ export function initializePeripheralManagement() {
                     await loadFunctionConfigFunctions();
                 }, 100);
             }
+            if (peripheral === 'vod-forward') refreshVodForward();
         });
     });
+    initializeVodForward();
 
     // 2. 右侧页签切换逻辑
     panelTabs.forEach(tab => {
@@ -904,24 +988,6 @@ export function initializePeripheralManagement() {
         });
     });
 
-    // 2.1 串口类型标签页切换逻辑
-    const serialTypeTabs = document.querySelectorAll('.panel-tab[data-serial-type]');
-    serialTypeTabs.forEach(tab => {
-        tab.addEventListener('click', () => {
-            const serialType = tab.getAttribute('data-serial-type');
-
-            // 更新标签页选中态
-            serialTypeTabs.forEach(t => t.classList.remove('active'));
-            tab.classList.add('active');
-
-            // 更新配置内容显示
-            const typeConfigs = document.querySelectorAll('.serial-type-config');
-            typeConfigs.forEach(c => c.classList.remove('active'));
-
-            const targetConfig = document.getElementById(`serial-${serialType}`);
-            if (targetConfig) targetConfig.classList.add('active');
-        });
-    });
 
     // 3. 动态列表管理
     // DMX 推子按帧节流：每帧最多发一次各通道最新值，减少请求堆积、提升屏幕反应
@@ -1202,6 +1268,8 @@ export function initializePeripheralManagement() {
     }
 }
 
+
+
 /**
  * @brief 初始化串口相关功能
  */
@@ -1213,7 +1281,7 @@ function initSerialFeatures() {
             const isEnabled = e.target.checked;
             const serialConfig = getActiveSerialConfig();
             if (isEnabled && !serialConfig.port) {
-                addToCommandLog('学习模式设置失败', 'error', '请先选择串口号');
+                addToCommandLog('学习模式设置失败', 'error', '请输入串口号（例如 7）或路径（例如 /dev/ttyUSB0）');
                 e.target.checked = false;
                 return;
             }
@@ -1274,6 +1342,16 @@ function initSerialFeatures() {
         await addManualSerialTemplate();
     });
 
+    initSerialTemplateImport({
+        getType: getActiveSerialTemplateType,
+        confirm: showConfirm,
+        submit: (type, templates) => apiAction('peripherals', 'import_templates', {
+            peripheral_type: type, templates
+        }, 30000),
+        refresh: async () => { resetSerial工作区(); await loadSerialTemplates(); },
+        log: addToCommandLog
+    });
+
     // 7.3 功能列表按钮事件（先绑定事件，数据加载在loadPeripheralConfigs中）
     initSerialFunctionButtons();
 
@@ -1286,6 +1364,20 @@ function initSerialFeatures() {
     // 7.6 保存模板功能配置按钮
     document.getElementById('save-template-functions-btn')?.addEventListener('click', async () => {
         await saveTemplateFunctions();
+    });
+
+    document.getElementById('serial-type-select')?.addEventListener('change', async (event) => {
+        serialConfigs[displayedSerialType] = {
+            ...(serialConfigs[displayedSerialType] || {}),
+            port: normalizeCustomSerialPort(document.getElementById('serial-port-select')?.value),
+            baudrate: Number(document.getElementById('serial-baud-select')?.value) || 9600,
+            learn_mode: document.getElementById('serial-learn-mode')?.checked || false
+        };
+        applySharedSerialConfig(event.target.value);
+        resetSerial工作区();
+        serialTemplatesInitialized = false;
+        knownSerialTemplateCodes = new Set();
+        await loadSerialTemplates();
     });
 
     document.getElementById('serial-port-select')?.addEventListener('change', async () => {
@@ -1372,7 +1464,6 @@ function resetSerial工作区() {
  */
 function initSerialTemplateList() {
     const templateList = document.querySelectorAll('#config-serial .template-item');
-    const workspaceCanvas = document.querySelector('#config-serial .workspace-canvas');
     const workspaceHeader = document.querySelector('#config-serial .workspace-header .badge-tag');
 
     templateList.forEach(item => {
@@ -1513,6 +1604,7 @@ async function loadTemplateTo工作区(templateItem) {
                     chip.dataset.functionId = func.function_id || '';
                     chip.dataset.action = func.action || '';
                     chip.dataset.functionCode = func.function_code || '';
+                    if (func.action === 'delay') chip.dataset.delayMs = String(func.delay_ms ?? 1000);
                     if (isForwardFunctionLike(func)) {
                         chip.dataset.functionId = FORWARD_FUNCTION_ID;
                         chip.dataset.action = 'forward_payload';
@@ -1551,6 +1643,7 @@ async function loadTemplateTo工作区(templateItem) {
                     if (isForwardFunctionLike(func)) {
                         applyForwardConfigToChip(chip, func);
                     }
+                    initializeDelayChip(chip);
                     workspaceCanvas.appendChild(chip);
 
                     // 绑定删除按钮
@@ -1618,7 +1711,7 @@ function initSerialFunctionButtons() {
             const functionId = btn.dataset.functionId || '';
             const action = btn.dataset.action || '';
             const code = btn.dataset.code || '';
-            const functionName = btn.textContent.trim();
+            const functionName = (globalThis.PlayerI18n?.sourceText(btn) ?? btn.textContent).trim();
 
             // 优先尝试绑定到命令映射
             const cmdList = document.getElementById('rs232-command-list');
@@ -1679,6 +1772,7 @@ function initSerialFunctionButtons() {
                             functionData.isPlaylist = true;
                         }
 
+                        if (action === 'delay') functionData.delay_ms = 1000;
                         const functionValue = JSON.stringify(functionData);
                         functionSelect.value = functionValue.replace(/"/g, '&quot;');
                         addToCommandLog('绑定功能', 'success', `已绑定功能: ${functionName}`);
@@ -1692,8 +1786,8 @@ function initSerialFunctionButtons() {
 
             // 检查是否已存在该功能
             const existingChips = Array.from(workspaceCanvas?.querySelectorAll('.function-chip') || []);
-            const alreadyExists = functionId !== FORWARD_FUNCTION_ID &&
-                existingChips.some(chip => chip.textContent.includes(functionName));
+            const alreadyExists = action !== 'delay' && functionId !== FORWARD_FUNCTION_ID &&
+                existingChips.some(chip => (globalThis.PlayerI18n?.sourceText(chip) ?? chip.textContent).includes(functionName));
 
             if (alreadyExists) {
                 addToCommandLog('功能已存在', 'warning', `${functionName} 已在工作区中`);
@@ -1749,6 +1843,8 @@ function initSerialFunctionButtons() {
                 if (emptyState) {
                     emptyState.remove();
                 }
+
+                initializeDelayChip(chip);
 
                 workspaceCanvas.appendChild(chip);
 
@@ -1841,7 +1937,7 @@ async function saveTemplateFunctions() {
 
     chips.forEach(chip => {
         const functionId = chip.dataset.functionId || '';
-        const functionName = chip.querySelector('span')?.textContent.trim() || '';
+        const functionName = (globalThis.PlayerI18n?.sourceText(chip.querySelector('span')) ?? chip.querySelector('span')?.textContent)?.trim() || '';
         let action = chip.dataset.action || '';
         let functionCode = parseInt(chip.dataset.functionCode || '0', 10);
         const isTemplate = chip.dataset.isTemplate === 'true';
@@ -1865,7 +1961,7 @@ async function saveTemplateFunctions() {
         const identityKey = functionId === FORWARD_FUNCTION_ID
             ? functionIdentityFromChip(chip)
             : functionId;
-        if (seenFunctionIds.has(identityKey)) {
+        if (action !== 'delay' && seenFunctionIds.has(identityKey)) {
             addToCommandLog('保存功能配置', 'warning', `功能 "${functionName}" 重复，已跳过`);
             return;
         }
@@ -1877,6 +1973,8 @@ async function saveTemplateFunctions() {
             action: action,
             function_code: functionCode
         };
+
+        if (action === 'delay') functionData.delay_ms = Number(chip.dataset.delayMs ?? 1000);
 
         // 如果是图层模板，添加场景名称参数或标记为默认
         if (isTemplate) {
@@ -2124,13 +2222,6 @@ function filterFunctions() {
     });
 }
 
-/**
- * @brief 检查学习模式状态并启动自动刷新
- * 注意：这个函数现在由loadRs232Config调用，不需要单独调用
- */
-async function checkLearnModeAndStartRefresh() {
-    // 已移至loadRs232Config中处理
-}
 
 /**
  * @brief 初始化时立即加载 DMX 状态，完全依赖后端状态确保唯一性和准确性
@@ -2147,7 +2238,7 @@ async function loadDmxStatusOnInit() {
                 const cfg = response.config || {};
                 const externalPortEl = document.getElementById('dmx-external-port');
                 const infoShowEl = document.getElementById('dmx-info-show');
-                if (externalPortEl && cfg.external_port) externalPortEl.value = cfg.external_port;
+                if (externalPortEl && cfg.external_port) externalPortEl.value = cfg.external_port.replace(/^\/dev\/ttyS(?=\d+$)/, '');
                 if (infoShowEl && typeof cfg.dmx_info_show !== 'undefined') {
                     infoShowEl.checked = !!cfg.dmx_info_show;
                 }
@@ -2166,6 +2257,8 @@ async function loadDmxStatusOnInit() {
 /**
  * @brief 初始化 DMX 实时监控
  */
+let dmxMonitorTimer = null;
+
 function initDmxMiniMonitor() {
     const grid = document.getElementById('dmx-mini-monitor-grid');
     if (!grid) return;
@@ -2184,7 +2277,10 @@ function initDmxMiniMonitor() {
     }
 
     // 启动轮询
-    const pollInterval = setInterval(async () => {
+    if (dmxMonitorTimer !== null) {
+        clearInterval(dmxMonitorTimer);
+    }
+    dmxMonitorTimer = setInterval(async () => {
         // 检查页面是否还活跃
         const page = document.getElementById('peripheral-management-page');
         if (!page || !page.classList.contains('active')) return;
@@ -2268,6 +2364,9 @@ async function loadPeripheralConfigs() {
 
     try {
         await Promise.all(tasks);
+        const serialType = ['rs485', 'rs232'].find(type => serialConfigs[type]?.learn_mode) ||
+            ['rs485', 'rs232'].find(type => serialConfigs[type]?.enabled) || 'rs485';
+        applySharedSerialConfig(serialType);
 
         // 加载完成后，根据需要加载额外数据
         await loadSerialTemplates();
@@ -2311,14 +2410,13 @@ async function loadSerialPortOptions() {
         serialPortOptions = ports;
         rs232SerialPortOptions = rs232Ports;
         rs485SerialPortOptions = rs485Ports;
-        updateSerialPortSelect('dmx-port', rs485Ports, [
-            { value: 'artnet', label: 'Art-Net (Network)' },
-            { value: 'sacn', label: 'sACN (Network)' }
-        ], true);
-        updateSerialPortSelect('dmx-external-port', rs232Ports, [
-            { value: '/dev/ttySWK4', label: 'RS232 (/dev/ttySWK4)' }
-        ], true);
-        updateSerialPortSelect('serial-port-select', ports, []);
+        // 本机 DMX 只提供板载 RS485 的 7、9 两个端口，避免显示无关外设。
+        updateSerialPortSelect('dmx-port', [
+            { value: '/dev/ttyS7', label: '7' },
+            { value: '/dev/ttyS9', label: '9' }
+        ], [], true);
+        updateDmxExternalPortOptions(rs232Ports);
+        updateCustomSerialPortOptions();
         updateSerialPortSelect('rs485-port', rs485Ports, [], true);
         const forwardDialog = document.getElementById('forward-config-dialog');
         if (forwardDialog && forwardDialog.classList.contains('active')) {
@@ -2329,33 +2427,72 @@ async function loadSerialPortOptions() {
     }
 }
 
+function updateDmxExternalPortOptions(ports) {
+    const input = document.getElementById('dmx-external-port');
+    const list = document.getElementById('dmx-external-port-options');
+    if (!input || !list) return;
+    const current = normalizeCustomSerialPort(input.value) || '/dev/ttyS5';
+    input.value = current.replace(/^\/dev\/ttyS(?=\d+$)/, '');
+    list.replaceChildren();
+    const values = new Set(['/dev/ttyS5', ...ports.map(getPortOptionValue)]);
+    values.forEach(value => {
+        if (!/^\/dev\/ttyS\d+$/.test(value)) return;
+        const option = document.createElement('option');
+        option.value = value.replace('/dev/ttyS', '');
+        option.label = option.value;
+        list.appendChild(option);
+    });
+}
+
 function isRs485Port(port) {
     // 兼容字符串和对象格式 {value, label}
     if (typeof port === 'object' && port !== null && port.type) {
         return port.type === 'rs485';
     }
     const portValue = (typeof port === 'object' && port !== null) ? port.value : port;
-    const name = String(portValue || '').split('/').pop() || '';
-    if (name === 'ttySWK4' || name === 'ttysWK4') return false;
-    return name.startsWith('ttyRS') || name.startsWith('ttyUSB') ||
-        name.startsWith('ttyXRUSB') || name.startsWith('ttySWK') || name.startsWith('ttysWK');
+    return portValue === '/dev/ttyS7' || portValue === '/dev/ttyS9';
+}
+
+function normalizeCustomSerialPort(value) {
+    const text = String(value || '').trim();
+    if (/^\d+$/.test(text)) return `/dev/ttyS${Number(text)}`;
+    return /^\/dev\/tty(?:S|USB|ACM)\d+$/.test(text) ? text : '';
 }
 
 function getActiveSerialConfig() {
-    const activeType = document.querySelector('.panel-tab[data-serial-type].active')?.getAttribute('data-serial-type') || 'rs232';
-    let type = activeType === 'rs485' ? 'rs485' : 'rs232';
-    const portSelect = document.getElementById('serial-port-select');
-    const port = portSelect?.value || '';
-    const selectedOptionType = portSelect?.selectedOptions?.[0]?.dataset?.type || '';
-    if (selectedOptionType === 'rs485' || selectedOptionType === 'rs232') {
-        type = selectedOptionType;
-    } else if (isRs485Port(port)) {
-        type = 'rs485';
-    }
-    const baudrate = parseInt(document.getElementById('serial-baud-select')?.value ||
-        '9600', 10) || 9600;
-
+    const type = document.getElementById('serial-type-select')?.value === 'rs232' ? 'rs232' : 'rs485';
+    const port = normalizeCustomSerialPort(document.getElementById('serial-port-select')?.value);
+    const baudrate = parseInt(document.getElementById('serial-baud-select')?.value || '9600', 10) || 9600;
     return { type, port, baudrate };
+}
+
+function updateCustomSerialPortOptions() {
+    const list = document.getElementById('serial-port-options');
+    if (!list) return;
+    const type = document.getElementById('serial-type-select')?.value || 'rs485';
+    list.replaceChildren();
+    const ports = getForwardSerialPortOptions(type);
+    const values = new Set([defaultSerialPorts[type], ...ports.map(getPortOptionValue)]);
+    values.forEach(value => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.label = `${type.toUpperCase()} (${value})`;
+        list.appendChild(option);
+    });
+}
+
+function applySharedSerialConfig(type) {
+    const config = serialConfigs[type] || {};
+    const typeEl = document.getElementById('serial-type-select');
+    const portEl = document.getElementById('serial-port-select');
+    const baudEl = document.getElementById('serial-baud-select');
+    displayedSerialType = type;
+    if (typeEl) typeEl.value = type;
+    const port = normalizeCustomSerialPort(config.port) || defaultSerialPorts[type];
+    if (portEl) portEl.value = port.replace(/^\/dev\/ttyS(?=\d+$)/, '');
+    if (baudEl) baudEl.value = String(config.baudrate || 9600);
+    applySerialLearnModeUI({ learn_mode: Boolean(config.learn_mode) });
+    updateCustomSerialPortOptions();
 }
 
 function applySerialLearnModeUI(config) {
@@ -2386,6 +2523,7 @@ function updateSerialPortSelect(selectId, ports, extraOptions, strict = false) {
         select.appendChild(option);
     });
     extraOptions.forEach(item => {
+        if (Array.from(select.options).some(option => option.value === item.value)) return;
         const option = document.createElement('option');
         option.value = item.value;
         option.textContent = item.label;
@@ -2406,19 +2544,6 @@ function getPortOptionValue(port) {
     return typeof port === 'object' && port !== null ? port.value : port;
 }
 
-function appendSerialPortOption(select, port) {
-    const option = document.createElement('option');
-    if (typeof port === 'object' && port !== null) {
-        option.value = port.value;
-        option.textContent = port.label || port.value;
-        option.dataset.type = port.type || '';
-    } else {
-        option.value = port;
-        option.textContent = port;
-    }
-    select.appendChild(option);
-}
-
 function getForwardSerialPortOptions(target) {
     if (target === 'rs485') {
         return rs485SerialPortOptions.length ? rs485SerialPortOptions : serialPortOptions.filter(isRs485Port);
@@ -2430,39 +2555,25 @@ function getForwardSerialPortOptions(target) {
 }
 
 function refreshForwardSerialPortOptions(dialog, preferredValue = undefined) {
-    const select = dialog?.querySelector('#forward-port-input');
-    if (!select) return;
+    const input = dialog?.querySelector('#forward-port-input');
+    const list = dialog?.querySelector('#forward-port-options');
+    if (!input || !list) return;
 
     const target = dialog.querySelector('#forward-target-select')?.value || 'rs232';
-    const ports = getForwardSerialPortOptions(target);
-    const desiredValue = preferredValue !== undefined ? preferredValue : select.value;
-    const hasDesiredValue = !!desiredValue;
-    const desiredInList = ports.some(port => getPortOptionValue(port) === desiredValue);
-    const shouldKeepUnlistedValue = preferredValue !== undefined && hasDesiredValue && !desiredInList;
-
-    select.innerHTML = '';
-    if (!ports.length && !shouldKeepUnlistedValue) {
+    const desiredValue = preferredValue !== undefined ? preferredValue : input.value;
+    const port = desiredValue || defaultSerialPorts[target];
+    input.value = String(port || '').replace(/^\/dev\/ttyS(?=\d+$)/, '');
+    input.placeholder = target === 'rs485' ? '7 或 /dev/ttyUSB0' : '5 或 /dev/ttyUSB0';
+    list.replaceChildren();
+    const values = new Set([defaultSerialPorts[target],
+        ...getForwardSerialPortOptions(target).map(getPortOptionValue)]);
+    values.forEach(value => {
+        if (!value) return;
         const option = document.createElement('option');
-        option.value = '';
-        option.textContent = `未检测到${target.toUpperCase()}可用串口`;
-        select.appendChild(option);
-        select.value = '';
-        return;
-    }
-
-    ports.forEach(port => appendSerialPortOption(select, port));
-    if (shouldKeepUnlistedValue) {
-        const option = document.createElement('option');
-        option.value = desiredValue;
-        option.textContent = `${desiredValue} (当前配置)`;
-        select.insertBefore(option, select.firstChild);
-    }
-
-    if (desiredInList || shouldKeepUnlistedValue) {
-        select.value = desiredValue;
-    } else if (select.options.length > 0) {
-        select.selectedIndex = 0;
-    }
+        option.value = value;
+        option.label = `${target.toUpperCase()} (${value})`;
+        list.appendChild(option);
+    });
 }
 /**
  * @brief 为特定类型加载配置并更新 UI
@@ -2474,8 +2585,8 @@ async function loadConfigForType(type) {
 
     try {
         const response = await apiAction('peripherals', 'get_config', {
-                peripheral_type: backendType
-            });
+            peripheral_type: backendType
+        });
 
         if (!response || typeof response !== 'object') return;
 
@@ -2489,35 +2600,37 @@ async function loadConfigForType(type) {
         const portEl = document.getElementById(portId);
         const baudEl = document.getElementById(baudId);
 
-        const shouldApplySharedSerialConfig = !usesSharedSerialControls ||
-            type === 'rs485' || !isRs485Port(config.port);
-        if (shouldApplySharedSerialConfig && portEl && config.port) portEl.value = config.port;
-        if (shouldApplySharedSerialConfig && baudEl && config.baudrate) baudEl.value = config.baudrate.toString();
+        if (usesSharedSerialControls) {
+            serialConfigs[type] = config;
+        } else {
+            if (portEl && config.port) portEl.value = config.port;
+            if (baudEl && config.baudrate) baudEl.value = config.baudrate.toString();
+        }
 
         // 为特定协议处理特有字段
         switch (type) {
-            case 'dmx':
+            case 'dmx': {
                 const modeEl = document.getElementById('dmx-input-mode');
                 const externalPortEl = document.getElementById('dmx-external-port');
                 const addressEl = document.getElementById('dmx-start-address');
                 const infoShowEl = document.getElementById('dmx-info-show');
                 if (modeEl) modeEl.value = config.mode === 'external' ? 'external' : 'local';
-                if (externalPortEl && config.external_port) externalPortEl.value = config.external_port;
+                if (externalPortEl && config.external_port) externalPortEl.value = config.external_port.replace(/^\/dev\/ttyS(?=\d+$)/, '');
                 if (addressEl && config.address) addressEl.value = config.address;
                 if (infoShowEl && typeof config.dmx_info_show !== 'undefined') {
                     infoShowEl.checked = !!config.dmx_info_show;
                 }
                 updateDmxInputModeUI();
                 break;
+            }
             case 'rs232':
-                if (shouldApplySharedSerialConfig) applySerialLearnModeUI(config);
                 // 串口已改为模板驱动（save_template_functions），mappings 字段废弃
                 break;
-            case 'rs485':
-                applySerialLearnModeUI(config);
+            case 'rs485': {
                 const slaveIdEl = document.getElementById('rs485-slave-id');
                 if (slaveIdEl && config.slave_id) slaveIdEl.value = config.slave_id;
                 break;
+            }
             case 'udp':
             case 'tcp':
                 updateNetworkConfigUI(type, config);
@@ -2687,9 +2800,9 @@ function renderSerialTemplates(templates, serialType = getActiveSerialTemplateTy
         item.dataset.templateType = templateType;
 
         item.innerHTML = `
-            <span class="template-cell template-cell-code" title="${hexData}">${displayCode}</span>
+            <span class="template-cell template-cell-code" title="${escapeHtml(hexData)}">${escapeHtml(displayCode)}</span>
             <span class="template-cell template-cell-name">
-                <span class="template-name-text">${name}</span>
+                <span class="template-name-text" data-i18n-ignore>${escapeHtml(name)}</span>
                 <button type="button" class="template-rename-btn" title="修改名称">🖊</button>
             </span>
             <span class="template-cell template-cell-actions">
@@ -2968,8 +3081,7 @@ function renderSerialFunctions(functions) {
             return;
         }
 
-        // 获取父容器的计算样式和实际高度
-        const parentComputedStyle = window.getComputedStyle(parent);
+        // Get the parent container height
         let parentHeight = parent.offsetHeight;
 
         // 如果offsetHeight为0，尝试使用clientHeight
@@ -3214,6 +3326,61 @@ function showErrorState(container, title, message) {
     `;
 }
 
+function isIpv4MulticastAddress(value) {
+    const parts = String(value || '').split('.');
+    if (parts.length !== 4 || parts.some(part => !/^\d{1,3}$/.test(part))) return false;
+    const octets = parts.map(Number);
+    return octets.every(octet => octet >= 0 && octet <= 255) &&
+        octets[0] >= 224 && octets[0] <= 239;
+}
+
+function isSupportedForwardBaudrate(value) {
+    return [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200].includes(Number(value));
+}
+
+function normalizeForwardConfig(config = {}) {
+    const supportedTargets = new Set(['rs232', 'rs485', 'udp', 'tcp', 'websocket']);
+    const requestedTarget = String(config.forward_target || '').toLowerCase();
+    const target = supportedTargets.has(requestedTarget) ? requestedTarget : 'rs232';
+    const normalized = { forward_target: target };
+
+    if (target === 'rs232' || target === 'rs485') {
+        normalized.forward_port = String(config.forward_port || '').trim();
+        normalized.forward_baudrate = parseInt(config.forward_baudrate || '0', 10) || 9600;
+    } else if (target === 'udp') {
+        const port = parseInt(config.forward_port || '0', 10) || 0;
+        normalized.broadcast = config.broadcast === true;
+        normalized.multicast = config.multicast === true && !normalized.broadcast;
+        if (port > 0) normalized.forward_port = port;
+        if (normalized.multicast) {
+            normalized.multicast_group = String(config.multicast_group || '').trim();
+        } else if (!normalized.broadcast) {
+            normalized.forward_address = String(config.forward_address || '').trim();
+        }
+    } else if (target === 'tcp') {
+        normalized.forward_mode = config.forward_mode === 'broadcast' ? 'broadcast' : 'direct';
+        if (normalized.forward_mode === 'direct') {
+            const port = parseInt(config.forward_port || '0', 10) || 0;
+            normalized.forward_address = String(config.forward_address || '').trim();
+            if (port > 0) normalized.forward_port = port;
+        }
+    } else {
+        normalized.forward_mode = 'broadcast';
+    }
+
+    if (isFixedForwardConfig(config)) {
+        const payloadType = config.fixed_payload_type === 'text' ? 'text' : 'hex';
+        normalized.fixed_send = true;
+        normalized.fixed_payload_type = payloadType;
+        normalized.payload = payloadType === 'text' ? String(config.payload || '') : '';
+        normalized.hex = String(config.hex || '');
+    } else {
+        normalized.command_mappings = normalizeForwardCommandMappings(config.command_mappings || []);
+    }
+
+    return normalized;
+}
+
 function ensureForwardConfigDialog() {
     let dialog = document.getElementById('forward-config-dialog');
     if (!dialog) {
@@ -3236,8 +3403,10 @@ function ensureForwardConfigDialog() {
                             </select>
                         </div>
                         <div class="forward-form-item forward-serial-only">
-                            <label for="forward-port-input">串口</label>
-                            <select id="forward-port-input" class="form-control"></select>
+                            <label for="forward-port-input">自定义串口号</label>
+                            <input id="forward-port-input" class="form-control" type="text"
+                                list="forward-port-options" placeholder="5 或 /dev/ttyUSB0">
+                            <datalist id="forward-port-options"></datalist>
                         </div>
                         <div class="forward-form-item forward-serial-only">
                             <label for="forward-baudrate-input">波特率</label>
@@ -3294,6 +3463,7 @@ function ensureForwardConfigDialog() {
                         <div id="forward-command-mapping-list" class="forward-command-mapping-list"></div>
                     </div>
                     <div class="forward-dialog-hint forward-mapping-hint">未配置或未命中映射时继续转发原始指令；同一个收到 Hex 可添加多条映射，按列表顺序发送。</div>
+                    <div id="forward-config-error" class="forward-config-error" role="alert"></div>
                 </div>
                 <div class="dialog-footer">
                     <button id="forward-config-cancel-btn" class="btn">取消</button>
@@ -3303,6 +3473,15 @@ function ensureForwardConfigDialog() {
         `;
         document.body.appendChild(dialog);
 
+        const clearValidationError = () => {
+            const errorElement = dialog.querySelector('#forward-config-error');
+            if (errorElement) errorElement.textContent = '';
+        };
+        const showValidationError = (title, message) => {
+            const errorElement = dialog.querySelector('#forward-config-error');
+            if (errorElement) errorElement.textContent = message;
+            addToCommandLog(title, 'warning', message);
+        };
         const toggle = (preferredSerialPort) => {
             const target = dialog.querySelector('#forward-target-select')?.value || 'rs232';
             const modeSelect = dialog.querySelector('#forward-mode-select');
@@ -3312,22 +3491,42 @@ function ensureForwardConfigDialog() {
             const targetMode = dialog.querySelectorAll('.forward-target-mode');
             const isSerial = target === 'rs232' || target === 'rs485';
             const isUdp = target === 'udp';
-            const supportsMode = target === 'tcp' || target === 'websocket';
+            const showsMode = target === 'tcp' || target === 'websocket';
 
-            serialOnly.forEach(el => { el.style.display = isSerial ? '' : 'none'; });
-            networkOnly.forEach(el => { el.style.display = isSerial ? 'none' : ''; });
-            udpOnly.forEach(el => { el.style.display = isUdp ? '' : 'none'; });
-            targetMode.forEach(el => { el.style.display = supportsMode ? '' : 'none'; });
             if (modeSelect) {
-                modeSelect.disabled = !supportsMode;
-                if (!supportsMode) modeSelect.value = 'direct';
+                if (target === 'websocket') {
+                    modeSelect.value = 'broadcast';
+                } else if (!showsMode) {
+                    modeSelect.value = 'direct';
+                }
+                modeSelect.disabled = target !== 'tcp';
             }
+
+            const mode = modeSelect?.value || 'direct';
+            const showsNetworkTarget = isUdp || (target === 'tcp' && mode === 'direct');
+            serialOnly.forEach(el => { el.style.display = isSerial ? '' : 'none'; });
+            networkOnly.forEach(el => { el.style.display = showsNetworkTarget ? '' : 'none'; });
+            udpOnly.forEach(el => { el.style.display = isUdp ? '' : 'none'; });
+            targetMode.forEach(el => { el.style.display = showsMode ? '' : 'none'; });
             if (isSerial) {
                 refreshForwardSerialPortOptions(dialog, preferredSerialPort);
             }
+            clearValidationError();
         };
 
-        dialog.querySelector('#forward-target-select')?.addEventListener('change', () => toggle());
+        dialog.querySelector('#forward-target-select')?.addEventListener('change', () => toggle(''));
+        dialog.querySelector('#forward-mode-select')?.addEventListener('change', () => toggle());
+        const broadcastCheck = dialog.querySelector('#forward-broadcast-check');
+        const multicastCheck = dialog.querySelector('#forward-multicast-check');
+        broadcastCheck?.addEventListener('change', () => {
+            if (broadcastCheck.checked && multicastCheck) multicastCheck.checked = false;
+            clearValidationError();
+        });
+        multicastCheck?.addEventListener('change', () => {
+            if (multicastCheck.checked && broadcastCheck) broadcastCheck.checked = false;
+            clearValidationError();
+        });
+        dialog.addEventListener('input', clearValidationError);
         dialog.querySelector('#forward-fixed-payload-type')?.addEventListener('change', () => {
             const type = dialog.querySelector('#forward-fixed-payload-type')?.value || 'hex';
             const input = dialog.querySelector('#forward-fixed-payload-input');
@@ -3352,8 +3551,10 @@ function ensureForwardConfigDialog() {
             const fixedMode = !!dialog._forwardFixedMode;
             const config = {
                 forward_target: target,
-                forward_port: isSerial ? (dialog.querySelector('#forward-port-input')?.value?.trim() || '') : '',
-                forward_baudrate: parseInt(dialog.querySelector('#forward-baudrate-input')?.value || '0', 10) || 0,
+                forward_port: isSerial ? normalizeCustomSerialPort(dialog.querySelector('#forward-port-input')?.value) : '',
+                forward_baudrate: isSerial
+                    ? (parseInt(dialog.querySelector('#forward-baudrate-input')?.value || '0', 10) || 9600)
+                    : 0,
                 forward_address: dialog.querySelector('#forward-address-input')?.value?.trim() || '',
                 multicast_group: dialog.querySelector('#forward-multicast-group-input')?.value?.trim() || '',
                 forward_mode: dialog.querySelector('#forward-mode-select')?.value || 'direct',
@@ -3366,7 +3567,7 @@ function ensureForwardConfigDialog() {
                 const payloadInput = dialog.querySelector('#forward-fixed-payload-input');
                 const rawValue = payloadInput?.value || '';
                 if (!rawValue.trim()) {
-                    addToCommandLog('发送固定指令', 'warning', '请填写要发送的内容');
+                    showValidationError('发送固定指令', '请填写要发送的内容');
                     return;
                 }
                 config.fixed_send = true;
@@ -3377,7 +3578,7 @@ function ensureForwardConfigDialog() {
                 } else {
                     const normalized = normalizeHexInput(rawValue);
                     if (!normalized.ok) {
-                        addToCommandLog('发送固定指令', 'warning', normalized.message);
+                        showValidationError('发送固定指令', normalized.message);
                         return;
                     }
                     config.hex = normalized.value;
@@ -3386,38 +3587,74 @@ function ensureForwardConfigDialog() {
             } else {
                 const mappingResult = collectForwardCommandMappings(dialog);
                 if (!mappingResult.ok) {
-                    addToCommandLog('转发配置', 'warning', mappingResult.message);
+                    showValidationError('转发配置', mappingResult.message);
                     return;
                 }
                 config.command_mappings = mappingResult.value;
             }
-            const networkPort = parseInt(dialog.querySelector('#forward-network-port-input')?.value || '0', 10) || 0;
+            const networkPortText = dialog.querySelector('#forward-network-port-input')?.value?.trim() || '';
+            const networkPort = networkPortText ? Number(networkPortText) : 0;
+            const usesNetworkPort = target === 'udp' ||
+                (target === 'tcp' && config.forward_mode === 'direct');
+            if (usesNetworkPort && networkPortText &&
+                (!Number.isInteger(networkPort) || networkPort < 1 || networkPort > 65535)) {
+                showValidationError('\u8f6c\u53d1\u914d\u7f6e', '\u76ee\u6807\u7aef\u53e3\u5fc5\u987b\u5728 1 \u5230 65535 \u4e4b\u95f4');
+                return;
+            }
             if (isSerial) {
                 if (!config.forward_port) {
-                    addToCommandLog('转发配置', 'warning', '请选择目标串口');
+                    showValidationError('转发配置', '请输入串口号（例如 7）或路径（例如 /dev/ttyUSB0）');
+                    return;
+                }
+                if (!isSupportedForwardBaudrate(config.forward_baudrate)) {
+                    showValidationError(
+                        '\u8f6c\u53d1\u914d\u7f6e',
+                        '\u6ce2\u7279\u7387\u4ec5\u652f\u6301 1200\u30012400\u30014800\u30019600\u300119200\u300138400\u300157600\u3001115200'
+                    );
                     return;
                 }
             } else if (target === 'udp') {
+                if (config.broadcast && config.multicast) {
+                    showValidationError('转发配置', 'UDP 广播和组播不能同时启用');
+                    return;
+                }
+                if (config.multicast && !config.multicast_group) {
+                    showValidationError('转发配置', '请填写 UDP 组播地址');
+                    return;
+                }
+                if (config.multicast && !isIpv4MulticastAddress(config.multicast_group)) {
+                    showValidationError('转发配置', '请填写 224.0.0.0 到 239.255.255.255 范围内的 UDP 组播地址');
+                    return;
+                }
                 if (!config.broadcast && !config.multicast && !config.forward_address) {
-                    addToCommandLog('转发配置', 'warning', '请填写 UDP 目标地址，或启用广播/组播');
+                    showValidationError('转发配置', '请填写 UDP 目标地址，或启用广播/组播');
                     return;
                 }
                 if (!config.broadcast && networkPort <= 0) {
-                    addToCommandLog('转发配置', 'warning', '请填写 UDP 目标端口');
+                    showValidationError('转发配置', '请填写 UDP 目标端口');
                     return;
                 }
-            } else if ((target === 'tcp' || target === 'websocket') &&
-                       config.forward_mode !== 'broadcast') {
-                addToCommandLog('转发配置', 'warning', `${target.toUpperCase()} 当前只支持广播到已连接客户端`);
+            } else if (target === 'tcp' && config.forward_mode === 'direct') {
+                if (!config.forward_address) {
+                    showValidationError('转发配置', '请填写 TCP 目标地址');
+                    return;
+                }
+                if (networkPort <= 0) {
+                    showValidationError('转发配置', '请填写 TCP 目标端口');
+                    return;
+                }
+            } else if (target === 'websocket' && config.forward_mode !== 'broadcast') {
+                showValidationError('转发配置', 'WebSocket 当前只支持广播到已连接客户端');
                 return;
             }
-            if (networkPort > 0) {
+            if (networkPort > 0 &&
+                (target === 'udp' || (target === 'tcp' && config.forward_mode === 'direct'))) {
                 config.forward_port = networkPort;
             }
             const resolve = dialog._resolve;
             dialog.classList.remove('active');
             dialog._resolve = null;
-            if (resolve) resolve(config);
+            if (resolve) resolve(normalizeForwardConfig(config));
         });
         dialog.addEventListener('click', (e) => {
             if (e.target === dialog) {
@@ -3486,14 +3723,15 @@ function collectForwardCommandMappings(dialog) {
 function showForwardConfigDialog(initial = {}) {
     return new Promise((resolve) => {
         const dialog = ensureForwardConfigDialog();
-        const initialTarget = initial.forward_target || 'rs232';
+        const initialConfig = normalizeForwardConfig(initial);
+        const initialTarget = initialConfig.forward_target;
         const isSerial = initialTarget === 'rs232' || initialTarget === 'rs485';
         const fixedMode = initial.fixedMode === true || isFixedForwardConfig(initial);
-        const payloadType = initial.fixed_payload_type || initial.payload_type ||
-            (initial.payload && !initial.hex ? 'text' : 'hex');
+        const payloadType = initialConfig.fixed_payload_type || initial.payload_type ||
+            (initialConfig.payload && !initialConfig.hex ? 'text' : 'hex');
         const payloadValue = payloadType === 'text'
-            ? (initial.payload || '')
-            : (initial.hex || initial.payload || '');
+            ? (initialConfig.payload || '')
+            : (initialConfig.hex || initialConfig.payload || '');
         dialog._resolve = resolve;
         dialog._forwardFixedMode = fixedMode;
         const defaultSource = normalizeHexInput(initial.default_source_hex || '');
@@ -3502,20 +3740,22 @@ function showForwardConfigDialog(initial = {}) {
         dialog.querySelector('#forward-config-title').textContent = fixedMode ? '发送固定指令' : '配置转发目标';
         dialog.querySelector('#forward-config-ok-btn').textContent = fixedMode ? '保存' : '确定';
         dialog.querySelector('#forward-target-select').value = initialTarget;
-        dialog.querySelector('#forward-baudrate-input').value = initial.forward_baudrate || '';
-        dialog.querySelector('#forward-address-input').value = initial.forward_address || '';
-        dialog.querySelector('#forward-network-port-input').value = isSerial ? '' : (initial.forward_port || '');
-        dialog.querySelector('#forward-multicast-group-input').value = initial.multicast_group || '';
-        dialog.querySelector('#forward-mode-select').value = initial.forward_mode || 'direct';
-        dialog.querySelector('#forward-broadcast-check').checked = !!initial.broadcast;
-        dialog.querySelector('#forward-multicast-check').checked = !!initial.multicast;
+        dialog.querySelector('#forward-baudrate-input').value = initialConfig.forward_baudrate || '';
+        dialog.querySelector('#forward-address-input').value = initialConfig.forward_address || '';
+        dialog.querySelector('#forward-network-port-input').value = isSerial ? '' : (initialConfig.forward_port || '');
+        dialog.querySelector('#forward-multicast-group-input').value = initialConfig.multicast_group || '';
+        dialog.querySelector('#forward-mode-select').value = initialConfig.forward_mode || 'direct';
+        dialog.querySelector('#forward-broadcast-check').checked = !!initialConfig.broadcast && !initialConfig.multicast;
+        dialog.querySelector('#forward-multicast-check').checked = !!initialConfig.multicast;
         dialog.querySelector('#forward-fixed-payload-type').value = payloadType;
         dialog.querySelector('#forward-fixed-payload-input').value = payloadValue;
         dialog.querySelector('#forward-fixed-payload-input').placeholder =
             payloadType === 'text' ? '例如 power on' : '例如 AABBCC';
-        renderForwardCommandMappings(dialog, fixedMode ? [] : (initial.command_mappings || initial.forward_command_mappings || []));
+        const errorElement = dialog.querySelector('#forward-config-error');
+        if (errorElement) errorElement.textContent = '';
+        renderForwardCommandMappings(dialog, fixedMode ? [] : (initialConfig.command_mappings || []));
         if (typeof dialog._toggle === 'function') {
-            dialog._toggle(isSerial ? (initial.forward_port || '') : undefined);
+            dialog._toggle(isSerial ? (initialConfig.forward_port || '') : undefined);
         }
         dialog.classList.add('active');
     });
@@ -3527,7 +3767,7 @@ function getForwardConfigFromChip(chip) {
         forward_port: chip.dataset.forwardPort || '',
         forward_baudrate: parseInt(chip.dataset.forwardBaudrate || '0', 10) || 0,
         forward_address: chip.dataset.forwardAddress || '',
-        forward_mode: chip.dataset.forwardMode || 'direct',
+        forward_mode: chip.dataset.forwardMode || '',
         multicast_group: chip.dataset.multicastGroup || '',
         broadcast: chip.dataset.forwardBroadcast === 'true',
         multicast: chip.dataset.forwardMulticast === 'true',
@@ -3544,49 +3784,52 @@ function getForwardConfigFromChip(chip) {
         config.hex = chip.dataset.forwardHex || '';
         config.command_mappings = [];
     }
-    return config;
+    return normalizeForwardConfig(config);
 }
 
 function applyForwardConfigToChip(chip, config) {
-    const commandMappings = normalizeForwardCommandMappings(config.command_mappings || config.forward_command_mappings || []);
-    const fixedSend = isFixedForwardConfig(config);
-    const fixedPayloadType = config.fixed_payload_type || config.payload_type ||
-        (config.payload && !config.hex ? 'text' : 'hex');
-    chip.dataset.forwardTarget = config.forward_target || '';
-    chip.dataset.forwardPort = config.forward_port ? String(config.forward_port) : '';
-    chip.dataset.forwardBaudrate = config.forward_baudrate ? String(config.forward_baudrate) : '';
-    chip.dataset.forwardAddress = config.forward_address || '';
-    chip.dataset.forwardMode = config.forward_mode || 'direct';
-    chip.dataset.multicastGroup = config.multicast_group || '';
-    chip.dataset.forwardBroadcast = config.broadcast ? 'true' : '';
-    chip.dataset.forwardMulticast = config.multicast ? 'true' : '';
+    const normalized = normalizeForwardConfig(config);
+    const commandMappings = normalized.command_mappings || [];
+    const fixedSend = normalized.fixed_send === true;
+    const fixedPayloadType = normalized.fixed_payload_type || 'hex';
+    chip.dataset.forwardTarget = normalized.forward_target || '';
+    chip.dataset.forwardPort = normalized.forward_port ? String(normalized.forward_port) : '';
+    chip.dataset.forwardBaudrate = normalized.forward_baudrate ? String(normalized.forward_baudrate) : '';
+    chip.dataset.forwardAddress = normalized.forward_address || '';
+    chip.dataset.forwardMode = normalized.forward_mode || '';
+    chip.dataset.multicastGroup = normalized.multicast_group || '';
+    chip.dataset.forwardBroadcast = normalized.broadcast ? 'true' : '';
+    chip.dataset.forwardMulticast = normalized.multicast ? 'true' : '';
     chip.dataset.commandMappings = !fixedSend && commandMappings.length ? JSON.stringify(commandMappings) : '';
     chip.dataset.forwardFixedSend = fixedSend ? 'true' : '';
     chip.dataset.fixedPayloadType = fixedSend ? fixedPayloadType : '';
-    chip.dataset.forwardPayload = fixedSend ? (config.payload || '') : '';
-    chip.dataset.forwardHex = fixedSend ? (config.hex || '') : '';
+    chip.dataset.forwardPayload = fixedSend ? (normalized.payload || '') : '';
+    chip.dataset.forwardHex = fixedSend ? (normalized.hex || '') : '';
 
     const parts = [];
-    if (config.forward_target) parts.push(config.forward_target.toUpperCase());
-    if (config.forward_address) parts.push(config.forward_address);
-    if (config.forward_port) parts.push(String(config.forward_port));
-    if (config.forward_port && (config.forward_target === 'rs232' || config.forward_target === 'rs485') && config.forward_baudrate) {
-        parts.push(`@${config.forward_baudrate}`);
+    if (normalized.forward_target) parts.push(normalized.forward_target.toUpperCase());
+    if (normalized.forward_address) parts.push(normalized.forward_address);
+    if (normalized.forward_port) parts.push(String(normalized.forward_port));
+    if (normalized.forward_port &&
+        (normalized.forward_target === 'rs232' || normalized.forward_target === 'rs485') &&
+        normalized.forward_baudrate) {
+        parts.push(`@${normalized.forward_baudrate}`);
     }
-    if (config.broadcast) parts.push('广播');
-    if (config.multicast) parts.push('组播');
+    if (normalized.broadcast) parts.push('\u5e7f\u64ad');
+    if (normalized.multicast) parts.push('\u7ec4\u64ad');
     if (commandMappings.length > 0) {
-        parts.push(`映射${commandMappings.length}条`);
+        parts.push(`\u6620\u5c04${commandMappings.length}\u6761`);
     }
     if (fixedSend) {
         const content = fixedPayloadType === 'text'
-            ? `文本 ${getForwardPayloadPreview(config.payload)}`
-            : `Hex ${getForwardPayloadPreview(config.hex)}`;
+            ? `\u6587\u672c ${getForwardPayloadPreview(normalized.payload)}`
+            : `Hex ${getForwardPayloadPreview(normalized.hex)}`;
         parts.push(content);
     }
     const subtitle = chip.querySelector('.function-chip-subtitle');
     if (subtitle) {
-        subtitle.textContent = parts.join(' ') || (fixedSend ? '未配置发送内容' : '未配置转发目标');
+        subtitle.textContent = parts.join(' ') ||
+            (fixedSend ? '\u672a\u914d\u7f6e\u53d1\u9001\u5185\u5bb9' : '\u672a\u914d\u7f6e\u8f6c\u53d1\u76ee\u6807');
     }
 }
 
@@ -3625,6 +3868,9 @@ function initFunctionConfigWorkbench() {
     document.getElementById('function-button-list')?.addEventListener('click', event => {
         const row = event.target.closest('.function-button-row');
         if (!row) return;
+        // 控件自身负责变更配置；不要在点击滑块/输入框时重新渲染整行，
+        // 否则浏览器尚未派发 change 事件，刚切换的状态会被旧值覆盖。
+        if (event.target.closest('input, select, button, label')) return;
         commitFunctionConfigEditor();
         activeFunctionButtonId = row.dataset.buttonId || activeFunctionButtonId;
         renderFunctionButtons();
@@ -3658,7 +3904,8 @@ function renderFunctionRegions() {
     if (!container) return;
     const regions = [
         { key: 'hvac', label: functionConfigState.hvac.title || '空调', desc: '温度、模式、风速按钮' },
-        { key: 'lighting', label: functionConfigState.lighting.title || '灯光', desc: '灯光开关与调光区域' }
+        { key: 'lighting', label: functionConfigState.lighting.title || '灯光', desc: '灯光开关与调光区域' },
+        { key: 'projector', label: functionConfigState.projector.title || '投影', desc: '投影开机与关机按钮' }
     ];
     container.innerHTML = regions.map(region => {
         const area = functionConfigState[region.key];
@@ -3729,30 +3976,47 @@ function renderFunctionRegionSettings() {
         return;
     }
 
+    if (activeFunctionRegion === 'lighting') {
+        container.innerHTML = `
+            <div class="function-config-row-toggle">
+                <span>启用灯光区域</span>
+                <label class="preview-switch">
+                    <input type="checkbox" id="function-region-enabled" ${area.enabled !== false ? 'checked' : ''}>
+                    <span class="switch-slider"></span>
+                </label>
+            </div>
+            <div class="setting-item">
+                <label>区域名称:</label>
+                <input type="text" id="function-region-title" class="form-control dark-input peripheral-config-input" value="${escapeHtml(area.title || '')}">
+            </div>
+            <div class="function-config-inline-fields">
+                <div class="setting-item">
+                    <label>默认亮度:</label>
+                    <input type="number" id="function-lighting-dimmer" class="form-control dark-input peripheral-config-input" min="0" max="100" value="${area.dimmer?.default_value ?? 50}">
+                </div>
+                <div class="setting-item">
+                    <label>显示调光:</label>
+                    <label class="preview-switch">
+                        <input type="checkbox" id="function-lighting-dimmer-enabled" ${area.dimmer?.enabled !== false ? 'checked' : ''}>
+                        <span class="switch-slider"></span>
+                    </label>
+                </div>
+            </div>
+        `;
+        return;
+    }
+
     container.innerHTML = `
         <div class="function-config-row-toggle">
-            <span>启用灯光区域</span>
+            <span>启用投影区域</span>
             <label class="preview-switch">
                 <input type="checkbox" id="function-region-enabled" ${area.enabled !== false ? 'checked' : ''}>
                 <span class="switch-slider"></span>
             </label>
         </div>
         <div class="setting-item">
-            <label>区域名称:</label>
+            <label>TAB 名称:</label>
             <input type="text" id="function-region-title" class="form-control dark-input peripheral-config-input" value="${escapeHtml(area.title || '')}">
-        </div>
-        <div class="function-config-inline-fields">
-            <div class="setting-item">
-                <label>默认亮度:</label>
-                <input type="number" id="function-lighting-dimmer" class="form-control dark-input peripheral-config-input" min="0" max="100" value="${area.dimmer?.default_value ?? 50}">
-            </div>
-            <div class="setting-item">
-                <label>显示调光:</label>
-                <label class="preview-switch">
-                    <input type="checkbox" id="function-lighting-dimmer-enabled" ${area.dimmer?.enabled !== false ? 'checked' : ''}>
-                    <span class="switch-slider"></span>
-                </label>
-            </div>
         </div>
     `;
 }
@@ -3807,7 +4071,7 @@ function updateActiveFunctionRegionFromFields() {
         );
         area.default_mode = document.getElementById('function-hvac-default-mode')?.value || area.default_mode;
         area.default_fan_speed = clampNumber(document.getElementById('function-hvac-default-fan')?.value, 1, 3, area.default_fan_speed);
-    } else {
+    } else if (activeFunctionRegion === 'lighting') {
         area.dimmer = area.dimmer || {};
         area.dimmer.enabled = document.getElementById('function-lighting-dimmer-enabled')?.checked !== false;
         area.dimmer.default_value = clampNumber(document.getElementById('function-lighting-dimmer')?.value, 0, 100, area.dimmer.default_value || 50);
@@ -3830,6 +4094,11 @@ function updateFunctionButtonsFromRows() {
         };
     });
     renderFunctionRegions();
+    const activeButton = getActiveFunctionButton();
+    const context = document.querySelector('#function-button-workspace .workspace-selection-context');
+    if (context && activeButton) {
+        context.textContent = `当前按钮：${area.title || activeFunctionRegion} / ${activeButton.label || activeButton.id}`;
+    }
 }
 
 function commitFunctionWorkspaceToActiveButton() {
@@ -3844,7 +4113,7 @@ function commitFunctionWorkspaceToActiveButton() {
         const identityKey = fd.function_id === FORWARD_FUNCTION_ID
             ? forwardFunctionIdentity(fd)
             : fd.function_id;
-        if (seen.has(identityKey)) return;
+        if (fd.action !== 'delay' && seen.has(identityKey)) return;
         seen.add(identityKey);
         functions.push(fd);
     });
@@ -3867,9 +4136,17 @@ function renderActiveFunctionButtonWorkspace() {
         workspace.innerHTML = '<div class="workspace-empty-state">请先选择按钮</div>';
         return;
     }
+    const area = getActiveFunctionArea();
+    const context = document.createElement('div');
+    context.className = 'workspace-selection-context';
+    context.textContent = `当前按钮：${area.title || activeFunctionRegion} / ${button.label || button.id}`;
+    workspace.appendChild(context);
     const functions = Array.isArray(button.functions) ? button.functions : [];
     if (!functions.length) {
-        workspace.innerHTML = '<div class="workspace-empty-state">从右侧选择功能，点击即可添加到此按钮</div>';
+        const empty = document.createElement('div');
+        empty.className = 'workspace-empty-state';
+        empty.textContent = '从右侧选择功能，点击即可添加到此按钮';
+        workspace.appendChild(empty);
         return;
     }
     functions.forEach(func => {
@@ -3885,6 +4162,7 @@ function createFunctionChipFromData(func) {
     chip.dataset.functionId = func.function_id || '';
     chip.dataset.action = func.action || '';
     chip.dataset.functionCode = func.function_code || '';
+    if (func.action === 'delay') chip.dataset.delayMs = String(func.delay_ms ?? 1000);
     if (isForwardFunctionLike(func)) {
         chip.dataset.functionId = FORWARD_FUNCTION_ID;
         chip.dataset.action = 'forward_payload';
@@ -3914,12 +4192,13 @@ function createFunctionChipFromData(func) {
     if (isForwardFunctionLike(func)) {
         applyForwardConfigToChip(chip, func);
     }
+    initializeDelayChip(chip);
     return chip;
 }
 
 function createFunctionChipFromButton(btn) {
     const functionId = btn.dataset.functionId || '';
-    const functionName = btn.textContent.trim();
+    const functionName = (globalThis.PlayerI18n?.sourceText(btn) ?? btn.textContent).trim();
     const func = {
         function_id: functionId,
         function_name: functionName,
@@ -3957,8 +4236,8 @@ function addFunctionToActiveButton(btn) {
     }
 
     const functionId = btn.dataset.functionId || '';
-    const functionName = btn.textContent.trim();
-    if (functionId !== FORWARD_FUNCTION_ID &&
+    const functionName = (globalThis.PlayerI18n?.sourceText(btn) ?? btn.textContent).trim();
+    if (btn.dataset.action !== 'delay' && functionId !== FORWARD_FUNCTION_ID &&
         workspace.querySelector(`.function-chip[data-function-id="${CSS.escape(functionId)}"]`)) {
         addToCommandLog('添加功能', 'warning', `"${functionName}" 已存在`);
         return;
@@ -3979,9 +4258,7 @@ function addFunctionToActiveButton(btn) {
             if (!config) {
                 chip.remove();
                 commitFunctionWorkspaceToActiveButton();
-                if (!workspace.querySelector('.function-chip')) {
-                    workspace.innerHTML = '<div class="workspace-empty-state">从右侧选择功能，点击即可添加到此按钮</div>';
-                }
+                renderActiveFunctionButtonWorkspace();
                 return;
             }
             applyForwardConfigToChip(chip, config);
@@ -3996,14 +4273,11 @@ function addFunctionToActiveButton(btn) {
 }
 
 function bindFunctionConfigChipActions(chip) {
-    const workspace = document.getElementById('function-button-workspace');
     chip.querySelector('.close-btn')?.addEventListener('click', () => {
         chip.remove();
         commitFunctionWorkspaceToActiveButton();
         renderFunctionButtons();
-        if (workspace && !workspace.querySelector('.function-chip')) {
-            workspace.innerHTML = '<div class="workspace-empty-state">从右侧选择功能，点击即可添加到此按钮</div>';
-        }
+        renderActiveFunctionButtonWorkspace();
     });
     chip.querySelector('.move-up')?.addEventListener('click', event => {
         event.stopPropagation();
@@ -4119,6 +4393,8 @@ function getFunctionButtonRoleLabel(item) {
     if (item.kind === 'mode') return '模式';
     if (item.kind === 'fan') return '风速';
     if (item.kind === 'power') return '电源';
+    if (item.kind === 'power_on') return '开';
+    if (item.kind === 'power_off') return '关';
     return item.id;
 }
 
@@ -4144,7 +4420,7 @@ async function saveFunctionConfig() {
             });
 
         if (response != null) {
-            addToCommandLog('保存功能配置', 'success', '移动端空调/灯光配置已同步');
+            addToCommandLog('保存功能配置', 'success', '移动端空调/灯光/投影配置已同步');
             appendLog('SYSTEM', '功能配置已持久化至后端');
         } else {
             throw new Error(response?.message || '引擎拒绝了配置请求');
@@ -4172,13 +4448,33 @@ async function savePeripheralConfig(type) {
 
     if (portEl) config.port = portEl.value;
     if (baudEl) config.baudrate = parseInt(baudEl.value);
+    if (usesSharedSerialControls) {
+        config.port = getActiveSerialConfig().port;
+        if (!config.port) {
+            addToCommandLog('保存串口配置失败', 'error', '请输入串口号（例如 7）或路径（例如 /dev/ttyUSB0）');
+            return;
+        }
+    }
+
 
     // 协议特定参数收集
     switch (type) {
         case 'dmx':
             config.peripheral_type = 'dmx512';
             config.mode = document.getElementById('dmx-input-mode')?.value || 'local';
-            config.external_port = document.getElementById('dmx-external-port')?.value || '/dev/ttySWK4';
+            if (config.mode === 'local') {
+                config.port = ['/dev/ttyS7', '/dev/ttyS9'].includes(config.port)
+                    ? config.port : '/dev/ttyS7';
+            }
+            if (config.mode === 'external' && !/^\d+$/.test(
+                document.getElementById('dmx-external-port')?.value || ''
+            )) {
+                addToCommandLog('保存配置失败', 'error', '请输入232接口数字，例如 3');
+                return;
+            }
+            config.external_port = normalizeCustomSerialPort(
+                document.getElementById('dmx-external-port')?.value
+            ) || '/dev/ttyS5';
             config.external_baudrate = 115200;
             config.external_data_bit = 8;
             config.external_stop_bit = 1;
@@ -4214,8 +4510,8 @@ async function savePeripheralConfig(type) {
 
     try {
         const response = await apiAction('peripherals', 'set_config', {
-                ...config
-            });
+            ...config
+        });
 
         if (response && typeof response === 'object') {
             if (usesSharedSerialControls) {
@@ -4228,6 +4524,10 @@ async function savePeripheralConfig(type) {
                 if (learnResponse == null) {
                     throw new Error(learnResponse?.message || '学习监听状态同步失败');
                 }
+            }
+            if (usesSharedSerialControls) {
+                serialConfigs[type] = { ...serialConfigs[type], ...config, enabled: true };
+                applySharedSerialConfig(type);
             }
             addToCommandLog(`保存 ${type.toUpperCase()} 配置`, 'success', `已同步引擎设置`);
             appendLog('SYSTEM', `${type.toUpperCase()} 配置已持久化至后端`);
@@ -4687,10 +4987,10 @@ function addFunctionToNetwork工作区(type, btn) {
     }
 
     const functionId = btn.dataset.functionId || '';
-    const functionName = btn.textContent.trim();
+    const functionName = (globalThis.PlayerI18n?.sourceText(btn) ?? btn.textContent).trim();
 
     // 防重复
-    const existing = functionId !== FORWARD_FUNCTION_ID
+    const existing = btn.dataset.action !== 'delay' && functionId !== FORWARD_FUNCTION_ID
         ? workspaceCanvas.querySelector(`.function-chip[data-function-id="${CSS.escape(functionId)}"]`)
         : null;
     if (existing) {
@@ -4725,6 +5025,7 @@ function addFunctionToNetwork工作区(type, btn) {
             <button class="close-btn" title="删除">×</button>
         </div>
     `;
+    initializeDelayChip(chip);
     workspaceCanvas.appendChild(chip);
 
     bindNetworkChipActions(type, chip);
@@ -4811,7 +5112,7 @@ function bindNetworkChipActions(type, chip) {
  */
 function chipToFunctionData(chip) {
     const functionId = chip.dataset.functionId || '';
-    const functionName = chip.querySelector('span')?.textContent.trim() || '';
+    const functionName = (globalThis.PlayerI18n?.sourceText(chip.querySelector('span')) ?? chip.querySelector('span')?.textContent)?.trim() || '';
     let action = chip.dataset.action || '';
     let functionCode = parseInt(chip.dataset.functionCode || '0', 10) || 0;
     if (!functionId || !functionName) return null;
@@ -4822,6 +5123,7 @@ function chipToFunctionData(chip) {
     }
 
     const fd = { function_id: functionId, function_name: functionName, action, function_code: functionCode };
+    if (action === 'delay') fd.delay_ms = Number(chip.dataset.delayMs ?? 1000);
     if (chip.dataset.layerId) {
         const lid = parseInt(chip.dataset.layerId, 10);
         if (!isNaN(lid)) fd.layerId = lid;
@@ -4872,7 +5174,7 @@ function commit工作区ToActiveTrigger(type) {
         const identityKey = fd.function_id === FORWARD_FUNCTION_ID
             ? forwardFunctionIdentity(fd)
             : fd.function_id;
-        if (seen.has(identityKey)) return;
+        if (fd.action !== 'delay' && seen.has(identityKey)) return;
         seen.add(identityKey);
         functions.push(fd);
     });
@@ -5226,6 +5528,7 @@ function renderActiveNetworkTrigger工作区(type) {
         chip.dataset.functionId = func.function_id || '';
         chip.dataset.action = func.action || '';
         chip.dataset.functionCode = func.function_code || '';
+        if (func.action === 'delay') chip.dataset.delayMs = String(func.delay_ms ?? 1000);
         if (isForwardFunctionLike(func)) {
             chip.dataset.functionId = FORWARD_FUNCTION_ID;
             chip.dataset.action = 'forward_payload';
@@ -5256,6 +5559,7 @@ function renderActiveNetworkTrigger工作区(type) {
         if (isForwardFunctionLike(func)) {
             applyForwardConfigToChip(chip, func);
         }
+        initializeDelayChip(chip);
         workspaceCanvas.appendChild(chip);
         bindNetworkChipActions(type, chip);
     });

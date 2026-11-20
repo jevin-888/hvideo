@@ -232,8 +232,7 @@ typedef struct VAAPIEncodeContext {
     int             slice_block_width;
     int             slice_block_height;
 
-    // Everything above this po
-  int must be set before calling
+    // Everything above this point must be set before calling
     // ff_vaapi_encode_init().
 
     // Chosen encoding profile details.

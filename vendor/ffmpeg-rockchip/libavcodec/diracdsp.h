@@ -33,7 +33,7 @@ typedef struct {
      * dirac_pixels_tab[width][subpel]
      * width is 2 for 32, 1 for 16, 0 for 8
      * subpel is 0 for fpel and hpel (only need to copy from the first plane in src)
-     *           1 if an average of the first 2 planes is needed (TODO: worth it)
+     *           1 if an average of the first 2 planes is needed (TODO: worth it?)
      *           2 for general qpel (avg of 4)
      *           3 for general epel (biweight of 4 using the weights in src[4])
      * src[0-3] is each of the hpel planes

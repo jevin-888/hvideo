@@ -4,7 +4,7 @@
  */
 #include "renderer/RegionRotationRenderer.h"
 #include "renderer/CaveProjection.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "utils/Logger.h"
 #include "utils/SplineMath.h"

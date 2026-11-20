@@ -390,7 +390,7 @@ static int fdk_aac_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     if (avpkt->size) {
         err = aacDecoder_Fill(s->handle, &avpkt->data, &avpkt->size, &valid);
         if (err != AAC_DEC_OK) {
-            av_log(avctx, AV_LOG_ERROR, "aacDecoder_Fill() ? failed: %x\n", err);
+            av_log(avctx, AV_LOG_ERROR, "aacDecoder_Fill() failed: %x\n", err);
             return AVERROR_INVALIDDATA;
         }
     } else {
@@ -415,7 +415,7 @@ static int fdk_aac_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     }
     if (err != AAC_DEC_OK) {
         av_log(avctx, AV_LOG_ERROR,
-               "aacDecoder_DecodeFrame() ? failed: %x\n", err);
+               "aacDecoder_DecodeFrame() failed: %x\n", err);
         ret = AVERROR_UNKNOWN;
         goto end;
     }

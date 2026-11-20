@@ -49,7 +49,7 @@ typedef struct VkImageDrmFormatModifierExplicitCreateInfoEXT {
 #endif
 
 extern "C" {
-#include <drm/drm_fourcc.h>
+#include <drm_fourcc.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_drm.h>
@@ -59,6 +59,9 @@ extern "C" {
 #endif
 #ifndef DRM_FORMAT_P010
 #define DRM_FORMAT_P010 fourcc_code('P', '0', '1', '0')
+#endif
+#ifndef DRM_FORMAT_NV20
+#define DRM_FORMAT_NV20 fourcc_code('N', 'V', '2', '0')
 #endif
 #include <libavutil/pixfmt.h>
 }
@@ -265,9 +268,6 @@ inline void recordCopyAndTransition(VkCommandBuffer cmd, VkBuffer buffer,
                      VK_PIPELINE_STAGE_TRANSFER_BIT,
                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 }
-
-/** applyKawaseBlur 内静态描述符/纹理 ID，逻辑设备销毁后必须重置 */
-void resetKawaseBlurApplyStatics();
 
 /**
  * @brief 应用 fitMode==1（保持视频比例显示）的源采样裁剪。

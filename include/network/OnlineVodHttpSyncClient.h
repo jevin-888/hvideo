@@ -5,14 +5,18 @@
  
  #ifndef HSVJ_ONLINE_VOD_HTTP_SYNC_CLIENT_H
  #define HSVJ_ONLINE_VOD_HTTP_SYNC_CLIENT_H
+
+#include "database/VodDatabase.h"
  
  #include <atomic>
+#include <functional>
+#include <mutex>
  #include <string>
  #include <thread>
+#include <utility>
  
  namespace hsvj {
  
- class VodDatabase;
  
  /**
   * @brief 通过 HTTP 轮询同步 OnlineVod 房间 state/queue/played 到本地 vod_queue.db（online_vod_* 表）
@@ -33,6 +37,10 @@
    bool start(const std::string& host, int port, const std::string& roomId, VodDatabase* db, int pollIntervalMs = 1000);
    void stop();
    bool isRunning() const { return running_.load(); }
+   void setOnRoomStateChanged(
+       std::function<void(const VodDatabase::OnlineVodState&)> callback) {
+     onRoomStateChanged_ = std::move(callback);
+   }
  
  private:
    void threadMain();
@@ -44,9 +52,11 @@
    VodDatabase* db_ = nullptr;
    int pollIntervalMs_ = 1000;
  
+   std::mutex lifecycleMutex_;
    std::atomic<bool> running_{false};
    std::atomic<bool> stopRequested_{false};
    std::thread worker_;
+   std::function<void(const VodDatabase::OnlineVodState&)> onRoomStateChanged_;
  };
  
  } // 命名空间 hsvj

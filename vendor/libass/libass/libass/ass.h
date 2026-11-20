@@ -76,7 +76,8 @@ typedef struct ass_image {
     enum {
         IMAGE_TYPE_CHARACTER,
         IMAGE_TYPE_OUTLINE,
-        IMAGE_TYPE_SHADOW
+        IMAGE_TYPE_SHADOW,
+        IMAGE_TYPE_LYRIC_BACKGROUND // HSVJ: merged into one two-row backdrop.
     } type;
 
     // New fields can be added here in new ABI-compatible library releases.
@@ -601,15 +602,11 @@ void ass_set_cache_limits(ASS_Renderer *priv, int glyph_max,
  * \param now video timestamp in milliseconds
  * \param detect_change compare to the previous call and set to 1
  * if positions may have changed, or set to 2 if content may have changed.
+ * The returned list is owned by the renderer and remains valid until the next
+ * renderer operation. The caller must not free it or release its reference.
  */
 ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
                             long long now, int *detect_change);
-
-/**
- * \brief Release the image list returned by ass_render_frame().
- * Caller must call this when done with the list to avoid memory leak.
- */
-void ass_frame_unref(ASS_Image *img);
 
 /*
  * The following functions operate on track objects and do not need

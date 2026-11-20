@@ -1,6 +1,6 @@
 // 切片管理模块
-import { apiPost, apiPut, apiAction } from '../../core/api.js';
-import { addToCommandLog } from '../../core/commandLog.js';
+import { apiPut, apiAction } from '../../core/api.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { clearContainer } from '../../utils/domHelpers.js';
 import { handleApiOperation } from '../../utils/apiHelpers.js';
 import {
@@ -97,6 +97,20 @@ function mergeFormSliceFields(layerId, sliceKey, sliceConfig) {
     };
 
     applySliceRectFromDom(sliceConfig);
+
+    if (document.getElementById('slice-crop-left')) {
+        const readCrop = (side, maximum = 1) => {
+            const number = getValue(`slice-crop-${side}`, 0) / 100;
+            const value = Number.isFinite(number) ? Math.max(0, Math.min(maximum, number)) : 0;
+            document.getElementById(`slice-crop-${side}`).value = Math.round(value * 1000) / 10;
+            return value;
+        };
+        sliceConfig.cropLeft = readCrop('left');
+        sliceConfig.cropTop = readCrop('top');
+        sliceConfig.cropRight = readCrop('right', 1 - sliceConfig.cropLeft);
+        sliceConfig.cropBottom = readCrop('bottom', 1 - sliceConfig.cropTop);
+        for (const side of ['left', 'top', 'right', 'bottom']) delete sliceConfig[`crop_${side}`];
+    }
 
     const invertEl = document.getElementById('slice-invert');
     if (invertEl) {
@@ -408,7 +422,7 @@ export async function toggleSliceVisibility(
     const properties = {};
     properties[sliceKey] = sliceConfig;
 
-    await handleApiOperation(
+    return handleApiOperation(
         apiPut(`/layers/${layerId}`, properties),
         '切片操作',
         null, // 静默成功
@@ -416,7 +430,10 @@ export async function toggleSliceVisibility(
         async (result) => {
             await refreshLayerInfo(layerId, layers);
             updateSliceInfo(layerId);
-            showSliceProperties(layerId, sliceKey);
+            const form = document.getElementById('layer-properties-form');
+            if (form && Number(form.dataset.layerId) === Number(layerId) && form.dataset.sliceKey === String(sliceKey)) {
+                await showSliceProperties(layerId, sliceKey);
+            }
             drawCanvas();
         }
     );
@@ -446,7 +463,6 @@ export function updateSliceInfo(layerId, layers, selectedSlice, onSelectSlice, o
     if (sliceCount > 0) {
         const layerDisplayName = (getLayerDisplayName && layer) ? getLayerDisplayName(layer, ALL_AVAILABLE_LAYERS || []) : `Layer${layerId} 图层`;
         sliceKeys.forEach(key => {
-            const sliceData = layer[key];
             const sliceIndex = key.replace('slice', '');
             const sliceName = `${layerDisplayName} 切片${sliceIndex}`;
 

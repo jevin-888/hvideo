@@ -1,407 +1,543 @@
-/**
- * @file xf86drmMode.h
- * @brief libdrm 模式设置接口（Android 简化版）
- * 
- * 来源：libdrm xf86drmMode.h
- * 提供 DRM KMS（内核模式设置）功能
+/*
+ * \file xf86drmMode.h
+ * Header for DRM modesetting interface.
+ *
+ * \author Jakob Bornecrantz <wallbraker@gmail.com>
+ *
+ * \par Acknowledgements:
+ * Feb 2007, Dave Airlie <airlied@linux.ie>
+ */
+
+/*
+ * Copyright (c) 2007-2008 Tungsten Graphics, Inc., Cedar Park, Texas.
+ * Copyright (c) 2007-2008 Dave Airlie <airlied@linux.ie>
+ * Copyright (c) 2007-2008 Jakob Bornecrantz <wallbraker@gmail.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
  */
 
 #ifndef _XF86DRMMODE_H_
 #define _XF86DRMMODE_H_
 
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <drm/drm.h>
-#include <drm/drm_mode.h>
-
-#ifdef __cplusplus
+#if defined(__cplusplus)
 extern "C" {
 #endif
 
-/* 模式信息 */
-typedef struct drm_mode_modeinfo drmModeModeInfo, *drmModeModeInfoPtr;
+#include <drm.h>
+#include <drm_mode.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
-/* 资源 */
+/*
+ * This is the interface for modesetting for drm.
+ *
+ * It aims to provide a randr1.2 compatible interface for modesettings in the
+ * kernel, the interface is also meant to be used by libraries like EGL.
+ *
+ * More information can be found in randrproto.txt which can be found here:
+ * http://gitweb.freedesktop.org/?p=xorg/proto/randrproto.git
+ *
+ * There are some major differences to be noted. Unlike the randr1.2 proto you
+ * need to create the memory object of the framebuffer yourself with the ttm
+ * buffer object interface. This object needs to be pinned.
+ */
+
+/*
+ * Feature defines
+ *
+ * Just because these are defined doesn't mean that the kernel
+ * can do that feature, its just for new code vs old libdrm.
+ */
+#define DRM_MODE_FEATURE_KMS		1
+#define DRM_MODE_FEATURE_DIRTYFB	1
+
+
 typedef struct _drmModeRes {
-    int count_fbs;
-    uint32_t *fbs;
-    
-    int count_crtcs;
-    uint32_t *crtcs;
-    
-    int count_connectors;
-    uint32_t *connectors;
-    
-    int count_encoders;
-    uint32_t *encoders;
-    
-    uint32_t min_width, max_width;
-    uint32_t min_height, max_height;
+
+	int count_fbs;
+	uint32_t *fbs;
+
+	int count_crtcs;
+	uint32_t *crtcs;
+
+	int count_connectors;
+	uint32_t *connectors;
+
+	int count_encoders;
+	uint32_t *encoders;
+
+	uint32_t min_width, max_width;
+	uint32_t min_height, max_height;
 } drmModeRes, *drmModeResPtr;
 
-/* CRTC */
+typedef struct _drmModeModeInfo {
+	uint32_t clock;
+	uint16_t hdisplay, hsync_start, hsync_end, htotal, hskew;
+	uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
+
+	uint32_t vrefresh;
+
+	uint32_t flags;
+	uint32_t type;
+	char name[DRM_DISPLAY_MODE_LEN];
+} drmModeModeInfo, *drmModeModeInfoPtr;
+
+typedef struct _drmModeFB {
+	uint32_t fb_id;
+	uint32_t width, height;
+	uint32_t pitch;
+	uint32_t bpp;
+	uint32_t depth;
+	/* driver specific handle */
+	uint32_t handle;
+} drmModeFB, *drmModeFBPtr;
+
+typedef struct _drmModeFB2 {
+	uint32_t fb_id;
+	uint32_t width, height;
+	uint32_t pixel_format; /* fourcc code from drm_fourcc.h */
+	uint64_t modifier; /* applies to all buffers */
+	uint32_t flags;
+
+	/* per-plane GEM handle; may be duplicate entries for multiple planes */
+	uint32_t handles[4];
+	uint32_t pitches[4]; /* bytes */
+	uint32_t offsets[4]; /* bytes */
+} drmModeFB2, *drmModeFB2Ptr;
+
+typedef struct drm_clip_rect drmModeClip, *drmModeClipPtr;
+
+typedef struct _drmModePropertyBlob {
+	uint32_t id;
+	uint32_t length;
+	void *data;
+} drmModePropertyBlobRes, *drmModePropertyBlobPtr;
+
+typedef struct _drmModeProperty {
+	uint32_t prop_id;
+	uint32_t flags;
+	char name[DRM_PROP_NAME_LEN];
+	int count_values;
+	uint64_t *values; /* store the blob lengths */
+	int count_enums;
+	struct drm_mode_property_enum *enums;
+	int count_blobs;
+	uint32_t *blob_ids; /* store the blob IDs */
+} drmModePropertyRes, *drmModePropertyPtr;
+
+static inline uint32_t drmModeGetPropertyType(const drmModePropertyRes *prop)
+{
+	return prop->flags & (DRM_MODE_PROP_LEGACY_TYPE | DRM_MODE_PROP_EXTENDED_TYPE);
+}
+
+static inline int drm_property_type_is(const drmModePropertyPtr property,
+		uint32_t type)
+{
+	return drmModeGetPropertyType(property) == type;
+}
+
 typedef struct _drmModeCrtc {
-    uint32_t crtc_id;
-    uint32_t buffer_id;
-    
-    uint32_t x, y;
-    uint32_t width, height;
-    int mode_valid;
-    drmModeModeInfo mode;
-    
-    int gamma_size;
+	uint32_t crtc_id;
+	uint32_t buffer_id; /**< FB id to connect to 0 = disconnect */
+
+	uint32_t x, y; /**< Position on the framebuffer */
+	uint32_t width, height;
+	int mode_valid;
+	drmModeModeInfo mode;
+
+	int gamma_size; /**< Number of gamma stops */
+
 } drmModeCrtc, *drmModeCrtcPtr;
 
-/* Encoder */
 typedef struct _drmModeEncoder {
-    uint32_t encoder_id;
-    uint32_t encoder_type;
-    uint32_t crtc_id;
-    uint32_t possible_crtcs;
-    uint32_t possible_clones;
+	uint32_t encoder_id;
+	uint32_t encoder_type;
+	uint32_t crtc_id;
+	uint32_t possible_crtcs;
+	uint32_t possible_clones;
 } drmModeEncoder, *drmModeEncoderPtr;
 
-/* Connector */
+/**
+ * Describes the connector status.
+ *
+ * DRM_MODE_CONNECTED means that the connector has a sink plugged in.
+ * DRM_MODE_DISCONNECTED means the contrary. DRM_MODE_UNKNOWNCONNECTION is used
+ * when it could be either.
+ *
+ * User-space should first try to enable DRM_MODE_CONNECTED connectors and
+ * ignore other connectors. If there are no DRM_MODE_CONNECTED connectors,
+ * user-space should then try to probe and enable DRM_MODE_UNKNOWNCONNECTION
+ * connectors.
+ */
+typedef enum {
+	DRM_MODE_CONNECTED         = 1,
+	DRM_MODE_DISCONNECTED      = 2,
+	DRM_MODE_UNKNOWNCONNECTION = 3
+} drmModeConnection;
+
+typedef enum {
+	DRM_MODE_SUBPIXEL_UNKNOWN        = 1,
+	DRM_MODE_SUBPIXEL_HORIZONTAL_RGB = 2,
+	DRM_MODE_SUBPIXEL_HORIZONTAL_BGR = 3,
+	DRM_MODE_SUBPIXEL_VERTICAL_RGB   = 4,
+	DRM_MODE_SUBPIXEL_VERTICAL_BGR   = 5,
+	DRM_MODE_SUBPIXEL_NONE           = 6
+} drmModeSubPixel;
+
 typedef struct _drmModeConnector {
-    uint32_t connector_id;
-    uint32_t encoder_id;
-    uint32_t connector_type;
-    uint32_t connector_type_id;
-    uint32_t connection;
-    uint32_t mmWidth, mmHeight;
-    uint32_t subpixel;
-    
-    int count_modes;
-    drmModeModeInfoPtr modes;
-    
-    int count_props;
-    uint32_t *props;
-    uint64_t *prop_values;
-    
-    int count_encoders;
-    uint32_t *encoders;
+	uint32_t connector_id;
+	uint32_t encoder_id; /**< Encoder currently connected to */
+	uint32_t connector_type;
+	uint32_t connector_type_id;
+	drmModeConnection connection;
+	uint32_t mmWidth, mmHeight; /**< HxW in millimeters */
+	drmModeSubPixel subpixel;
+
+	int count_modes;
+	drmModeModeInfoPtr modes;
+
+	int count_props;
+	uint32_t *props; /**< List of property ids */
+	uint64_t *prop_values; /**< List of property values */
+
+	int count_encoders;
+	uint32_t *encoders; /**< List of encoder ids */
 } drmModeConnector, *drmModeConnectorPtr;
 
-/* Plane */
-typedef struct _drmModePlane {
-    uint32_t count_formats;
-    uint32_t *formats;
-    uint32_t plane_id;
-    
-    uint32_t crtc_id;
-    uint32_t fb_id;
-    
-    uint32_t crtc_x, crtc_y;
-    uint32_t x, y;
-    
-    uint32_t possible_crtcs;
-    uint32_t gamma_size;
-} drmModePlane, *drmModePlanePtr;
+#define DRM_PLANE_TYPE_OVERLAY 0
+#define DRM_PLANE_TYPE_PRIMARY 1
+#define DRM_PLANE_TYPE_CURSOR  2
 
-/* Plane Resources */
-typedef struct _drmModePlaneRes {
-    uint32_t count_planes;
-    uint32_t *planes;
-} drmModePlaneRes, *drmModePlaneResPtr;
-
-/* Object Properties */
 typedef struct _drmModeObjectProperties {
-    uint32_t count_props;
-    uint32_t *props;
-    uint64_t *prop_values;
+	uint32_t count_props;
+	uint32_t *props;
+	uint64_t *prop_values;
 } drmModeObjectProperties, *drmModeObjectPropertiesPtr;
 
-/* Property */
-typedef struct _drmModeProperty {
-    uint32_t prop_id;
-    uint32_t flags;
-    char name[DRM_PROP_NAME_LEN];
-    int count_values;
-    uint64_t *values;
-    int count_enums;
-    struct drm_mode_property_enum *enums;
-    int count_blobs;
-    uint32_t *blob_ids;
-} drmModeProperty, *drmModePropertyPtr;
+typedef struct _drmModeFormatModifierIterator {
+	uint32_t fmt_idx, mod_idx;
+	uint32_t fmt;
+	uint64_t mod;
+} drmModeFormatModifierIterator;
 
-/* 内联函数实现 */
+typedef struct _drmModePlane {
+	uint32_t count_formats;
+	uint32_t *formats;
+	uint32_t plane_id;
 
-static inline drmModeResPtr drmModeGetResources(int fd) {
-    struct drm_mode_card_res res = {};
-    
-    // 首先获取计数
-    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0)
-        return NULL;
-    
-    drmModeResPtr r = (drmModeResPtr)calloc(1, sizeof(drmModeRes));
-    if (!r) return NULL;
-    
-    r->count_fbs = res.count_fbs;
-    r->count_crtcs = res.count_crtcs;
-    r->count_connectors = res.count_connectors;
-    r->count_encoders = res.count_encoders;
-    r->min_width = res.min_width;
-    r->max_width = res.max_width;
-    r->min_height = res.min_height;
-    r->max_height = res.max_height;
-    
-    // 分配数组
-    if (res.count_crtcs) {
-        r->crtcs = (uint32_t*)malloc(res.count_crtcs * sizeof(uint32_t));
-        res.crtc_id_ptr = (uint64_t)(uintptr_t)r->crtcs;
-    }
-    if (res.count_connectors) {
-        r->connectors = (uint32_t*)malloc(res.count_connectors * sizeof(uint32_t));
-        res.connector_id_ptr = (uint64_t)(uintptr_t)r->connectors;
-    }
-    if (res.count_encoders) {
-        r->encoders = (uint32_t*)malloc(res.count_encoders * sizeof(uint32_t));
-        res.encoder_id_ptr = (uint64_t)(uintptr_t)r->encoders;
-    }
-    
-    // 再次调用获取实际数据
-    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
-        free(r->crtcs);
-        free(r->connectors);
-        free(r->encoders);
-        free(r);
-        return NULL;
-    }
-    
-    return r;
-}
+	uint32_t crtc_id;
+	uint32_t fb_id;
 
-static inline void drmModeFreeResources(drmModeResPtr ptr) {
-    if (!ptr) return;
-    free(ptr->fbs);
-    free(ptr->crtcs);
-    free(ptr->connectors);
-    free(ptr->encoders);
-    free(ptr);
-}
+	uint32_t crtc_x, crtc_y;
+	uint32_t x, y;
 
-static inline drmModeConnectorPtr drmModeGetConnector(int fd, uint32_t connectorId) {
-    struct drm_mode_get_connector conn = {};
-    conn.connector_id = connectorId;
-    
-    // 首先获取计数
-    if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0)
-        return NULL;
-    
-    drmModeConnectorPtr c = (drmModeConnectorPtr)calloc(1, sizeof(drmModeConnector));
-    if (!c) return NULL;
-    
-    c->connector_id = conn.connector_id;
-    c->encoder_id = conn.encoder_id;
-    c->connector_type = conn.connector_type;
-    c->connector_type_id = conn.connector_type_id;
-    c->connection = conn.connection;
-    c->mmWidth = conn.mm_width;
-    c->mmHeight = conn.mm_height;
-    c->subpixel = conn.subpixel;
-    c->count_modes = conn.count_modes;
-    c->count_props = conn.count_props;
-    c->count_encoders = conn.count_encoders;
-    
-    // 分配数组
-    if (conn.count_modes) {
-        c->modes = (drmModeModeInfoPtr)malloc(conn.count_modes * sizeof(drmModeModeInfo));
-        conn.modes_ptr = (uint64_t)(uintptr_t)c->modes;
-    }
-    if (conn.count_props) {
-        c->props = (uint32_t*)malloc(conn.count_props * sizeof(uint32_t));
-        c->prop_values = (uint64_t*)malloc(conn.count_props * sizeof(uint64_t));
-        conn.props_ptr = (uint64_t)(uintptr_t)c->props;
-        conn.prop_values_ptr = (uint64_t)(uintptr_t)c->prop_values;
-    }
-    if (conn.count_encoders) {
-        c->encoders = (uint32_t*)malloc(conn.count_encoders * sizeof(uint32_t));
-        conn.encoders_ptr = (uint64_t)(uintptr_t)c->encoders;
-    }
-    
-    // 再次调用获取实际数据
-    if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) {
-        free(c->modes);
-        free(c->props);
-        free(c->prop_values);
-        free(c->encoders);
-        free(c);
-        return NULL;
-    }
-    
-    return c;
-}
+	uint32_t possible_crtcs;
+	uint32_t gamma_size;
+} drmModePlane, *drmModePlanePtr;
 
-static inline void drmModeFreeConnector(drmModeConnectorPtr ptr) {
-    if (!ptr) return;
-    free(ptr->modes);
-    free(ptr->props);
-    free(ptr->prop_values);
-    free(ptr->encoders);
-    free(ptr);
-}
+typedef struct _drmModePlaneRes {
+	uint32_t count_planes;
+	uint32_t *planes;
+} drmModePlaneRes, *drmModePlaneResPtr;
 
-static inline drmModeEncoderPtr drmModeGetEncoder(int fd, uint32_t encoderId) {
-    struct drm_mode_get_encoder enc = {};
-    enc.encoder_id = encoderId;
-    
-    if (ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &enc) < 0)
-        return NULL;
-    
-    drmModeEncoderPtr e = (drmModeEncoderPtr)calloc(1, sizeof(drmModeEncoder));
-    if (!e) return NULL;
-    
-    e->encoder_id = enc.encoder_id;
-    e->encoder_type = enc.encoder_type;
-    e->crtc_id = enc.crtc_id;
-    e->possible_crtcs = enc.possible_crtcs;
-    e->possible_clones = enc.possible_clones;
-    
-    return e;
-}
+extern void drmModeFreeModeInfo( drmModeModeInfoPtr ptr );
+extern void drmModeFreeResources( drmModeResPtr ptr );
+extern void drmModeFreeFB( drmModeFBPtr ptr );
+extern void drmModeFreeFB2( drmModeFB2Ptr ptr );
+extern void drmModeFreeCrtc( drmModeCrtcPtr ptr );
+extern void drmModeFreeConnector( drmModeConnectorPtr ptr );
+extern void drmModeFreeEncoder( drmModeEncoderPtr ptr );
+extern void drmModeFreePlane( drmModePlanePtr ptr );
+extern void drmModeFreePlaneResources(drmModePlaneResPtr ptr);
 
-static inline void drmModeFreeEncoder(drmModeEncoderPtr ptr) {
-    free(ptr);
-}
+/**
+ * Check whether the DRM node supports Kernel Mode-Setting.
+ *
+ * Returns 1 if suitable for KMS, 0 otherwise.
+ */
+extern int drmIsKMS(int fd);
 
-static inline drmModePlaneResPtr drmModeGetPlaneResources(int fd) {
-    struct drm_mode_get_plane_res res = {};
-    
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &res) < 0)
-        return NULL;
-    
-    drmModePlaneResPtr r = (drmModePlaneResPtr)calloc(1, sizeof(drmModePlaneRes));
-    if (!r) return NULL;
-    
-    r->count_planes = res.count_planes;
-    
-    if (res.count_planes) {
-        r->planes = (uint32_t*)malloc(res.count_planes * sizeof(uint32_t));
-        res.plane_id_ptr = (uint64_t)(uintptr_t)r->planes;
-        
-        if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &res) < 0) {
-            free(r->planes);
-            free(r);
-            return NULL;
-        }
-    }
-    
-    return r;
-}
+/**
+ * Retrieves all of the resources associated with a card.
+ */
+extern drmModeResPtr drmModeGetResources(int fd);
 
-static inline void drmModeFreePlaneResources(drmModePlaneResPtr ptr) {
-    if (!ptr) return;
-    free(ptr->planes);
-    free(ptr);
-}
+/*
+ * FrameBuffer manipulation.
+ */
 
-static inline drmModePlanePtr drmModeGetPlane(int fd, uint32_t planeId) {
-    struct drm_mode_get_plane plane = {};
-    plane.plane_id = planeId;
-    
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &plane) < 0)
-        return NULL;
-    
-    drmModePlanePtr p = (drmModePlanePtr)calloc(1, sizeof(drmModePlane));
-    if (!p) return NULL;
-    
-    p->plane_id = plane.plane_id;
-    p->crtc_id = plane.crtc_id;
-    p->fb_id = plane.fb_id;
-    p->possible_crtcs = plane.possible_crtcs;
-    p->gamma_size = plane.gamma_size;
-    p->count_formats = plane.count_format_types;
-    
-    if (plane.count_format_types) {
-        p->formats = (uint32_t*)malloc(plane.count_format_types * sizeof(uint32_t));
-        plane.format_type_ptr = (uint64_t)(uintptr_t)p->formats;
-        
-        if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &plane) < 0) {
-            free(p->formats);
-            free(p);
-            return NULL;
-        }
-    }
-    
-    return p;
-}
+/**
+ * Retrieve information about framebuffer bufferId
+ */
+extern drmModeFBPtr drmModeGetFB(int fd, uint32_t bufferId);
+extern drmModeFB2Ptr drmModeGetFB2(int fd, uint32_t bufferId);
 
-static inline void drmModeFreePlane(drmModePlanePtr ptr) {
-    if (!ptr) return;
-    free(ptr->formats);
-    free(ptr);
-}
+/**
+ * Creates a new framebuffer with an buffer object as its scanout buffer.
+ */
+extern int drmModeAddFB(int fd, uint32_t width, uint32_t height, uint8_t depth,
+			uint8_t bpp, uint32_t pitch, uint32_t bo_handle,
+			uint32_t *buf_id);
+/* ...with a specific pixel format */
+extern int drmModeAddFB2(int fd, uint32_t width, uint32_t height,
+			 uint32_t pixel_format, const uint32_t bo_handles[4],
+			 const uint32_t pitches[4], const uint32_t offsets[4],
+			 uint32_t *buf_id, uint32_t flags);
 
-static inline drmModeObjectPropertiesPtr drmModeObjectGetProperties(int fd, 
-                                                                     uint32_t object_id,
-                                                                     uint32_t object_type) {
-    struct drm_mode_obj_get_properties props = {};
-    props.obj_id = object_id;
-    props.obj_type = object_type;
-    
-    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &props) < 0)
-        return NULL;
-    
-    drmModeObjectPropertiesPtr p = (drmModeObjectPropertiesPtr)calloc(1, sizeof(drmModeObjectProperties));
-    if (!p) return NULL;
-    
-    p->count_props = props.count_props;
-    
-    if (props.count_props) {
-        p->props = (uint32_t*)malloc(props.count_props * sizeof(uint32_t));
-        p->prop_values = (uint64_t*)malloc(props.count_props * sizeof(uint64_t));
-        props.props_ptr = (uint64_t)(uintptr_t)p->props;
-        props.prop_values_ptr = (uint64_t)(uintptr_t)p->prop_values;
-        
-        if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &props) < 0) {
-            free(p->props);
-            free(p->prop_values);
-            free(p);
-            return NULL;
-        }
-    }
-    
-    return p;
-}
+/* ...with format modifiers */
+int drmModeAddFB2WithModifiers(int fd, uint32_t width, uint32_t height,
+			       uint32_t pixel_format, const uint32_t bo_handles[4],
+			       const uint32_t pitches[4], const uint32_t offsets[4],
+			       const uint64_t modifier[4], uint32_t *buf_id,
+				   uint32_t flags);
 
-static inline void drmModeFreeObjectProperties(drmModeObjectPropertiesPtr ptr) {
-    if (!ptr) return;
-    free(ptr->props);
-    free(ptr->prop_values);
-    free(ptr);
-}
+/**
+ * Destroies the given framebuffer.
+ */
+extern int drmModeRmFB(int fd, uint32_t bufferId);
 
-static inline drmModePropertyPtr drmModeGetProperty(int fd, uint32_t propertyId) {
-    struct drm_mode_get_property prop = {};
-    prop.prop_id = propertyId;
-    
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &prop) < 0)
-        return NULL;
-    
-    drmModePropertyPtr p = (drmModePropertyPtr)calloc(1, sizeof(drmModeProperty));
-    if (!p) return NULL;
-    
-    p->prop_id = prop.prop_id;
-    p->flags = prop.flags;
-    memcpy(p->name, prop.name, DRM_PROP_NAME_LEN);
-    p->count_values = prop.count_values;
-    p->count_enums = prop.count_enum_blobs;
-    
-    return p;
-}
+/**
+ * Close a framebuffer.
+ *
+ * Same as drmModeRmFB(), except it doesn't implicitly disable planes and CRTCs.
+ */
+extern int drmModeCloseFB(int fd, uint32_t buffer_id);
 
-static inline void drmModeFreeProperty(drmModePropertyPtr ptr) {
-    if (!ptr) return;
-    free(ptr->values);
-    free(ptr->enums);
-    free(ptr->blob_ids);
-    free(ptr);
-}
+/**
+ * Mark a region of a framebuffer as dirty.
+ */
+extern int drmModeDirtyFB(int fd, uint32_t bufferId,
+			  drmModeClipPtr clips, uint32_t num_clips);
 
-#ifdef __cplusplus
+
+/*
+ * Crtc functions
+ */
+
+/**
+ * Retrieve information about the ctrt crtcId
+ */
+extern drmModeCrtcPtr drmModeGetCrtc(int fd, uint32_t crtcId);
+
+/**
+ * Set the mode on a crtc crtcId with the given mode modeId.
+ */
+int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId,
+                   uint32_t x, uint32_t y, uint32_t *connectors, int count,
+		   drmModeModeInfoPtr mode);
+
+/*
+ * Cursor functions
+ */
+
+/**
+ * Set the cursor on crtc
+ */
+int drmModeSetCursor(int fd, uint32_t crtcId, uint32_t bo_handle, uint32_t width, uint32_t height);
+
+int drmModeSetCursor2(int fd, uint32_t crtcId, uint32_t bo_handle, uint32_t width, uint32_t height, int32_t hot_x, int32_t hot_y);
+/**
+ * Move the cursor on crtc
+ */
+int drmModeMoveCursor(int fd, uint32_t crtcId, int x, int y);
+
+/**
+ * Encoder functions
+ */
+drmModeEncoderPtr drmModeGetEncoder(int fd, uint32_t encoder_id);
+
+/*
+ * Connector manipulation
+ */
+
+/**
+ * Retrieve all information about the connector connectorId. This will do a
+ * forced probe on the connector to retrieve remote information such as EDIDs
+ * from the display device.
+ */
+extern drmModeConnectorPtr drmModeGetConnector(int fd,
+					       uint32_t connectorId);
+
+/**
+ * Retrieve current information, i.e the currently active mode and encoder,
+ * about the connector connectorId. This will not do any probing on the
+ * connector or remote device, and only reports what is currently known.
+ * For the complete set of modes and encoders associated with the connector
+ * use drmModeGetConnector() which will do a probe to determine any display
+ * link changes first.
+ */
+extern drmModeConnectorPtr drmModeGetConnectorCurrent(int fd,
+						      uint32_t connector_id);
+
+/**
+ * Get a bitmask of CRTCs a connector is compatible with.
+ *
+ * The bits reference CRTC indices. If the n-th CRTC is compatible with the
+ * connector, the n-th bit will be set. The indices are taken from the array
+ * returned by drmModeGetResources(). The indices are different from the object
+ * IDs.
+ *
+ * Zero is returned on error.
+ */
+extern uint32_t drmModeConnectorGetPossibleCrtcs(int fd,
+                                                 const drmModeConnector *connector);
+
+/**
+ * Attaches the given mode to an connector.
+ */
+extern int drmModeAttachMode(int fd, uint32_t connectorId, drmModeModeInfoPtr mode_info);
+
+/**
+ * Detaches a mode from the connector
+ * must be unused, by the given mode.
+ */
+extern int drmModeDetachMode(int fd, uint32_t connectorId, drmModeModeInfoPtr mode_info);
+
+extern drmModePropertyPtr drmModeGetProperty(int fd, uint32_t propertyId);
+extern void drmModeFreeProperty(drmModePropertyPtr ptr);
+
+extern drmModePropertyBlobPtr drmModeGetPropertyBlob(int fd, uint32_t blob_id);
+extern bool drmModeFormatModifierBlobIterNext(const drmModePropertyBlobRes *blob,
+					      drmModeFormatModifierIterator *iter);
+extern void drmModeFreePropertyBlob(drmModePropertyBlobPtr ptr);
+extern int drmModeConnectorSetProperty(int fd, uint32_t connector_id, uint32_t property_id,
+				    uint64_t value);
+extern int drmCheckModesettingSupported(const char *busid);
+
+extern int drmModeCrtcSetGamma(int fd, uint32_t crtc_id, uint32_t size,
+			       const uint16_t *red, const uint16_t *green, const uint16_t *blue);
+extern int drmModeCrtcGetGamma(int fd, uint32_t crtc_id, uint32_t size,
+			       uint16_t *red, uint16_t *green, uint16_t *blue);
+extern int drmModePageFlip(int fd, uint32_t crtc_id, uint32_t fb_id,
+			   uint32_t flags, void *user_data);
+extern int drmModePageFlipTarget(int fd, uint32_t crtc_id, uint32_t fb_id,
+				 uint32_t flags, void *user_data,
+				 uint32_t target_vblank);
+
+extern drmModePlaneResPtr drmModeGetPlaneResources(int fd);
+extern drmModePlanePtr drmModeGetPlane(int fd, uint32_t plane_id);
+extern int drmModeSetPlane(int fd, uint32_t plane_id, uint32_t crtc_id,
+			   uint32_t fb_id, uint32_t flags,
+			   int32_t crtc_x, int32_t crtc_y,
+			   uint32_t crtc_w, uint32_t crtc_h,
+			   uint32_t src_x, uint32_t src_y,
+			   uint32_t src_w, uint32_t src_h);
+
+extern drmModeObjectPropertiesPtr drmModeObjectGetProperties(int fd,
+							uint32_t object_id,
+							uint32_t object_type);
+extern void drmModeFreeObjectProperties(drmModeObjectPropertiesPtr ptr);
+extern int drmModeObjectSetProperty(int fd, uint32_t object_id,
+				    uint32_t object_type, uint32_t property_id,
+				    uint64_t value);
+
+
+typedef struct _drmModeAtomicReq drmModeAtomicReq, *drmModeAtomicReqPtr;
+
+extern drmModeAtomicReqPtr drmModeAtomicAlloc(void);
+extern drmModeAtomicReqPtr drmModeAtomicDuplicate(const drmModeAtomicReqPtr req);
+extern int drmModeAtomicMerge(drmModeAtomicReqPtr base,
+			      const drmModeAtomicReqPtr augment);
+extern void drmModeAtomicFree(drmModeAtomicReqPtr req);
+extern int drmModeAtomicGetCursor(const drmModeAtomicReqPtr req);
+extern void drmModeAtomicSetCursor(drmModeAtomicReqPtr req, int cursor);
+extern int drmModeAtomicAddProperty(drmModeAtomicReqPtr req,
+				    uint32_t object_id,
+				    uint32_t property_id,
+				    uint64_t value);
+extern int drmModeAtomicCommit(int fd,
+			       const drmModeAtomicReqPtr req,
+			       uint32_t flags,
+			       void *user_data);
+
+extern int drmModeCreatePropertyBlob(int fd, const void *data, size_t size,
+				     uint32_t *id);
+extern int drmModeDestroyPropertyBlob(int fd, uint32_t id);
+
+/*
+ * DRM mode lease APIs. These create and manage new drm_masters with
+ * access to a subset of the available DRM resources
+ */
+
+extern int drmModeCreateLease(int fd, const uint32_t *objects, int num_objects, int flags, uint32_t *lessee_id);
+
+typedef struct drmModeLesseeList {
+	uint32_t count;
+	uint32_t lessees[];
+} drmModeLesseeListRes, *drmModeLesseeListPtr;
+
+extern drmModeLesseeListPtr drmModeListLessees(int fd);
+
+typedef struct drmModeObjectList {
+	uint32_t count;
+	uint32_t objects[];
+} drmModeObjectListRes, *drmModeObjectListPtr;
+
+extern drmModeObjectListPtr drmModeGetLease(int fd);
+
+extern int drmModeRevokeLease(int fd, uint32_t lessee_id);
+
+/**
+ * Get a string describing a connector type.
+ *
+ * NULL is returned if the connector type is unsupported. Callers should handle
+ * this gracefully, e.g. by falling back to "Unknown" or printing the raw value.
+ */
+extern const char *
+drmModeGetConnectorTypeName(uint32_t connector_type);
+
+/**
+ * Create a dumb buffer.
+ *
+ * Given a width, height and bits-per-pixel, the kernel will return a buffer
+ * handle, pitch and size. The flags must be zero.
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+extern int
+drmModeCreateDumbBuffer(int fd, uint32_t width, uint32_t height, uint32_t bpp,
+                        uint32_t flags, uint32_t *handle, uint32_t *pitch,
+                        uint64_t *size);
+
+/**
+ * Destroy a dumb buffer.
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+extern int
+drmModeDestroyDumbBuffer(int fd, uint32_t handle);
+
+/**
+ * Prepare a dumb buffer for mapping.
+ *
+ * The kernel returns an offset which can be used as an argument to mmap(2) on
+ * the DRM FD.
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+extern int
+drmModeMapDumbBuffer(int fd, uint32_t handle, uint64_t *offset);
+
+#if defined(__cplusplus)
 }
 #endif
 
-#endif /* _XF86DRMMODE_H_ */
+#endif

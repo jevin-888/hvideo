@@ -353,6 +353,7 @@ void VulkanRenderer::cleanupSwapchain() {
 }
 
 bool VulkanRenderer::recreateSwapchain() {
+  std::lock_guard<std::recursive_mutex> queueLock(queueOpMutex_);
   if (device_ == VK_NULL_HANDLE || surface_ == VK_NULL_HANDLE) {
     static int invalidRecreateCount = 0;
     if (++invalidRecreateCount <= 10) {
@@ -363,7 +364,7 @@ bool VulkanRenderer::recreateSwapchain() {
   }
 
   // 关键修复：防抖机制，避免频繁重建 swapchain 导致 SurfaceFlinger composition type 冲突
-  static auto lastRecreateTime = std::chrono::steady_clock::now();
+  static auto lastRecreateTime = std::chrono::steady_clock::time_point{};
   auto now = std::chrono::steady_clock::now();
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRecreateTime).count();
   
@@ -386,27 +387,30 @@ bool VulkanRenderer::recreateSwapchain() {
   waitForPresentIdle();
 
   // 关键修复：等待设备空闲，确保旧 swapchain 不再被使用
-  vkDeviceWaitIdle(device_);
+  const VkResult idleResult = vkDeviceWaitIdle(device_);
+  if (idleResult != VK_SUCCESS) {
+    if (idleResult == VK_ERROR_DEVICE_LOST)
+      markDeviceLostFatal("vkDeviceWaitIdle(recreateSwapchain)", idleResult);
+    return false;
+  }
   deviceGeneration_.fetch_add(1, std::memory_order_acq_rel);
-  recreateAsyncAcquireSemaphoresAfterIdle();
+  if (!recreateAsyncAcquireSemaphoresAfterIdle()) return false;
+  asyncPresentNeedsRecreate_.store(true, std::memory_order_release);
   
   // 保存旧 swapchain 句柄用于平滑过渡（在 createSwapchain 中使用）
   VkSwapchainKHR oldSwapchain = swapchain_;
   
   // 清理旧资源（但保留 swapchain 句柄传递给新 swapchain）
-  for (auto imageView : swapchainImageViews_) {
-    if (imageView != VK_NULL_HANDLE) {
-      vkDestroyImageView(device_, imageView, nullptr);
-    }
-  }
-  swapchainImageViews_.clear();
-  
   for (auto framebuffer : swapchainFramebuffers_) {
     if (framebuffer != VK_NULL_HANDLE) {
       vkDestroyFramebuffer(device_, framebuffer, nullptr);
     }
   }
   swapchainFramebuffers_.clear();
+  for (auto imageView : swapchainImageViews_) {
+    if (imageView != VK_NULL_HANDLE) vkDestroyImageView(device_, imageView, nullptr);
+  }
+  swapchainImageViews_.clear();
   
   // 临时将 swapchain_ 设为 NULL，createSwapchain 会创建新的（传入 oldSwapchain 实现平滑过渡）
   swapchain_ = VK_NULL_HANDLE;
@@ -415,13 +419,18 @@ bool VulkanRenderer::recreateSwapchain() {
   sharedPresentNeedsInitialLayoutTransition_ = false;
   sharedPresentInitialRefreshSubmitted_ = false;
   
-  const bool ok = createSwapchain(oldSwapchain) && createFramebuffers();
+  const bool ok = createSwapchain(oldSwapchain) &&
+                  recreateRenderFinishedSemaphoresAfterIdle() &&
+                  createFramebuffers();
   
   // 销毁旧 swapchain（在新 swapchain 创建成功后）
   if (oldSwapchain != VK_NULL_HANDLE) {
     vkDestroySwapchainKHR(device_, oldSwapchain, nullptr);
   }
-  configureAsyncAcquire();
+  if (ok) {
+    asyncPresentNeedsRecreate_.store(false, std::memory_order_release);
+    configureAsyncAcquire();
+  }
   
   LOG_WARN("[Vulkan] recreateSwapchain %s (swapchain=%p, imageViews=%zu, framebuffers=%zu)",
            ok ? "done" : "failed", (void *)swapchain_,

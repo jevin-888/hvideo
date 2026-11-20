@@ -307,7 +307,7 @@ bool ApngLoader::load(const std::string& filePath) {
     }
     
     FILE * f;
-    uint32_t id, i, j, w, h, w0, h0, x0, y0;
+    uint32_t id, j, w, h, w0, h0, x0, y0;
     uint32_t delay_num = 1, delay_den = 10, dop = 0, bop = 0, rowbytes, imagesize;
     unsigned char sig[8];
     png_structp png_ptr = NULL;

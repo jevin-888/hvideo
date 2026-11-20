@@ -35,7 +35,7 @@ static const int16_t ydt3[8] = { 4, -6, 20, -20, 46, -46, 94, -94 };
 static const int16_t fat_ydt3[8] = { 0, -15, 50, -50, 115, -115, 235, -235 };
 static const int16_t ydt4[8] = { 0, -4, 4, -16, 16, -36, 36, -80 };
 /* NOTE: This table breaks the [+,-] pattern that the rest of the
- * tables maintain. Is this intentional*/
+ * tables maintain. Is this intentional? */
 static const int16_t fat_ydt4[8] = { 0, 40, 80, -76, 160, -154, 236, -236 };
 
 /* C delta tables, skinny and fat */

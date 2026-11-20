@@ -1,10 +1,11 @@
-import { apiPost, apiAction } from '../../core/api.js';
+import { apiAction } from '../../core/api.js';
 
 export const PROJECTION_CORRECTION_ACTIONS = Object.freeze({
     LOAD_REGION_CONFIG: 'get_region_config',
     LOAD: 'get_projection_correction',
     SAVE: 'set_projection_correction',
-    SAVE_CONFIG: 'save_projection_correction_config'
+    SAVE_CONFIG: 'save_projection_correction_config',
+    INITIALIZE_CAVE: 'initialize_cave_wall'
 });
 
 export function postProjectionCorrectionCommand(param, timeoutMs) {
@@ -38,6 +39,14 @@ export const projectionCorrectionApi = {
         return postProjectionCorrectionCommand({
             action: PROJECTION_CORRECTION_ACTIONS.SAVE_CONFIG,
             region_id: regionId
+        });
+    },
+
+    initializeCave(regionId, wallType = 0) {
+        return postProjectionCorrectionCommand({
+            action: PROJECTION_CORRECTION_ACTIONS.INITIALIZE_CAVE,
+            region_id: regionId,
+            wall_type: wallType
         });
     }
 };

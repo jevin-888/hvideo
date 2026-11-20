@@ -1,7 +1,7 @@
 import { ensureBlendRegion, setActiveRegion, getState } from '../actions.js?v=2.95';
 import { clamp } from '../utils/grid.js';
-import { getActiveGeometry, getActiveMask, getActiveBlend, getNextRegionId } from '../selectors.js?v=2.95';
-import { switchFusionTab } from '../modeSwitch.js?v=2.100';
+import { getActiveGeometry, getActiveMask, getNextRegionId } from '../selectors.js?v=2.95';
+import { switchFusionTab } from '../modeSwitch.js?v=2.104';
 import { createDefaultBlendRegionState, createDefaultGeometryRegion } from '../state.js?v=2.95';
 import {
     applyGeometryMoveLocal,
@@ -15,9 +15,9 @@ import {
     setInterpolationMode,
     resizeGeometryRegionTo
 } from '../geometry/actions.js?v=2.95';
-import { renderFusionUi } from '../ui/panel.js?v=2.100';
+import { renderFusionUi } from '../ui/panel.js?v=2.103';
 import { showNotification } from '../../../components/toast.js';
-import { scheduleFullMaskSync } from '../ui/bindings.js?v=2.100';
+import { scheduleFullMaskSync } from '../ui/bindings.js?v=2.104';
 import { pushGeometryUndo, pushMaskUndo, pushBlendUndo, restoreGeometryUndo, restoreMaskUndo, restoreBlendUndo } from '../undo.js';
 import {
     syncGeometryGrid,
@@ -41,10 +41,11 @@ import {
     setMaskGridVisible
 } from '../mask/actions.js?v=2.95';
 import { syncMask, persistMask, syncMaskGuideVisibility, resizeMaskGridByOp, syncMaskMoveOp } from '../sync/syncMask.js?v=2.95';
-import { hydrateBlendRegionsFromResponse, loadBlendRegion, resizeBlendGridsByOp, syncBlendManagerMode, syncBlendRegion, persistBlend, resetFusionConfig } from '../sync/syncBlend.js?v=2.95';
+import { hydrateBlendRegionsFromResponse, loadBlendRegion, resizeBlendGridsByOp, syncBlendManagerMode, syncBlendRegion, persistBlend, resetFusionConfig } from '../sync/syncBlend.js?v=2.96';
 import { setActiveBlendCorner, setActiveBlendSide, setBlendAutoEdges, setBlendManagerMode, setBlendMasterEnabled } from '../blend/actions.js?v=2.95';
-import { persistFusionConfig, setGridVisualStyle, setMergeGapBrightness, setMaskEnabledState, setBlendMaster } from '../api.js?v=2.95';
+import { persistFusionConfig, setGridVisualStyle, setMergeGapBrightness, setMaskEnabledState, setBlendMaster } from '../api.js?v=2.97';
 import { applyGridVisualStyle, getGridVisualStyle } from '../canvas/visualStyle.js?v=2.81';
+import { defaultBlendWidthForGrid } from '../utils/blend.js';
 
 // ─── 状态 ───────────────────────────────────────────────────────────────────────
 
@@ -417,8 +418,7 @@ function getDefaultResetBlendWidth(regionId, side) {
     const blend = getState().blend.byRegionId[regionId];
     const cols = Math.max(2, Number(blend?.gridCols ?? geometry?.cols ?? 2));
     const rows = Math.max(2, Number(blend?.gridRows ?? geometry?.rows ?? 2));
-    if (side === 'left' || side === 'right') return cols > 2 ? 1 / (cols - 1) : 0;
-    return rows > 2 ? 1 / (rows - 1) : 0;
+    return defaultBlendWidthForGrid(side === 'left' || side === 'right' ? cols : rows);
 }
 
 function createResetBlendRegion(regionId) {

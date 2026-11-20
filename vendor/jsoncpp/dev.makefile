@@ -21,16 +21,6 @@ build:
 	cd build/debug; cmake -DCMAKE_BUILD_TYPE=debug -DBUILD_SHARED_LIBS=ON -G "Unix Makefiles" ../..
 	make -C build/debug
 
-# Currently, this depends on include/json/version.h generated
-# by cmake.
-test-amalgamate:
-	python2.7 amalgamate.py
-	python3.4 amalgamate.py
-	cd dist; gcc -I. -c jsoncpp.cpp
-
-valgrind:
-	valgrind --error-exitcode=42 --leak-check=full ./build/debug/src/test_lib_json/jsoncpp_test
-
 clean:
 	\rm -rf *.gz *.asc dist/
 

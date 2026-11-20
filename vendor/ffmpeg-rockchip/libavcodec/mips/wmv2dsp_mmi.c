@@ -207,7 +207,7 @@ void ff_wmv2_idct_add_mmi(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
           [ftmp8]"=&f"(ftmp[8]),            [ftmp9]"=&f"(ftmp[9]),
           [ftmp10]"=&f"(ftmp[10]),
           [block]"+&r"(block),              [dest]"+&r"(dest)
-        : [line_size]"r"((mips_reg)? line_size)
+        : [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }
@@ -272,7 +272,7 @@ void ff_wmv2_idct_put_mmi(uint8_t *dest, ptrdiff_t line_size, int16_t *block)
           [ftmp4]"=&f"(ftmp[4]),            [ftmp5]"=&f"(ftmp[5]),
           [ftmp6]"=&f"(ftmp[6]),            [ftmp7]"=&f"(ftmp[7]),
           [block]"+&r"(block),              [dest]"+&r"(dest)
-        : [line_size]"r"((mips_reg)? line_size)
+        : [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }

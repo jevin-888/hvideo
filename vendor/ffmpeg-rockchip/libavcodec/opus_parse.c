@@ -351,7 +351,7 @@ av_cold int ff_opus_parse_extradata(AVCodecContext *avctx,
             ret = AVERROR_INVALIDDATA;
             goto fail;
         }
-        layout         = (channels == 1) ? (AVChannelLayout)? AV_CHANNEL_LAYOUT_MONO :
+        layout         = (channels == 1) ? (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO :
                                            (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
         streams        = 1;
         stereo_streams = channels - 1;

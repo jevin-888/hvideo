@@ -1,7 +1,7 @@
-prefix=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/android/arm64
+prefix=/mnt/d/HVIDEO/Hplayer/vendor/ffmpeg-rockchip/android/arm64
 exec_prefix=${prefix}
-libdir=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/android/arm64/lib
-includedir=/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/android/arm64/include
+libdir=/mnt/d/HVIDEO/Hplayer/vendor/ffmpeg-rockchip/android/arm64/lib
+includedir=/mnt/d/HVIDEO/Hplayer/vendor/ffmpeg-rockchip/android/arm64/include
 
 Name: libavcodec
 Description: FFmpeg codec library
@@ -10,5 +10,5 @@ Requires:
 Requires.private: libswresample >= 4.12.100, libavutil >= 58.29.100
 Conflicts:
 Libs: -L${libdir}  -lavcodec 
-Libs.private: -pthread -lm -latomic -L/mnt/d/Hvideo/Third-Party/ffmpeg-rockchip/../rkmpp/android_lib/system-stub/arm64-v8a -lmpp -landroid -lz
+Libs.private: -pthread -lm -latomic -L/mnt/d/HVIDEO/Hplayer/vendor/ffmpeg-rockchip/../rkmpp/android_lib/system-stub/arm64-v8a -lmpp -lz
 Cflags: -I${includedir}

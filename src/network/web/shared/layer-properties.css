@@ -1,0 +1,517 @@
+/* QR and screen-mirroring controls shared by desktop and mobile pages. */
+
+/* Shared layer-property contract. This file is loaded after the platform skin so
+   the same field geometry wins on desktop and mobile. */
+#layer-properties-form {
+    min-width: 0;
+    container-type: inline-size;
+    container-name: layer-properties;
+}
+
+#layer-properties-form .property-content {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 164px), 1fr));
+    gap: 12px;
+    min-width: 0;
+    align-items: end;
+}
+
+#layer-properties-form .property-content .setting-item {
+    min-width: 0;
+    max-width: 100%;
+    gap: 6px;
+}
+
+#layer-properties-form .property-content .setting-item > label {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.4;
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input,
+#layer-properties-form .property-content .setting-item > .form-control:not(.number-input) {
+    width: min(100%, 180px);
+    max-width: 180px;
+    min-width: 0;
+    box-sizing: border-box;
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input {
+    width: min(100%, var(--layer-param-control-width, 164px));
+    max-width: var(--layer-param-control-width, 164px);
+}
+
+#layer-properties-form .property-group .property-content .setting-item .number-input-wrapper.layer-param-input {
+    width: min(100%, var(--layer-param-control-width, 164px));
+    max-width: var(--layer-param-control-width, 164px);
+}
+
+#layer-properties-form .property-group .property-content.property-content--compact-advanced,
+#layer-properties-form .property-group .property-content.property-content--compact-advanced.tab-common,
+#layer-properties-form .property-group .property-content:has(.compact-advanced-params) {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 164px), 1fr));
+    justify-content: start;
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input {
+    height: var(--layer-param-control-height, 36px);
+    min-height: var(--layer-param-control-height, 36px);
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input .number-btn {
+    width: var(--layer-param-button-width, 28px);
+    min-width: var(--layer-param-button-width, 28px);
+    flex-basis: var(--layer-param-button-width, 28px);
+    min-height: 100%;
+}
+
+#layer-properties-form .property-group .property-content .setting-item .number-input-wrapper.layer-param-input .number-btn {
+    width: var(--layer-param-button-width, 28px);
+    min-width: var(--layer-param-button-width, 28px);
+    flex-basis: var(--layer-param-button-width, 28px);
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input.numeric-drag-field {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+    border-radius: 8px;
+    --numeric-drag-color: 59, 130, 246;
+    background: rgba(255, 255, 255, .035);
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input.numeric-drag-field::before {
+    content: '';
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: var(--numeric-drag-level, 0%);
+    background: linear-gradient(90deg, rgba(var(--numeric-drag-color), .18), rgba(var(--numeric-drag-color), .5));
+    opacity: .45;
+    pointer-events: none;
+    transition: width .08s linear, opacity .12s ease;
+    z-index: 0;
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input.numeric-drag-field::after {
+    content: '';
+    position: absolute;
+    inset: 8px auto 8px var(--numeric-drag-level, 0%);
+    width: 2px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, .86);
+    opacity: 0;
+    transform: translateX(-1px);
+    pointer-events: none;
+    z-index: 2;
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input.numeric-drag-field.is-horizontal-dragging::before {
+    opacity: .95;
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input.numeric-drag-field.is-horizontal-dragging::after {
+    opacity: 1;
+}
+
+#layer-properties-form .property-group .property-content .setting-item .number-input-wrapper.layer-param-input input.number-input {
+    min-width: 48px;
+    width: 48px;
+    flex: 1 1 48px;
+    min-height: 100%;
+    border: 0;
+    background: transparent;
+    color: #fff;
+    font-variant-numeric: tabular-nums;
+    -webkit-user-select: text;
+    user-select: text;
+    touch-action: pan-y;
+    position: relative;
+    z-index: 1;
+}
+
+#layer-properties-form .property-content .number-input-wrapper.layer-param-input .number-btn {
+    position: relative;
+    z-index: 3;
+}
+
+#layer-properties-form .property-content .number-input-wrapper.numeric-drag-field {
+    touch-action: pan-y;
+}
+
+#layer-properties-form .property-content .number-input-wrapper.numeric-drag-field.is-horizontal-dragging {
+    cursor: ew-resize;
+    border-color: var(--layer-param-focus, #3b82f6);
+}
+
+#layer-properties-form .property-content .number-input-wrapper:focus-within {
+    border-color: var(--layer-param-focus, #a8baff);
+}
+
+#layer-matrix-page #layer-properties-form .property-group .property-content .number-input-wrapper .number-btn:focus-visible,
+#layer-matrix-page #layer-properties-form .property-group .property-content .setting-item :is(input, select, textarea):focus-visible {
+    outline: 2px solid var(--layer-param-focus, #a8baff);
+    outline-offset: -2px;
+}
+
+@container layer-properties (max-width: 600px) {
+    #layer-properties-form .property-content,
+    #layer-properties-form .property-content.property-content--compact-advanced,
+    #layer-properties-form .property-content.property-content--compact-advanced.tab-common {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    #layer-properties-form .property-content .setting-item[style*="grid-column: span 2"] {
+        grid-column: 1 / -1;
+    }
+}
+
+@media (pointer: coarse) {
+    #layer-properties-form .property-content .number-input-wrapper.layer-param-input {
+        width: min(100%, var(--layer-param-control-width, 164px));
+        max-width: var(--layer-param-control-width, 164px);
+    }
+
+    #layer-properties-form .property-content .setting-item > .form-control:not(.number-input) {
+        width: 100%;
+        max-width: 100%;
+    }
+
+    #layer-properties-form .property-content .number-input-wrapper.layer-param-input {
+        height: 44px;
+        min-height: 44px;
+    }
+
+    #layer-properties-form .property-content .number-input-wrapper.layer-param-input .number-btn {
+        width: 36px;
+        min-width: 36px;
+    }
+}
+
+#layer-properties-form .mirror-number-control .mirror-number-wrapper {
+    width: 100%;
+    max-width: 180px;
+    height: 36px;
+    min-height: 36px;
+}
+
+#layer-properties-form .mirror-number-control .mirror-number-wrapper .number-btn {
+    min-width: 28px;
+    width: 28px;
+}
+
+#layer-properties-form .mirror-number-control .mirror-number-wrapper .number-input {
+    min-width: 40px;
+}
+
+@media (pointer: coarse) {
+    #layer-properties-form .mirror-number-control .mirror-number-wrapper {
+        height: 44px;
+        min-height: 44px;
+    }
+
+    #layer-properties-form .mirror-number-control .mirror-number-wrapper .number-btn {
+        min-width: 36px;
+        width: 36px;
+    }
+}
+#layer-properties-form .property-group .property-content .qr-params-table {
+    table-layout: auto;
+}
+
+#layer-properties-form .property-group .property-content .qr-params-center .qr-params-table td:last-child {
+    width: auto;
+    min-width: 0;
+    max-width: none;
+}
+
+#layer-properties-form .property-group .property-content .qr-params-layout {
+    width: 100%;
+    overflow-x: auto;
+    padding-bottom: 4px;
+}
+
+#layer-properties-form .property-group .property-content .qr-params-row1 {
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.5fr) minmax(88px, 140px);
+    align-items: stretch;
+    margin-bottom: 8px;
+}
+
+#layer-properties-form .property-group .property-content .qr-params-row1 .qr-params-left,
+#layer-properties-form .property-group .property-content .qr-params-row1 .qr-params-center {
+    overflow: visible;
+}
+
+#layer-properties-form .property-group .property-content .qr-params-row1 .qr-params-right {
+    display: flex;
+    justify-content: flex-end;
+}
+
+#layer-properties-form .property-group .property-content .qr-params-bottom {
+    margin-top: 4px;
+}
+
+.qr-params-layout .preview-switch {
+    display: inline-flex;
+    align-items: center;
+    cursor: pointer;
+}
+
+.qr-params-layout .preview-switch input {
+    display: none;
+}
+
+.qr-params-layout .preview-switch .switch-slider {
+    position: relative;
+    display: block;
+    width: 40px;
+    height: 20px;
+    border-radius: 10px;
+    background: #555;
+    transition: background .2s;
+}
+
+.qr-params-layout .preview-switch .switch-slider::before {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #fff;
+    transition: transform .2s;
+}
+
+.qr-params-layout .preview-switch input:checked + .switch-slider {
+    background: #667eea;
+}
+
+.qr-params-layout .preview-switch input:checked + .switch-slider::before {
+    transform: translateX(20px);
+}
+
+.mirror-setting-section {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: minmax(0, 1fr) minmax(190px, 24%);
+    gap: 8px 12px;
+    align-items: start;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    padding: 0 2px;
+    box-sizing: border-box;
+}
+
+.mirror-operations,
+.mirror-status-panel {
+    min-width: 0;
+    max-width: 100%;
+}
+
+.mirror-operations {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+}
+
+.mirror-action-grid {
+    display: grid;
+    grid-template-columns: minmax(78px, 96px) repeat(2, minmax(64px, 1fr)) minmax(108px, 1.1fr);
+    align-items: center;
+    gap: 6px 8px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.mirror-method-title,
+.mirror-status-label {
+    min-width: 0;
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.mirror-action-grid > .mirror-app-scene-grid {
+    grid-column: 2 / 4;
+    grid-template-columns: minmax(82px, .9fr) minmax(82px, 1.2fr) minmax(54px, .65fr);
+}
+
+.mirror-app-scene-grid {
+    display: grid;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.mirror-app-scene-grid .form-control,
+.mirror-app-scene-grid .btn.small,
+.mirror-action-grid > .btn.small,
+.mirror-side-control {
+    width: 100%;
+    min-width: 0;
+    height: 30px;
+    min-height: 30px;
+    box-sizing: border-box;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1;
+}
+
+.mirror-app-scene-grid .form-control {
+    padding: 0 24px 0 7px;
+}
+
+.mirror-app-scene-grid .btn.small,
+.mirror-action-grid > .btn.small {
+    padding: 0 6px;
+    white-space: nowrap;
+}
+
+.mirror-side-control.btn.small {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 6px;
+    text-align: center;
+}
+
+.mirror-toggle-btn {
+    font-weight: 800;
+}
+
+.mirror-autostart-control {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 5px;
+    min-width: 0;
+    height: 30px;
+    min-height: 30px;
+    padding: 0 7px;
+    box-sizing: border-box;
+    border: 1px solid var(--glass-border);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, .04);
+}
+
+.mirror-autostart-label {
+    min-width: 0;
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.15;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mirror-autostart-control .preview-switch {
+    width: 30px;
+    min-width: 30px;
+    height: 16px;
+    flex: 0 0 30px;
+}
+
+.mirror-autostart-control .switch-slider {
+    width: 30px;
+    height: 16px;
+}
+
+.mirror-autostart-control .switch-slider::before {
+    width: 12px;
+    height: 12px;
+}
+
+.mirror-autostart-control input[type="checkbox"]:checked + .switch-slider::before {
+    transform: translateX(14px);
+}
+
+.mirror-number-control {
+    display: grid;
+    grid-template-columns: minmax(52px, 1fr) minmax(48px, 66px);
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    height: 30px;
+    min-height: 30px;
+    padding: 0 7px;
+    box-sizing: border-box;
+    border: 1px solid var(--glass-border);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, .04);
+}
+
+.mirror-number-input {
+    width: 100%;
+    min-width: 0;
+    height: 24px;
+    min-height: 24px;
+    padding: 1px 5px;
+    font-size: 11px;
+    text-align: right;
+}
+
+.mirror-status-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+}
+
+.mirror-status-row {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr);
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+}
+
+.mirror-status-value {
+    display: block;
+    min-width: 0;
+    min-height: 28px;
+    padding: 5px 7px;
+    box-sizing: border-box;
+    border: 1px solid var(--glass-border);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, .2);
+    color: var(--text-primary);
+    font-size: 11px;
+    font-weight: 650;
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+    .mirror-setting-section {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .mirror-status-panel {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 620px) {
+    .mirror-action-grid {
+        grid-template-columns: minmax(74px, 88px) repeat(2, minmax(58px, 1fr)) minmax(96px, 1.05fr);
+        gap: 5px;
+    }
+
+    .mirror-action-grid > .mirror-app-scene-grid {
+        grid-template-columns: minmax(76px, .9fr) minmax(72px, 1.2fr) minmax(50px, .65fr);
+    }
+
+    .mirror-status-panel {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}

@@ -11,11 +11,11 @@
  */
 
 #include "core/CommandRouter.h"
-#include "utils/SliceConfigJson.h"
+#include "core/SliceConfigJson.h"
 #include "core/Engine.h"
 #include "core/LayerDefinitions.h"
 #include "core/Mubu.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "layer/Layer.h"
 #include "layer/LayerImage.h"
@@ -70,6 +70,31 @@ static Size parseSizeString(const std::string &str) {
     }
   }
   return size;
+}
+
+static bool parseExactPositionString(const Json::Value &value, Position &position) {
+  if (!value.isString()) return false;
+  int x = 0;
+  int y = 0;
+  char trailing = '\0';
+  if (std::sscanf(value.asCString(), " %d %d %c", &x, &y, &trailing) != 2) {
+    return false;
+  }
+  position = Position(x, y);
+  return true;
+}
+
+static bool parseExactSizeString(const Json::Value &value, Size &size) {
+  if (!value.isString()) return false;
+  int width = 0;
+  int height = 0;
+  char trailing = '\0';
+  if (std::sscanf(value.asCString(), " %d %d %c", &width, &height, &trailing) != 2 ||
+      width <= 0 || height <= 0) {
+    return false;
+  }
+  size = Size(width, height);
+  return true;
 }
 
 static Size getConfiguredCanvasSize(SystemConfig *systemConfig) {
@@ -169,6 +194,10 @@ static Json::Value layerToJson(Layer *layer) {
   info["invert"] = layer->getInvert();
   info["gaussianBlur"] = std::round(layer->getGaussianBlur() * 10.0f) / 10.0f;
   info["fitMode"] = layer->getFitMode();
+  info["cropLeft"] = layer->getCropLeft();
+  info["cropTop"] = layer->getCropTop();
+  info["cropRight"] = layer->getCropRight();
+  info["cropBottom"] = layer->getCropBottom();
   info["effectLinkedSlices"] = layer->getEffectLinkedSlices();
   if (layer->getType() == LayerType::MIRROR) {
     info["mirrorReadyHintVisible"] =
@@ -206,7 +235,7 @@ static Json::Value layerToJson(Layer *layer) {
     // 添加文本图层通用属性；从图层当前状态返文件名
     info["text"] = textLayer->getText();
     std::string fontPath = textLayer->getFontPath();
-    if (!fontPath.empty())
+    if (layer->getLayerId() != 21 && !fontPath.empty())
       info["font_file"] = FileUtils::getFilename(fontPath);
     info["fontSize"] = textLayer->getFontSize();
     info["textColor"] = textLayer->getTextColor().toString();
@@ -274,6 +303,12 @@ static void applyCommonConfigFields(Json::Value &info,
   info["gaussianBlur"] = std::round(config.gaussianBlur * 10.0f) / 10.0f;
   info["effectLinkedSlices"] = config.effectLinkedSlices;
   info["fitMode"] = std::clamp(config.fitMode, 0, 1);
+  info["cropLeft"] = std::clamp(config.cropLeft, 0.0f, 1.0f);
+  info["cropTop"] = std::clamp(config.cropTop, 0.0f, 1.0f);
+  info["cropRight"] = std::clamp(config.cropRight, 0.0f,
+                                  1.0f - std::clamp(config.cropLeft, 0.0f, 1.0f));
+  info["cropBottom"] = std::clamp(config.cropBottom, 0.0f,
+                                   1.0f - std::clamp(config.cropTop, 0.0f, 1.0f));
   if (config.layerId == 31) {
     info["mirrorReadyHintVisible"] = config.mirrorReadyHintVisible;
     info["tvVerticalCropPx"] = std::clamp(config.tvVerticalCropPx, 0, 4000);
@@ -332,16 +367,10 @@ static void applyConfigFieldsToLayerJson(Json::Value &info,
       info["qrBgColor"] = config.qrBgColor;
       info["qrFgColor"] = config.qrFgColor;
       info["qrErrorCorrection"] = config.qrErrorCorrection;
-      if (!config.qrLogoPath.empty()) {
-        info["qr_logo_file"] = FileUtils::getFilename(config.qrLogoPath);
-      }
-      if (config.qrLogoSize > 0) {
-        info["qrLogoSize"] = config.qrLogoSize;
-      }
     }
   } else if (layerType == LayerType::TEXT) {
     info["text"] = config.text;
-    if (!config.fontPath.empty()) {
+    if (layerId != 21 && !config.fontPath.empty()) {
       info["font_file"] = FileUtils::getFilename(config.fontPath);
     }
     info["fontSize"] = config.fontSize;
@@ -439,6 +468,10 @@ static Json::Value buildLayerResponseJson(int layerId,
     }
   }
 
+  if (layerId == 21) {
+    info.removeMember("fontFile");
+    info.removeMember("font_file");
+  }
   ensureLayerDisplayName(info, layerId, layerType);
   return info;
 }
@@ -721,12 +754,29 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
     }
     LayerType layerType = definition->type;
 
+    const bool hasInitialPosition = param.isMember("position");
+    const bool hasInitialSize = param.isMember("size");
+    if (hasInitialPosition != hasInitialSize) {
+      setParamError(response, "position and size must be provided together");
+      return response;
+    }
+
+    Position initialPosition;
+    Size initialSize;
+    const bool hasInitialBounds = hasInitialPosition && hasInitialSize;
+    if (hasInitialBounds &&
+        (!parseExactPositionString(param["position"], initialPosition) ||
+         !parseExactSizeString(param["size"], initialSize))) {
+      setParamError(response, "Invalid position or size");
+      return response;
+    }
+
     Layer *layer = mubu_->getLayer(layerId);
     bool layerExisted = (layer != nullptr);
 
     // 如果图层不存在于 Warm Pool 中，尝试创建
     if (!layer) {
-      if (!mubu_->createLayer(layerId, layerType)) {
+      if (!mubu_->createLayer(layerId, layerType, false, false)) {
         response.ok = false;
         response.error = 0x0102;
         response.message = "Failed to create layer";
@@ -742,6 +792,14 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
     }
 
     // 设置渲染器（关键！没有渲染器的图层无法渲染）
+    if (hasInitialBounds) {
+      // Keep an existing warm-pool layer hidden while changing both geometry
+      // fields, then reveal it only after the configuration is complete.
+      layer->setVisible(false);
+      layer->setPosition(initialPosition);
+      layer->setSize(initialSize);
+    }
+
     if (engine_ && engine_->getRenderer()) {
       layer->setRenderer(engine_->getRenderer());
       LOG_INFO("图层 %d 已设置渲染器", layerId);
@@ -750,14 +808,17 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
     }
 
     if (layerId == 60 && layer->getType() == LayerType::IMAGE) {
-      Size canvasSize = getConfiguredCanvasSize(systemConfig_);
-      layer->setPosition(Position(0, 0));
-      layer->setSize(canvasSize);
+      if (!hasInitialBounds) {
+        Size canvasSize = getConfiguredCanvasSize(systemConfig_);
+        layer->setPosition(Position(0, 0));
+        layer->setSize(canvasSize);
+      }
       if (auto *imageLayer = dynamic_cast<LayerImage *>(layer)) {
         imageLayer->setScaleMode(0);
       }
-      LOG_INFO("图层 60 背景图按幕布尺寸创建: %dx%d", canvasSize.width,
-               canvasSize.height);
+      const Size finalSize = layer->getSize();
+      LOG_INFO("\u56fe\u5c42 60 \u80cc\u666f\u56fe\u521b\u5efa\u5c3a\u5bf8: %dx%d", finalSize.width,
+               finalSize.height);
     }
 
     // 检查图层是否已在 SystemConfig 中（当前场景配置）
@@ -786,6 +847,10 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
       config.priority = layer->getPriority();
       config.gaussianBlur = layer->getGaussianBlur();
       config.fitMode = layer->getFitMode();
+      config.cropLeft = layer->getCropLeft();
+      config.cropTop = layer->getCropTop();
+      config.cropRight = layer->getCropRight();
+      config.cropBottom = layer->getCropBottom();
       if (layer->getType() == LayerType::MIRROR) {
         auto *mirrorLayer = static_cast<LayerMirror *>(layer);
         config.mirrorReadyHintVisible = mirrorLayer->isReadyHintVisible();
@@ -801,8 +866,6 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
 
       systemConfig_->setLayerConfig(layerId, config);
 
-      // 同时设置图层可见
-      layer->setVisible(true);
       if ((layerId == 10 || layerId == 11) && layer->getType() == LayerType::VIDEO) {
         static_cast<LayerVideo *>(layer)->setConfiguredCaptureLayer(true);
       }
@@ -812,6 +875,9 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
     } else {
       LOG_WARN("SystemConfig 未初始化，无法保存图层配置");
     }
+
+    // Reveal only after geometry, renderer and persisted configuration are complete.
+    layer->setVisible(true);
 
     data["layerId"] = layerId;
     data["layer_type"] = layerTypeToString(layer->getType());
@@ -1410,6 +1476,25 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
       int newFitMode = std::max(0, std::min(1, param["fitMode"].asInt()));
       layer->setFitMode(newFitMode);
     }
+    if (param.isMember("cropLeft") || param.isMember("crop_left") ||
+        param.isMember("cropTop") || param.isMember("crop_top") ||
+        param.isMember("cropRight") || param.isMember("crop_right") ||
+        param.isMember("cropBottom") || param.isMember("crop_bottom")) {
+      const auto crop = [&param](const char *camel, const char *snake,
+                                 float fallback) {
+        if (param.isMember(camel) && param[camel].isNumeric()) {
+          return param[camel].asFloat();
+        }
+        if (param.isMember(snake) && param[snake].isNumeric()) {
+          return param[snake].asFloat();
+        }
+        return fallback;
+      };
+      layer->setContentCrop(crop("cropLeft", "crop_left", layer->getCropLeft()),
+                            crop("cropTop", "crop_top", layer->getCropTop()),
+                            crop("cropRight", "crop_right", layer->getCropRight()),
+                            crop("cropBottom", "crop_bottom", layer->getCropBottom()));
+    }
     if (param.isMember("mirrorReadyHintVisible") &&
         param["mirrorReadyHintVisible"].isBool() &&
         layer->getType() == LayerType::MIRROR) {
@@ -1478,6 +1563,43 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
           }
         }
 
+        if ((param.isMember("captureWidth") && param["captureWidth"].isInt()) ||
+            (param.isMember("capture_width") && param["capture_width"].isInt()) ||
+            (param.isMember("captureHeight") && param["captureHeight"].isInt()) ||
+            (param.isMember("capture_height") && param["capture_height"].isInt()) ||
+            (param.isMember("captureResolutionLocked") && param["captureResolutionLocked"].isBool()) ||
+            (param.isMember("capture_resolution_locked") && param["capture_resolution_locked"].isBool())) {
+          const LayerConfigData *existingConfig =
+              systemConfig_ ? systemConfig_->getLayerConfig(layerId) : nullptr;
+          LayerConfigData config;
+          if (existingConfig) config = *existingConfig;
+          config.layerId = layerId;
+          config.layerKey = "layer" + std::to_string(layerId);
+          if (param.isMember("captureWidth") && param["captureWidth"].isInt()) {
+            config.captureWidth = param["captureWidth"].asInt();
+          } else if (param.isMember("capture_width") && param["capture_width"].isInt()) {
+            config.captureWidth = param["capture_width"].asInt();
+          }
+          if (param.isMember("captureHeight") && param["captureHeight"].isInt()) {
+            config.captureHeight = param["captureHeight"].asInt();
+          } else if (param.isMember("capture_height") && param["capture_height"].isInt()) {
+            config.captureHeight = param["capture_height"].asInt();
+          }
+          if (param.isMember("captureResolutionLocked") &&
+              param["captureResolutionLocked"].isBool()) {
+            config.captureResolutionLocked = param["captureResolutionLocked"].asBool();
+          } else if (param.isMember("capture_resolution_locked") &&
+                     param["capture_resolution_locked"].isBool()) {
+            config.captureResolutionLocked = param["capture_resolution_locked"].asBool();
+          }
+          config.captureWidth = std::clamp(config.captureWidth, 0, 4088);
+          config.captureHeight = std::clamp(config.captureHeight, 0, 2160);
+          config.captureResolutionLocked = config.captureResolutionLocked &&
+                                             config.captureWidth > 0 && config.captureHeight > 0;
+          captureParamsChanged = true;
+          if (systemConfig_) systemConfig_->setLayerConfig(layerId, config);
+        }
+
         if ((param.isMember("captureRotation") && param["captureRotation"].isInt()) ||
             (param.isMember("capture_rotation") && param["capture_rotation"].isInt())) {
           int newCaptureRotation = param.isMember("captureRotation")
@@ -1510,8 +1632,19 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
         float volume = roundVolume01(param["volume"].asFloat());
         if (volume >= 0.0f && volume <= 1.0f) {
           float oldVolume = videoLayer->getVolume();
-          videoLayer->setVolume(volume);
-          LOG_INFO("图层 %d 音量已设置为 %.2f", layerId, volume);
+          if (systemConfig_) {
+            if (const LayerConfigData *config =
+                    systemConfig_->getLayerConfig(layerId)) {
+              oldVolume = std::clamp(config->volume, 0.0f, 1.0f);
+            }
+          }
+          const bool onlineVodPolicyApplied =
+              engine_ && engine_->applyOnlineVodConfiguredLayerVolume(
+                             layerId, videoLayer, volume, "layer_update");
+          if (!onlineVodPolicyApplied) {
+            videoLayer->setVolume(volume);
+          }
+          LOG_INFO("Layer %d configured volume set to %.2f", layerId, volume);
 
           // 显示静音/取消静音或音量百分比提示（单行文字：如 "音量20%"）
           int volumePercent = static_cast<int>(volume * 100.0f + 0.5f);
@@ -1668,7 +1801,10 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
       }
 
       // 仅文件名：font_file → ROOT_PATH + "ttf/" + font_file（根目录语义路径，不接收路径字段）
-      if (param.isMember("font_file") && param["font_file"].isString()) {
+      if (layerId == 21) {
+        const std::string font = systemConfig_ ? systemConfig_->getLyricFont() : std::string();
+        textLayer->setFontPath(font.empty() ? "" : ROOT_PATH + "ttf/" + font);
+      } else if (param.isMember("font_file") && param["font_file"].isString()) {
         std::string ff = param["font_file"].asString();
         if (!ff.empty())
             textLayer->setFontPath(ROOT_PATH + "ttf/" + ff);
@@ -1841,6 +1977,10 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
           config->invert = layer->getInvert();
           config->gaussianBlur = layer->getGaussianBlur();
           config->fitMode = layer->getFitMode();
+          config->cropLeft = layer->getCropLeft();
+          config->cropTop = layer->getCropTop();
+          config->cropRight = layer->getCropRight();
+          config->cropBottom = layer->getCropBottom();
           if (layer->getType() == LayerType::MIRROR) {
             auto *mirrorLayer = static_cast<LayerMirror *>(layer);
             config->mirrorReadyHintVisible =
@@ -1850,7 +1990,14 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
 
           if (layer->getType() == LayerType::VIDEO) {
             LayerVideo *videoLayer = static_cast<LayerVideo *>(layer);
-            config->volume = videoLayer->getVolume();
+            const bool isOnlineVodLayer =
+                engine_ && engine_->isOnlineVodRuntimeEnabled() &&
+                layerId == std::max(1, systemConfig_->getVodLayerId());
+            if (param.isMember("volume") && param["volume"].isNumeric()) {
+              config->volume = roundVolume01(param["volume"].asFloat());
+            } else if (!isOnlineVodLayer) {
+              config->volume = videoLayer->getVolume();
+            }
             config->playbackRate = videoLayer->getPlaybackRate();
             config->audioTrack = videoLayer->getCurrentAudioTrack();
             config->audioChannel = videoLayer->getAudioChannel();
@@ -1863,7 +2010,7 @@ CommandRouter::handleLayerManagement(const std::string &paramJson) {
           } else if (layer->getType() == LayerType::TEXT) {
             LayerText *textLayer = static_cast<LayerText *>(layer);
             config->text = textLayer->getText();
-            config->fontPath = textLayer->getFontPath();
+            config->fontPath = layerId == 21 ? "" : textLayer->getFontPath();
             config->fontSize = textLayer->getFontSize();
             config->textColor = textLayer->getTextColor().toString();
             config->bgColor = textLayer->getBgColor().toString();

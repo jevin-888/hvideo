@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Locale;
 
 /**
  * 配置文件缓存
@@ -334,7 +335,7 @@ public class ConfigCache {
             }
             
             long cacheSize = cacheManager.getCacheFileSize(cacheType);
-            return String.format("配置缓存 %s: 缓存大小 %d 字节", configFileName, cacheSize);
+            return String.format(Locale.ROOT, "配置缓存 %s: 缓存大小 %d 字节", configFileName, cacheSize);
             
         } catch (Exception e) {
             return "配置缓存 " + configFileName + ": 获取统计信息失败";

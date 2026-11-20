@@ -57,7 +57,8 @@ typedef struct BlockNode{
 #define BLOCK_INTRA   1         ///< Intra block, inter otherwise
 #define BLOCK_OPT     2         ///< Block needs no checks in this round of iterative motion estiation
 //#define TYPE_NOCOLOR  4
-    uint8_t level; //FIXME merge into type}BlockNode;
+    uint8_t level; //FIXME merge into type?
+}BlockNode;
 
 static const BlockNode null_block= { //FIXME add border maybe
     .color= {128,128,128},

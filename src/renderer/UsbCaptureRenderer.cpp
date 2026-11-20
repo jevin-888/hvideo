@@ -20,8 +20,21 @@
 
 #include <chrono>
 #include <cstring>
+#include <algorithm>
 
 namespace hsvj {
+
+namespace {
+int64_t monotonicMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void recordMaximum(std::atomic<int64_t> &value, int64_t sample) {
+  auto old = value.load(std::memory_order_relaxed);
+  while (old < sample && !value.compare_exchange_weak(
+      old, sample, std::memory_order_relaxed)) {}
+}
+} // namespace
 
 UsbCaptureRenderer::UsbCaptureRenderer() = default;
 UsbCaptureRenderer::~UsbCaptureRenderer() { shutdown(); }
@@ -64,7 +77,7 @@ void UsbCaptureRenderer::setUsbCapture(UsbCapture *capture) {
 
 void UsbCaptureRenderer::shutdown() {
   if (renderer_) {
-    renderer_->flushDeferredFrameFenceCallbacks();
+    renderer_->flushDeferredFrameFenceCallbacks("USB capture shutdown");
   }
 
   // 1. 停 解码器 线程
@@ -130,8 +143,7 @@ void UsbCaptureRenderer::onCaptureFrame(const UsbCaptureFrame &frame) {
     pendingMjpeg_.assign(static_cast<const uint8_t *>(frame.data),
                          static_cast<const uint8_t *>(frame.data) + frame.size);
     pendingSeq_ = frame.sequence;
-    pendingWidth_ = frame.width;
-    pendingHeight_ = frame.height;
+    if (hasPendingMjpeg_) pendingReplacedCount_.fetch_add(1, std::memory_order_relaxed);
     hasPendingMjpeg_ = true;
   }
   mjpegCv_.notify_one();
@@ -142,17 +154,21 @@ void UsbCaptureRenderer::onCaptureFrame(const UsbCaptureFrame &frame) {
   }
 
   // 3. 心跳
-  lastFrameTime_ = std::chrono::steady_clock::now();
-  currentWidth_.store(frame.width);
-  currentHeight_.store(frame.height);
-  hasSignal_.store(true);
+  recordCaptureHeartbeat(frame);
 }
 
 void UsbCaptureRenderer::dropCaptureFrame(const UsbCaptureFrame &frame) {
   if (usbCapture_ && frame.bufferIndex >= 0) {
     usbCapture_->releaseFrame(frame.bufferIndex);
   }
-  lastFrameTime_ = std::chrono::steady_clock::now();
+  recordCaptureHeartbeat(frame);
+}
+
+void UsbCaptureRenderer::recordCaptureHeartbeat(const UsbCaptureFrame &frame) {
+  const auto now = monotonicMs();
+  const auto previous = lastFrameTimeMs_.exchange(now, std::memory_order_relaxed);
+  if (previous) recordMaximum(maxCaptureGapMs_, now - previous);
+  captureCount_.fetch_add(1, std::memory_order_relaxed);
   currentWidth_.store(frame.width);
   currentHeight_.store(frame.height);
   hasSignal_.store(true);
@@ -166,6 +182,7 @@ void UsbCaptureRenderer::decoderThreadFunc() {
   std::vector<uint8_t> localMjpeg;
 
   while (!decoderShouldStop_.load()) {
+    uint32_t inputSeq = 0;
     {
       std::unique_lock<std::mutex> lk(mjpegMutex_);
       mjpegCv_.wait(lk, [&] {
@@ -173,6 +190,7 @@ void UsbCaptureRenderer::decoderThreadFunc() {
       });
       if (decoderShouldStop_.load()) break;
       localMjpeg.swap(pendingMjpeg_);
+      inputSeq = pendingSeq_;
       pendingMjpeg_.clear();
       hasPendingMjpeg_ = false;
     }
@@ -180,13 +198,28 @@ void UsbCaptureRenderer::decoderThreadFunc() {
 
 #ifdef __ANDROID__
     RkmppDecodedFrame newFrame{};
+    const auto decodeStart = std::chrono::steady_clock::now();
     bool ok = decoder_.decode(localMjpeg.data(), localMjpeg.size(), newFrame);
-    if (!ok) continue;
+    recordMaximum(maxDecodeTimeUs_, std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - decodeStart).count());
+    if (!ok) {
+      const auto count = decodeFailedCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (count <= 3 || count % 60 == 0) {
+        LOG_WARN("[UsbPipeline] decode rejected inputSeq=%u bytes=%zu intervalFailures=%llu",
+                 inputSeq, localMjpeg.size(), (unsigned long long)count);
+      }
+      continue;
+    }
+    decodedCount_.fetch_add(1, std::memory_order_relaxed);
+    lastDecodedTimeMs_.store(monotonicMs(), std::memory_order_relaxed);
 
     // 单槽队列：旧帧立即归还 MPP pool，新帧入槽
     {
       std::lock_guard<std::mutex> lk(frameMutex_);
-      if (hasReadyFrame_) RkmppMjpegDecoder::releaseFrame(readyFrame_);
+      if (hasReadyFrame_) {
+        readyReplacedCount_.fetch_add(1, std::memory_order_relaxed);
+        RkmppMjpegDecoder::releaseFrame(readyFrame_);
+      }
       readyFrame_ = newFrame;
       hasReadyFrame_ = true;
     }
@@ -201,6 +234,8 @@ void UsbCaptureRenderer::decoderThreadFunc() {
 // ============================================================================
 bool UsbCaptureRenderer::updateTexture() {
   if (!renderer_) return false;
+  const auto nowMs = monotonicMs();
+  logPipelineProgress(nowMs);
 
   if (usbCapture_ && usbCapture_->isUnhealthy()) {
     clearFrameCache(true);
@@ -209,10 +244,9 @@ bool UsbCaptureRenderer::updateTexture() {
 
   // 心跳：>2s 无回调 → 视为无信号
   if (hasSignal_.load()) {
-    auto now = std::chrono::steady_clock::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  now - lastFrameTime_).count();
+    const auto ms = nowMs - lastFrameTimeMs_.load(std::memory_order_relaxed);
     if (ms > 2000) {
+      LOG_WARN("[UsbPipeline] input heartbeat expired ageMs=%lld; display no signal", (long long)ms);
       hasSignal_.store(false);
       textureUpdated_ = false;
     }
@@ -240,11 +274,19 @@ bool UsbCaptureRenderer::updateTexture() {
     return false;
   }
 
+  const auto importStart = std::chrono::steady_clock::now();
   bool ok = renderer_->updateTextureFromDmaBuf(
       textureId, localFrame.dmaBufFd, localFrame.width, localFrame.height,
       localFrame.v4l2Fourcc, localFrame.hStride, localFrame.vStride);
+  maxImportTimeUs_ = std::max(maxImportTimeUs_, (int64_t)
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - importStart).count());
 
   if (!ok) {
+    if (++importFailedCount_ <= 3 || importFailedCount_ % 60 == 0) {
+      LOG_WARN("[UsbPipeline] texture import failed fd=%d size=%dx%d; retain last picture",
+               localFrame.dmaBufFd, localFrame.width, localFrame.height);
+    }
     RkmppMjpegDecoder::releaseFrame(localFrame);
     return false;
   }
@@ -265,6 +307,10 @@ bool UsbCaptureRenderer::updateTexture() {
   textureUpdated_ = true;
   updatedTextureId_ = textureId;
   textureUpdateSerial_.fetch_add(1, std::memory_order_acq_rel);
+  const auto publishedMs = monotonicMs();
+  if (lastPublishedTimeMs_) maxPublishGapMs_ = std::max(maxPublishGapMs_, publishedMs - lastPublishedTimeMs_);
+  lastPublishedTimeMs_ = publishedMs;
+  ++publishedCount_;
 
   return true;
 #else
@@ -303,18 +349,19 @@ bool UsbCaptureRenderer::render(float x, float y, float width, float height,
                                 float rotation, float scale, float alpha,
                                 int shapeType, float shapeParam,
                                 bool blackToTransparent, int invert,
-                                int fitMode) {
+                                float gaussianBlur, int fitMode) {
   if (!renderer_) return false;
 
   if (textureUpdated_ && updatedTextureId_ != 0) {
+    renderer_->setTextureContentCrop(updatedTextureId_, cropEnabled_, cropX_, cropY_, cropW_, cropH_, true);
     renderer_->renderLayer(updatedTextureId_, static_cast<int>(x), static_cast<int>(y),
                            static_cast<int>(width), static_cast<int>(height),
                            rotation, scale, alpha, nullptr, shapeType, shapeParam,
-                           blackToTransparent, invert, 0.0f, fitMode);
+                           blackToTransparent, invert, gaussianBlur, fitMode);
     return true;
   }
   renderBlackTexture(x, y, width, height, rotation, scale, alpha, shapeType,
-                     shapeParam, blackToTransparent, invert, fitMode);
+                     shapeParam, blackToTransparent, invert, gaussianBlur, fitMode);
   return false;
 }
 
@@ -322,12 +369,13 @@ void UsbCaptureRenderer::renderBlackTexture(float x, float y, float width, float
                                             float rotation, float scale, float alpha,
                                             int shapeType, float shapeParam,
                                             bool blackToTransparent, int invert,
-                                            int fitMode) {
+                                            float gaussianBlur, int fitMode) {
   if (!renderer_ || !blackTextureCreated_ || blackTextureId_ == 0) return;
+  renderer_->setTextureContentCrop(blackTextureId_, cropEnabled_, cropX_, cropY_, cropW_, cropH_, true);
   renderer_->renderLayer(blackTextureId_, static_cast<int>(x), static_cast<int>(y),
                          static_cast<int>(width), static_cast<int>(height),
                          rotation, scale, alpha, nullptr, shapeType, shapeParam,
-                         blackToTransparent, invert, 0.0f, fitMode);
+                         blackToTransparent, invert, gaussianBlur, fitMode);
 }
 
 void UsbCaptureRenderer::prepareTextures() {
@@ -336,10 +384,6 @@ void UsbCaptureRenderer::prepareTextures() {
 }
 
 void UsbCaptureRenderer::clearFrameCache(bool clearTextureState) {
-  if (clearTextureState && renderer_) {
-    renderer_->flushDeferredFrameFenceCallbacks();
-  }
-
   {
     std::lock_guard<std::mutex> lk(mjpegMutex_);
     pendingMjpeg_.clear();
@@ -364,10 +408,39 @@ void UsbCaptureRenderer::clearFrameCache(bool clearTextureState) {
 
 bool UsbCaptureRenderer::hasRecentFrame() const {
   if (!hasSignal_.load()) return false;
-  auto now = std::chrono::steady_clock::now();
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - lastFrameTime_).count();
+  const auto ms = monotonicMs() - lastFrameTimeMs_.load(std::memory_order_relaxed);
   return ms < 1500;
+}
+
+void UsbCaptureRenderer::logPipelineProgress(int64_t nowMs) {
+  if (!lastProgressLogMs_) { lastProgressLogMs_ = nowMs; return; }
+  if (nowMs - lastProgressLogMs_ < 10000) return;
+  const auto inputTime = lastFrameTimeMs_.load(std::memory_order_relaxed);
+  const auto decodedTime = lastDecodedTimeMs_.load(std::memory_order_relaxed);
+  // LOG_INFO writes twice (logcat + file); never pass mutating expressions.
+  const auto captured = captureCount_.exchange(0);
+  const auto pendingReplaced = pendingReplacedCount_.exchange(0);
+  const auto decoded = decodedCount_.exchange(0);
+  const auto decodeFailed = decodeFailedCount_.exchange(0);
+  const auto readyReplaced = readyReplacedCount_.exchange(0);
+  const auto maxInputGap = maxCaptureGapMs_.exchange(0);
+  const auto maxDecode = maxDecodeTimeUs_.exchange(0);
+  LOG_INFO("[UsbPipeline] windowMs=%lld capture=%llu pendingReplaced=%llu decoded=%llu decodeFailed=%llu readyReplaced=%llu published=%llu importFailed=%llu inputAgeMs=%lld decodedAgeMs=%lld publishedAgeMs=%lld maxInputGapMs=%lld maxDecodeUs=%lld maxPublishGapMs=%lld maxImportUs=%lld",
+      (long long)(nowMs - lastProgressLogMs_),
+      (unsigned long long)captured,
+      (unsigned long long)pendingReplaced,
+      (unsigned long long)decoded,
+      (unsigned long long)decodeFailed,
+      (unsigned long long)readyReplaced,
+      (unsigned long long)publishedCount_, (unsigned long long)importFailedCount_,
+      (long long)(inputTime ? nowMs - inputTime : -1),
+      (long long)(decodedTime ? nowMs - decodedTime : -1),
+      (long long)(lastPublishedTimeMs_ ? nowMs - lastPublishedTimeMs_ : -1),
+      (long long)maxInputGap, (long long)maxDecode,
+      (long long)maxPublishGapMs_, (long long)maxImportTimeUs_);
+  publishedCount_ = importFailedCount_ = 0;
+  maxPublishGapMs_ = maxImportTimeUs_ = 0;
+  lastProgressLogMs_ = nowMs;
 }
 
 void UsbCaptureRenderer::getCurrentResolution(int &w, int &h) const {

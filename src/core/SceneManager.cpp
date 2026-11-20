@@ -10,10 +10,10 @@
  */
 
 #include "core/SceneManager.h"
-#include "utils/SliceConfigJson.h"
+#include "core/SliceConfigJson.h"
 #include "core/LayerDefinitions.h"
 #include "core/Mubu.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "layer/Layer.h"
 #include "layer/LayerImage.h"
@@ -303,36 +303,38 @@ bool SceneManager::applySceneConfigWithStats(const std::string &configJson,
   }
   LOG_DEBUG("SceneManager: 新场景包含 %zu 个图层配置", newSceneLayerIds.size());
 
-  // 新架构：不删除图层，改为隐藏所有图层，再应用新配置
-  // 图层已在引擎启动时预创建，这里只需更新可见性和参数
+  // 场景成员关系与可见性分开处理。新旧场景都存在的图层必须原地更新，
+  // 不能先统一隐藏，否则播放中的视频会进入隐藏丢帧和音频焦点切换路径。
   std::vector<int> existingLayerIds = mubu_->getAllLayerIds();
-  LOG_DEBUG("SceneManager: 当前 Mubu 中有 %zu 个图层，将全部隐藏后再应用新配置",
-           existingLayerIds.size());
-
-  // 隐藏所有图层但保留媒体运行态。场景配置只决定画面是否显示和布局，
-  // 不能因为隐藏/切换场景而停止正在播放/采集的媒体。
-  int hiddenCount = 0;
-  int slicesClearedCount = 0;
+  int removedLayerCount = 0;
+  int removedSliceCount = 0;
   for (int existingId : existingLayerIds) {
     Layer *layer = mubu_->getLayer(existingId);
-    if (layer) {
-      // 采集图层 10/11 是硬件输入源，场景切换只改变显示/布局，不停止采集设备。
-      // 当前场景是否显示采集层由 visible/SystemConfig 控制，采集层身份保持不变。
-      layer->setVisible(false);
-      if (layer->hasSlices()) {
-        layer->clearAllSlices();
-        slicesClearedCount++;
-      }
-#ifdef __ANDROID__
-      if (layer->getType() == LayerType::MIRROR) {
-        LOG_INFO("[投屏] 场景切换隐藏 MIRROR 图层 %d，投屏后台保持运行", existingId);
-      }
-#endif
-      hiddenCount++;
+    if (!layer) {
+      continue;
     }
+
+    const bool presentInNewScene =
+        newSceneLayerIds.find(existingId) != newSceneLayerIds.end();
+    layer->setPresentInScene(presentInNewScene);
+    if (presentInNewScene) {
+      continue;
+    }
+
+    layer->setVisible(false);
+    if (layer->hasSlices()) {
+      layer->clearAllSlices();
+      removedSliceCount++;
+    }
+#ifdef __ANDROID__
+    if (layer->getType() == LayerType::MIRROR) {
+      LOG_INFO("[投屏] 场景移除 MIRROR 图层 %d，投屏后台保持运行", existingId);
+    }
+#endif
+    removedLayerCount++;
   }
-  LOG_DEBUG("SceneManager: 已隐藏 %d 个图层，清除 %d 个图层的旧切片，媒体运行态保持不变",
-            hiddenCount, slicesClearedCount);
+  LOG_DEBUG("SceneManager: runtime layers=%zu removed=%d removedSlices=%d",
+            existingLayerIds.size(), removedLayerCount, removedSliceCount);
 
   // 清除 SystemConfig 中的旧图层配置
   // 这样 /layers API 只返回新场景的图层配置
@@ -402,6 +404,7 @@ bool SceneManager::applySceneConfigWithStats(const std::string &configJson,
       LOG_WARN("SceneManager: 图层 %d 未预创建且无法补创建，跳过配置", layerId);
       continue;
     }
+    layer->setPresentInScene(true);
     layerType = layer->getType();
 
     if ((layerId == 10 || layerId == 11) && layerType == LayerType::VIDEO) {
@@ -500,6 +503,19 @@ bool SceneManager::applySceneConfigWithStats(const std::string &configJson,
     if (layerConfig.isMember("invert") && layerConfig["invert"].isInt()) {
       layer->setInvert(layerConfig["invert"].asInt());
     }
+    if (layerConfig.isMember("cropLeft") || layerConfig.isMember("crop_left") ||
+        layerConfig.isMember("cropTop") || layerConfig.isMember("crop_top") ||
+        layerConfig.isMember("cropRight") || layerConfig.isMember("crop_right") ||
+        layerConfig.isMember("cropBottom") || layerConfig.isMember("crop_bottom")) {
+      const auto crop = [&layerConfig](const char *camel, const char *snake) {
+        return layerConfig.isMember(camel) ? layerConfig[camel].asFloat()
+                                           : layerConfig.get(snake, 0.0f).asFloat();
+      };
+      layer->setContentCrop(crop("cropLeft", "crop_left"),
+                            crop("cropTop", "crop_top"),
+                            crop("cropRight", "crop_right"),
+                            crop("cropBottom", "crop_bottom"));
+    }
 
     // 根据图层类型应用特定属性
     const bool deferNonMedia = isDeferredSceneLayerType(layerType);
@@ -518,23 +534,30 @@ bool SceneManager::applySceneConfigWithStats(const std::string &configJson,
             videoLayer->getCaptureRotation()));
       }
 
-      if (layerConfig.isMember("playbackRate") &&
-          layerConfig["playbackRate"].isNumeric()) {
-        videoLayer->setPlaybackRate(layerConfig["playbackRate"].asFloat());
-      }
+      // 播放状态不属于场景状态。只在图层未播放时应用默认播放参数；
+      // 正在播放时切换音轨会在解码器内部触发 seek，必须跳过。
+      const bool playbackActive =
+          videoLayer->getState() != LayerVideo::PlayState::STOPPED;
+      if (!playbackActive) {
+        if (layerConfig.isMember("playbackRate") &&
+            layerConfig["playbackRate"].isNumeric()) {
+          videoLayer->setPlaybackRate(layerConfig["playbackRate"].asFloat());
+        }
 
-      if (layerConfig.isMember("volume") && layerConfig["volume"].isNumeric()) {
-        videoLayer->setVolume(roundVolume01(layerConfig["volume"].asFloat()));
-      }
+        if (layerConfig.isMember("volume") &&
+            layerConfig["volume"].isNumeric()) {
+          videoLayer->setVolume(roundVolume01(layerConfig["volume"].asFloat()));
+        }
 
-      if (layerConfig.isMember("audioTrack") &&
-          layerConfig["audioTrack"].isInt()) {
-        videoLayer->switchAudioTrack(layerConfig["audioTrack"].asInt());
-      }
+        if (layerConfig.isMember("audioTrack") &&
+            layerConfig["audioTrack"].isInt()) {
+          videoLayer->switchAudioTrack(layerConfig["audioTrack"].asInt());
+        }
 
-      if (layerConfig.isMember("audioChannel") &&
-          layerConfig["audioChannel"].isString()) {
-        videoLayer->setAudioChannel(layerConfig["audioChannel"].asString());
+        if (layerConfig.isMember("audioChannel") &&
+            layerConfig["audioChannel"].isString()) {
+          videoLayer->setAudioChannel(layerConfig["audioChannel"].asString());
+        }
       }
 
       // 注意：subtitle_path 字段已删除，字幕现在通过播放列表管理
@@ -632,7 +655,7 @@ bool SceneManager::applySceneConfigWithStats(const std::string &configJson,
           LOG_DEBUG("SceneManager: 图层 70 (Logo) 加载成功: %s", logoPath.c_str());
           applyLayerSizeAndPosition(layer, layerConfig);
         }
-      } else if (layerConfig.isMember("image_file") &&
+      } else if (layerId != 71 && layerConfig.isMember("image_file") &&
           layerConfig["image_file"].isString()) {
         std::string f = layerConfig["image_file"].asString();
         if (!f.empty()) {
@@ -652,24 +675,12 @@ bool SceneManager::applySceneConfigWithStats(const std::string &configJson,
         }
       }
 
-      // 二维码内容配置：如果配置中有 qrContent，且 image_file 对应图片未成功加载，检查对应的二维码文件是否存在并自动加载
-      if (layerConfig.isMember("qrContent") &&
-          layerConfig["qrContent"].isString()) {
-        LOG_DEBUG("QR code content specified for layer %d: %s", layerId,
-                 layerConfig["qrContent"].asString().c_str());
-        
-        // 若 image_file 对应图片未成功加载，尝试加载固定路径的二维码文件
-        if (!imagePathLoaded) {
-          std::string qrFileName = "qrcode_" + std::to_string(layerId) + ".png";
-          std::string fixedPath = ROOT_PATH + "QRCode/" + qrFileName;
-          std::string normalizedQRPath = FileUtils::normalizePath(fixedPath);
-          if (FileUtils::exists(normalizedQRPath) && imageLayer->loadImage(normalizedQRPath)) {
-            LOG_DEBUG("SceneManager: 图层 %d 自动加载二维码文件成功: %s", layerId, normalizedQRPath.c_str());
-            applyLayerSizeAndPosition(layer, layerConfig);
-          }
-          // 文件不存在时不打日志：可能尚未生成或由其他路径加载，避免与「已正确显示」矛盾
-        }
+      if (layerId == 71) {
+        imageLayer->setContentReady(false);
+        imageLayer->setDisplayDuration(0.0f);
+        imageLayer->setFadeInTime(0.0f);
       }
+
       }
 
     } else if (layerType == LayerType::MIRROR) {
@@ -710,7 +721,10 @@ bool SceneManager::applySceneConfigWithStats(const std::string &configJson,
       }
 
       // 仅文件名：font_file → ROOT_PATH + "ttf/" + font_file（根目录语义路径）
-      if (layerConfig.isMember("font_file") &&
+      if (layerId == 21) {
+        const std::string font = systemConfig_ ? systemConfig_->getLyricFont() : std::string();
+        textLayer->setFontPath(font.empty() ? "" : ROOT_PATH + "ttf/" + font);
+      } else if (layerConfig.isMember("font_file") &&
           layerConfig["font_file"].isString()) {
         std::string f = layerConfig["font_file"].asString();
         if (!f.empty())
@@ -797,30 +811,29 @@ bool SceneManager::applySceneConfigWithStats(const std::string &configJson,
       }
     }
 
-    // 加载切片配置：支持嵌套 "slices"（与 config.json / getLayerInfo 布局一致）或顶层 slice1、slice2
+    // 先构建完整切片集合，再一次性发布，避免渲染线程观察到
+    // “先清空、再逐项恢复”的中间状态。
+    std::map<std::string, Json::Value> sceneSlices;
     if (layerConfig.isMember("slices") && layerConfig["slices"].isObject()) {
-      for (const auto &sk : layerConfig["slices"].getMemberNames()) {
-        if (layerConfig["slices"][sk].isObject()) {
-          layer->setSlice(sk, normalizeSliceJson(layerConfig["slices"][sk]));
-          LOG_DEBUG("图层 %d: 加载切片 %s (slices)", layerId, sk.c_str());
+      for (const auto &sliceKey : layerConfig["slices"].getMemberNames()) {
+        if (layerConfig["slices"][sliceKey].isObject()) {
+          sceneSlices[sliceKey] =
+              normalizeSliceJson(layerConfig["slices"][sliceKey]);
         }
       }
     }
     for (const auto &key : layerConfig.getMemberNames()) {
-      if (key.length() > 5 && key.substr(0, 5) == "slice") {
-        bool isSlice = true;
-        for (size_t i = 5; i < key.length(); i++) {
-          if (!std::isdigit(key[i])) {
-            isSlice = false;
-            break;
-          }
-        }
-        if (isSlice && layerConfig[key].isObject()) {
-          layer->setSlice(key, normalizeSliceJson(layerConfig[key]));
-          LOG_DEBUG("图层 %d: 加载切片 %s", layerId, key.c_str());
-        }
+      if (key.length() <= 5 || key.substr(0, 5) != "slice") {
+        continue;
+      }
+      const bool numericSuffix = std::all_of(
+          key.begin() + 5, key.end(),
+          [](unsigned char ch) { return std::isdigit(ch) != 0; });
+      if (numericSuffix && layerConfig[key].isObject()) {
+        sceneSlices[key] = normalizeSliceJson(layerConfig[key]);
       }
     }
+    layer->replaceAllSlices(sceneSlices);
 
     syncLayerConfigToSystemConfig(layerId, layerKey, layerConfig);
 
@@ -912,7 +925,6 @@ void SceneManager::applyDeferredNonMediaLayer(const DeferredSceneLayer& deferred
       imageLayer->setScaleMode(layerConfig["scaleMode"].asInt());
     }
 
-    bool imagePathLoaded = false;
     if (deferred.layerId == 70) {
       std::string logoPath = ROOT_PATH + "Logo/logo.png";
       if (!FileUtils::exists(logoPath)) {
@@ -922,37 +934,33 @@ void SceneManager::applyDeferredNonMediaLayer(const DeferredSceneLayer& deferred
         }
       }
       if (FileUtils::exists(logoPath) && imageLayer->loadImage(logoPath)) {
-        imagePathLoaded = true;
         applyLayerSizeAndPosition(layer, layerConfig);
       }
-    } else if (layerConfig.isMember("image_file") && layerConfig["image_file"].isString()) {
+    } else if (layer->getLayerId() != 71 && layerConfig.isMember("image_file") && layerConfig["image_file"].isString()) {
       std::string fileName = layerConfig["image_file"].asString();
       if (!fileName.empty()) {
         std::string fullPath = FileUtils::normalizePath(ROOT_PATH + "Image/" + fileName);
         if (imageLayer->loadImage(fullPath)) {
-          imagePathLoaded = true;
           applyLayerSizeAndPosition(layer, layerConfig);
         }
       }
     }
 
-    if (!imagePathLoaded &&
-        layerConfig.isMember("qrContent") &&
-        layerConfig["qrContent"].isString()) {
-      std::string qrFileName = "qrcode_" + std::to_string(deferred.layerId) + ".png";
-      std::string normalizedQRPath =
-          FileUtils::normalizePath(ROOT_PATH + "QRCode/" + qrFileName);
-      if (FileUtils::exists(normalizedQRPath) &&
-          imageLayer->loadImage(normalizedQRPath)) {
-        applyLayerSizeAndPosition(layer, layerConfig);
-      }
+    if (deferred.layerId == 71) {
+      imageLayer->setContentReady(false);
+      imageLayer->setDisplayDuration(0.0f);
+      imageLayer->setFadeInTime(0.0f);
     }
+
   } else if (layer->getType() == LayerType::TEXT) {
     LayerText* textLayer = static_cast<LayerText*>(layer);
     if (layerConfig.isMember("text") && layerConfig["text"].isString()) {
       textLayer->setText(layerConfig["text"].asString());
     }
-    if (layerConfig.isMember("font_file") && layerConfig["font_file"].isString()) {
+    if (deferred.layerId == 21) {
+      const std::string font = systemConfig_ ? systemConfig_->getLyricFont() : std::string();
+      textLayer->setFontPath(font.empty() ? "" : ROOT_PATH + "ttf/" + font);
+    } else if (layerConfig.isMember("font_file") && layerConfig["font_file"].isString()) {
       std::string fontFile = layerConfig["font_file"].asString();
       if (!fontFile.empty()) {
         textLayer->setFontPath(ROOT_PATH + "ttf/" + fontFile);
@@ -1087,6 +1095,9 @@ void SceneManager::syncLayerConfigToSystemConfig(int layerId,
     if (layerConfig.isMember("qrText") && layerConfig["qrText"].isString()) {
       cfg.qrText = layerConfig["qrText"].asString();
     }
+    if (layerConfig.isMember("qrTextColor") && layerConfig["qrTextColor"].isString()) {
+      cfg.qrTextColor = layerConfig["qrTextColor"].asString();
+    }
     if (layerConfig.isMember("qrSize") && layerConfig["qrSize"].isInt()) {
       cfg.qrSize = layerConfig["qrSize"].asInt();
     }
@@ -1114,7 +1125,8 @@ void SceneManager::syncLayerConfigToSystemConfig(int layerId,
     cfg.outlineWidth = textLayer->getOutlineWidth();
     cfg.shadow = textLayer->getShadow();
     cfg.outlineColor = textLayer->getOutlineColor().toString();
-    std::string fontPath = textLayer->getFontPath();
+    std::string fontPath = layerId == 21 ? "" : textLayer->getFontPath();
+    cfg.fontPath.clear();
     if (!fontPath.empty()) {
       size_t slash = fontPath.find_last_of("/\\");
       cfg.fontPath = (slash != std::string::npos) ? fontPath.substr(slash + 1) : fontPath;

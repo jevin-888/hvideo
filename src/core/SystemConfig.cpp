@@ -6,11 +6,11 @@
  */
 
 #include "core/SystemConfig.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "fusion/FusionTypes.h"
 #include "fusion/FusionFileStore.h"
-#include "utils/SliceConfigJson.h"
-#include "core/Resolution.h"
+#include "core/SliceConfigJson.h"
+#include "foundation/Resolution.h"
 #include "utils/FileUtils.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
@@ -22,6 +22,7 @@
 #include <set>
 #include <sstream>
 #include <cstdint>
+#include <cctype>
 
 namespace hsvj {
 
@@ -93,7 +94,7 @@ inline std::string jsonStringAny(const Json::Value &v, const char *key,
 
 inline int normalizeCaptureRotationDegrees(int degrees) {
   if (degrees < 0) {
-    return -1;
+    return 0;
   }
   int normalized = degrees % 360;
   if (normalized < 0) {
@@ -114,6 +115,48 @@ inline int positiveOrDefault(int value, int fallback) {
   return value > 0 ? value : fallback;
 }
 
+
+std::string normalizeLyricFontPath(const std::string& value) {
+  if (value.empty()) {
+    return {};
+  }
+
+  std::string path = value;
+  std::replace(path.begin(), path.end(), '\\', '/');
+  if (path.rfind("ttf/", 0) == 0) {
+    path.erase(0, 4);
+  }
+  if (path.empty() || path.front() == '/' || path.find(':') != std::string::npos) {
+    return {};
+  }
+
+  size_t start = 0;
+  while (start <= path.size()) {
+    const size_t separator = path.find('/', start);
+    const std::string segment = path.substr(
+        start, separator == std::string::npos ? std::string::npos : separator - start);
+    if (segment.empty() || segment == "." || segment == "..") {
+      return {};
+    }
+    if (separator == std::string::npos) {
+      break;
+    }
+    start = separator + 1;
+  }
+
+  const size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos) {
+    return {};
+  }
+  std::string extension = path.substr(dot);
+  std::transform(extension.begin(), extension.end(), extension.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  if (extension != ".ttf" && extension != ".otf" && extension != ".ttc") {
+    return {};
+  }
+  return path;
+}
+
 } // 命名空间
 
 SystemConfig::SystemConfig()
@@ -127,6 +170,30 @@ SystemConfig::SystemConfig()
       outputLayoutRows_(0), rotationAngle_(0.0f) {}
 
 SystemConfig::~SystemConfig() = default;
+
+void SystemConfig::setSyncGroupConfig(
+    bool enabled, const std::string &groupId, const std::string &role,
+    const std::string &leaderIp,
+    const std::string &leaderDeviceId, const std::string &multicastAddress,
+    const std::string &interfaceAddress, int ttl) {
+  syncGroupEnabled_ = enabled;
+  syncGroupId_ = groupId.empty() ? "default" : groupId;
+  syncGroupRole_ = role == "leader" ? "leader" : "follower";
+  syncLeaderIp_ = leaderIp;
+  syncLeaderDeviceId_ = leaderDeviceId;
+  syncMulticastAddress_ = multicastAddress.empty()
+                              ? "239.255.42.10"
+                              : multicastAddress;
+  syncInterfaceAddress_ = interfaceAddress;
+  syncTtl_ = std::clamp(ttl, 0, 255);
+}
+
+void SystemConfig::setLyricFont(const std::string& font) {
+  lyricFont_ = normalizeLyricFontPath(font);
+  if (!font.empty() && lyricFont_.empty()) {
+    LOG_WARN("SystemConfig: ignored invalid lyricFont value");
+  }
+}
 
 bool SystemConfig::load(const std::string &configPath) {
   if (!FileUtils::exists(configPath)) {
@@ -184,10 +251,29 @@ bool SystemConfig::load(const std::string &configPath) {
       1, 512);
   if (root.isMember("lyricEnabled"))
     lyricEnabled_ = root["lyricEnabled"].asBool();
+  setLyricFont(jsonString(root, "lyricFont", ""));
+  lyricHeaderVisible_ = root["lyricHeaderVisible"].isBool() &&
+                        root["lyricHeaderVisible"].asBool();
+  lyricBackgroundVisible_ = !root["lyricBackgroundVisible"].isBool() ||
+                            root["lyricBackgroundVisible"].asBool();
+  lyricPinyinEnabled_ = jsonString(root, "lyricDisplayMode", "original") == "pinyin";
+  if (root["lyricTitleFontSize"].isNumeric())
+    lyricTitleFontSize_ = std::clamp(root["lyricTitleFontSize"].asDouble(), 1.0, 300.0);
+  if (root["lyricTitleOutlineWidth"].isNumeric())
+    lyricTitleOutlineWidth_ = std::clamp(root["lyricTitleOutlineWidth"].asDouble(), 0.0, 20.0);
+  if (root["lyricTextFontSize"].isNumeric())
+    lyricTextFontSize_ = std::clamp(root["lyricTextFontSize"].asDouble(), 1.0, 300.0);
+  if (root["lyricTextOutlineWidth"].isNumeric())
+    lyricTextOutlineWidth_ = std::clamp(root["lyricTextOutlineWidth"].asDouble(), 0.0, 20.0);
+  if (root["lyricTextSpacing"].isNumeric())
+    lyricTextSpacing_ = std::clamp(root["lyricTextSpacing"].asDouble(), -20.0, 100.0);
+  lyricProducerText_ = jsonString(root, "lyricProducerText", "");
   licenseServerUrl_ = jsonString(root, "licenseServerUrl", "");
   enableVod_ = root.get("enableVod", false).asBool();
   audioReactiveEnabled_ = root.get("audioReactiveEnabled", false).asBool();
-  onlineVodHost_ = jsonString(root, "onlineVodHost", "");
+  setOnlineVodHost(jsonString(root, "onlineVodHost", ""));
+  vodVolumeGainDb_ = root["vodVolumeGainDb"].isInt()
+      ? std::clamp(root["vodVolumeGainDb"].asInt(), 0, 10) : 0;
   onlineVodRoomId_ = jsonString(root, "onlineVodRoomId", "current");
   if (onlineVodRoomId_.empty()) onlineVodRoomId_ = "current";
   
@@ -197,14 +283,55 @@ bool SystemConfig::load(const std::string &configPath) {
   enableVod_ = vodMode_ > 0;
   localSongFileScanEnabled_ = root.get("localSongFileScanEnabled", false).asBool();
   appUpdateEnabled_ = root.get("appUpdateEnabled", true).asBool();
+  mirrorControlConfigured_ = root.isMember("mirrorAutoStartMode") ||
+                             root.isMember("usbAppSceneEnabled") ||
+                             root.isMember("usbAppSceneName");
+  mirrorAutoStartMode_ = jsonString(root, "mirrorAutoStartMode", "none");
+  if (mirrorAutoStartMode_ != "usb" && mirrorAutoStartMode_ != "android" &&
+      mirrorAutoStartMode_ != "apple") {
+    mirrorAutoStartMode_ = "none";
+  }
+  usbAppSceneEnabled_ = root.get("usbAppSceneEnabled", false).asBool();
+  usbAppSceneName_ = jsonString(root, "usbAppSceneName", "");
   setRenderFrameRateMode(jsonString(root, "renderFrameRateMode", "auto"));
   setRenderQuality(jsonString(root, "renderQuality", "normal"));
+  setPlaybackOperationHintEnabled(root.get("playbackOperationHintEnabled", true).asBool());
+  setStartupIpHintEnabled(root.get("startupIpHintEnabled", true).asBool());
   networkIpMode_ = jsonString(root, "networkIpMode", "dynamic");
   if (networkIpMode_ != "static") networkIpMode_ = "dynamic";
   networkStaticIp_ = jsonString(root, "networkStaticIp", "");
   networkGateway_ = jsonString(root, "networkGateway", "");
   networkDns_ = jsonString(root, "networkDns", "");
-  debugHotspotEnabled_ = root.get("debugHotspotEnabled", false).asBool();
+  setStartupWirelessMode(jsonString(root, "startupWirelessMode", "hotspot"));
+  fusionDebugEnabled_ = root.get("fusionDebugEnabled", true).asBool();
+  if (root.isMember("syncGroup") && root["syncGroup"].isObject()) {
+    const Json::Value &sync = root["syncGroup"];
+    setSyncGroupConfig(
+        sync.get("enabled", false).asBool(),
+        jsonString(sync, "groupId", "default"),
+        jsonString(sync, "role", "follower"),
+        jsonString(sync, "leaderIp", ""),
+        jsonString(sync, "leaderDeviceId", ""),
+        jsonString(sync, "multicastAddr", "239.255.42.10"),
+        jsonString(sync, "interface", ""), sync.get("ttl", 1).asInt());
+  } else {
+    setSyncGroupConfig(false, "default", "follower", "", "",
+                       "239.255.42.10", "", 1);
+  }
+  usbOtgModeConfigured_ = root.isMember("usbOtgMode") &&
+                          root["usbOtgMode"].isString();
+  if (usbOtgModeConfigured_) {
+    const std::string usbOtgMode = root["usbOtgMode"].asString();
+    usbOtgModeConfigured_ = usbOtgMode == "otg" ||
+                           usbOtgMode == "peripheral" ||
+                           usbOtgMode == "host";
+    usbOtgMode_ = usbOtgMode == "otg"
+                      ? "otg"
+                      : (usbOtgMode == "host" ? "host" : "peripheral");
+  } else {
+    // 鼠标等 USB 外设是播放器的默认用途；刷机需由配置显式选择 Peripheral。
+    usbOtgMode_ = "host";
+  }
   powerScheduleEnabled_ = root.get("powerScheduleEnabled", false).asBool();
   powerOnScheduleEnabled_ = root.get("powerOnScheduleEnabled", false).asBool();
   powerOnDate_ = jsonString(root, "powerOnDate", "");
@@ -398,6 +525,9 @@ void SystemConfig::setLayerConfig(int layerId, const LayerConfigData &config) {
   layerConfigs_[layerId] = config;
   layerConfigs_[layerId].layerId = layerId;
   layerConfigs_[layerId].layerKey = "layer" + std::to_string(layerId);
+  if (layerId == 21) {
+    layerConfigs_[layerId].fontPath.clear();
+  }
 }
 
 bool SystemConfig::hasLayerConfig(int layerId) const {
@@ -680,14 +810,21 @@ void SystemConfig::retainOnlyConfigJsonKeys(Json::Value &root) {
       "audioReactiveEnabled",
       "enableVod", "vodMode", "localSongFileScanEnabled",
       "appUpdateEnabled",
+      "mirrorAutoStartMode", "usbAppSceneEnabled", "usbAppSceneName",
       "renderFrameRateMode", "renderQuality",
+      "playbackOperationHintEnabled",
+      "startupIpHintEnabled",
       "networkIpMode", "networkStaticIp", "networkGateway", "networkDns",
-      "debugHotspotEnabled",
+      "startupWirelessMode", "fusionDebugEnabled", "usbOtgMode", "syncGroup",
       "powerScheduleEnabled", "powerOnScheduleEnabled", "powerOnDate", "powerOnTime",
       "powerOffScheduleEnabled", "powerOffDate", "powerOffTime",
       "mpegPsHardwareDecode", "audioLipSyncOffsetMs",
-      "onlineVodHost", "onlineVodRoomId",
-      "dmxBaudRate", "dmxStartAddress", "lyricEnabled", "licenseServerUrl"};
+      "onlineVodHost", "onlineVodRoomId", "vodVolumeGainDb",
+      "dmxBaudRate", "dmxStartAddress", "lyricEnabled", "lyricFont", "lyricHeaderVisible",
+      "lyricBackgroundVisible", "lyricDisplayMode", "lyricTitleFontSize",
+      "lyricTitleOutlineWidth", "lyricTextFontSize", "lyricTextOutlineWidth",
+      "lyricTextSpacing", "lyricProducerText",
+      "licenseServerUrl"};
   std::vector<std::string> toRemove;
   for (const auto &key : root.getMemberNames()) {
     bool keep = false;
@@ -714,15 +851,101 @@ void SystemConfig::retainOnlyConfigJsonKeys(Json::Value &root) {
   for (const auto &k : toRemove)
     root.removeMember(k);
 
+  // QR code logos are no longer supported. Strip legacy fields at the
+  // configuration boundary so old config files cannot resurrect the removed
+  // upload/size controls in API responses or subsequent saves.
   for (const auto &key : root.getMemberNames()) {
-    if (!key.empty() && key.rfind("layer", 0) == 0 && root[key].isObject()) {
-      Json::Value &layer = root[key];
-      layer.removeMember("captureWidth");
-      layer.removeMember("captureHeight");
-      layer.removeMember("capture_width");
-      layer.removeMember("capture_height");
+    if (key.length() <= 5 || key.substr(0, 5) != "layer") continue;
+    bool allDigits = true;
+    for (size_t i = 5; i < key.length(); ++i) {
+      if (!std::isdigit(static_cast<unsigned char>(key[i]))) {
+        allDigits = false;
+        break;
+      }
+    }
+    if (!allDigits || !root[key].isObject()) continue;
+    root[key].removeMember("qrLogoPath");
+    root[key].removeMember("qrLogoSize");
+    root[key].removeMember("qr_logo_path");
+    root[key].removeMember("qr_logo_size");
+    if (key == "layer21") {
+      root[key].removeMember("fontFile");
+      root[key].removeMember("font_file");
     }
   }
+
+  // Old debugHotspotEnabled=false never selected WiFi at system boot.
+  // Missing/legacy configurations therefore retain the ROM's hotspot default.
+  root["startupWirelessMode"] =
+      jsonString(root, "startupWirelessMode", "hotspot") == "wifi" ? "wifi" : "hotspot";
+
+  if (!root.isMember("fusionDebugEnabled") ||
+      !root["fusionDebugEnabled"].isBool()) {
+    root["fusionDebugEnabled"] = true;
+  }
+
+  if (!root.isMember("startupIpHintEnabled") ||
+      !root["startupIpHintEnabled"].isBool()) {
+    root["startupIpHintEnabled"] = true;
+  }
+
+  // Keep the synchronization schema canonical at the API boundary. The
+  // transport port is reserved and cannot be overridden by config input.
+  if (root.isMember("syncGroup") && root["syncGroup"].isObject()) {
+    const Json::Value &sync = root["syncGroup"];
+    Json::Value normalized(Json::objectValue);
+    normalized["enabled"] = jsonBoolAny(sync, "enabled", nullptr, false);
+    const std::string role = jsonString(sync, "role", "follower");
+    normalized["role"] = role == "leader" ? "leader" : "follower";
+    const std::string groupId = jsonString(sync, "groupId", "default");
+    normalized["groupId"] = groupId.empty() ? "default" : groupId;
+    const std::string leaderIp = jsonString(sync, "leaderIp", "");
+    const std::string legacyLeaderId = jsonString(sync, "leaderDeviceId", "");
+    normalized["leaderIp"] = leaderIp;
+    if (leaderIp.empty() && !legacyLeaderId.empty()) {
+      normalized["leaderDeviceId"] = legacyLeaderId;
+    }
+    const std::string multicastAddr =
+        jsonString(sync, "multicastAddr", "239.255.42.10");
+    normalized["multicastAddr"] = multicastAddr.empty()
+                                       ? "239.255.42.10"
+                                       : multicastAddr;
+    normalized["interface"] = jsonString(sync, "interface", "");
+    normalized["port"] = 4322;
+    normalized["ttl"] = std::clamp(jsonIntAny(sync, "ttl", nullptr, 1), 0, 255);
+    root["syncGroup"] = normalized;
+  }
+
+  if (!root.isMember("onlineVodHost") || !root["onlineVodHost"].isString()) {
+    root["onlineVodHost"] = "";
+  }
+  root["vodVolumeGainDb"] = root["vodVolumeGainDb"].isInt()
+      ? std::clamp(root["vodVolumeGainDb"].asInt(), 0, 10) : 0;
+
+  if (root.isMember("lyricFont")) {
+    root["lyricFont"] = root["lyricFont"].isString()
+        ? normalizeLyricFontPath(root["lyricFont"].asString())
+        : std::string();
+  }
+  root["lyricDisplayMode"] =
+      jsonString(root, "lyricDisplayMode", "original") == "pinyin" ? "pinyin" : "original";
+  auto normalizeLyricNumber = [&root](const char *key, double fallback,
+                                      double minValue, double maxValue) {
+    if (!root[key].isNumeric()) {
+      root[key] = fallback;
+      return;
+    }
+    const double value = root[key].asDouble();
+    root[key] = std::isfinite(value)
+        ? std::clamp(value, minValue, maxValue)
+        : fallback;
+  };
+  normalizeLyricNumber("lyricTitleFontSize", 150.0, 1.0, 300.0);
+  normalizeLyricNumber("lyricTitleOutlineWidth", 8.0, 0.0, 20.0);
+  normalizeLyricNumber("lyricTextFontSize", 140.0, 1.0, 300.0);
+  normalizeLyricNumber("lyricTextOutlineWidth", 10.0, 0.0, 20.0);
+  normalizeLyricNumber("lyricTextSpacing", -10.0, -20.0, 100.0);
+
 }
 
 void SystemConfig::applySystemAndMatrixToRoot(void *jsonRoot) const {
@@ -762,13 +985,37 @@ void SystemConfig::applySystemAndMatrixToRoot(void *jsonRoot) const {
   root["vodMode"] = vodMode_;
   root["localSongFileScanEnabled"] = localSongFileScanEnabled_;
   root["appUpdateEnabled"] = appUpdateEnabled_;
+  if (mirrorControlConfigured_) {
+    root["mirrorAutoStartMode"] = mirrorAutoStartMode_;
+    root["usbAppSceneEnabled"] = usbAppSceneEnabled_;
+    root["usbAppSceneName"] = usbAppSceneName_;
+  }
   root["renderFrameRateMode"] = renderFrameRateMode_;
   root["renderQuality"] = renderQuality_;
+  root["playbackOperationHintEnabled"] = isPlaybackOperationHintEnabled();
+  root["startupIpHintEnabled"] = isStartupIpHintEnabled();
   root["networkIpMode"] = networkIpMode_;
   root["networkStaticIp"] = networkStaticIp_;
   root["networkGateway"] = networkGateway_;
   root["networkDns"] = networkDns_;
-  root["debugHotspotEnabled"] = debugHotspotEnabled_;
+  root["startupWirelessMode"] = startupWirelessMode_;
+  root["fusionDebugEnabled"] = fusionDebugEnabled_;
+  Json::Value syncGroup(Json::objectValue);
+  syncGroup["enabled"] = syncGroupEnabled_;
+  syncGroup["groupId"] = syncGroupId_;
+  syncGroup["role"] = syncGroupRole_;
+  syncGroup["leaderIp"] = syncLeaderIp_;
+  if (syncLeaderIp_.empty() && !syncLeaderDeviceId_.empty()) {
+    syncGroup["leaderDeviceId"] = syncLeaderDeviceId_;
+  }
+  syncGroup["multicastAddr"] = syncMulticastAddress_;
+  syncGroup["interface"] = syncInterfaceAddress_;
+  syncGroup["port"] = 4322;
+  syncGroup["ttl"] = syncTtl_;
+  root["syncGroup"] = syncGroup;
+  if (usbOtgModeConfigured_) {
+    root["usbOtgMode"] = usbOtgMode_;
+  }
   root["powerScheduleEnabled"] = powerScheduleEnabled_;
   root["powerOnScheduleEnabled"] = powerOnScheduleEnabled_;
   root["powerOnDate"] = powerOnDate_;
@@ -780,9 +1027,20 @@ void SystemConfig::applySystemAndMatrixToRoot(void *jsonRoot) const {
   root["audioLipSyncOffsetMs"] = audioLipSyncOffsetMs_;
   root["onlineVodHost"] = onlineVodHost_;
   root["onlineVodRoomId"] = onlineVodRoomId_;
+  root["vodVolumeGainDb"] = getVodVolumeGainDb();
   root["dmxBaudRate"] = dmxBaudRate_;
   root["dmxStartAddress"] = dmxStartAddress_;
   root["lyricEnabled"] = lyricEnabled_;
+  root["lyricFont"] = lyricFont_;
+  root["lyricHeaderVisible"] = isLyricHeaderVisible();
+  root["lyricBackgroundVisible"] = isLyricBackgroundVisible();
+  root["lyricDisplayMode"] = isLyricPinyinEnabled() ? "pinyin" : "original";
+  root["lyricTitleFontSize"] = getLyricTitleFontSize();
+  root["lyricTitleOutlineWidth"] = getLyricTitleOutlineWidth();
+  root["lyricTextFontSize"] = getLyricTextFontSize();
+  root["lyricTextOutlineWidth"] = getLyricTextOutlineWidth();
+  root["lyricTextSpacing"] = getLyricTextSpacing();
+  root["lyricProducerText"] = lyricProducerText_;
   root["licenseServerUrl"] = licenseServerUrl_;
 }
 
@@ -817,7 +1075,8 @@ bool SystemConfig::parseLayerConfig(const std::string &layerKey,
     cfg.subtitleVisible = cfg.visible;
   }
   cfg.boundPlaylistId = jsonString(v, "boundPlaylistId", "");
-  cfg.fontPath = jsonString(v, "fontFile", "");
+  // Layer21 uses the root-level lyricFont shared setting.
+  cfg.fontPath = layerId == 21 ? "" : jsonString(v, "fontFile", "");
   cfg.filterMode = v.get("filterMode", 0).asInt();
   cfg.fadeInTime = roundFloat2(v.get("fadeInTime", 0.5f).asFloat());
   cfg.fadeOutTime = roundFloat2(v.get("fadeOutTime", 0.5f).asFloat());
@@ -862,6 +1121,16 @@ bool SystemConfig::parseLayerConfig(const std::string &layerKey,
       jsonBoolAny(v, "mirrorReadyHintVisible", "mirror_ready_hint_visible", true);
   cfg.tvVerticalCropPx =
       std::clamp(jsonIntAny(v, "tvVerticalCropPx", "tv_vertical_crop_px", 0), 0, 4000);
+  const auto cropValue = [&v](const char *camel, const char *snake) {
+    if (v.isMember(camel)) return v[camel].asFloat();
+    return v.get(snake, 0.0f).asFloat();
+  };
+  cfg.cropLeft = std::clamp(cropValue("cropLeft", "crop_left"), 0.0f, 1.0f);
+  cfg.cropTop = std::clamp(cropValue("cropTop", "crop_top"), 0.0f, 1.0f);
+  cfg.cropRight = std::clamp(cropValue("cropRight", "crop_right"), 0.0f,
+                             1.0f - cfg.cropLeft);
+  cfg.cropBottom = std::clamp(cropValue("cropBottom", "crop_bottom"), 0.0f,
+                              1.0f - cfg.cropTop);
   cfg.text = jsonString(v, "text", layerId == 40 ? "欢迎使用本系统" : "");
   if (layerId == 40 && cfg.text.empty()) {
     cfg.text = "欢迎使用本系统";
@@ -890,10 +1159,9 @@ bool SystemConfig::parseLayerConfig(const std::string &layerKey,
   cfg.l41ShowList = v.get("l41ShowList", true).asBool();
   cfg.qrContent = jsonString(v, "qrContent", layerId == 71 ? "http://192.168.1.6:8081" : "");
   cfg.qrSize = v.get("qrSize", 256).asInt();
-  cfg.qrLogoSize = v.get("qrLogoSize", 0).asInt();
   cfg.qrText = jsonString(v, "qrText", "");
   cfg.qrTextColor = jsonString(v, "qrTextColor", "1.0 1.0 1.0 1.0");
-  cfg.qrBgColor = jsonString(v, "qrBgColor", layerId == 71 ? "0 0.2 1 1" : "1.0 1.0 1.0 1.0"); // 图层71默认 #0051FF
+  cfg.qrBgColor = jsonString(v, "qrBgColor", layerId == 71 ? "0 0.2 1 1" : "1.0 1.0 1.0 1.0"); // 图层71默认 #0033FF
   cfg.qrFgColor = jsonString(v, "qrFgColor", "0.0 0.0 0.0 1.0");
   cfg.qrErrorCorrection = v.get("qrErrorCorrection", 1).asInt();
   cfg.roamConfig = jsonString(v, "roamConfig", "");
@@ -911,8 +1179,11 @@ bool SystemConfig::parseLayerConfig(const std::string &layerKey,
       cfg.size = Size(canvasRes.width, canvasRes.height);
     }
   }
-  cfg.captureWidth = 0;
-  cfg.captureHeight = 0;
+  cfg.captureWidth = std::max(0, jsonIntAny(v, "captureWidth", "capture_width", 0));
+  cfg.captureHeight = std::max(0, jsonIntAny(v, "captureHeight", "capture_height", 0));
+  cfg.captureResolutionLocked = jsonBoolAny(
+      v, "captureResolutionLocked", "capture_resolution_locked", false) &&
+      cfg.captureWidth > 0 && cfg.captureHeight > 0;
   cfg.captureIndex = std::max(0, jsonIntAny(v, "captureIndex", "capture_index", 0));
   cfg.captureRotation = normalizeCaptureRotationDegrees(
       jsonIntAny(v, "captureRotation", "capture_rotation", 0));
@@ -957,6 +1228,12 @@ void SystemConfig::saveLayerConfig(void *jsonRoot, int layerId,
   layer["scale"] = roundFloat2(config.scale);
   layer["alpha"] = roundVolume01(config.alpha);
   layer["priority"] = config.priority;
+  layer["cropLeft"] = std::clamp(config.cropLeft, 0.0f, 1.0f);
+  layer["cropTop"] = std::clamp(config.cropTop, 0.0f, 1.0f);
+  layer["cropRight"] = std::clamp(config.cropRight, 0.0f,
+                                   1.0f - std::clamp(config.cropLeft, 0.0f, 1.0f));
+  layer["cropBottom"] = std::clamp(config.cropBottom, 0.0f, 1.0f -
+                                    std::clamp(config.cropTop, 0.0f, 1.0f));
 
   // 漫游配置：所有图层都支持（仅在配置非空时保存）
   if (!config.roamConfig.empty()) {
@@ -973,6 +1250,11 @@ void SystemConfig::saveLayerConfig(void *jsonRoot, int layerId,
       if (config.captureIndex != 0) {
         layer["captureIndex"] = config.captureIndex;
       }
+      if (config.captureWidth > 0 && config.captureHeight > 0) {
+        layer["captureWidth"] = config.captureWidth;
+        layer["captureHeight"] = config.captureHeight;
+      }
+      layer["captureResolutionLocked"] = config.captureResolutionLocked;
       // 显示效果参数（对应UI中的参数）
       layer["shapeType"] = config.shapeType;
       layer["shapeParam"] = roundFloat2(config.shapeParam);
@@ -1059,7 +1341,6 @@ void SystemConfig::saveLayerConfig(void *jsonRoot, int layerId,
     if (isQr) {
       layer["qrContent"] = config.qrContent;
       layer["qrSize"] = config.qrSize;
-      layer["qrLogoSize"] = config.qrLogoSize;
       layer["qrText"] = config.qrText;
       layer["qrTextColor"] = config.qrTextColor;
       layer["qrBgColor"] = config.qrBgColor;
@@ -1072,7 +1353,7 @@ void SystemConfig::saveLayerConfig(void *jsonRoot, int layerId,
   if (isText) {
     layer["text"] = config.text;
     // fontFile: 仅保存文件名（从 fontPath 提取），启动时由 parseLayerConfig 拼出完整路径
-    if (!config.fontPath.empty()) {
+    if (layerId != 21 && !config.fontPath.empty()) {
       std::string fontFile = config.fontPath;
       size_t lastSlash = fontFile.find_last_of("/\\");
       if (lastSlash != std::string::npos) {

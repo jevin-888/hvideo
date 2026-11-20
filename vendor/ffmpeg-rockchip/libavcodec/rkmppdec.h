@@ -82,10 +82,10 @@ enum {
 
 static const AVRational mpp_tb = { 1, 1000000 };
 
-#define PTS_TO_MPP_PTS(pts, pts_tb) ((pts_tb.num && pts_tb.den) \
+#define PTS_TO_MPP_PTS(pts, pts_tb) ((pts_tb.num && pts_tb.den) ? \
     av_rescale_q(pts, pts_tb, mpp_tb) : pts)
 
-#define MPP_PTS_TO_PTS(mpp_pts, pts_tb) ((pts_tb.num && pts_tb.den) \
+#define MPP_PTS_TO_PTS(mpp_pts, pts_tb) ((pts_tb.num && pts_tb.den) ? \
     av_rescale_q(mpp_pts, mpp_tb, pts_tb) : mpp_pts)
 
 #define OFFSET(x) offsetof(RKMPPDecContext, x)

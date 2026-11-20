@@ -1,0 +1,41 @@
+{
+  "id": "destructive-playback-controls",
+  "name": "真实播放器暂停和恢复",
+  "tags": ["real-device", "destructive", "playback"],
+  "destructive": true,
+  "steps": [
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/playback/actions/pause",
+      "body": {"layerId": 1},
+      "expect_status": 200,
+      "save_as": "paused"
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "paused.body.data.state",
+      "equals": "paused"
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/playback/actions/resume",
+      "body": {"layerId": 1},
+      "expect_status": 200,
+      "save_as": "resumed"
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "resumed.body.data.state",
+      "equals": "playing"
+    },
+    {
+      "type": "adb_capture",
+      "command": ["exec-out", "screencap", "-p"],
+      "save_file": "device/playback-controls-screen.png"
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 #define HSVJ_CLOUD_SYNC_SERVICE_H
 
 #include "database/PlaylistDatabase.h"
+#include "foundation/CloudMaterialMetadata.h"
 #include <string>
 #include <atomic>
 #include <thread>
@@ -34,7 +35,8 @@ public:
     /**
      * @brief 启动同步服务
      */
-    void start(const SyncConfig& config, PlaylistDatabase* db);
+    using MaterialReadyCallback = std::function<void(const std::string&, const std::string&, const CloudMaterialMetadata&)>;
+    void start(const SyncConfig& config, PlaylistDatabase* db, MaterialReadyCallback materialReady = {});
 
     /**
      * @brief 停止同步服务
@@ -64,13 +66,15 @@ private:
     int mapLayerTypeToId(const std::string& type);
     
     // 下载素材文件
-    bool downloadMaterial(const std::string& materialId, const std::string& cdnUrl, const std::string& md5, int64_t expectedSize, std::string& outPath);
+    bool downloadMaterial(const std::string& materialId, const std::string& name, const std::string& cdnUrl, const std::string& md5, int64_t expectedSize, std::string& outPath);
     
     // 上报下载成功
-    void reportDownloadSuccess(const std::string& materialId, int64_t fileSize);
+    void reportDownloadSuccess(const std::string& materialId, int64_t fileSize,
+                               const std::string& downloadToken);
 
     SyncConfig config_;
     PlaylistDatabase* db_ = nullptr;
+    MaterialReadyCallback materialReady_;
     
     std::atomic<bool> running_{false};
     std::atomic<bool> stopRequested_{false};

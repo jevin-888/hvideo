@@ -1,4 +1,4 @@
-import { projectionCorrectionApi } from './projectionCorrection/api.js?v=1.1';
+import { projectionCorrectionApi } from './projectionCorrection/api.js?v=1.2';
 
 let initialized = false;
 let activeRegionId = 1;
@@ -115,7 +115,7 @@ function ensurePageShell() {
                             <canvas id="projectionCorrectionCaveCanvas"></canvas>
                         </div>
                         <div class="projection-correction-visual-actions">
-                            <button id="projectionCorrectionResetCaveWall" class="btn secondary" type="button">重置墙面</button>
+                            <button id="projectionCorrectionResetCaveWall" class="btn secondary" type="button">初始化 CAVE</button>
                         </div>
                     </div>
                     <div class="projection-correction-fields">
@@ -170,7 +170,7 @@ function normalizeCave(cave = {}) {
     return {
         enabled: !!cave.enabled,
         wall_type: Number(cave.wall_type ?? cave.wallType ?? 0),
-        eye_distance: Number(cave.eye_distance ?? cave.eyeDistance ?? 0.065),
+        eye_distance: Number(cave.eye_distance ?? cave.eyeDistance ?? 2),
         near_plane: Number(cave.near_plane ?? cave.nearPlane ?? 0.1),
         far_plane: Number(cave.far_plane ?? cave.farPlane ?? 100),
         llx: Number(cave.llx ?? 0),
@@ -230,7 +230,7 @@ function readForm() {
         cave: {
             enabled: boolValue('pcCaveEnabled'),
             wall_type: Math.round(numberValue('pcWallType', 0)),
-            eye_distance: numberValue('pcEyeDistance', 0.065),
+            eye_distance: numberValue('pcEyeDistance', 2),
             near_plane: numberValue('pcNearPlane', 0.1),
             far_plane: numberValue('pcFarPlane', 100),
             llx: numberValue('pcLlx', 0),
@@ -465,7 +465,7 @@ function drawCorrectionCanvas() {
 
         ctx.fillStyle = 'rgba(226, 232, 240, 0.78)';
         ctx.font = '12px sans-serif';
-        ctx.fillText(`区域 ${activeRegionId}`, 14, 22);
+        ctx.fillText((globalThis.PlayerI18n?.t(`区域 ${activeRegionId}`) ?? (`区域 ${activeRegionId}`)), 14, 22);
     });
 }
 
@@ -604,21 +604,6 @@ const CAVE_VIEW_AXES = {
 
 function readCaveForm() {
     return readForm().cave;
-}
-
-function writeCaveForm(cave = {}) {
-    setChecked('pcCaveEnabled', cave.enabled !== false);
-    setValue('pcWallType', Math.round(cave.wall_type ?? numberValue('pcWallType', 0)));
-    setValue('pcEyeDistance', roundedValue(cave.eye_distance ?? numberValue('pcEyeDistance', 0.065)));
-    setValue('pcNearPlane', roundedValue(cave.near_plane ?? numberValue('pcNearPlane', 0.1)));
-    setValue('pcFarPlane', roundedValue(cave.far_plane ?? numberValue('pcFarPlane', 100)));
-    Object.entries(CAVE_POINT_FIELDS).forEach(([key, fields]) => {
-        ['x', 'y', 'z'].forEach((axis) => {
-            const value = cave[`${key}${axis}`];
-            if (value !== undefined) setValue(fields[axis], roundedValue(value));
-        });
-    });
-    drawCaveSpaceCanvas();
 }
 
 function getCavePoints(cave = readCaveForm()) {
@@ -795,7 +780,7 @@ function drawCaveSpaceCanvas() {
             ctx.stroke();
             ctx.fillStyle = 'rgba(226, 232, 240, 0.92)';
             ctx.font = '12px sans-serif';
-            ctx.fillText(CAVE_POINT_FIELDS[key].label, point.x + 9, point.y - 8);
+            ctx.fillText((globalThis.PlayerI18n?.t(CAVE_POINT_FIELDS[key].label) ?? (CAVE_POINT_FIELDS[key].label)), point.x + 9, point.y - 8);
         });
 
         ctx.fillStyle = 'rgba(148, 163, 184, 0.8)';
@@ -803,7 +788,7 @@ function drawCaveSpaceCanvas() {
         const axisText = caveViewMode === 'iso'
             ? 'ISO'
             : `${geometry.hAxis.toUpperCase()} / ${geometry.vAxis.toUpperCase()}`;
-        ctx.fillText(axisText, 14, 22);
+        ctx.fillText((globalThis.PlayerI18n?.t(axisText) ?? (axisText)), 14, 22);
     });
 }
 
@@ -897,29 +882,13 @@ function bindCaveSpaceCanvas() {
     }
 }
 
-function caveWallTemplate(wallType) {
-    switch (Number(wallType)) {
-        case 1:
-            return { llx: -1, lly: -1, llz: 1, ulx: -1, uly: 1, ulz: 1, lrx: -1, lry: -1, lrz: -1 };
-        case 2:
-            return { llx: 1, lly: -1, llz: -1, ulx: 1, uly: 1, ulz: -1, lrx: 1, lry: -1, lrz: 1 };
-        case 3:
-            return { llx: -1, lly: -1, llz: 1, ulx: -1, uly: -1, ulz: -1, lrx: 1, lry: -1, lrz: 1 };
-        case 4:
-            return { llx: -1, lly: 1, llz: -1, ulx: -1, uly: 1, ulz: 1, lrx: 1, lry: 1, lrz: -1 };
-        case 0:
-        default:
-            return { llx: -1, lly: -1, llz: 0, ulx: -1, uly: 1, ulz: 0, lrx: 1, lry: -1, lrz: 0 };
-    }
-}
-
-function resetCaveWallForm() {
-    const cave = readCaveForm();
-    writeCaveForm({
-        ...cave,
-        enabled: true,
-        ...caveWallTemplate(cave.wall_type)
-    });
+async function initializeCaveWall() {
+    setStatus('正在初始化 CAVE...', 'info');
+    const wallType = Math.round(numberValue('pcWallType', 0));
+    currentConfig = await projectionCorrectionApi.initializeCave(activeRegionId, wallType);
+    fillForm(currentConfig || {});
+    setConfigPath(currentConfig || {});
+    setStatus(`区域 ${activeRegionId} CAVE 已初始化并应用`, 'ok');
 }
 
 function renderRegionMap() {
@@ -1040,8 +1009,7 @@ function bindEvents() {
         saveCorrection().catch(error => setStatus(error.message || '保存失败', 'error'));
     });
     $('#projectionCorrectionResetCaveWall')?.addEventListener('click', () => {
-        resetCaveWallForm();
-        saveCorrection().catch(error => setStatus(error.message || '保存失败', 'error'));
+        initializeCaveWall().catch(error => setStatus(error.message || 'CAVE 初始化失败', 'error'));
     });
     document.querySelectorAll('#projectionCorrectionCaveViews [data-cave-view]').forEach((button) => {
         button.addEventListener('click', () => {

@@ -2,6 +2,7 @@
 #define HSVJ_LOCAL_SONG_FILE_SCANNER_H
 
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -50,6 +51,7 @@ private:
     bool shouldUseSuFind(const std::string& root) const;
 
     std::atomic<bool> running_{false};
+    std::mutex lifecycleMutex_;
     std::atomic<bool> stopRequested_{false};
     std::thread worker_;
 };

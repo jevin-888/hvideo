@@ -1,6 +1,10 @@
 #include "lyric/LyricRenderer.h"
 
 #include "lyric/ASSRenderer.h"
+#include "lyric/LyricPinyin.h"
+#include "lyric/LyricCountdown.h"
+#include "lyric/AssOverrideTags.h"
+#include "lyric/LyricVocalColor.h"
 
 #include "utils/Logger.h"
 
@@ -11,6 +15,8 @@
 #include <array>
 
 #include <cstring>
+
+#include <cctype>
 
 #include <string>
 
@@ -36,17 +42,16 @@ namespace {
 
 constexpr double kLyricFontSize = 150.0;
 
-constexpr int32_t kLyricPrimaryColour = 0xFF210000;
+constexpr double kLyricCharacterSpacing = 0.0;
 
 constexpr int32_t kLyricSecondaryColour = 0xFFFFFF00;
 
-constexpr int32_t kLyricOutlineColour = 0x00000000;
+constexpr int32_t kLyricUnsungOutlineColour = 0x00000000;
 
-constexpr int32_t kLyricBackColour = 0xFFFFFF00;
+constexpr int32_t kLyricSungOutlineColour = 0xFFFFFF00;
 
-constexpr double kLyricOutline = 1.5;
 
-constexpr double kLyricShadow = 0.0;
+constexpr double kLyricBackgroundPadding = 12.0;
 
 
 
@@ -91,18 +96,11 @@ struct LyricEventSnapshot {
 
 
 bool containsKaraokeTag(const char *text) {
-
-  if (!text) {
-
-    return false;
-
-  }
-
-  return std::strstr(text, "{\\K") != nullptr || std::strstr(text, "{\\k") != nullptr;
-
+  if (!text) return false;
+  bool found = false;
+  stripAssTags(text, AssTagGroup::Karaoke, &found);
+  return found;
 }
-
-
 
 void replaceOwnedString(char **dest, const std::string &value) {
 
@@ -138,61 +136,62 @@ void replaceOwnedString(char **dest, const std::string &value) {
 
 
 
-std::string stripTagPrefix(const std::string &text, const char *tagPrefix) {
-
-  std::string result = text;
-
-  size_t pos = 0;
-
-  while ((pos = result.find(tagPrefix, pos)) != std::string::npos) {
-
-    const size_t end = result.find('}', pos);
-
-    if (end == std::string::npos) {
-
-      break;
-
-    }
-
-    result.erase(pos, end - pos + 1);
-
-  }
-
-  return result;
-
-}
-
-
-
 std::string stripPositioningTags(const std::string &text) {
-
-  std::string result = text;
-
-  result = stripTagPrefix(result, "{\\pos");
-
-  result = stripTagPrefix(result, "{\\move");
-
-  result = stripTagPrefix(result, "{\\an");
-
-  return result;
-
+  return stripAssTags(text, AssTagGroup::Position);
 }
-
-
 
 std::string stripKaraokeTags(const std::string &text) {
-
-  std::string result = text;
-
-  result = stripTagPrefix(result, "{\\K");
-
-  result = stripTagPrefix(result, "{\\k");
-
-  return result;
-
+  return stripAssTags(text, AssTagGroup::Karaoke);
 }
 
+// Countdown dots are ASS vector events so every output uses the same atlas,
+// composite texture and timeline (including pause, seek, slices and device reset).
+int appendCountdownEvents(ASS_Track *track,
+                          const std::vector<LyricEventSnapshot> &lyrics,
+                          int anchorX, int anchorY) {
+  std::vector<LyricVocalInterval> vocals;
+  for (const auto &line : lyrics) vocals.push_back({line.start, line.start + line.duration});
+  const auto windows = lyricCountdownWindows(std::move(vocals));
+  if (windows.empty()) return 0;
 
+  const int styleIndex = ass_alloc_style(track);
+  if (styleIndex < 0) return 0;
+  ASS_Style &style = track->styles[styleIndex];
+  style.Name = ::strdup("Countdown");
+  style.FontName = ::strdup("sans-serif");
+  style.FontSize = 72;
+  style.ScaleX = style.ScaleY = 1.0;
+  // libass colors are RRGGBBAA; alpha 00 is opaque.
+  style.PrimaryColour = 0x0011FF00;
+  style.OutlineColour = 0xFFFFFF00;
+  style.BorderStyle = 1;
+  style.Alignment = 7;
+
+  int added = 0;
+  for (const auto &window : windows) {
+    for (int slot = 0; slot < 3; ++slot) {
+      const int64_t end = window.end - slot * 1000;
+      if (end <= window.start) continue;
+      const int index = ass_alloc_event(track);
+      if (index < 0) continue;
+      ASS_Event &event = track->events[index];
+      event.Start = window.start;
+      event.Duration = end - window.start;
+      event.Style = styleIndex;
+      event.Layer = 1;
+      event.ReadOrder = index;
+      // 72px circle, 5px white rim; fixed overrides isolate it from font settings.
+      const std::string text = "{\\an7\\pos(" + std::to_string(anchorX + slot * 108) +
+          "," + std::to_string(anchorY) +
+          ")\\fscx100\\fscy100\\bord5\\shad0\\1c&HFF1100&\\3c&HFFFFFF&\\alpha&H00&\\p1}"
+          "m 36 5 b 53 5 67 19 67 36 b 67 53 53 67 36 67 "
+          "b 19 67 5 53 5 36 b 5 19 19 5 36 5{\\p0}";
+      replaceOwnedString(&event.Text, text);
+      ++added;
+    }
+  }
+  return added;
+}
 
 const char *getEventStyleName(const ASS_Track *track, const ASS_Event *event) {
 
@@ -208,37 +207,36 @@ const char *getEventStyleName(const ASS_Track *track, const ASS_Event *event) {
 
 
 
+std::string normalizeHeaderStyleName(std::string styleName) {
+  while (!styleName.empty() && std::isspace(static_cast<unsigned char>(styleName.front()))) styleName.erase(styleName.begin());
+  while (!styleName.empty() && std::isspace(static_cast<unsigned char>(styleName.back()))) styleName.pop_back();
+  for (char &ch : styleName) if (static_cast<unsigned char>(ch) < 0x80) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return styleName;
+}
+
 HeaderCategory getHeaderCategory(const std::string &styleName) {
-
-  if (styleName == "SongName" || styleName == "SongName:" ||
-
-      styleName == "\xe6\xad\x8c\xe5\x90\x8d" || styleName == "\xe6\xad\x8c\xe5\x90\x8d:") {
-
+  const std::string normalized = normalizeHeaderStyleName(styleName);
+  if (normalized == "songname" || normalized == "songname:" || normalized == "title" ||
+      normalized == "song" || normalized == "songtitle" || normalized == "tracktitle" ||
+      normalized == "歌名" || normalized == "歌名:" || normalized == "歌曲" || normalized == "曲名") {
     return HeaderCategory::kSongName;
-
   }
-
-  if (styleName == "Singer" || styleName == "\xe6\xbc\x94\xe5\x94\xb1") {
-
+  if (normalized == "singer" || normalized == "artist" || normalized == "vocal" || normalized == "演唱") {
     return HeaderCategory::kSinger;
-
   }
-
-  if (styleName == "Producer" || styleName == "Album" ||
-
-      styleName == "\xe5\x87\xba\xe5\x93\x81" || styleName == "\xe4\xb8\x93\xe8\xbe\x91") {
-
+  if (normalized == "producer" || normalized == "album" || normalized == "credit" ||
+      normalized == "credits" || normalized == "出品" || normalized == "专辑") {
     return HeaderCategory::kProducer;
-
   }
-
   return HeaderCategory::kUnknown;
-
 }
 
 
 
-void applyDefaultStyles(ASS_Track *track) {
+void applyDefaultStyles(ASS_Track *track, double titleFontSize,
+                        double titleOutlineWidth,
+                        double textFontSize, double textOutlineWidth,
+                        double textSpacing) {
 
   for (int i = 0; i < track->n_styles; ++i) {
 
@@ -254,23 +252,24 @@ void applyDefaultStyles(ASS_Track *track) {
 
     const std::string styleName = style->Name ? style->Name : "";
 
+    // Our libass uses BackColour for the sung outline. BorderStyle 4 adds
+    // a separate translucent black rectangle; Shadow controls its padding.
+    style->BorderStyle = 4;
+    style->BackColour = kLyricSungOutlineColour;
+    style->Shadow = kLyricBackgroundPadding;
+
     if (styleName == "Lyric" || styleName == "\xe6\xad\x8c\xe8\xaf\x8d") {
 
-      style->FontSize = kLyricFontSize;
+      style->FontSize = textFontSize;
 
-      style->PrimaryColour = kLyricPrimaryColour;
+      // Primary color is selected per line by the external vocal-role rule.
 
       style->SecondaryColour = kLyricSecondaryColour;
 
-      style->OutlineColour = kLyricOutlineColour;
+      style->OutlineColour = kLyricUnsungOutlineColour;
 
-      style->BackColour = kLyricBackColour;
-
-      style->BorderStyle = 1;
-
-      style->Outline = kLyricOutline;
-
-      style->Shadow = kLyricShadow;
+      style->Outline = textOutlineWidth;
+      style->Spacing = textSpacing;
 
       continue;
 
@@ -278,21 +277,15 @@ void applyDefaultStyles(ASS_Track *track) {
 
 
 
-    if (styleName == "SongName" || styleName == "SongName:" ||
+    if (getHeaderCategory(styleName) == HeaderCategory::kSongName) {
 
-        styleName == "\xe6\xad\x8c\xe5\x90\x8d" || styleName == "\xe6\xad\x8c\xe5\x90\x8d:") {
+      style->FontSize = titleFontSize;
 
-      style->FontSize = 150.0;
-
-      style->PrimaryColour = 0xFF210000;
+      style->PrimaryColour = 0x0021FF00;
 
       style->OutlineColour = 0xFFFFFF00;
 
-      style->BorderStyle = 1;
-
-      style->Outline = 3.0;
-
-      style->Shadow = 0.0;
+      style->Outline = titleOutlineWidth;
 
       continue;
 
@@ -300,11 +293,8 @@ void applyDefaultStyles(ASS_Track *track) {
 
 
 
-    if (styleName == "Singer" || styleName == "Album" ||
-
-        styleName == "\xe6\xbc\x94\xe5\x94\xb1" || styleName == "\xe4\xb8\x93\xe8\xbe\x91" ||
-
-        styleName == "Producer" || styleName == "\xe5\x87\xba\xe5\x93\x81") {
+    if (getHeaderCategory(styleName) == HeaderCategory::kSinger ||
+        getHeaderCategory(styleName) == HeaderCategory::kProducer) {
 
       style->FontSize = 60.0;
 
@@ -312,11 +302,7 @@ void applyDefaultStyles(ASS_Track *track) {
 
       style->OutlineColour = 0x00000000;
 
-      style->BorderStyle = 1;
-
-      style->Outline = 2.0;
-
-      style->Shadow = 0.0;
+      style->Outline = 2.6;
 
     }
 
@@ -346,6 +332,18 @@ void clearHeaderEvent(ASS_Event *event) {
 
 
 
+void LyricRenderer::applyHeaderVisibilityToTrack() {
+  ASS_Track* track = currentTrack();
+  if (headerVisible_ || !track) return;
+  for (int i = 0; i < track->n_events; ++i) {
+    ASS_Event* event = &track->events[i];
+    const char* styleName = getEventStyleName(track, event);
+    if (styleName && getHeaderCategory(styleName) != HeaderCategory::kUnknown) {
+      clearHeaderEvent(event);
+    }
+  }
+}
+
 int LyricRenderer::adjustSubtitleTimingAndTracks() {
 
   if (!assRenderer_ || !assRenderer_->isInitialized()) {
@@ -366,7 +364,37 @@ int LyricRenderer::adjustSubtitleTimingAndTracks() {
 
 
 
-  applyDefaultStyles(track);
+  // External layout owns typography and the vocal palette. Resolve voice before
+  // pinyin conversion and line duplication; unlabeled continuations inherit it.
+  std::vector<int> vocalOrder;
+  for (int i = 0; i < track->n_events; ++i)
+    if (containsKaraokeTag(track->events[i].Text)) vocalOrder.push_back(i);
+  std::stable_sort(vocalOrder.begin(), vocalOrder.end(), [track](int a, int b) {
+    return track->events[a].Start < track->events[b].Start;
+  });
+  LyricVocalRole previousRole = LyricVocalRole::Unknown;
+  for (int index : vocalOrder) {
+    ASS_Event& event = track->events[index];
+    const char* name = getEventStyleName(track, &event);
+    const uint32_t color = name ? track->styles[event.Style].PrimaryColour : 0;
+    previousRole = resolveLyricVocalRole(event.Text, name ? name : "", color, previousRole);
+    if (name) track->styles[event.Style].Spacing = kLyricCharacterSpacing;
+    const auto spacedText = stripAssTags(event.Text, AssTagGroup::CharacterSpacing);
+    replaceOwnedString(&event.Text, applyLyricVocalColor(spacedText, previousRole));
+  }
+  applyDefaultStyles(track, titleFontSize_, titleOutlineWidth_,
+                     textFontSize_, textOutlineWidth_, textSpacing_);
+
+  // Convert the original events before building waiting lines and listening
+  // mode copies. Karaoke tags and timestamps keep their original ownership.
+  if (pinyinEnabled_) {
+    for (int i = 0; i < track->n_events; ++i) {
+      ASS_Event &event = track->events[i];
+      if (!event.Text) continue;
+      const std::string text = convertAssToPinyin(event.Text);
+      if (text != event.Text) replaceOwnedString(&event.Text, text);
+    }
+  }
 
 
 
@@ -450,9 +478,10 @@ int LyricRenderer::adjustSubtitleTimingAndTracks() {
 
 
 
-    const int titleY = std::max(24, playResY / 60);
+    const int baseTitleY = std::max(24, playResY / 60);
+    const int titleY = baseTitleY + 5;
 
-    const int singerY = std::max(titleY + 92, playResY / 12);
+    const int singerY = std::max(baseTitleY + 92, playResY / 12);
 
     const int producerY = std::max(singerY + 64, playResY / 8);
 
@@ -573,18 +602,23 @@ int LyricRenderer::adjustSubtitleTimingAndTracks() {
       const int64_t originalDuration = event->Duration;
 
       std::string headerText = stripPositioningTags(event->Text);
+      if (categoryIndex == 2 && !producerText_.empty()) {
+        headerText = producerText_;
+      }
 
       if (categoryIndex == 0) {
 
-        headerText = "{\\fs96}{\\c&HFFFFFF&}{\\3c&H000000&}{\\bord1.8}" + headerText;
+        headerText = "{\\fs" + std::to_string(titleFontSize_) +
+                     "}{\\c&HFFFFFF&}{\\3c&H000000&}{\\bord" +
+                     std::to_string(titleOutlineWidth_) + "}" + headerText;
 
       } else if (categoryIndex == 1) {
 
-        headerText = "{\\fs62}{\\c&HFFFFFF&}{\\3c&H000000&}{\\bord1.2}" + headerText;
+        headerText = "{\\fs62}{\\c&HFFFFFF&}{\\3c&H000000&}{\\bord1.8}" + headerText;
 
       } else {
 
-        headerText = "{\\fs54}{\\c&HE9EEF5&}{\\3c&H000000&}{\\bord1.0}" + headerText;
+        headerText = "{\\fs54}{\\c&HE9EEF5&}{\\3c&H000000&}{\\bord1.6}" + headerText;
 
       }
 
@@ -887,6 +921,8 @@ int LyricRenderer::adjustSubtitleTimingAndTracks() {
 
 
 
+    adjustedCount += appendCountdownEvents(track, lyricEvents,
+        std::max(0, centerX_ - 144), std::max(0, highlightY - 240));
     return adjustedCount;
 
   }
@@ -901,238 +937,17 @@ int LyricRenderer::adjustSubtitleTimingAndTracks() {
 
   topX_ = 200;
 
-  topY_ = playResY - 300;
+  topY_ = playResY * 860 / 1080;
 
   bottomX_ = playResX - 200;
 
-  bottomY_ = playResY - 150;
-
-  karaokeCountdownAnchorX_ = topX_;
-
-  karaokeCountdownAnchorY_ = topY_;
+  bottomY_ = playResY * 1010 / 1080;
 
   centerX_ = effectiveLeft + (effectiveRight - effectiveLeft) / 2;
 
 
 
-  std::vector<LyricEventSnapshot> lyricEvents;
-
-  lyricEvents.reserve(static_cast<size_t>(track->n_events));
-
-  for (int i = 0; i < originalEventCount; ++i) {
-
-    ASS_Event *event = &track->events[i];
-
-    if (!event || !event->Text || !containsKaraokeTag(event->Text)) {
-
-      continue;
-
-    }
-
-
-
-    LyricEventSnapshot snapshot;
-
-    snapshot.eventIndex = i;
-
-    snapshot.start = event->Start;
-
-    snapshot.duration = event->Duration;
-
-    snapshot.readOrder = event->ReadOrder;
-
-    snapshot.layer = event->Layer;
-
-    snapshot.style = event->Style;
-
-    snapshot.marginL = event->MarginL;
-
-    snapshot.marginR = event->MarginR;
-
-    snapshot.marginV = event->MarginV;
-
-    snapshot.text = event->Text;
-
-    lyricEvents.push_back(std::move(snapshot));
-
-  }
-
-
-
-  if (lyricEvents.empty()) {
-
-    return 0;
-
-  }
-
-
-
-  const int64_t firstLyricStartTime = lyricEvents.front().start;
-
-  const int64_t countdownStartTime = std::max<int64_t>(0, firstLyricStartTime - 3000);
-
-
-
-  std::vector<int64_t> upperLineEndTimes;
-
-  std::vector<int64_t> lowerLineEndTimes;
-
-  upperLineEndTimes.reserve((lyricEvents.size() + 1) / 2);
-
-  lowerLineEndTimes.reserve(lyricEvents.size() / 2);
-
-  for (size_t i = 0; i < lyricEvents.size(); ++i) {
-
-    const int64_t endTime = lyricEvents[i].start + lyricEvents[i].duration;
-
-    if ((i % 2) == 0) {
-
-      upperLineEndTimes.push_back(endTime);
-
-    } else {
-
-      lowerLineEndTimes.push_back(endTime);
-
-    }
-
-  }
-
-
-
-  for (size_t i = 0; i < lyricEvents.size(); ++i) {
-
-    const LyricEventSnapshot &snapshot = lyricEvents[i];
-
-    const bool isUpperLine = (i % 2) == 0;
-
-    const int posX = isUpperLine ? topX_ : bottomX_;
-
-    const int posY = isUpperLine ? topY_ : bottomY_;
-
-    const int alignment = isUpperLine ? 1 : 3;
-
-
-
-    if (i == 0) {
-
-      karaokeCountdownAnchorX_ = posX;
-
-      karaokeCountdownAnchorY_ = posY;
-
-    }
-
-
-
-    int64_t waitStart = countdownStartTime;
-
-    if (isUpperLine) {
-
-      const size_t lineIndex = i / 2;
-
-      if (lineIndex > 0) {
-
-        waitStart = upperLineEndTimes[lineIndex - 1];
-
-      }
-
-    } else {
-
-      const size_t lineIndex = (i - 1) / 2;
-
-      if (lineIndex > 0) {
-
-        waitStart = lowerLineEndTimes[lineIndex - 1];
-
-      }
-
-    }
-
-    if (waitStart > snapshot.start) {
-
-      waitStart = snapshot.start;
-
-    }
-
-
-
-    ASS_Event *waitEvent = &track->events[snapshot.eventIndex];
-
-    if (!waitEvent) {
-
-      continue;
-
-    }
-
-
-
-    waitEvent->Start = waitStart;
-
-    waitEvent->Duration = std::max<int64_t>(0, snapshot.start - waitStart);
-
-
-
-    std::string waitText = stripPositioningTags(snapshot.text);
-
-    waitText = stripKaraokeTags(waitText);
-
-    waitText = "{\\an" + std::to_string(alignment) + "}{\\pos(" +
-
-               std::to_string(posX) + "," + std::to_string(posY) + ")}" +
-
-               "{\\c&HFFFFFF&}{\\3c&H000000&}{\\bord2.0}" + waitText;
-
-    replaceOwnedString(&waitEvent->Text, waitText);
-
-    ++adjustedCount;
-
-
-
-    const int scrollIndex = ass_alloc_event(track);
-
-    if (scrollIndex < 0) {
-
-      continue;
-
-    }
-
-
-
-    ASS_Event *scrollEvent = &track->events[scrollIndex];
-
-    scrollEvent->Start = snapshot.start;
-
-    scrollEvent->Duration = snapshot.duration;
-
-    scrollEvent->ReadOrder = snapshot.readOrder;
-
-    scrollEvent->Layer = snapshot.layer;
-
-    scrollEvent->Style = snapshot.style;
-
-    scrollEvent->MarginL = snapshot.marginL;
-
-    scrollEvent->MarginR = snapshot.marginR;
-
-    scrollEvent->MarginV = snapshot.marginV;
-
-
-
-    std::string scrollText = stripPositioningTags(snapshot.text);
-
-    scrollText = "{\\an" + std::to_string(alignment) + "}{\\pos(" +
-
-                 std::to_string(posX) + "," + std::to_string(posY) + ")}" +
-
-                 scrollText;
-
-    replaceOwnedString(&scrollEvent->Text, scrollText);
-
-    ++adjustedCount;
-
-  }
-
-
-
+  // Progressive snapshots can contain headers only: position them before any lyric early return.
   std::array<int, 3> primaryHeaderIndices = {-1, -1, -1};
 
   for (int i = 0; i < originalEventCount; ++i) {
@@ -1214,13 +1029,9 @@ int LyricRenderer::adjustSubtitleTimingAndTracks() {
 
 
   const std::array<int, 3> headerPosY = {
-
-      playResY * 20 / 100,
-
+      playResY * 20 / 100 + 5,
       playResY * 35 / 100,
-
       playResY * 42 / 100,
-
   };
 
 
@@ -1250,6 +1061,9 @@ int LyricRenderer::adjustSubtitleTimingAndTracks() {
     const int64_t originalDuration = event->Duration;
 
     std::string headerText = stripPositioningTags(event->Text);
+    if (categoryIndex == 2 && !producerText_.empty()) {
+      headerText = producerText_;
+    }
 
     headerText = "{\\an8}{\\pos(" + std::to_string(centerX_) + "," +
 
@@ -1265,6 +1079,183 @@ int LyricRenderer::adjustSubtitleTimingAndTracks() {
 
 
 
+  std::vector<LyricEventSnapshot> lyricEvents;
+
+  lyricEvents.reserve(static_cast<size_t>(track->n_events));
+
+  for (int i = 0; i < originalEventCount; ++i) {
+
+    ASS_Event *event = &track->events[i];
+
+    if (!event || !event->Text || !containsKaraokeTag(event->Text)) {
+
+      continue;
+
+    }
+
+
+
+    LyricEventSnapshot snapshot;
+
+    snapshot.eventIndex = i;
+
+    snapshot.start = event->Start;
+
+    snapshot.duration = event->Duration;
+
+    snapshot.readOrder = event->ReadOrder;
+
+    snapshot.layer = event->Layer;
+
+    snapshot.style = event->Style;
+
+    snapshot.marginL = event->MarginL;
+
+    snapshot.marginR = event->MarginR;
+
+    snapshot.marginV = event->MarginV;
+
+    snapshot.text = event->Text;
+
+    lyricEvents.push_back(std::move(snapshot));
+
+  }
+
+
+
+  if (lyricEvents.empty()) {
+
+    return adjustedCount;
+
+  }
+
+
+
+  std::stable_sort(lyricEvents.begin(), lyricEvents.end(),
+      [](const auto &a, const auto &b) { return a.start < b.start; });
+
+  const int64_t firstLyricStartTime = lyricEvents.front().start;
+
+  const int64_t countdownStartTime = std::max<int64_t>(0, firstLyricStartTime - 3000);
+
+
+
+  // Preserve the fully sung line for one second without shifting karaoke tags.
+  // A new lyric in the same row takes priority once its singing starts.
+  constexpr int64_t kCompletedLineHoldMs = 1000;
+  std::vector<int64_t> lineDisplayEndTimes;
+  lineDisplayEndTimes.reserve(lyricEvents.size());
+  for (size_t i = 0; i < lyricEvents.size(); ++i) {
+    const int64_t vocalEnd = lyricEvents[i].start + lyricEvents[i].duration;
+    int64_t displayEnd = vocalEnd + kCompletedLineHoldMs;
+    if (i + 2 < lyricEvents.size()) {
+      displayEnd = std::min(displayEnd,
+                           std::max(vocalEnd, lyricEvents[i + 2].start));
+    }
+    lineDisplayEndTimes.push_back(displayEnd);
+  }
+
+  for (size_t i = 0; i < lyricEvents.size(); ++i) {
+
+    const LyricEventSnapshot &snapshot = lyricEvents[i];
+
+    const bool isUpperLine = (i % 2) == 0;
+
+    const int posX = isUpperLine ? topX_ : bottomX_;
+
+    const int posY = isUpperLine ? topY_ : bottomY_;
+
+    const int alignment = isUpperLine ? 1 : 3;
+
+
+
+
+
+    const int64_t waitStart = std::min(
+        snapshot.start, i >= 2 ? lineDisplayEndTimes[i - 2] : countdownStartTime);
+
+    ASS_Event *waitEvent = &track->events[snapshot.eventIndex];
+
+    if (!waitEvent) {
+
+      continue;
+
+    }
+
+
+
+    waitEvent->Start = waitStart;
+
+    waitEvent->Duration = std::max<int64_t>(0, snapshot.start - waitStart);
+
+
+
+    std::string waitText = stripPositioningTags(snapshot.text);
+
+    waitText = stripKaraokeTags(waitText);
+    // Waiting lines remain white; vocal colors apply when their singing starts.
+    waitText = stripAssTags(waitText, AssTagGroup::PrimaryColor);
+
+    waitText = "{\\an" + std::to_string(alignment) + "}{\\pos(" +
+
+               std::to_string(posX) + "," + std::to_string(posY) + ")}" +
+
+               "{\\c&HFFFFFF&}{\\3c&H000000&}" + waitText;
+
+    replaceOwnedString(&waitEvent->Text, waitText);
+
+    ++adjustedCount;
+
+
+
+    const int scrollIndex = ass_alloc_event(track);
+
+    if (scrollIndex < 0) {
+
+      continue;
+
+    }
+
+
+
+    ASS_Event *scrollEvent = &track->events[scrollIndex];
+
+    scrollEvent->Start = snapshot.start;
+
+    scrollEvent->Duration = lineDisplayEndTimes[i] - snapshot.start;
+
+    scrollEvent->ReadOrder = snapshot.readOrder;
+
+    scrollEvent->Layer = snapshot.layer;
+
+    scrollEvent->Style = snapshot.style;
+
+    scrollEvent->MarginL = snapshot.marginL;
+
+    scrollEvent->MarginR = snapshot.marginR;
+
+    scrollEvent->MarginV = snapshot.marginV;
+
+
+
+    std::string scrollText = stripPositioningTags(snapshot.text);
+
+    scrollText = "{\\an" + std::to_string(alignment) + "}{\\pos(" +
+
+                 std::to_string(posX) + "," + std::to_string(posY) + ")}" +
+
+                 scrollText;
+
+    replaceOwnedString(&scrollEvent->Text, scrollText);
+
+    ++adjustedCount;
+
+  }
+
+
+
+  adjustedCount += appendCountdownEvents(track, lyricEvents, topX_,
+      std::max(0, topY_ - static_cast<int>(kLyricFontSize * 1.1) - 92));
   return adjustedCount;
 
 }
@@ -1272,5 +1263,3 @@ int LyricRenderer::adjustSubtitleTimingAndTracks() {
 
 
 } // 命名空间 hsvj
-
-

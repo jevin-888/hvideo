@@ -3,6 +3,9 @@
  * @brief 纯音频播放器实现，规则 A 下与视频解码器互斥使用 AudioPlayer
  */
 
+#ifdef __ANDROID__
+#include "utils/EncryptedMedia.h"
+#endif
 #include "decoder/AudioOnlyPlayer.h"
 #include "audio/AudioPlayerManager.h"
 #include "utils/FileUtils.h"
@@ -85,7 +88,7 @@ bool AudioOnlyPlayer::open(const std::string& path) {
   AVDictionary* opts = nullptr;
   av_dict_set(&opts, "probesize", "500000", 0);
   av_dict_set(&opts, "analyzeduration", "500000", 0);
-  int ret = avformat_open_input(&impl_->formatCtx, path.c_str(), nullptr, &opts);
+  int ret = encrypted_media::openInput(&impl_->formatCtx, path.c_str(), nullptr, &opts);
   av_dict_free(&opts);
   if (ret < 0) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -231,16 +234,18 @@ bool AudioOnlyPlayer::start(int layerId) {
     player->setAudioDataCallback(impl_->audioDataCallback);
   }
 
-  if (AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId)) {
+  if (AudioPlayerManager::getInstance().hasFocus(AudioFocusSource::AUDIO_ONLY) &&
+      AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId)) {
     player->flush();
     player->setTargetVolume(impl_->volume);
-  }
-
-  if (!player->start()) {
-    LOG_ERROR("[AudioOnlyPlayer] Failed to start AudioPlayer");
-    AudioPlayerManager::getInstance().releaseFocus(AudioFocusSource::AUDIO_ONLY);
-    impl_->hasFocus.store(false);
-    return false;
+    if (!player->start()) {
+      LOG_ERROR("[AudioOnlyPlayer] Failed to start AudioPlayer");
+      AudioPlayerManager::getInstance().releaseFocus(AudioFocusSource::AUDIO_ONLY);
+      impl_->hasFocus.store(false);
+      return false;
+    }
+  } else {
+    LOG_INFO("[AudioOnlyPlayer] Started muted by external audio focus for layer %d", layerId);
   }
 
   impl_->decodeThread = std::thread(&AudioOnlyPlayer::decodeThreadFunc, this);
@@ -287,11 +292,12 @@ void AudioOnlyPlayer::resume() {
   impl_->paused.store(false, std::memory_order_release);
   if (impl_->hasFocus.load(std::memory_order_acquire) &&
       AudioPlayerManager::getInstance().hasAudioFocusForLayer(impl_->currentLayerId.load())) {
-    AudioPlayerManager::getInstance().restoreFocus(AudioFocusSource::AUDIO_ONLY);
-    AudioPlayer* p = AudioPlayerManager::getInstance().getAudioPlayer();
-    if (p) {
-      p->setTargetVolume(impl_->volume);
-      p->resume();
+    if (AudioPlayerManager::getInstance().restoreFocus(AudioFocusSource::AUDIO_ONLY)) {
+      AudioPlayer* p = AudioPlayerManager::getInstance().getAudioPlayer();
+      if (p) {
+        p->setTargetVolume(impl_->volume);
+        p->resume();
+      }
     }
   }
 #endif
@@ -369,8 +375,9 @@ void AudioOnlyPlayer::decodeThreadFunc() {
         std::lock_guard<std::mutex> cbLock(impl_->callbackMutex);
         player->setAudioDataCallback(impl_->audioDataCallback);
         player->setTargetVolume(impl_->volume);
-        player->start();
-        AudioPlayerManager::getInstance().restoreFocus(AudioFocusSource::AUDIO_ONLY);
+        if (AudioPlayerManager::getInstance().restoreFocus(AudioFocusSource::AUDIO_ONLY)) {
+          player->start();
+        }
       }
     }
     return player != nullptr;
@@ -382,10 +389,11 @@ void AudioOnlyPlayer::decodeThreadFunc() {
   auto restoreAudioOnlyFocusIfLayerOwnsAudio = [&]() {
     if (AudioPlayerManager::getInstance().hasAudioFocusForLayer(impl_->currentLayerId.load()) &&
         impl_->hasFocus.load(std::memory_order_acquire)) {
-      AudioPlayerManager::getInstance().restoreFocus(AudioFocusSource::AUDIO_ONLY);
-      AudioPlayer* activePlayer = player ? player : AudioPlayerManager::getInstance().getAudioPlayer();
-      if (activePlayer) {
-        activePlayer->setTargetVolume(impl_->volume);
+      if (AudioPlayerManager::getInstance().restoreFocus(AudioFocusSource::AUDIO_ONLY)) {
+        AudioPlayer* activePlayer = player ? player : AudioPlayerManager::getInstance().getAudioPlayer();
+        if (activePlayer) {
+          activePlayer->setTargetVolume(impl_->volume);
+        }
       }
     }
   };
@@ -450,7 +458,9 @@ void AudioOnlyPlayer::decodeThreadFunc() {
                                      &impl_->audioBuffer, static_cast<int>(outSamples),
                                      const_cast<const uint8_t**>(frame->data), frame->nb_samples);
               if (conv > 0) {
-                player->write(impl_->audioBuffer, conv);
+                AudioPlayerManager::getInstance().writeForLayer(
+                    AudioFocusSource::AUDIO_ONLY, impl_->currentLayerId.load(),
+                    impl_->audioBuffer, conv);
                 throttleAudioQueue();
               }
             }
@@ -512,7 +522,9 @@ void AudioOnlyPlayer::decodeThreadFunc() {
                                &impl_->audioBuffer, static_cast<int>(outSamples),
                                const_cast<const uint8_t**>(frame->data), frame->nb_samples);
         if (conv > 0) {
-          player->write(impl_->audioBuffer, conv);
+          AudioPlayerManager::getInstance().writeForLayer(
+              AudioFocusSource::AUDIO_ONLY, impl_->currentLayerId.load(),
+              impl_->audioBuffer, conv);
           throttleAudioQueue();
         }
       }

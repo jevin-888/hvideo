@@ -1,245 +1,267 @@
-# 安卓原生投屏系统编译交接说明
+# H66_POR Android 11 Miracast Sink 系统编译交接
 
-## 目标
+## 1. 目标与结论
 
-把安卓 Miracast 接收改成输出到 app 提供的 `ImageReader Surface`，再由当前 app 的
-`HardwareBuffer -> LayerMirror` 管线显示。不要再使用 native WFD 自己创建的顶层
-`SurfaceControl`，否则会挡住 app 图层或黑屏。
+本方案让 Android Miracast 接收端把视频输出到 HSVJEngine 提供的
+`ImageReader Surface`，再进入 app 的 `HardwareBuffer -> LayerMirror` 显示链路。
+native sink 不再创建独立顶层 `SurfaceControl`，避免遮挡 app 图层或出现黑屏。
 
-## 需要给系统同事的源码
+Android 11 标准实现是发送端（Source）：
 
-当前工程路径：
+- `WifiDisplayController` 配置 `DEVICE_TYPE_WFD_SOURCE`
+- 使用 `MIRACAST_SOURCE`
+- 通过 `RemoteDisplay.listen()` 发送画面
 
-```text
-D:\CHUANGWEI
-```
+H66_POR 使用独立接收端（Sink）：
 
-关键目录：
+- `WfdSinkService` 配置 `DEVICE_TYPE_PRIMARY_SINK`
+- 通过 Wi-Fi P2P 获取 peer IP
+- 调用 HSVJ/Rockchip native sink
+
+两条路由不能同时争用 `WifiP2pManager.setWfdInfo()`。专用 Sink 产品必须关闭标准
+Source 路由。
+
+## 2. 源码位置与唯一编译入口
+
+Windows 交接工程：
 
 ```text
 D:\CHUANGWEI\aosp_wfd_sink
 D:\CHUANGWEI\vendor\WifiDisplay_backup\jni
 ```
 
-不要使用旧项目：
+H66_POR AOSP：
 
 ```text
-D:\Hvideo\Third-Party\huoshanVJ
+/home/jevin/android11-firefly-src
 ```
 
-旧项目只用于参考苹果投屏方案，不要再改。
+Java/AIDL 必须放在 AOSP 标准目录，由现有 glob 自动编译：
 
-## 必须编译的两部分
-
-### 1. framework/system_server 侧服务
-
-把下面目录拷到 AOSP：
-
-```bash
-cp -r aosp_wfd_sink $AOSP_ROOT/frameworks/base/wfd_sink
+```text
+frameworks/base/core/java/android/wfd_sink/IWfdSinkService.aidl
+frameworks/base/core/java/android/wfd_sink/WfdSinkStatus.aidl
+frameworks/base/core/java/android/wfd_sink/WfdSinkManager.java
+frameworks/base/core/java/android/wfd_sink/WfdSinkStatus.java
+frameworks/base/services/core/java/com/android/server/wfd_sink/hsvj/WfdSinkService.java
+frameworks/base/services/core/java/com/rockchip/wfd/WifiDisplayService.java
 ```
 
-需要改 AOSP 下面几个地方：
+不要再创建或引用以下旧 filegroup：
 
-- `frameworks/base/Android.bp` 加入 `:wfd_sink_aidl`、`:wfd_sink_framework_java`、`:wfd_sink_services_java`
-- `SystemServer.java` 注册：
+```text
+wfd_sink_aidl
+wfd_sink_framework_java
+wfd_sink_services_java
+```
+
+`frameworks/base/wfd_sink/Android.bp` 只负责一个 JNI prebuilt 模块；Java/AIDL
+不能在该目录保留第二份参与维护的镜像，否则容易发生 API 漂移。
+
+## 3. framework 接入点
+
+### Context.java
+
+定义隐藏服务名：
 
 ```java
-mSystemServiceManager.startService(
-        com.android.server.wfd_sink.hsvj.WfdSinkService.class);
-```
-
-### AOSP 补丁明细
-
-#### frameworks/base/Android.bp
-
-在 `framework-aidl-sources` 里追加：
-
-```bp
-":wfd_sink_aidl",
-```
-
-在 `framework-core-sources` 或 `framework-default-sources` 里追加：
-
-```bp
-":wfd_sink_framework_java",
-```
-
-在 `services-core-sources` 里追加：
-
-```bp
-":wfd_sink_services_java",
-```
-
-#### SystemServer.java
-
-在 `startOtherServices()` 合适位置追加：
-
-```java
-t.traceBegin("StartWfdSinkService");
-try {
-    mSystemServiceManager.startService(
-            com.android.server.wfd_sink.hsvj.WfdSinkService.class);
-    Slog.i(TAG, "WfdSinkService");
-} catch (Throwable e) {
-    Slog.e(TAG, "WfdSinkService start failure", e);
-}
-t.traceEnd();
-```
-
-#### Context.java
-
-在服务名常量区追加：
-
-```java
-/**
- * WFD Miracast Sink 系统服务。
- * @see #getSystemService
- * @hide
- */
 public static final String WFD_SINK_SERVICE = "wfd_sink";
 ```
 
-#### SystemServiceRegistry.java
+### SystemServiceRegistry.java
 
-在 static 块里注册 Manager：
+注册 `WfdSinkManager`，通过 `IWfdSinkService.Stub.asInterface()` 获取 Binder。
+
+### SystemServer.java
+
+`WfdSinkService` 依赖 Wi-Fi P2P，必须在 `StartWifiP2P` 成功后启动，并限制在
+`PackageManager.FEATURE_WIFI_DIRECT` 存在时启动：
 
 ```java
-registerService(Context.WFD_SINK_SERVICE, WfdSinkManager.class,
-        new CachedServiceFetcher<WfdSinkManager>() {
-    @Override
-    public WfdSinkManager createService(ContextImpl ctx)
-            throws ServiceNotFoundException {
-        IBinder b = ServiceManager.getServiceOrThrow(Context.WFD_SINK_SERVICE);
-        IWfdSinkService service = IWfdSinkService.Stub.asInterface(b);
-        return new WfdSinkManager(service);
+if (context.getPackageManager().hasSystemFeature(
+        PackageManager.FEATURE_WIFI_DIRECT)) {
+    t.traceBegin("StartWifiP2P");
+    mSystemServiceManager.startServiceFromJar(
+            WIFI_P2P_SERVICE_CLASS, WIFI_APEX_SERVICE_JAR_PATH);
+    t.traceEnd();
+
+    t.traceBegin("StartWfdSinkService");
+    try {
+        mSystemServiceManager.startService(
+                com.android.server.wfd_sink.hsvj.WfdSinkService.class);
+    } catch (Throwable e) {
+        Slog.e(TAG, "WfdSinkService start failure", e);
     }
-});
+    t.traceEnd();
+}
 ```
 
-需要 import：
+## 4. Binder 权限与 API 一对一
 
-```java
-import android.wfd_sink.IWfdSinkService;
-import android.wfd_sink.WfdSinkManager;
+`WfdSinkService` 只允许 root 或 UID 1000 调用。HSVJEngine 必须同时满足：
+
+```xml
+android:sharedUserId="android.uid.system"
 ```
 
-### 2. 新的 native 库 `libwfdsink_jni_hsvj.so`
+并使用与 ROM 匹配的 platform 证书。仅“platform 签名”本身不会自动变成 UID 1000。
+设备上应验证：
 
-必须用这份源码重新编：
+```bash
+adb shell dumpsys package com.hsvj.engine | grep -E 'userId=|sharedUserId'
+```
+
+当前接口必须保持 AIDL、Manager、Binder Service 一对一，共 9 个：
 
 ```text
-D:\CHUANGWEI\vendor\WifiDisplay_backup\jni
+start
+startWithSurface
+stop
+setDeviceName
+getDeviceName
+getStatus
+isNativeAvailable
+getNativeLoadError
+isSurfaceOutputSupported
 ```
 
-旧的 `wfd_miracast_sink` 里的 so 不能用，因为只有：
+JNI Java 声明与 `JNINativeMethod` 描述符必须一对一：
 
 ```text
-native_startWFDSink
+native_startWFDSink             (Ljava/lang/String;Z)I
+native_startWFDSinkWithSurface  (Ljava/lang/String;ZLandroid/view/Surface;)I
+native_stopWFDSink              ()V
 ```
 
-新的 so 必须包含：
+JNI 回调的实例对象参数必须是 `jobject thiz`，不能写成 `jobject *thiz`。
 
-```text
-native_startWFDSinkWithSurface
-native_stopWFDSink
-using external app Surface
-```
+## 5. 双 ABI JNI 库
 
-编出来后检查：
-
-```bash
-strings libwfdsink_jni_hsvj.so | grep native_startWFDSinkWithSurface
-strings libwfdsink_jni_hsvj.so | grep native_stopWFDSink
-strings libwfdsink_jni_hsvj.so | grep "using external app Surface"
-```
-
-三个都能搜到才是正确版本。
-
-## 推荐编译流程
-
-在 AOSP 编译机上：
-
-```bash
-cd $AOSP_ROOT
-source build/envsetup.sh
-lunch <你的产品名>-userdebug
-```
-
-先把 native 源码放进 AOSP，比如：
-
-```bash
-mkdir -p vendor/WifiDisplay_backup
-cp -r /path/to/CHUANGWEI/vendor/WifiDisplay_backup/jni vendor/WifiDisplay_backup/
-```
-
-进入 native 目录编译：
-
-```bash
-cd $AOSP_ROOT/vendor/WifiDisplay_backup/jni
-mm -j8
-```
-
-找到产物，例如：
-
-```bash
-find $AOSP_ROOT/out/target/product -name libwfdsink_jni_hsvj.so
-```
-
-把新 so 放到：
-
-```bash
-cp out/target/product/<product>/system/lib64/libwfdsink_jni_hsvj.so \
-   $AOSP_ROOT/frameworks/base/wfd_sink/prebuilts/arm64-v8a/libwfdsink_jni_hsvj.so
-```
-
-确认 `frameworks/base/wfd_sink/Android.bp` 里的 `cc_prebuilt_library_shared`
-会把它安装到系统：
+唯一 Soong 模块：
 
 ```bp
 cc_prebuilt_library_shared {
     name: "libwfdsink_jni_hsvj",
-    srcs: ["prebuilts/arm64-v8a/libwfdsink_jni_hsvj.so"],
-    compile_multilib: "64",
+    arch: {
+        arm: {
+            srcs: ["prebuilts/armeabi-v7a/libwfdsink_jni_hsvj.so"],
+        },
+        arm64: {
+            srcs: ["prebuilts/arm64-v8a/libwfdsink_jni_hsvj.so"],
+        },
+    },
+    compile_multilib: "both",
+    check_elf_files: false,
+    strip: {
+        none: true,
+    },
 }
 ```
 
-设备产品配置里加入：
+已验证的文件：
 
-```makefile
-PRODUCT_PACKAGES += libwfdsink_jni_hsvj
+```text
+32-bit  size=130944  sha256=32ffbf7022648f1a5772249054b03c010286f39e9f5fbc1bd97ee8de94663587
+64-bit  size=161664  sha256=df882df08dc64be4144ea2226141fbd5f10fe3571890e56f1f4f9264237a3856
 ```
 
-然后编系统：
+两种 ABI 都必须包含：
 
-```bash
-cd $AOSP_ROOT
-make framework services libwfdsink_jni_hsvj -j8
-make systemimage -j8
+```text
+native_startWFDSink
+native_startWFDSinkWithSurface
+native_stopWFDSink
+initPlayer: using external app Surface, skip top-level SurfaceControl
 ```
 
-也可以全量：
+产品配置只保留：
 
-```bash
-make -j8
+```make
+PRODUCT_PACKAGES += \
+    HSVJEngine \
+    libwfdsink_jni_hsvj
 ```
 
-## 刷机后验证
+禁止再用 `PRODUCT_COPY_FILES` 安装同名库。一个目标文件只能由一个 Soong/Make
+入口负责，避免 `/system/lib` 与 `/system/lib64` 版本不一致。
+
+## 6. H66_POR 系统裁剪
+
+H66 专用 overlay：
+
+```text
+device/rockchip/rk356x_box/h66_por/overlay/frameworks/base/core/res/res/values/config.xml
+```
+
+设置：
+
+```xml
+<bool name="config_enableWifiDisplay">false</bool>
+```
+
+这只关闭 Android 标准 Source 路由，不影响自定义 `WfdSinkService`。
+
+产品中移除旧 Rockchip UI/Source 包：
+
+```make
+CHUANGWEI_REMOVE_PACKAGES := \
+    WifiDisplay
+PRODUCT_PACKAGES := $(filter-out $(CHUANGWEI_REMOVE_PACKAGES),$(PRODUCT_PACKAGES))
+```
+
+不要裁掉以下依赖：
+
+- Wi-Fi Direct / `WifiP2pService`
+- `framework` 与 `services`
+- HSVJEngine
+- `libwfdsink_jni_hsvj` 的 32/64 位版本
+
+## 7. 编译与产物验证
+
+不要与其他 Soong 构建并发。确认 `out/.lock` 空闲后执行：
 
 ```bash
-adb root
-adb remount
+cd /home/jevin/android11-firefly-src
+source build/envsetup.sh
+lunch h66_por-userdebug
+m framework services libwfdsink_jni_hsvj -j8
+m systemimage -j8
+```
+
+验证：
+
+```bash
+sha256sum \
+  out/target/product/h66_por/system/lib/libwfdsink_jni_hsvj.so \
+  out/target/product/h66_por/system/lib64/libwfdsink_jni_hsvj.so
+
+strings out/target/product/h66_por/system/lib64/libwfdsink_jni_hsvj.so \
+  | grep -E 'native_startWFDSinkWithSurface|native_stopWFDSink|using external app Surface'
+
+unzip -l out/soong/.intermediates/frameworks/base/services/services/android_common/combined/services.jar \
+  | grep WfdSinkService
+```
+
+`framework-res.apk` 中应为：
+
+```text
+resource bool/config_enableWifiDisplay
+() false
+```
+
+## 8. 刷机后验证
+
+未经明确要求不要刷机。刷入新 system image 后再检查：
+
+```bash
+adb shell sha256sum \
+  /system/lib/libwfdsink_jni_hsvj.so \
+  /system/lib64/libwfdsink_jni_hsvj.so
 adb shell service list | grep wfd_sink
-adb shell ls -l /system/lib64/libwfdsink_jni_hsvj.so
+adb logcat -s WfdSinkService RockchipWfdNative wfd_jni WifiDisplaySink TunnelRenderer
 ```
 
-查看日志：
-
-```bash
-adb logcat -s WfdSinkService RockchipWfdNative wfd_jni WifiDisplaySink TunnelRenderer MirrorManager WfdSinkClient
-```
-
-启动安卓投屏后，正确日志应该出现：
+正确日志应出现：
 
 ```text
 starting native sink with app ImageReader Surface
@@ -247,15 +269,11 @@ native_startWFDSinkWithSurface
 initPlayer: using external app Surface, skip top-level SurfaceControl
 ```
 
-如果 app 提示：
+不应再出现：
 
 ```text
-安卓投屏 native 不支持 app 图层输出
+No implementation found for native_stopWFDSink
 ```
 
-说明系统里还是旧 `libwfdsink_jni_hsvj.so`，需要重新替换系统库。
-
-## 一句话重点
-
-app 已经会传 `ImageReader Surface`，系统服务也会接 Surface；真正能不能显示，取决于
-`/system/lib64/libwfdsink_jni_hsvj.so` 是否是重新编译后的新版本。
+注意：AirPlay/RAOP 的 `raop_rtp_mirror`、`raop_ntp`、`omx_vdec`、
+`mpp_rkvdec2` 日志属于另一条接收链路，不能当作 Android Miracast/WFD 日志分析。

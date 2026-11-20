@@ -5,7 +5,7 @@
 
 #include "layer/initializer/LayerInitializer.h"
 #include "layer/initializer/LayerConfigHelpers.h"
-#include "utils/SliceConfigJson.h"  // 使用项目中已有的sliceConfigToJson
+#include "core/SliceConfigJson.h"  // 使用项目中已有的sliceConfigToJson
 #include "utils/FileUtils.h"
 #include "utils/Logger.h"
 #include <algorithm>
@@ -71,6 +71,8 @@ LayerInitResult LayerInitializer::applyCommonProperties(
     layer->setEffectLinkedSlices(config.effectLinkedSlices);
     layer->setInvert(config.invert);
     layer->setGaussianBlur(config.gaussianBlur);
+    layer->setContentCrop(config.cropLeft, config.cropTop,
+                          config.cropRight, config.cropBottom);
 
     // 加载切片配置
     if (!config.slices.empty()) {

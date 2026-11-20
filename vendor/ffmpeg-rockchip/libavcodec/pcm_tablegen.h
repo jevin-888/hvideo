@@ -72,7 +72,7 @@ static av_cold int ulaw2linear(unsigned char u_val)
     t = ((u_val & QUANT_MASK) << 3) + BIAS;
     t <<= ((unsigned)u_val & SEG_MASK) >> SEG_SHIFT;
 
-    return (u_val & SIGN_BIT) (BIAS - t) : (t - BIAS);
+    return (u_val & SIGN_BIT) ? (BIAS - t) : (t - BIAS);
 }
 
 static av_cold int vidc2linear(unsigned char u_val)
@@ -86,7 +86,7 @@ static av_cold int vidc2linear(unsigned char u_val)
     t = (((u_val & VIDC_QUANT_MASK) >> VIDC_QUANT_SHIFT) << 3) + BIAS;
     t <<= ((unsigned)u_val & VIDC_SEG_MASK) >> VIDC_SEG_SHIFT;
 
-    return (u_val & VIDC_SIGN_BIT) (BIAS - t) : (t - BIAS);
+    return (u_val & VIDC_SIGN_BIT) ? (BIAS - t) : (t - BIAS);
 }
 
 #if CONFIG_HARDCODED_TABLES

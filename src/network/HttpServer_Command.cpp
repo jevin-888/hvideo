@@ -9,7 +9,8 @@
 #include "HttpRequest.h"
 #include "HttpResponse.h"
 #include "core/CommandRouter.h"
-#include "core/PathConfig.h"
+#include "core/PeripheralManager.h"
+#include "foundation/PathConfig.h"
 #include "utils/FileUtils.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
@@ -83,6 +84,7 @@ void HttpServer::registerCommandRoutes() {
   registerModuleAction("/api/v1/system", 0x10);
   registerModuleAction("/api/v1/peripherals", 0x50);
   registerModuleAction("/api/v1/peripheral-events", 0x51);
+  registerModuleAction("/api/v1/stage-control", 0x52);
 
   // 读取CommandList文件
   get("/api/v1/peripherals/command-lists/read", [this](const HttpRequest &request, HttpResponse &response) {
@@ -165,15 +167,10 @@ void HttpServer::registerCommandRoutes() {
   get("/api/v1/peripherals/command-lists", [this](const HttpRequest &request, HttpResponse &response) {
     (void)request;
     const std::string &commandListDir = hsvj::COMMAND_LIST_DIR;
-    Json::Value result(Json::arrayValue);
+    Json::Value result = hsvj::PeripheralManager::builtinControlFunctions();
 
     try {
       fs::path basePath(commandListDir);
-      if (!fs::exists(basePath) || !fs::is_directory(basePath)) {
-        setJsonDataResponse(response, result, "CommandList目录不存在");
-        return;
-      }
-
       // 遍历playback目录
       fs::path playbackDir = basePath / "playback";
       if (fs::exists(playbackDir) && fs::is_directory(playbackDir)) {
@@ -205,6 +202,12 @@ void HttpServer::registerCommandRoutes() {
                 }
                 
                 std::string action;
+                if (jsonContent.isMember("name")) {
+                  item["name"] = jsonContent["name"];
+                }
+                if (jsonContent.isMember("description")) {
+                  item["description"] = jsonContent["description"];
+                }
                 if (jsonContent.isMember("param")) {
                   Json::Value param = jsonContent["param"];
                   if (param.isMember("action")) {
@@ -214,6 +217,16 @@ void HttpServer::registerCommandRoutes() {
                   if (param.isMember("layerId")) {
                     item["layerId"] = param["layerId"];
                   }
+                }
+
+                if (action == "set_flexible_mapping" && item["code"].asInt() == 0x0C) {
+                  item["category"] = "矩阵映射";
+                  if (!item.isMember("name")) item["name"] = "矩阵映射 " + item["id"].asString();
+                  if (!item.isMember("description")) {
+                    item["description"] = "调用时立即应用并保存矩阵映射";
+                  }
+                  result.append(item);
+                  continue;
                 }
                 
                 // 从文件名解析信息

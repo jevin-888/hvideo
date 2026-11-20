@@ -1,0 +1,33 @@
+{
+  "id": "server-song-fixture",
+  "name": "真实服务器可播放歌曲测试资源",
+  "tags": ["real-server", "fixture", "read-only"],
+  "description": "从真实点歌服务器选择一条歌曲作为本轮播放流程测试数据，并验证字段完整。",
+  "steps": [
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "${server_url}/api/v1/songdb/songs?page=1&pageSize=5",
+      "expect_status": 200,
+      "save_as": "song_page"
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "song_page.body.data.items",
+      "exists": true
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "song_page.body.data.items.0.songNo",
+      "matches": "^\\d+$"
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "song_page.body.data.items.0.videoFileType",
+      "exists": true
+    }
+  ]
+}

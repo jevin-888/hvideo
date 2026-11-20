@@ -93,7 +93,7 @@ typedef struct Atrac3pChanParams {
     int num_coded_vals;         ///< number of transmitted quant unit values
     int fill_mode;
     int split_point;
-    int table_type;             ///< table type: 0 - tone, 1- noise?
+    int table_type;             ///< table type: 0 - tone?, 1- noise?
     int qu_wordlen[32];         ///< array of word lengths for each quant unit
     int qu_sf_idx[32];          ///< array of scale factor indexes for each quant unit
     int qu_tab_idx[32];         ///< array of code table indexes for each quant unit

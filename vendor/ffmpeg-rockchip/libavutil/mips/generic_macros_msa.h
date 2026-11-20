@@ -352,7 +352,7 @@
 /* Description : Store vectors with stride
    Arguments   : Inputs  - in0, in1, stride
                  Outputs - pdst    (destination pointer to store to)
-   ? Details     : Stores elements from 'in0' to (pdst)
+   Details     : Stores elements from 'in0' to (pdst)
                  Stores elements from 'in1' to (pdst + stride)
 */
 #define ST_V2(RTYPE, in0, in1, pdst, stride)  \
@@ -914,7 +914,7 @@
 
 /* Description : Clips all halfword elements of input vector between min & max
                  out = ((in) < (min)) ? (min) : (((in) > (max)) ? (max) : (in))
-   ? Arguments   : Inputs  - in    (input vector)
+   Arguments   : Inputs  - in    (input vector)
                          - min   (min threshold)
                          - max   (max threshold)
                  Outputs - in    (output vector with clipped elements)
@@ -1107,7 +1107,7 @@
 #define HSUB_UB4_SH(...) HSUB_UB4(v8i16, __VA_ARGS__)
 
 /* Description : SAD (Sum of Absolute Difference)
-   ? Arguments   : Inputs  - in0, in1, ref0, ref1  (unsigned byte src & ref)
+   Arguments   : Inputs  - in0, in1, ref0, ref1  (unsigned byte src & ref)
                  Outputs - sad_m                 (halfword vector with sad)
                  Return Type - unsigned halfword
    Details     : Absolute difference of all the byte elements from 'in0' with
@@ -1906,7 +1906,7 @@
 #define ADDS_SH4_SH(...) ADDS_SH4(v8i16, __VA_ARGS__)
 
 /* Description : Shift left all elements of vector (generic for all data types)
-   ? Arguments   : Inputs  - in0, in1, in2, in3, shift
+   Arguments   : Inputs  - in0, in1, in2, in3, shift
                  Outputs - in0, in1, in2, in3 (in place)
                  Return Type - as per input vector RTYPE
    Details     : Each element of vector 'in0' is left shifted by 'shift' and
@@ -1928,7 +1928,7 @@
 
 /* Description : Arithmetic shift right all elements of vector
                  (generic for all data types)
-   ? Arguments   : Inputs  - in0, in1, in2, in3, shift
+   Arguments   : Inputs  - in0, in1, in2, in3, shift
                  Outputs - in0, in1, in2, in3 (in place)
                  Return Type - as per input vector RTYPE
    Details     : Each element of vector 'in0' is right shifted by 'shift' and
@@ -2041,7 +2041,7 @@
 #define SRAR_W4_SW(...) SRAR_W4(v4i32, __VA_ARGS__)
 
 /* Description : Shift right arithmetic rounded (immediate)
-   ? Arguments   : Inputs  - in0, in1, in2, in3, shift
+   Arguments   : Inputs  - in0, in1, in2, in3, shift
                  Outputs - in0, in1, in2, in3 (in place)
                  Return Type - as per RTYPE
    Details     : Each element of vector 'in0' is shifted right arithmetic by
@@ -2067,7 +2067,7 @@
 #define SRARI_H4_SH(...) SRARI_H4(v8i16, __VA_ARGS__)
 
 /* Description : Shift right arithmetic rounded (immediate)
-   ? Arguments   : Inputs  - in0, in1, shift
+   Arguments   : Inputs  - in0, in1, shift
                  Outputs - in0, in1     (in place)
                  Return Type - as per RTYPE
    Details     : Each element of vector 'in0' is shifted right arithmetic by
@@ -2232,7 +2232,7 @@
 /* Description : Swap two variables
    Arguments   : Inputs  - in0, in1
                  Outputs - in0, in1 (in-place)
-   ? Details     : Swapping of two input variables using xor
+   Details     : Swapping of two input variables using xor
 */
 #define SWAP(in0, in1)  \
 {                       \

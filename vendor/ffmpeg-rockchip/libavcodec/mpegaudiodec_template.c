@@ -1583,7 +1583,7 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
     }
     /* update codec info */
     av_channel_layout_uninit(&avctx->ch_layout);
-    avctx->ch_layout = s->nb_channels == 1 ? (AVChannelLayout)? AV_CHANNEL_LAYOUT_MONO :
+    avctx->ch_layout = s->nb_channels == 1 ? (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO :
                                              (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
     if (!avctx->bit_rate)
         avctx->bit_rate = s->bit_rate;
@@ -1665,7 +1665,7 @@ static int decode_frame_adu(AVCodecContext *avctx, AVFrame *frame,
     /* update codec info */
     avctx->sample_rate = s->sample_rate;
     av_channel_layout_uninit(&avctx->ch_layout);
-    avctx->ch_layout = s->nb_channels == 1 ? (AVChannelLayout)? AV_CHANNEL_LAYOUT_MONO :
+    avctx->ch_layout = s->nb_channels == 1 ? (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO :
                                              (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
     if (!avctx->bit_rate)
         avctx->bit_rate = s->bit_rate;

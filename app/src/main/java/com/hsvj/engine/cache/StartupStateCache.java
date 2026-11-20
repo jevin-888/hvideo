@@ -16,6 +16,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 
 /**
  * 启动状态缓存
@@ -187,7 +188,7 @@ public class StartupStateCache {
         
         saveStartupState(state);
         
-        Log.i(TAG, String.format("启动统计已更新: 第%d次启动, 耗时%dms, 内存%dMB", 
+        Log.i(TAG, String.format(Locale.ROOT, "启动统计已更新: 第%d次启动, 耗时%dms, 内存%dMB",
             state.startupCount, startupTime, availableMemory));
     }
     
@@ -210,7 +211,7 @@ public class StartupStateCache {
         
         saveStartupState(state);
         
-        Log.i(TAG, String.format("资源复制状态已更新: 关键资源=%s, 延后资源=%s", 
+        Log.i(TAG, String.format(Locale.ROOT, "资源复制状态已更新: 关键资源=%s, 延后资源=%s",
             state.criticalResourcesCopied, state.deferredResourcesCopied));
     }
     
@@ -220,7 +221,7 @@ public class StartupStateCache {
     public void markModuleReady(String moduleName, boolean ready) {
         StartupState state = loadStartupState();
         
-        switch (moduleName.toLowerCase()) {
+        switch (moduleName.toLowerCase(Locale.ROOT)) {
             case "vulkan":
             case "renderer":
                 state.vulkanRendererReady = ready;
@@ -236,7 +237,7 @@ public class StartupStateCache {
         
         saveStartupState(state);
         
-        Log.i(TAG, String.format("模块状态已更新: %s = %s", moduleName, ready));
+        Log.i(TAG, String.format(Locale.ROOT, "模块状态已更新: %s = %s", moduleName, ready));
     }
     
     /**
@@ -288,7 +289,7 @@ public class StartupStateCache {
         
         long avgTime = state.totalStartupTime / state.startupCount;
         
-        return String.format("启动统计: 总计%d次, 平均%dms, 上次%dms, 内存%dMB%s", 
+        return String.format(Locale.ROOT, "启动统计: 总计%d次, 平均%dms, 上次%dms, 内存%dMB%s",
             state.startupCount, avgTime, state.lastStartupTime, 
             state.availableMemoryMB, state.lowMemoryMode ? "(低内存)" : "");
     }

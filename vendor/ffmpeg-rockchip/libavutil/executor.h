@@ -33,8 +33,7 @@ typedef struct AVTaskCallbacks {
 
     int local_context_size;
 
-    // 
-  return 1 if a's priority > b's priority
+    // return 1 if a's priority > b's priority
     int (*priority_higher)(const AVTask *a, const AVTask *b);
 
     // task is ready for run

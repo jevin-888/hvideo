@@ -11,9 +11,10 @@
  */
 
 #include "layer/Layer.h"
+#include "renderer/VulkanRenderer.h"
+#include <algorithm>
 #include "utils/Logger.h"
 #include <json/json.h>
-#include <algorithm>
 #include <cmath>
 
 namespace hsvj {
@@ -140,17 +141,41 @@ bool Layer::hasSlices() const {
     return !slices_.empty();
 }
 
-void Layer::clearAllSlices() {
+void Layer::replaceAllSlices(
+    const std::map<std::string, Json::Value> &slices) {
     std::lock_guard<std::mutex> lock(slicesMutex_);
-    if (!slices_.empty()) {
-        LOG_DEBUG("Layer %d: Clearing all %zu slices", layerId_, slices_.size());
-        slices_.clear();
-        sliceRevision_.fetch_add(1, std::memory_order_release);
+    if (slices_ == slices) {
+        return;
     }
+
+    LOG_DEBUG("Layer %d: Replacing %zu slices with %zu slices", layerId_,
+              slices_.size(), slices.size());
+    slices_ = slices;
+    sliceRevision_.fetch_add(1, std::memory_order_release);
+}
+
+void Layer::clearAllSlices() {
+    replaceAllSlices({});
 }
 
 void Layer::setInvert(int mode) {
     invert_ = mode;
+}
+
+void Layer::setContentCrop(float left, float top, float right, float bottom) {
+  cropLeft_ = std::clamp(left, 0.0f, 1.0f);
+  cropTop_ = std::clamp(top, 0.0f, 1.0f);
+  cropRight_ = std::clamp(right, 0.0f, 1.0f - cropLeft_);
+  cropBottom_ = std::clamp(bottom, 0.0f, 1.0f - cropTop_);
+}
+
+void Layer::applyContentCrop(uint32_t textureId) const {
+  if (!renderer_ || textureId == 0) return;
+  const bool enabled = cropLeft_ > 0.0f || cropTop_ > 0.0f ||
+                       cropRight_ > 0.0f || cropBottom_ > 0.0f;
+  renderer_->setTextureContentCrop(textureId, enabled, cropLeft_, cropTop_,
+                                   1.0f - cropLeft_ - cropRight_,
+                                   1.0f - cropTop_ - cropBottom_, true);
 }
 
 void Layer::updateRoamConfig(const Json::Value &roamConfigJson) {

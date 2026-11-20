@@ -500,50 +500,13 @@ bool RegionRotationRenderer::updateGlobalMaskTexture() {
 
   VkBuffer stagingBuffer = VK_NULL_HANDLE;
   VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-  VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0,
-                                static_cast<VkDeviceSize>(mask.size()),
-                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
-  if (vkCreateBuffer(device, &bufferInfo, nullptr, &stagingBuffer) != VK_SUCCESS) {
+  if (!createHostVisibleBuffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                               static_cast<VkDeviceSize>(mask.size()),
+                               stagingBuffer, stagingMemory, mask.data())) {
     std::lock_guard<std::recursive_mutex> lock(regionsMutex_);
     globalMaskTextureContentValid_ = false;
     return false;
   }
-
-  VkMemoryRequirements bufferReq{};
-  vkGetBufferMemoryRequirements(device, stagingBuffer, &bufferReq);
-  VkMemoryAllocateInfo bufferAlloc{
-      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, bufferReq.size,
-      canvasRenderer->findMemoryType(bufferReq.memoryTypeBits,
-                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
-  if (vkAllocateMemory(device, &bufferAlloc, nullptr, &stagingMemory) !=
-      VK_SUCCESS) {
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    std::lock_guard<std::recursive_mutex> lock(regionsMutex_);
-    globalMaskTextureContentValid_ = false;
-    return false;
-  }
-  if (vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0) !=
-      VK_SUCCESS) {
-    vkFreeMemory(device, stagingMemory, nullptr);
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    std::lock_guard<std::recursive_mutex> lock(regionsMutex_);
-    globalMaskTextureContentValid_ = false;
-    return false;
-  }
-
-  void *data = nullptr;
-  if (vkMapMemory(device, stagingMemory, 0,
-                  static_cast<VkDeviceSize>(mask.size()), 0,
-                  &data) != VK_SUCCESS) {
-    vkFreeMemory(device, stagingMemory, nullptr);
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    std::lock_guard<std::recursive_mutex> lock(regionsMutex_);
-    globalMaskTextureContentValid_ = false;
-    return false;
-  }
-  std::memcpy(data, mask.data(), mask.size());
-  vkUnmapMemory(device, stagingMemory);
 
   auto queueLock = canvasRenderer->acquireQueueOpLock();
   VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -881,18 +844,21 @@ void RegionRotationRenderer::endQrOverlayRenderPass() {
 // 调用约定：本函数同时返回"是否需要渲染"并更新缓存签名，调用方只在返回 true 时
 // 才去 begin/draw/end。
 // ---------------------------------------------------------------------------
-bool RegionRotationRenderer::needsQrOverlayRender(Layer* layer71) {
+bool RegionRotationRenderer::needsQrOverlayRender(Layer* qrLayer) {
   // 计算当前状态签名
   uint64_t sig = 0;
 
-  bool visible = (layer71 != nullptr) && layer71->isVisible();
+  bool visible = (qrLayer != nullptr) && qrLayer->isVisible();
   uint32_t texId = 0;
-  if (visible && layer71->getType() == LayerType::IMAGE) {
-    LayerImage* img = static_cast<LayerImage*>(layer71);
+  const LayerType layerType = qrLayer ? qrLayer->getType() : LayerType::IMAGE;
+  const bool imageBacked =
+      layerType == LayerType::IMAGE || layerType == LayerType::QRCODE;
+  if (visible && imageBacked) {
+    LayerImage* img = static_cast<LayerImage*>(qrLayer);
     texId = img->getTextureId();
     if (texId == 0) visible = false; // 纹理尚未就绪 == 等同不可见
-  } else if (visible && layer71->getType() != LayerType::IMAGE) {
-    // 非 IMAGE 类型（如 TEXT/MIRROR）：texId 无法稳定探测 → 退化为每帧重绘
+  } else if (visible) {
+    // 非图像类型（如 TEXT/MIRROR）：texId 无法稳定探测 → 退化为每帧重绘
     // 通过把 texId 设为与帧号绑定的非零值，签名必不同 → 必重绘
     static uint32_t s_nonImageTick = 0;
     texId = ++s_nonImageTick;
@@ -902,9 +868,9 @@ bool RegionRotationRenderer::needsQrOverlayRender(Layer* layer71) {
     // 不可见状态固定签名（与初始值 0=无效 区分）
     sig = 0x1ULL;
   } else {
-    Position pos = layer71->getPosition();
-    Size    sz  = layer71->getSize();
-    uint32_t alphaFixed = static_cast<uint32_t>(layer71->getAlpha() * 1000.0f + 0.5f);
+    Position pos = qrLayer->getPosition();
+    Size    sz  = qrLayer->getSize();
+    uint32_t alphaFixed = static_cast<uint32_t>(qrLayer->getAlpha() * 1000.0f + 0.5f);
     // 拼 64 位签名（足够区分常见参数变化）
     sig = (static_cast<uint64_t>(texId) * 0xC6BC279692B5C323ULL)
         ^ (static_cast<uint64_t>(pos.x & 0xFFFF) << 32)
@@ -1362,17 +1328,132 @@ vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
       regionRects[i].aaEdgeFlags = regionAaEdgeFlagsCache_[i];
     }
   } else {
+    constexpr uint32_t kAaLeft = 0x1u;
+    constexpr uint32_t kAaRight = 0x2u;
+    constexpr uint32_t kAaTop = 0x4u;
+    constexpr uint32_t kAaBottom = 0x8u;
+
     regionAaEdgeFlagsCache_.assign(regionRects.size(), 0u);
+    std::vector<bool> regionNeedsAa(regionRects.size(), false);
     for (size_t i = 0; i < regionRects.size(); ++i) {
       auto &rect = regionRects[i];
       if (!rect.valid) continue;
       const auto &reg = regions_[i];
-      const bool needsOuterAa =
+      regionNeedsAa[i] =
           !isDefaultRectMesh(reg) || reg.useMatrixCorrection || reg.useCaveProjection;
-      rect.aaEdgeFlags = needsOuterAa
+      rect.aaEdgeFlags = regionNeedsAa[i]
           ? computeAaEdgeFlags(rect.outputCol, rect.outputRow, outCols, outRows)
           : 0u;
-      regionAaEdgeFlagsCache_[i] = rect.aaEdgeFlags;
+    }
+
+    auto findRegionAtCell = [&](int col, int row) -> int {
+      for (size_t index = 0; index < regionRects.size(); ++index) {
+        const auto &candidate = regionRects[index];
+        if (candidate.valid && candidate.outputCol == col &&
+            candidate.outputRow == row) {
+          return static_cast<int>(index);
+        }
+      }
+      return -1;
+    };
+
+    auto sampleEdgePoint = [&](size_t regionIndex, uint32_t edge,
+                               float t) -> Vec2 {
+      const auto &reg = regions_[regionIndex];
+      const auto &rect = regionRects[regionIndex];
+      const bool controlMeshValid =
+          reg.rows >= 2 && reg.cols >= 2 &&
+          reg.controlPoints.size() >=
+              static_cast<size_t>(reg.rows * reg.cols * 2);
+      if (!controlMeshValid) {
+        const float u = edge == kAaLeft ? 0.0f :
+                        edge == kAaRight ? 1.0f : t;
+        const float v = edge == kAaTop ? 0.0f :
+                        edge == kAaBottom ? 1.0f : t;
+        return Vec2(rect.useOutX + u * rect.useOutW,
+                    rect.useOutY + v * rect.useOutH);
+      }
+
+      const float u = edge == kAaLeft ? 0.0f :
+                      edge == kAaRight ? 1.0f : t;
+      const float v = edge == kAaTop ? 0.0f :
+                      edge == kAaBottom ? 1.0f : t;
+      const bool useCurve = reg.interpolationMode == 1;
+      const SplineInterpolator::Point point =
+          SplineInterpolator::getInterpolatedPoint(
+              reg.controlPoints, reg.rows, reg.cols, u, v, useCurve);
+      return Vec2(rect.useOutX + point.x * rect.useOutW,
+                  rect.useOutY + point.y * rect.useOutH);
+    };
+
+    auto edgesCoincident = [&](size_t first, uint32_t firstEdge,
+                               size_t second, uint32_t secondEdge) -> bool {
+      constexpr int kEdgeSamples = 16;
+      constexpr float kCoincidentPixelTolerance = 0.75f;
+      const float toleranceSquared =
+          kCoincidentPixelTolerance * kCoincidentPixelTolerance;
+      for (int sample = 0; sample <= kEdgeSamples; ++sample) {
+        const float t = static_cast<float>(sample) /
+                        static_cast<float>(kEdgeSamples);
+        const Vec2 a = sampleEdgePoint(first, firstEdge, t);
+        const Vec2 b = sampleEdgePoint(second, secondEdge, t);
+        const float dx = (a.x - b.x) * static_cast<float>(useOutputW);
+        const float dy = (a.y - b.y) * static_cast<float>(useOutputH);
+        if (dx * dx + dy * dy > toleranceSquared) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    // Internal cell edges may skip AA only when neighboring geometry is coincident.
+    // Exposed edges and edges separated by geometry correction need coverage AA.
+    for (size_t i = 0; i < regionRects.size(); ++i) {
+      auto &rect = regionRects[i];
+      if (!rect.valid || !regionNeedsAa[i]) continue;
+      if (findRegionAtCell(rect.outputCol - 1, rect.outputRow) < 0) {
+        rect.aaEdgeFlags |= kAaLeft;
+      }
+      if (findRegionAtCell(rect.outputCol + 1, rect.outputRow) < 0) {
+        rect.aaEdgeFlags |= kAaRight;
+      }
+      if (findRegionAtCell(rect.outputCol, rect.outputRow - 1) < 0) {
+        rect.aaEdgeFlags |= kAaTop;
+      }
+      if (findRegionAtCell(rect.outputCol, rect.outputRow + 1) < 0) {
+        rect.aaEdgeFlags |= kAaBottom;
+      }
+    }
+
+    for (size_t i = 0; i < regionRects.size(); ++i) {
+      auto &rect = regionRects[i];
+      if (!rect.valid) continue;
+
+      const int rightNeighbor =
+          findRegionAtCell(rect.outputCol + 1, rect.outputRow);
+      if (rightNeighbor >= 0) {
+        const size_t neighbor = static_cast<size_t>(rightNeighbor);
+        if ((regionNeedsAa[i] || regionNeedsAa[neighbor]) &&
+            !edgesCoincident(i, kAaRight, neighbor, kAaLeft)) {
+          rect.aaEdgeFlags |= kAaRight;
+          regionRects[neighbor].aaEdgeFlags |= kAaLeft;
+        }
+      }
+
+      const int bottomNeighbor =
+          findRegionAtCell(rect.outputCol, rect.outputRow + 1);
+      if (bottomNeighbor >= 0) {
+        const size_t neighbor = static_cast<size_t>(bottomNeighbor);
+        if ((regionNeedsAa[i] || regionNeedsAa[neighbor]) &&
+            !edgesCoincident(i, kAaBottom, neighbor, kAaTop)) {
+          rect.aaEdgeFlags |= kAaBottom;
+          regionRects[neighbor].aaEdgeFlags |= kAaTop;
+        }
+      }
+    }
+
+    for (size_t i = 0; i < regionRects.size(); ++i) {
+      regionAaEdgeFlagsCache_[i] = regionRects[i].aaEdgeFlags;
     }
     regionAaEdgeSignature_ = aaSignature;
   }
@@ -1702,6 +1783,9 @@ vkCmdBindPipeline(cmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
             cu.view[m] = caveResult.viewMatrix.m[m];
             cu.proj[m] = caveResult.projectionMatrix.m[m];
           }
+        } else {
+          // Invalid CAVE geometry must fall back to the normal/matrix path.
+          cu.projParams2.w = reg.useMatrixCorrection ? 1.0f : 0.0f;
         }
       }
       *reinterpret_cast<CaveUniform *>(static_cast<char *>(mappedCaveUniforms_) +

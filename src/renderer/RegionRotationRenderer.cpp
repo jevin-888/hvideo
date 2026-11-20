@@ -16,12 +16,11 @@
  */
 #include "renderer/RegionRotationRenderer.h"
 #include "renderer/CaveProjection.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/PeripheralManager.h"
 #include "core/SystemConfig.h"
 #include "utils/FileUtils.h"
 #include "utils/Logger.h"
-#include "../shaders/shader_spirv.h"
 
 #ifdef __ANDROID__
 #include <algorithm>
@@ -137,17 +136,68 @@ RegionRotationRenderer::RegionRotationRenderer()
 RegionRotationRenderer::~RegionRotationRenderer() { shutdown(); }
 
 uint32_t RegionRotationRenderer::calculateCanvasMipLevels(int width, int height) const {
-  return calculateMipLevelsForSize(width, height);
+  // Geometry correction only needs the first few levels. Capping the chain keeps
+  // per-frame barriers low while covering up to 8x local minification.
+  return std::min<uint32_t>(4u, calculateMipLevelsForSize(width, height));
 }
 
 bool RegionRotationRenderer::canUseCanvasMipmaps(VkFormat format) const {
-  (void)format;
-  // 禁用 mipmap 以提升性能
-  return false;
+  VulkanRenderer *canvasRenderer = canvasRenderer_.load(std::memory_order_acquire);
+  if (!canvasRenderer || canvasRenderer->getPhysicalDevice() == VK_NULL_HANDLE) {
+    return false;
+  }
+
+  VkFormatProperties properties{};
+  vkGetPhysicalDeviceFormatProperties(canvasRenderer->getPhysicalDevice(), format,
+                                      &properties);
+  constexpr VkFormatFeatureFlags required =
+      VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+      VK_FORMAT_FEATURE_BLIT_DST_BIT |
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+  return (properties.optimalTilingFeatures & required) == required;
 }
 
 bool RegionRotationRenderer::shouldUseCanvasMipmaps() const {
-  // Mipmap 已全局禁用以提升性能
+  if (!canvasMipmapsEnabled_ || canvasMipLevels_ <= 1) {
+    return false;
+  }
+
+  const int overrideValue =
+      getAndroidIntProperty("debug.hsvj.canvas_mipmaps", -1);
+  if (overrideValue >= 0) {
+    return overrideValue != 0;
+  }
+
+  std::lock_guard<std::recursive_mutex> lock(regionsMutex_);
+  constexpr float kIdentityEpsilon = 1e-5f;
+  for (const RegionConfig &reg : regions_) {
+    if (reg.useMatrixCorrection || reg.useCaveProjection ||
+        reg.interpolationMode != 0 || reg.rows < 2 || reg.cols < 2) {
+      return true;
+    }
+
+    const size_t expectedCount =
+        static_cast<size_t>(reg.rows * reg.cols * 2);
+    if (reg.controlPoints.size() < expectedCount) {
+      return true;
+    }
+    for (int row = 0; row < reg.rows; ++row) {
+      const float expectedV =
+          static_cast<float>(row) / static_cast<float>(reg.rows - 1);
+      for (int col = 0; col < reg.cols; ++col) {
+        const float expectedU =
+            static_cast<float>(col) / static_cast<float>(reg.cols - 1);
+        const size_t index =
+            static_cast<size_t>((row * reg.cols + col) * 2);
+        if (std::abs(reg.controlPoints[index] - expectedU) >
+                kIdentityEpsilon ||
+            std::abs(reg.controlPoints[index + 1] - expectedV) >
+                kIdentityEpsilon) {
+          return true;
+        }
+      }
+    }
+  }
   return false;
 }
 
@@ -568,21 +618,21 @@ void RegionRotationRenderer::shutdown() {
       vkFreeMemory(device, qrOverlayMemory_, nullptr);
       qrOverlayMemory_ = VK_NULL_HANDLE;
     }
-    if (outputBlendTextureView_ != VK_NULL_HANDLE) {
-      vkDestroyImageView(device, outputBlendTextureView_, nullptr);
-      outputBlendTextureView_ = VK_NULL_HANDLE;
+    if (neutralMaskTextureView_ != VK_NULL_HANDLE) {
+      vkDestroyImageView(device, neutralMaskTextureView_, nullptr);
+      neutralMaskTextureView_ = VK_NULL_HANDLE;
     }
-    if (outputBlendTextureImage_ != VK_NULL_HANDLE) {
-      vkDestroyImage(device, outputBlendTextureImage_, nullptr);
-      outputBlendTextureImage_ = VK_NULL_HANDLE;
+    if (neutralMaskTextureImage_ != VK_NULL_HANDLE) {
+      vkDestroyImage(device, neutralMaskTextureImage_, nullptr);
+      neutralMaskTextureImage_ = VK_NULL_HANDLE;
     }
-    if (outputBlendTextureMemory_ != VK_NULL_HANDLE) {
-      vkFreeMemory(device, outputBlendTextureMemory_, nullptr);
-      outputBlendTextureMemory_ = VK_NULL_HANDLE;
+    if (neutralMaskTextureMemory_ != VK_NULL_HANDLE) {
+      vkFreeMemory(device, neutralMaskTextureMemory_, nullptr);
+      neutralMaskTextureMemory_ = VK_NULL_HANDLE;
     }
-    outputBlendTextureInitialized_ = false;
-    outputBlendTextureWidth_ = 0;
-    outputBlendTextureHeight_ = 0;
+    neutralMaskTextureInitialized_ = false;
+    neutralMaskTextureWidth_ = 0;
+    neutralMaskTextureHeight_ = 0;
     if (globalMaskTextureView_ != VK_NULL_HANDLE) {
       vkDestroyImageView(device, globalMaskTextureView_, nullptr);
       globalMaskTextureView_ = VK_NULL_HANDLE;
@@ -635,15 +685,6 @@ void RegionRotationRenderer::shutdown() {
         vkDestroyBuffer(device, reg.gridLineVertexBuffer, nullptr);
       if (reg.gridLineVertexMemory != VK_NULL_HANDLE)
         vkFreeMemory(device, reg.gridLineVertexMemory, nullptr);
-      if (reg.blendTextureView != VK_NULL_HANDLE)
-        vkDestroyImageView(device, reg.blendTextureView, nullptr);
-      if (reg.blendTextureImage != VK_NULL_HANDLE)
-        vkDestroyImage(device, reg.blendTextureImage, nullptr);
-      if (reg.blendTextureMemory != VK_NULL_HANDLE)
-        vkFreeMemory(device, reg.blendTextureMemory, nullptr);
-      reg.blendTextureWidth = 0;
-      reg.blendTextureHeight = 0;
-      reg.blendTextureInitialized = false;
     }
 
   }
@@ -658,12 +699,12 @@ void RegionRotationRenderer::shutdown() {
   canvasSampler_ = VK_NULL_HANDLE;
   singleMipSampler_ = VK_NULL_HANDLE;
   nearestSampler_ = VK_NULL_HANDLE;
-  outputBlendTextureImage_ = VK_NULL_HANDLE;
-  outputBlendTextureMemory_ = VK_NULL_HANDLE;
-  outputBlendTextureView_ = VK_NULL_HANDLE;
-  outputBlendTextureWidth_ = 0;
-  outputBlendTextureHeight_ = 0;
-  outputBlendTextureInitialized_ = false;
+  neutralMaskTextureImage_ = VK_NULL_HANDLE;
+  neutralMaskTextureMemory_ = VK_NULL_HANDLE;
+  neutralMaskTextureView_ = VK_NULL_HANDLE;
+  neutralMaskTextureWidth_ = 0;
+  neutralMaskTextureHeight_ = 0;
+  neutralMaskTextureInitialized_ = false;
   globalMaskTextureImage_ = VK_NULL_HANDLE;
   globalMaskTextureMemory_ = VK_NULL_HANDLE;
   globalMaskTextureView_ = VK_NULL_HANDLE;
@@ -703,12 +744,6 @@ void RegionRotationRenderer::dropStaleDeviceHandlesAfterImplicitDestroy() {
     reg.gridVertexMemory = VK_NULL_HANDLE;
     reg.gridLineVertexBuffer = VK_NULL_HANDLE;
     reg.gridLineVertexMemory = VK_NULL_HANDLE;
-    reg.blendTextureImage = VK_NULL_HANDLE;
-    reg.blendTextureMemory = VK_NULL_HANDLE;
-    reg.blendTextureView = VK_NULL_HANDLE;
-    reg.blendTextureWidth = 0;
-    reg.blendTextureHeight = 0;
-    reg.blendTextureInitialized = false;
   }
 
   maskGridLineVertexBuffer_ = VK_NULL_HANDLE;
@@ -748,12 +783,12 @@ void RegionRotationRenderer::dropStaleDeviceHandlesAfterImplicitDestroy() {
   canvasSampler_ = VK_NULL_HANDLE;
   singleMipSampler_ = VK_NULL_HANDLE;
   nearestSampler_ = VK_NULL_HANDLE;
-  outputBlendTextureImage_ = VK_NULL_HANDLE;
-  outputBlendTextureMemory_ = VK_NULL_HANDLE;
-  outputBlendTextureView_ = VK_NULL_HANDLE;
-  outputBlendTextureInitialized_ = false;
-  outputBlendTextureWidth_ = 0;
-  outputBlendTextureHeight_ = 0;
+  neutralMaskTextureImage_ = VK_NULL_HANDLE;
+  neutralMaskTextureMemory_ = VK_NULL_HANDLE;
+  neutralMaskTextureView_ = VK_NULL_HANDLE;
+  neutralMaskTextureInitialized_ = false;
+  neutralMaskTextureWidth_ = 0;
+  neutralMaskTextureHeight_ = 0;
   globalMaskTextureImage_ = VK_NULL_HANDLE;
   globalMaskTextureMemory_ = VK_NULL_HANDLE;
   globalMaskTextureView_ = VK_NULL_HANDLE;
@@ -841,8 +876,8 @@ bool RegionRotationRenderer::processFrame() {
   return true;
 }
 
-bool RegionRotationRenderer::ensureNeutralBlendTexture() {
-  if (outputBlendTextureInitialized_ && outputBlendTextureView_ != VK_NULL_HANDLE) {
+bool RegionRotationRenderer::ensureNeutralMaskTexture() {
+  if (neutralMaskTextureInitialized_ && neutralMaskTextureView_ != VK_NULL_HANDLE) {
     return true;
   }
 
@@ -851,7 +886,7 @@ bool RegionRotationRenderer::ensureNeutralBlendTexture() {
   VkDevice device = canvasRenderer->getDevice();
   if (device == VK_NULL_HANDLE) return false;
 
-  if (outputBlendTextureImage_ == VK_NULL_HANDLE) {
+  if (neutralMaskTextureImage_ == VK_NULL_HANDLE) {
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr};
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.extent = {1u, 1u, 1u};
@@ -861,80 +896,54 @@ bool RegionRotationRenderer::ensureNeutralBlendTexture() {
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    if (vkCreateImage(device, &imageInfo, nullptr, &outputBlendTextureImage_) != VK_SUCCESS) {
+    if (vkCreateImage(device, &imageInfo, nullptr, &neutralMaskTextureImage_) != VK_SUCCESS) {
       return false;
     }
 
     VkMemoryRequirements memReq{};
-    vkGetImageMemoryRequirements(device, outputBlendTextureImage_, &memReq);
+    vkGetImageMemoryRequirements(device, neutralMaskTextureImage_, &memReq);
     VkMemoryAllocateInfo allocInfo{
         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, memReq.size,
         canvasRenderer->findMemoryType(memReq.memoryTypeBits,
                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &outputBlendTextureMemory_) != VK_SUCCESS) {
-      vkDestroyImage(device, outputBlendTextureImage_, nullptr);
-      outputBlendTextureImage_ = VK_NULL_HANDLE;
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &neutralMaskTextureMemory_) != VK_SUCCESS) {
+      vkDestroyImage(device, neutralMaskTextureImage_, nullptr);
+      neutralMaskTextureImage_ = VK_NULL_HANDLE;
       return false;
     }
-    if (vkBindImageMemory(device, outputBlendTextureImage_, outputBlendTextureMemory_, 0) != VK_SUCCESS) {
-      vkFreeMemory(device, outputBlendTextureMemory_, nullptr);
-      vkDestroyImage(device, outputBlendTextureImage_, nullptr);
-      outputBlendTextureMemory_ = VK_NULL_HANDLE;
-      outputBlendTextureImage_ = VK_NULL_HANDLE;
+    if (vkBindImageMemory(device, neutralMaskTextureImage_, neutralMaskTextureMemory_, 0) != VK_SUCCESS) {
+      vkFreeMemory(device, neutralMaskTextureMemory_, nullptr);
+      vkDestroyImage(device, neutralMaskTextureImage_, nullptr);
+      neutralMaskTextureMemory_ = VK_NULL_HANDLE;
+      neutralMaskTextureImage_ = VK_NULL_HANDLE;
       return false;
     }
 
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, nullptr};
-    viewInfo.image = outputBlendTextureImage_;
+    viewInfo.image = neutralMaskTextureImage_;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = VK_FORMAT_R8_UNORM;
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(device, &viewInfo, nullptr, &outputBlendTextureView_) != VK_SUCCESS) {
-      vkFreeMemory(device, outputBlendTextureMemory_, nullptr);
-      vkDestroyImage(device, outputBlendTextureImage_, nullptr);
-      outputBlendTextureView_ = VK_NULL_HANDLE;
-      outputBlendTextureMemory_ = VK_NULL_HANDLE;
-      outputBlendTextureImage_ = VK_NULL_HANDLE;
+    if (vkCreateImageView(device, &viewInfo, nullptr, &neutralMaskTextureView_) != VK_SUCCESS) {
+      vkFreeMemory(device, neutralMaskTextureMemory_, nullptr);
+      vkDestroyImage(device, neutralMaskTextureImage_, nullptr);
+      neutralMaskTextureView_ = VK_NULL_HANDLE;
+      neutralMaskTextureMemory_ = VK_NULL_HANDLE;
+      neutralMaskTextureImage_ = VK_NULL_HANDLE;
       return false;
     }
-    outputBlendTextureWidth_ = 1;
-    outputBlendTextureHeight_ = 1;
+    neutralMaskTextureWidth_ = 1;
+    neutralMaskTextureHeight_ = 1;
   }
 
   const uint8_t whitePixel = 255;
   VkBuffer stagingBuffer = VK_NULL_HANDLE;
   VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-  VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0,
-                                sizeof(whitePixel), VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
-  if (vkCreateBuffer(device, &bufferInfo, nullptr, &stagingBuffer) != VK_SUCCESS) {
+  if (!createHostVisibleBuffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                               sizeof(whitePixel), stagingBuffer,
+                               stagingMemory, &whitePixel)) {
     return false;
   }
-
-  VkMemoryRequirements bufferReq{};
-  vkGetBufferMemoryRequirements(device, stagingBuffer, &bufferReq);
-  VkMemoryAllocateInfo bufferAlloc{
-      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, bufferReq.size,
-      canvasRenderer->findMemoryType(bufferReq.memoryTypeBits,
-                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
-  if (vkAllocateMemory(device, &bufferAlloc, nullptr, &stagingMemory) != VK_SUCCESS) {
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    return false;
-  }
-  if (vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0) != VK_SUCCESS) {
-    vkFreeMemory(device, stagingMemory, nullptr);
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    return false;
-  }
-
-  void *data = nullptr;
-  if (vkMapMemory(device, stagingMemory, 0, sizeof(whitePixel), 0, &data) != VK_SUCCESS) {
-    vkFreeMemory(device, stagingMemory, nullptr);
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    return false;
-  }
-  std::memcpy(data, &whitePixel, sizeof(whitePixel));
-  vkUnmapMemory(device, stagingMemory);
 
   auto queueLock = canvasRenderer->acquireQueueOpLock();
   VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -952,16 +961,16 @@ bool RegionRotationRenderer::ensureNeutralBlendTexture() {
   }
 
   VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-  toTransfer.oldLayout = outputBlendTextureInitialized_
+  toTransfer.oldLayout = neutralMaskTextureInitialized_
       ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
       : VK_IMAGE_LAYOUT_UNDEFINED;
   toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  toTransfer.srcAccessMask = outputBlendTextureInitialized_ ? VK_ACCESS_SHADER_READ_BIT : 0;
+  toTransfer.srcAccessMask = neutralMaskTextureInitialized_ ? VK_ACCESS_SHADER_READ_BIT : 0;
   toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  toTransfer.image = outputBlendTextureImage_;
+  toTransfer.image = neutralMaskTextureImage_;
   toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   vkCmdPipelineBarrier(cmd,
-                       outputBlendTextureInitialized_
+                       neutralMaskTextureInitialized_
                            ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
                            : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
@@ -970,7 +979,7 @@ bool RegionRotationRenderer::ensureNeutralBlendTexture() {
   VkBufferImageCopy region{};
   region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.imageExtent = {1u, 1u, 1u};
-  vkCmdCopyBufferToImage(cmd, stagingBuffer, outputBlendTextureImage_,
+  vkCmdCopyBufferToImage(cmd, stagingBuffer, neutralMaskTextureImage_,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
   VkImageMemoryBarrier toRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -978,7 +987,7 @@ bool RegionRotationRenderer::ensureNeutralBlendTexture() {
   toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-  toRead.image = outputBlendTextureImage_;
+  toRead.image = neutralMaskTextureImage_;
   toRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
@@ -996,9 +1005,9 @@ bool RegionRotationRenderer::ensureNeutralBlendTexture() {
     vkFreeMemory(device, stagingMemory, nullptr);
     vkDestroyBuffer(device, stagingBuffer, nullptr);
   }
-  outputBlendTextureInitialized_ = true;
-  outputBlendTextureWidth_ = 1;
-  outputBlendTextureHeight_ = 1;
+  neutralMaskTextureInitialized_ = true;
+  neutralMaskTextureWidth_ = 1;
+  neutralMaskTextureHeight_ = 1;
   return true;
 }
 
@@ -1199,7 +1208,7 @@ bool RegionRotationRenderer::createResources() {
     }
   };
 
-  // 二维码叠加纹理（Layer71 单独渲染，DMX 不作用；透明底）
+  // 二维码叠加纹理（当前二维码覆盖层单独渲染，DMX 不作用；透明底）
   VkImageCreateInfo qrImageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, nullptr};
   qrImageInfo.imageType = VK_IMAGE_TYPE_2D;
   qrImageInfo.extent = {(uint32_t)bufferWidth, (uint32_t)bufferHeight, 1};
@@ -1545,17 +1554,17 @@ void RegionRotationRenderer::updateRegionDescriptorSets() {
 
   VkDescriptorImageInfo qrOverlayInfo{singleMipSampler_, qrOverlayView_,
                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-  if (!ensureNeutralBlendTexture()) {
-    LOG_ERROR("[RegionRotationRenderer] updateRegionDescriptorSets: failed to create neutral blend texture");
+  if (!ensureNeutralMaskTexture()) {
+    LOG_ERROR("[RegionRotationRenderer] updateRegionDescriptorSets: failed to create neutral mask texture");
     return;
   }
   canvasMipmapsRequested_ = shouldUseCanvasMipmaps();
   VkSampler activeCanvasSampler = canvasMipmapsRequested_ ? canvasSampler_ : singleMipSampler_;
   VkImageView activeCanvasView = canvasMipmapsRequested_ ? canvasBufferView_ : canvasAttachmentView_;
-  VkImageView neutralBlendView = outputBlendTextureView_ != VK_NULL_HANDLE ? outputBlendTextureView_ : activeCanvasView;
+  VkImageView neutralMaskView = neutralMaskTextureView_ != VK_NULL_HANDLE ? neutralMaskTextureView_ : activeCanvasView;
   const bool maskTextureReady = globalMaskTextureContentValid_ &&
                                 globalMaskTextureView_ != VK_NULL_HANDLE;
-  VkImageView maskView = maskTextureReady ? globalMaskTextureView_ : neutralBlendView;
+  VkImageView maskView = maskTextureReady ? globalMaskTextureView_ : neutralMaskView;
   VkSampler maskSampler = singleMipSampler_;
   for (size_t i = 0; i < n; i++) {
     VkDeviceSize caveUniformOffset =
@@ -1565,13 +1574,8 @@ void RegionRotationRenderer::updateRegionDescriptorSets() {
                                        sizeof(CaveUniform)};
     VkDescriptorImageInfo canvasInfo{activeCanvasSampler, activeCanvasView,
                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    const bool blendReady = regions_[i].blendTextureInitialized &&
-                            regions_[i].blendTextureView != VK_NULL_HANDLE;
-    VkImageView blendView = blendReady ? regions_[i].blendTextureView : neutralBlendView;
-    VkSampler blendSampler = singleMipSampler_;
     VkDescriptorImageInfo maskTextureInfo{maskSampler, maskView,
                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkDescriptorImageInfo blendTextureInfo{blendSampler, blendView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
 
     uint64_t descriptorSignature = 1469598103934665603ull;
     mixDescriptorHandle(descriptorSignature, activeCanvasSampler);
@@ -1585,13 +1589,11 @@ void RegionRotationRenderer::updateRegionDescriptorSets() {
     mixDescriptorHandle(descriptorSignature, qrOverlayView_);
     mixDescriptorHandle(descriptorSignature, maskSampler);
     mixDescriptorHandle(descriptorSignature, maskView);
-    mixDescriptorHandle(descriptorSignature, blendSampler);
-    mixDescriptorHandle(descriptorSignature, blendView);
     if (frameDescriptorSignatures[i] == descriptorSignature) {
       continue;
     }
 
-    VkWriteDescriptorSet writes[5] = {
+    VkWriteDescriptorSet writes[4] = {
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frameDescriptorSets[i], 0, 0, 1,
          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &canvasInfo, nullptr, nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frameDescriptorSets[i], 1, 0, 1,
@@ -1599,10 +1601,8 @@ void RegionRotationRenderer::updateRegionDescriptorSets() {
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frameDescriptorSets[i], 2, 0, 1,
          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &qrOverlayInfo, nullptr, nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frameDescriptorSets[i], 3, 0, 1,
-         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &maskTextureInfo, nullptr, nullptr},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frameDescriptorSets[i], 4, 0, 1,
-         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blendTextureInfo, nullptr, nullptr}};
-    vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &maskTextureInfo, nullptr, nullptr}};
+    vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
     frameDescriptorSignatures[i] = descriptorSignature;
   }
 }
@@ -1620,7 +1620,7 @@ bool RegionRotationRenderer::createRegionPipeline() {
     return false;
   }
 
-  VkDescriptorSetLayoutBinding bindings[5] = {
+  VkDescriptorSetLayoutBinding bindings[4] = {
       {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
       {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
@@ -1628,11 +1628,9 @@ bool RegionRotationRenderer::createRegionPipeline() {
       {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
       {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-       VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-      {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
   VkDescriptorSetLayoutCreateInfo layoutInfo{
-      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 5,
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0, 4,
       bindings};
   if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr,
                                   &regionDescriptorSetLayout_) != VK_SUCCESS) {
@@ -1662,7 +1660,7 @@ bool RegionRotationRenderer::createRegionPipeline() {
   const uint32_t kMaxRegionSets =
       kMaxRegionDescriptorSets * MAX_FRAMES_IN_FLIGHT;
   VkDescriptorPoolSize poolSizes[2] = {
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxRegionSets * 4},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxRegionSets * 3},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxRegionSets}};
   VkDescriptorPoolCreateInfo poolInfo{
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1766,18 +1764,11 @@ bool RegionRotationRenderer::createRegionPipeline() {
 
   // 说明：优先使用外部 SPIR-V，这样修复 shader 时无需重新生成内置二进制。
   std::vector<uint32_t> vertSpirv = canvasRenderer->loadSpirvFromFile("region.vert.spv");
-  if (vertSpirv.empty() && shaders::regionVertShaderSpirvSize > 4) {
-    vertSpirv.assign(shaders::regionVertShaderSpirv, shaders::regionVertShaderSpirv + (shaders::regionVertShaderSpirvSize / 4));
-  }
 
   std::vector<uint32_t> fragSpirv = canvasRenderer->loadSpirvFromFile("region.frag.spv");
-  if (fragSpirv.empty() && shaders::regionFragShaderSpirvSize > 4) {
-    fragSpirv.assign(shaders::regionFragShaderSpirv, shaders::regionFragShaderSpirv + (shaders::regionFragShaderSpirvSize / 4));
-  }
 
   if (vertSpirv.empty() || fragSpirv.empty()) {
-    LOG_ERROR("[RegionRotationRenderer] Cannot load region shaders (builtin size: %zu/%zu)",
-              shaders::regionVertShaderSpirvSize, shaders::regionFragShaderSpirvSize);
+    LOG_ERROR("[RegionRotationRenderer] Cannot load generated region shaders");
     cleanupRegionPipelineResources();
     return false;
   }
@@ -1950,18 +1941,11 @@ bool RegionRotationRenderer::createGridLinePipeline() {
 
   // 说明：优先使用外部 SPIR-V，这样修复 shader 时无需重新生成内置二进制。
   std::vector<uint32_t> vertSpirv = canvasRenderer->loadSpirvFromFile("grid_line.vert.spv");
-  if (vertSpirv.empty() && shaders::gridLineVertShaderSpirvSize > 4) {
-    vertSpirv.assign(shaders::gridLineVertShaderSpirv, shaders::gridLineVertShaderSpirv + (shaders::gridLineVertShaderSpirvSize / 4));
-  }
 
   std::vector<uint32_t> fragSpirv = canvasRenderer->loadSpirvFromFile("grid_line.frag.spv");
-  if (fragSpirv.empty() && shaders::gridLineFragShaderSpirvSize > 4) {
-    fragSpirv.assign(shaders::gridLineFragShaderSpirv, shaders::gridLineFragShaderSpirv + (shaders::gridLineFragShaderSpirvSize / 4));
-  }
 
   if (vertSpirv.empty() || fragSpirv.empty()) {
-    LOG_ERROR("[RegionRenderer] Cannot load grid line shaders (builtin size: %zu/%zu)",
-              shaders::gridLineVertShaderSpirvSize, shaders::gridLineFragShaderSpirvSize);
+    LOG_ERROR("[RegionRenderer] Cannot load generated grid line shaders");
     vkDestroyPipelineLayout(device, gridLinePipelineLayout_, nullptr);
     gridLinePipelineLayout_ = VK_NULL_HANDLE;
     return false;

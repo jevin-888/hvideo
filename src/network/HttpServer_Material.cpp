@@ -1,3 +1,4 @@
+#include "foundation/VideoStorage.h"
 /**
  * @file HttpServer_Material.cpp（文件名）
  * @brief 素材管理 API 实现
@@ -6,7 +7,7 @@
 #include "HttpServer.h"
 #include "HttpRequest.h"
 #include "HttpResponse.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "database/MaterialIndex.h"
 #include "database/PlaylistDatabase.h"
 #include "database/PlaylistManager.h"
@@ -15,6 +16,7 @@
 #include "utils/VideoTranscoder.h"
 #include "utils/Logger.h"
 #include <json/json.h>
+#include <cctype>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
@@ -29,13 +31,6 @@ static const unsigned char kThumbnailPlaceholderGif[] = {
     0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b
 };
 static const size_t kThumbnailPlaceholderGifSize = sizeof(kThumbnailPlaceholderGif);
-
-// 素材基础目录统一使用 PathConfig 的 ROOT_PATH（/huoshan/ 或 /sdcard/huoshan/ 等）
-static std::string getMaterialBaseDir() {
-  std::string root = hsvj::ROOT_PATH;
-  if (!root.empty() && root.back() == '/') root.pop_back();
-  return root.empty() ? "/huoshan" : root;
-}
 
 void HttpServer::registerMaterialRoutes() {
   // 获取素材列表 API
@@ -53,8 +48,25 @@ void HttpServer::registerMaterialRoutes() {
       return;
     }
 
+    const std::string storage = request.getQueryParam("storage");
+    if (!hsvj::videoStorage::validSelection(storage, true) || (storage == "sata" && type != "video")) {
+      setJsonErrorResponse(response, 400, "Invalid storage");
+      return;
+    }
+    const std::string source = request.getQueryParam("source");
+    if (!source.empty() && source != "all" && source != "local" && source != "cloud") {
+      setJsonErrorResponse(response, 400, "Invalid source");
+      return;
+    }
+    const std::string categoryId = request.getQueryParam("categoryId");
+    if (!categoryId.empty() && (!folder.empty() || source == "local" || categoryId.size() > 128 || categoryId.find('\0') != std::string::npos)) {
+      setJsonErrorResponse(response, 400, "Invalid categoryId");
+      return;
+    }
     if (materialIndex_) {
-      setJsonDataResponse(response, materialIndex_->listMaterials(type, folder, 500),
+      materialIndex_->refreshStorageState();
+      Json::Value materials = materialIndex_->listMaterials(type, folder, 500, storage, source, categoryId);
+      setJsonDataResponse(response, materials,
                           "素材列表加载成功");
       return;
     }
@@ -67,8 +79,19 @@ void HttpServer::registerMaterialRoutes() {
                                        HttpResponse &response) {
     std::string type = request.getQueryParam("type");
     if (type.empty()) type = "video";
+    const std::string storage = request.getQueryParam("storage");
+    if (!hsvj::videoStorage::validSelection(storage, true) || (storage == "sata" && type != "video")) {
+      setJsonErrorResponse(response, 400, "Invalid storage");
+      return;
+    }
+    const std::string source = request.getQueryParam("source");
+    if (!source.empty() && source != "all" && source != "local" && source != "cloud") {
+      setJsonErrorResponse(response, 400, "Invalid source");
+      return;
+    }
     if (materialIndex_) {
-      setJsonDataResponse(response, materialIndex_->listFolders(type),
+      materialIndex_->refreshStorageState();
+      setJsonDataResponse(response, materialIndex_->listFolders(type, storage, source),
                           "素材目录加载成功");
       return;
     }
@@ -232,7 +255,7 @@ void HttpServer::registerMaterialRoutes() {
     }
 
     // 计算缩略图缓存路
-    std::string cacheDir = hsvj::MediaUtils::getThumbnailCacheDir(path);
+    std::string cacheDir = hsvj::MediaUtils::getThumbnailCacheDir();
     size_t pathHash = std::hash<std::string>{}(path);
     std::string cacheFilePath = cacheDir + std::to_string(pathHash) + ".jpg";
 
@@ -240,7 +263,7 @@ void HttpServer::registerMaterialRoutes() {
     if (!fs::exists(cacheFilePath)) {
       // 如果是图片类型，直接返回原始图片作为缩略图（浏览器会自动缩放
       std::string ext = fs::path(path).extension().string();
-      std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+      std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
       if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp") {
         if (fs::exists(path) && fs::is_regular_file(path)) {
           try {
@@ -266,7 +289,7 @@ void HttpServer::registerMaterialRoutes() {
       
       // 缩略图不存在
       // 检查是否是视频文件，如果是则触发异步生成
-      if (ext == ".mp4" || ext == ".mkv" || ext == ".avi" ||
+      if (ext == ".hvideo" || ext == ".mp4" || ext == ".mkv" || ext == ".avi" ||
           ext == ".mov" || ext == ".mpg" || ext == ".mpeg") {
         if (fs::exists(path) && fs::is_regular_file(path)) {
           hsvj::MediaUtils::generateThumbnailAsync(path, [this](const std::string& event, const std::string& data) {
@@ -307,7 +330,7 @@ void HttpServer::registerMaterialRoutes() {
       return;
     }
 
-    std::string cacheDir = hsvj::MediaUtils::getThumbnailCacheDir(path);
+    std::string cacheDir = hsvj::MediaUtils::getThumbnailCacheDir();
     size_t pathHash = std::hash<std::string>{}(path);
     std::string cacheFilePath = cacheDir + std::to_string(pathHash) + ".jpg";
 
@@ -406,7 +429,7 @@ void HttpServer::registerMaterialRoutes() {
     }
 
     // 异步执行，避免阻塞 HTTP 线程（大视频转码可能需要数分钟）
-    std::thread([this, inputPath, opts]() {
+    launchBackgroundTask([this, inputPath, opts]() {
       hsvj::VideoTranscoder::TranscodeOptions mOpts = opts;
       std::string errMsg;
       
@@ -425,7 +448,7 @@ void HttpServer::registerMaterialRoutes() {
       } else {
         LOG_ERROR("[Transcode] Failed: %s - %s", inputPath.c_str(), errMsg.c_str());
       }
-    }).detach();
+    });
 
     // 不返回缓存路径——编码完成后会直接替换原文件
     // 返回缓存路径会导致客户端在编码未完成时尝试预览不完整文件
@@ -452,8 +475,8 @@ void HttpServer::registerMaterialRoutes() {
       for (const auto& entry : fs::directory_iterator(videoDir)) {
         if (!entry.is_regular_file()) continue;
         std::string ext = entry.path().extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        if (ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mov") {
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".hvideo" || ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mov") {
           videoFiles.push_back(entry.path().string());
         }
       }
@@ -467,7 +490,7 @@ void HttpServer::registerMaterialRoutes() {
       return;
     }
 
-    std::thread([this, videoFiles, force]() {
+    launchBackgroundTask([this, videoFiles, force]() {
       int total = videoFiles.size();
       int completed = 0;
       int failed = 0;
@@ -543,7 +566,7 @@ void HttpServer::registerMaterialRoutes() {
 
       LOG_INFO("[BatchTranscode] Done: success=%d skipped=%d failed=%d total=%d",
                completed - failed - skipped, skipped, failed, total);
-    }).detach();
+    });
 
     Json::Value result;
     result["message"] = "Batch transcode started";

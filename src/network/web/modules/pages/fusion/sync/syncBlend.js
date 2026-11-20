@@ -1,9 +1,10 @@
-import { autoRecalculateBlend, loadBlend, saveBlend, setBlendAutoEdges as apiSetBlendAutoEdges, setManagerMode, persistFusionConfig, resetFusionConfig as apiResetFusionConfig, resizeBlendGridBatchOp, resizeGeometryGridOp } from '../api.js?v=2.95';
+import { autoRecalculateBlend, loadBlend, saveBlend, setBlendAutoEdges as apiSetBlendAutoEdges, setManagerMode, persistFusionConfig, resetFusionConfig as apiResetFusionConfig, resizeBlendGridBatchOp } from '../api.js?v=2.97';
 import { ensureBlendRegion, getState } from '../actions.js?v=2.95';
 import { setBlendAutoEdges, setBlendManagerMode, setBlendMasterEnabled } from '../blend/actions.js?v=2.95';
 import { loadGeometryLayout, loadGeometryRegion } from './syncGeometry.js?v=2.95';
 import { loadMask } from './syncMask.js?v=2.95';
 import { getLastApiError } from '../../../core/api.js';
+import { defaultBlendWidthForGrid } from '../utils/blend.js';
 
 const BLEND_SIDES = ['left', 'right', 'top', 'bottom'];
 let blendMutationQueue = Promise.resolve();
@@ -12,11 +13,6 @@ function enqueueBlendMutation(task) {
     const run = blendMutationQueue.catch(() => {}).then(task);
     blendMutationQueue = run.catch(() => {});
     return run;
-}
-
-function defaultBlendWidthForGrid(gridCount) {
-    const count = Math.max(2, Number(gridCount) || 2);
-    return count > 2 ? 1 / (count - 1) : 0;
 }
 
 function normalizeRegionIds(regionIds) {
@@ -145,16 +141,6 @@ export async function loadBlendRegion(regionId) {
     const response = await loadBlend(regionId);
     hydrateBlendRegion(regionId, response);
     return response;
-}
-
-export async function resizeBlendGridByOp(regionId, op) {
-    // I 融合管理模式下，后端 geometry_resize_grid 会走 Fusion管理器::resizeBlendGrid：
-    // 只调整融合管理网格和融合带宽度，不改几何播放网格，也不覆盖手动边开关。
-    return enqueueBlendMutation(async () => {
-        const response = await resizeGeometryGridOp(regionId, op);
-        hydrateBlendRegion(regionId, response);
-        return response;
-    });
 }
 
 export async function resizeBlendGridsByOp(regionIds, op) {

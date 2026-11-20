@@ -14,7 +14,10 @@
 #   2. 设置 ANDROID_NDK_HOME 环境变量
 #   3. 先编译 RKMPP: cd ../rkmpp && ./build_android.sh
 
-set -e
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
 # ======================= 配置区域 =======================
 # Android NDK 路径（请根据实际情况修改）
@@ -26,15 +29,15 @@ ANDROID_ABI="arm64-v8a"
 API_LEVEL=26
 
 # 输出目录
-PREFIX="$(pwd)/android/arm64"
+PREFIX="$SCRIPT_DIR/android/arm64"
 
 # RKMPP 库路径
-RKMPP_DIR="$(pwd)/../rkmpp"
+RKMPP_DIR="$SCRIPT_DIR/../rkmpp"
 RKMPP_INSTALL_DIR="$RKMPP_DIR/android_lib"
 RKMPP_SYSTEM_STUB_DIR="$RKMPP_INSTALL_DIR/system-stub/$ANDROID_ABI"
 
 # libdrm 路径
-LIBDRM_DIR="$(pwd)/../libdrm-android"
+LIBDRM_DIR="$SCRIPT_DIR/../libdrm-android"
 
 # ======================= 检查环境 =======================
 echo "====================================================="
@@ -100,11 +103,11 @@ if [ -z "$ENABLE_RKMPP" ]; then
     echo "  cd ../rkmpp"
     echo "  ./build_android.sh"
     echo ""
-    echo "将继续仅启用 MediaCodec..."
-    echo ""
+    echo "ERROR: RKMPP library is required for the HSVJ build"
+    exit 1
 else
     # 创建 pkg-config 文件供 FFmpeg 使用
-    PKG_CONFIG_DIR="$(pwd)/pkgconfig"
+    PKG_CONFIG_DIR="$SCRIPT_DIR/pkgconfig"
     mkdir -p "$PKG_CONFIG_DIR"
     
     cat > "$PKG_CONFIG_DIR/rockchip_mpp.pc" << EOF
@@ -120,7 +123,7 @@ Libs: -L\${libdir} -lmpp
 Cflags: -I\${includedir}
 EOF
     
-    export PKG_CONFIG_PATH="$PKG_CONFIG_DIR:$PKG_CONFIG_PATH"
+    export PKG_CONFIG_PATH="$PKG_CONFIG_DIR:${PKG_CONFIG_PATH:-}"
     echo "创建 pkg-config 文件: $PKG_CONFIG_DIR/rockchip_mpp.pc"
     echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
 fi
@@ -210,12 +213,20 @@ echo "清理旧构建..."
 make clean 2>/dev/null || true
 make distclean 2>/dev/null || true
 
+# 该脚本只拥有 android/arm64 输出。每次完整删除，避免已关闭组件的旧库残留。
+EXPECTED_PREFIX="$SCRIPT_DIR/android/arm64"
+if [ "$PREFIX" != "$EXPECTED_PREFIX" ]; then
+    echo "ERROR: refusing to clean unexpected output directory: $PREFIX"
+    exit 1
+fi
+rm -rf -- "$PREFIX"
+
 # ======================= 配置 FFmpeg =======================
 echo ""
 echo "配置 FFmpeg..."
 
 # 确保 PKG_CONFIG_PATH 正确设置
-export PKG_CONFIG_PATH="$PKG_CONFIG_DIR:$PKG_CONFIG_PATH"
+export PKG_CONFIG_PATH="$PKG_CONFIG_DIR:${PKG_CONFIG_PATH:-}"
 echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
 
 # 验证 pkg-config 能找到库
@@ -225,8 +236,8 @@ if pkg-config --exists rockchip_mpp 2>/dev/null; then
     pkg-config --cflags --libs rockchip_mpp
 else
     echo "  rockchip_mpp: 未找到 (pkg-config)"
-    echo "  尝试禁用 RKMPP 继续编译..."
-    ENABLE_RKMPP=""
+    echo "ERROR: RKMPP is mandatory for the HSVJ build"
+    exit 1
 fi
 
 if pkg-config --exists libdrm 2>/dev/null; then
@@ -260,10 +271,13 @@ ALL_LIBS="$RKMPP_LIBS -ldrm"
     --disable-ffprobe \
     --disable-ffplay \
     --disable-programs \
+    --disable-avdevice \
+    --disable-avfilter \
+    --disable-postproc \
     --disable-debug \
     --enable-pic \
-    --enable-jni \
-    --enable-mediacodec \
+    --disable-jni \
+    --disable-mediacodec \
     --enable-gpl \
     --enable-nonfree \
     --enable-version3 \
@@ -291,15 +305,6 @@ ALL_LIBS="$RKMPP_LIBS -ldrm"
     --enable-decoder=vp8_rkmpp \
     --enable-decoder=vp9_rkmpp \
     --enable-decoder=av1_rkmpp \
-    --enable-decoder=h264_mediacodec \
-    --enable-decoder=hevc_mediacodec \
-    --enable-decoder=mpeg2_mediacodec \
-    --enable-decoder=mpeg4_mediacodec \
-    --enable-decoder=vp8_mediacodec \
-    --enable-decoder=vp9_mediacodec \
-    --enable-hwaccel=h264_mediacodec \
-    --enable-hwaccel=hevc_mediacodec \
-    --enable-hwaccel=mpeg2_mediacodec \
     --enable-encoder=h264_rkmpp \
     --enable-encoder=hevc_rkmpp \
     --enable-encoder=aac \
@@ -311,17 +316,20 @@ ALL_LIBS="$RKMPP_LIBS -ldrm"
 # 检查配置结果
 echo ""
 echo "检查配置结果..."
-if grep -q "rkmpp.*yes" ffbuild/config.mak 2>/dev/null; then
-    echo "✓ RKMPP 已启用"
+if grep -q '^CONFIG_RKMPP=yes$' ffbuild/config.mak 2>/dev/null; then
+    echo "OK: RKMPP enabled"
 else
-    echo "✗ RKMPP 未启用"
+    echo "ERROR: RKMPP is not enabled"
+    exit 1
 fi
 
-if grep -q "mediacodec.*yes" ffbuild/config.mak 2>/dev/null; then
-    echo "✓ MediaCodec 已启用"
-else
-    echo "✗ MediaCodec 未启用"
-fi
+for disabled_component in MEDIACODEC AVDEVICE AVFILTER POSTPROC; do
+    if grep -q "^CONFIG_${disabled_component}=yes$" ffbuild/config.mak 2>/dev/null; then
+        echo "ERROR: ${disabled_component} is still enabled"
+        exit 1
+    fi
+done
+echo "OK: MediaCodec, avdevice, avfilter and postproc disabled"
 
 # ======================= 编译 =======================
 echo ""
@@ -333,6 +341,65 @@ make -j$NPROC
 echo ""
 echo "安装到 $PREFIX..."
 make install
+
+# ======================= 产物验证 =======================
+echo ""
+echo "验证 HSVJ FFmpeg 产物..."
+
+EXPECTED_LIBS="libavcodec.so
+libavformat.so
+libavutil.so
+libswresample.so
+libswscale.so"
+ACTUAL_LIBS="$(find "$PREFIX/lib" -maxdepth 1 -type f -name '*.so' -printf '%f\n' | sort)"
+if [ "$ACTUAL_LIBS" != "$EXPECTED_LIBS" ]; then
+    echo "ERROR: unexpected FFmpeg shared-library set"
+    echo "Expected:"
+    printf '%s\n' "$EXPECTED_LIBS"
+    echo "Actual:"
+    printf '%s\n' "$ACTUAL_LIBS"
+    exit 1
+fi
+
+for forbidden_lib in libavdevice.so libavfilter.so libpostproc.so; do
+    if [ -e "$PREFIX/lib/$forbidden_lib" ]; then
+        echo "ERROR: forbidden stale library remains: $forbidden_lib"
+        exit 1
+    fi
+done
+
+for forbidden_header in jni.h mediacodec.h hwcontext_mediacodec.h; do
+    if find "$PREFIX/include" -type f -name "$forbidden_header" -print -quit | grep -q .; then
+        echo "ERROR: forbidden header installed: $forbidden_header"
+        exit 1
+    fi
+done
+
+if "$TOOLCHAIN/bin/llvm-nm" -D "$PREFIX/lib/libavcodec.so" | grep -Eq 'av_mediacodec_|AMediaCodec'; then
+    echo "ERROR: MediaCodec compatibility symbols remain in libavcodec.so"
+    exit 1
+fi
+
+if ! "$TOOLCHAIN/bin/llvm-readelf" -d "$PREFIX/lib/libavcodec.so" | grep -q 'Shared library: \[libmpp.so\]'; then
+    echo "ERROR: libavcodec.so does not require libmpp.so"
+    exit 1
+fi
+
+if grep -Eq 'ff_.*_mediacodec_(decoder|encoder)' libavcodec/codec_list.c; then
+    echo "ERROR: MediaCodec codec registration remains"
+    exit 1
+fi
+
+for required_codec in ff_h264_rkmpp_decoder ff_hevc_rkmpp_decoder ff_h264_rkmpp_encoder ff_hevc_rkmpp_encoder; do
+    if ! grep -q "$required_codec" libavcodec/codec_list.c; then
+        echo "ERROR: required RKMPP codec is missing: $required_codec"
+        exit 1
+    fi
+done
+
+echo "OK: exactly five FFmpeg libraries"
+echo "OK: MediaCodec/JNI/avdevice/avfilter/postproc artifacts absent"
+echo "OK: RKMPP codecs registered and libmpp.so required"
 
 # ======================= 完成 =======================
 echo ""

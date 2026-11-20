@@ -292,7 +292,7 @@ static MMSSCPacketType get_tcp_server_response(MMSTContext *mmst)
                                             length_remaining) ;
             if (read_result != length_remaining) {
                 av_log(mms->mms_hd, AV_LOG_ERROR,
-                       "Reading pkt data (length=%d) ? failed: %d (%s)\n",
+                       "Reading pkt data (length=%d) failed: %d (%s)\n",
                        length_remaining, read_result,
                        read_result < 0 ? strerror(AVUNERROR(read_result)) :
                            "The server closed the connection");

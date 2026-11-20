@@ -1,0 +1,71 @@
+name: architecture-ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      LICENSE_HMAC_KEY: ${{ secrets.LICENSE_HMAC_KEY }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate player contracts
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -B scripts/check_source_encoding.py
+          python -B scripts/check_architecture.py
+          python -B scripts/check_jni_contract.py
+          python -B scripts/check_api_contract.py --player-only
+
+      - name: Install Web test dependencies
+        run: npm install --no-save --no-package-lock acorn@8.15.0 playwright@1.57.0
+
+      - name: Run Web regressions
+        run: |
+          foreach ($test in Get-ChildItem -LiteralPath scripts -Filter 'test_*.cjs') {
+            node $test.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Set up JDK 17
+        if: env.LICENSE_HMAC_KEY != ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        if: env.LICENSE_HMAC_KEY != ''
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build toolchain
+        if: env.LICENSE_HMAC_KEY != ''
+        shell: pwsh
+        run: |
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "cmake;3.22.1" "ndk;26.1.10909125"
+
+      - name: Compile Java, native engine, and generated assets
+        if: env.LICENSE_HMAC_KEY != ''
+        shell: pwsh
+        run: |
+          .\gradlew.bat :app:compileHw82StableReleaseJavaWithJavac :app:externalNativeBuildHw82StableRelease :app:mergeHw82StableReleaseAssets --no-daemon --console=plain

@@ -1,21 +1,17 @@
+import { legacySpline1D, lerpPoint } from '../../../../shared/legacySpline.js';
 import { getState } from '../actions.js?v=2.95';
 import { clamp01 } from '../utils/grid.js';
 import { getActiveGeometry, getActiveMask } from '../selectors.js?v=2.95';
-import { calculateAspectRatioRect, projectionToScreen } from './coords.js';
+import { calculateAspectRatioRect } from './coords.js';
 import { GRID_VISUAL_METRICS } from './visualStyle.js?v=2.81';
-import {
-    blendPointToCanvas,
-    getBlendCurveAlpha,
-    getBlendCurveHandleLayout,
-    getBlendCurveParams,
-    getBlendPlotRect
-} from '../utils/blendCurve.js';
+import { drawBlendCurvePreview } from './blendCurvePreview.js';
 
 export {
     blendPointToCanvas,
     getBlendCurveAlpha,
     getBlendCurveAnchorFromDisplayValue,
     getBlendCurveHandleLayout,
+    getBlendCurvePatchFromDisplayPoint,
     getBlendCurveParams,
     getBlendPlotRect
 } from '../utils/blendCurve.js';
@@ -75,65 +71,6 @@ function getInputCanvasAspectRatio() {
     return input.cols / input.rows;
 }
 
-function getMatrixCellAspectRatio(totalWidth, totalHeight, rows, cols) {
-    // 矩阵布局统一按行×列(rows×cols)：12×1 表示 12 行 1 列。
-    // 单个输出格子的尺寸是 totalWidth / cols 与 totalHeight / rows。
-    const safeRows = Math.max(1, Number(rows) || 1);
-    const safeCols = Math.max(1, Number(cols) || 1);
-    return (totalWidth / safeCols) / (totalHeight / safeRows);
-}
-
-function isUsableProjectionAspect(aspectRatio) {
-    return Number.isFinite(aspectRatio) && aspectRatio >= 0.45 && aspectRatio <= 3.2;
-}
-
-function pickProjectionAspect(...candidates) {
-    for (const candidate of candidates) {
-        const number = Number(candidate);
-        if (isUsableProjectionAspect(number)) return number;
-    }
-    return 16 / 9;
-}
-
-function getRegionAspectRatio() {
-    const state = getState();
-    const tileInWidth = Number(state.layout.tileInWidth) || 0;
-    const tileInHeight = Number(state.layout.tileInHeight) || 0;
-    const tileWidth = Number(state.layout.tileOutWidth) || 0;
-    const tileHeight = Number(state.layout.tileOutHeight) || 0;
-    const width = Number(state.layout.outputWidth) || 0;
-    const height = Number(state.layout.outputHeight) || 0;
-    const cols = Math.max(1, Number(state.layout.cols) || Math.max(1, state.layout.regionIds?.length || 1));
-    const rows = Math.max(1, Number(state.layout.rows) || 1);
-    return pickProjectionAspect(
-        tileInWidth > 0 && tileInHeight > 0 ? tileInWidth / tileInHeight : null,
-        tileWidth > 0 && tileHeight > 0 ? tileWidth / tileHeight : null,
-        width > 0 && height > 0 ? getMatrixCellAspectRatio(width, height, rows, cols) : null,
-        width > 0 && height > 0 ? width / height : null
-    );
-}
-
-function getRegionAspectRatioById(regionId) {
-    const state = getState();
-    const region = state.geometry.byRegionId?.[regionId];
-    const outputWidth = Number(state.layout.outputWidth) || 0;
-    const outputHeight = Number(state.layout.outputHeight) || 0;
-    const outWidth = Number(region?.outWidth) || 0;
-    const outHeight = Number(region?.outHeight) || 0;
-    const srcWidth = Number(region?.srcWidth) || 0;
-    const srcHeight = Number(region?.srcHeight) || 0;
-    const regionOutputAspect = outputWidth > 0 && outputHeight > 0 && outWidth > 0 && outHeight > 0
-        ? (outWidth * outputWidth) / (outHeight * outputHeight)
-        : null;
-    const sourceAspect = srcWidth > 0 && srcHeight > 0 ? srcWidth / srcHeight : null;
-
-    return pickProjectionAspect(
-        regionOutputAspect,
-        sourceAspect,
-        getRegionAspectRatio()
-    );
-}
-
 function getDebugStyle(mode) {
     const selectedGridLineColor = '#00ff00';
     const selectedMaskLineColor = '#ff00ff';
@@ -188,13 +125,6 @@ function toGridPoint(source, row, col, options = {}) {
     };
 }
 
-function lerpPoint(a, b, t) {
-    return {
-        u: a.u * (1 - t) + b.u * t,
-        v: a.v * (1 - t) + b.v * t
-    };
-}
-
 function sampleLinearGrid(source, u, v, options = {}) {
     const rows = Math.max(2, Number(source?.rows) || 2);
     const cols = Math.max(2, Number(source?.cols) || 2);
@@ -209,167 +139,6 @@ function sampleLinearGrid(source, u, v, options = {}) {
     const top = lerpPoint(toGridPoint(source, r0, c0, options), toGridPoint(source, r0, c1, options), fC);
     const bottom = lerpPoint(toGridPoint(source, r1, c0, options), toGridPoint(source, r1, c1, options), fC);
     return lerpPoint(top, bottom, fR);
-}
-
-function linearCurvePoint(points, t) {
-    const n = points.length;
-    if (n <= 0) return { u: 0, v: 0 };
-    if (n === 1) return points[0];
-    const scaled = clamp01(t) * (n - 1);
-    const index = Math.min(n - 2, Math.max(0, Math.floor(scaled)));
-    return lerpPoint(points[index], points[index + 1], scaled - index);
-}
-
-function legacySpline1D(input, t, xyScale = 1) {
-    const n = input.length;
-    if (n <= 0) return { u: 0, v: 0 };
-    if (n === 1) return input[0];
-
-    const linearAt = () => linearCurvePoint(input, t);
-    if (n === 2) return linearAt();
-
-    const scale = Math.abs(xyScale) > EPSILON ? xyScale : 1;
-    const pts = input.map((point) => ({ u: point.u / scale, v: point.v }));
-    const distance = (a, b) => Math.hypot(a.u - b.u, a.v - b.v);
-    const safeDiv = (numerator, denominator) => Math.abs(denominator) > EPSILON ? numerator / denominator : 0;
-    const L = n - 1;
-    const N = n + 1;
-    const M = 4;
-    const curveTot = n + 2;
-    const knot = new Array(n + 6).fill(0);
-    knot[0] = 0;
-    knot[1] = distance(pts[0], pts[1]);
-    for (let i = 2; i < n; i += 1) {
-        knot[i] = knot[i - 1] + distance(pts[i - 1], pts[i]);
-    }
-    if (knot[L] <= EPSILON) return input[0];
-
-    const delta = new Array(n + 1).fill(0);
-    for (let i = 1; i < n; i += 1) {
-        delta[i] = knot[i] - knot[i - 1];
-        if (delta[i] <= EPSILON) return linearAt();
-    }
-
-    const coeffA = new Array(n).fill(0);
-    const coeffB = new Array(n).fill(0);
-    const coeffC = new Array(n).fill(0);
-    const coeffP = new Array(n).fill(0);
-    const coeffQ = new Array(n).fill(0);
-    const coeffR = new Array(n).fill(0);
-    const coeffZ = new Array(n).fill(0);
-    const coeffr = new Array(n).fill(0);
-
-    coeffA[1] = safeDiv(delta[2] * delta[2], delta[1] + delta[2]);
-    coeffB[0] = 1;
-    coeffB[L] = 1;
-    coeffB[1] = safeDiv(delta[2] * delta[1], delta[1] + delta[2]) +
-        safeDiv(delta[1] * (delta[2] + delta[3]), delta[1] + delta[2] + delta[3]);
-    coeffC[1] = safeDiv(delta[1] * delta[1], delta[1] + delta[2] + delta[3]);
-    for (let i = 2; i <= L - 1; i += 1) {
-        coeffA[i] = safeDiv(delta[i + 1] * delta[i + 1], delta[i - 1] + delta[i] + delta[i + 1]);
-        coeffB[i] = safeDiv(delta[i + 1] * (delta[i - 1] + delta[i]), delta[i - 1] + delta[i] + delta[i + 1]) +
-            safeDiv(delta[i] * (delta[i + 1] + delta[i + 2]), delta[i] + delta[i + 1] + delta[i + 2]);
-        coeffC[i] = safeDiv(delta[i] * delta[i], delta[i] + delta[i + 1] + delta[i + 2]);
-    }
-
-    coeffQ[0] = coeffB[0];
-    for (let i = 0; i < L; i += 1) coeffR[i] = coeffC[i];
-    for (let i = 1; i <= L; i += 1) {
-        if (Math.abs(coeffQ[i - 1]) <= EPSILON) return linearAt();
-        coeffP[i] = coeffA[i] / coeffQ[i - 1];
-        coeffQ[i] = coeffB[i] - coeffP[i] * coeffC[i - 1];
-    }
-
-    let beta = delta[1] + delta[2];
-    if (Math.abs(beta) <= EPSILON) return linearAt();
-    const startVec = {
-        u: safeDiv(-(2 * delta[1] + delta[2]) * pts[0].u, delta[1] * beta) +
-            safeDiv(beta * pts[1].u, delta[1] * delta[2]) -
-            safeDiv(delta[1] * pts[2].u, delta[2] * beta),
-        v: safeDiv(-(2 * delta[1] + delta[2]) * pts[0].v, delta[1] * beta) +
-            safeDiv(beta * pts[1].v, delta[1] * delta[2]) -
-            safeDiv(delta[1] * pts[2].v, delta[2] * beta)
-    };
-
-    beta = delta[L - 1] + delta[L];
-    if (Math.abs(beta) <= EPSILON) return linearAt();
-    const endVec = {
-        u: safeDiv(delta[L] * pts[L - 2].u, delta[L - 1] * beta) -
-            safeDiv(beta * pts[L - 1].u, delta[L - 1] * delta[L]) +
-            safeDiv((2 * delta[L] + delta[L - 1]) * pts[L].u, beta * delta[L]),
-        v: safeDiv(delta[L] * pts[L - 2].v, delta[L - 1] * beta) -
-            safeDiv(beta * pts[L - 1].v, delta[L - 1] * delta[L]) +
-            safeDiv((2 * delta[L] + delta[L - 1]) * pts[L].v, beta * delta[L])
-    };
-
-    const normalize = (vec) => {
-        const len = Math.hypot(vec.u, vec.v);
-        if (len <= EPSILON) return false;
-        vec.u /= len;
-        vec.v /= len;
-        return true;
-    };
-    if (!normalize(startVec) || !normalize(endVec)) return linearAt();
-
-    const curvePts = Array.from({ length: curveTot }, () => ({ u: 0, v: 0 }));
-    curvePts[0] = pts[0];
-    curvePts[1] = {
-        u: pts[0].u + distance(pts[0], pts[1]) * startVec.u / 3,
-        v: pts[0].v + distance(pts[0], pts[1]) * startVec.v / 3
-    };
-    curvePts[curveTot - 2] = {
-        u: pts[L].u - distance(pts[L - 1], pts[L]) * endVec.u / 3,
-        v: pts[L].v - distance(pts[L - 1], pts[L]) * endVec.v / 3
-    };
-    curvePts[N] = pts[L];
-
-    const solveAxis = (key) => {
-        coeffr[0] = curvePts[1][key];
-        for (let i = 1; i < L; i += 1) coeffr[i] = (delta[i] + delta[i + 1]) * pts[i][key];
-        coeffr[L] = curvePts[L + 1][key];
-        coeffZ[0] = coeffr[0];
-        for (let i = 1; i <= L; i += 1) coeffZ[i] = coeffr[i] - coeffP[i] * coeffZ[i - 1];
-        if (Math.abs(coeffQ[L]) <= EPSILON) return false;
-        curvePts[L + 1][key] = coeffZ[L] / coeffQ[L];
-        for (let i = L - 1; i >= 0; i -= 1) {
-            if (Math.abs(coeffQ[i]) <= EPSILON) return false;
-            curvePts[i + 1][key] = (coeffZ[i] - coeffR[i] * curvePts[i + 2][key]) / coeffQ[i];
-        }
-        return true;
-    };
-    if (!solveAxis('u') || !solveAxis('v')) return linearAt();
-
-    knot[N + M] = knot[N + M - 1] = knot[N + M - 2] = knot[N + M - 3] = knot[L];
-    for (let i = L - 1; i > 0; i -= 1) knot[i + 3] = knot[i];
-    knot[3] = knot[2] = knot[1] = knot[0] = 0;
-
-    const scaledT = clamp01(t) * (n - 1);
-    const seg = Math.min(n - 2, Math.max(0, Math.floor(scaledT)));
-    const local = scaledT - seg;
-    const i = 3 + seg;
-    const segmentLength = knot[i + 1] - knot[i];
-    if (segmentLength <= EPSILON) return linearAt();
-    const kt = knot[i] + local * segmentLength;
-
-    const N22 = safeDiv(knot[i + 1] - kt, knot[i + 1] - knot[i]);
-    const N32 = safeDiv(kt - knot[i], knot[i + 1] - knot[i]);
-    const N13 = safeDiv((knot[i + 1] - kt) * N22, knot[i + 1] - knot[i - 1]);
-    const N23 = safeDiv((kt - knot[i - 1]) * N22, knot[i + 1] - knot[i - 1]) +
-        safeDiv((knot[i + 2] - kt) * N32, knot[i + 2] - knot[i]);
-    const N33 = safeDiv((kt - knot[i]) * N32, knot[i + 2] - knot[i]);
-    const N04 = safeDiv((knot[i + 1] - kt) * N13, knot[i + 1] - knot[i - 2]);
-    const N14 = safeDiv((kt - knot[i - 2]) * N13, knot[i + 1] - knot[i - 2]) +
-        safeDiv((knot[i + 2] - kt) * N23, knot[i + 2] - knot[i - 1]);
-    const N24 = safeDiv((kt - knot[i - 1]) * N23, knot[i + 2] - knot[i - 1]) +
-        safeDiv((knot[i + 3] - kt) * N33, knot[i + 3] - knot[i]);
-    const N34 = safeDiv((kt - knot[i]) * N33, knot[i + 3] - knot[i]);
-    const denominator = N04 + N14 + N24 + N34;
-    if (Math.abs(denominator) <= EPSILON) return linearAt();
-
-    return {
-        u: ((N04 * curvePts[i - 3].u + N14 * curvePts[i - 2].u + N24 * curvePts[i - 1].u + N34 * curvePts[i].u) / denominator) * scale,
-        v: (N04 * curvePts[i - 3].v + N14 * curvePts[i - 2].v + N24 * curvePts[i - 1].v + N34 * curvePts[i].v) / denominator
-    };
 }
 
 function sampleGridSurface(source, u, v, rect = null, options = {}) {
@@ -1236,7 +1005,7 @@ function drawRegionCenterNumber(ctx, regionId, rect, isActive, role) {
     ctx.strokeStyle = 'rgba(2, 6, 23, 0.76)';
     ctx.fillStyle = isActive ? 'rgba(255, 255, 255, 0.92)' : 'rgba(226, 232, 240, 0.58)';
     ctx.strokeText(text, rect.x + rect.width / 2, rect.y + rect.height / 2);
-    ctx.fillText(text, rect.x + rect.width / 2, rect.y + rect.height / 2);
+    ctx.fillText((globalThis.PlayerI18n?.t(text) ?? (text)), rect.x + rect.width / 2, rect.y + rect.height / 2);
     ctx.restore();
 }
 
@@ -1351,85 +1120,21 @@ export function drawGridScene(canvas) {
         ctx.fillStyle = isActive ? '#e2e8f0' : 'rgba(226, 232, 240, 0.72)';
         ctx.font = role === 'focus' ? 'bold 14px Consolas, monospace' : 'bold 11px Consolas, monospace';
         const label = isBlendPage ? `融合 投影${regionId}` : `几何 投影${regionId}`;
-        ctx.fillText(isActive && role === 'focus' ? `${label} · 当前` : label, cell.x + (role === 'focus' ? 18 : 10), cell.y + (role === 'focus' ? 28 : 17));
+        ctx.fillText((globalThis.PlayerI18n?.t(isActive && role === 'focus' ? `${label} · 当前` : label) ?? (isActive && role === 'focus' ? `${label} · 当前` : label)), cell.x + (role === 'focus' ? 18 : 10), cell.y + (role === 'focus' ? 28 : 17));
     });
 }
 
 export function drawBlendScene(canvas) {
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const { width, height } = canvas;
     const state = getState();
     const regionId = state.page.activeRegionId;
     const side = state.blend.activeSide;
-    const sideState = state.blend.byRegionId[regionId]?.[side] || state.blend.byRegionId[state.page.activeRegionId]?.[side];
+    const sideState = state.blend.byRegionId[regionId]?.[side]
+        || state.blend.byRegionId[state.page.activeRegionId]?.[side];
     if (!sideState) return;
-    const rect = getBlendPlotRect(canvas);
-
-    ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = '#0b1220';
-    ctx.fillRect(0, 0, width, height);
-
-    ctx.strokeStyle = '#1e293b';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i += 1) {
-        const gx = rect.x + (rect.width / 4) * i;
-        const gy = rect.y + (rect.height / 4) * i;
-        ctx.beginPath();
-        ctx.moveTo(gx, rect.y);
-        ctx.lineTo(gx, rect.y + rect.height);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(rect.x, gy);
-        ctx.lineTo(rect.x + rect.width, gy);
-        ctx.stroke();
-    }
-
-    const layout = getBlendCurveHandleLayout(canvas, sideState);
-    const params = layout.params;
-
-    const drawCurveRange = (fromX, toX, style, lineWidth) => {
-        if (toX <= fromX) return;
-        ctx.strokeStyle = style;
-        ctx.lineWidth = lineWidth;
-        ctx.beginPath();
-        for (let i = 0; i <= 96; i += 1) {
-            const t = i / 96;
-            const x = fromX + (toX - fromX) * t;
-            const screen = blendPointToCanvas({ x, y: 1 - getBlendCurveAlpha(sideState, x) }, rect);
-            if (i === 0) ctx.moveTo(screen.x, screen.y);
-            else ctx.lineTo(screen.x, screen.y);
-        }
-        ctx.stroke();
-    };
-
-    drawCurveRange(0, params.stripStartRatio, 'rgba(96, 165, 250, 0.28)', 1.5);
-    drawCurveRange(params.stripEndRatio, 1, 'rgba(96, 165, 250, 0.28)', 1.5);
-    drawCurveRange(params.stripStartRatio, params.stripEndRatio, '#60a5fa', 2.5);
-
-    ctx.strokeStyle = 'rgba(248, 250, 252, 0.18)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(layout.handles[0].screen.x, rect.y);
-    ctx.lineTo(layout.handles[0].screen.x, rect.y + rect.height);
-    ctx.moveTo(layout.handles[2].screen.x, rect.y);
-    ctx.lineTo(layout.handles[2].screen.x, rect.y + rect.height);
-    ctx.stroke();
-
-    layout.handles.forEach((handle) => {
-        const radius = handle.id === 'anchor'
-            ? GRID_VISUAL_METRICS.blendCurvePointRadius + 1
-            : GRID_VISUAL_METRICS.blendCurvePointRadius;
-        ctx.fillStyle = '#f59e0b';
-        ctx.beginPath();
-        ctx.arc(handle.screen.x, handle.screen.y, radius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = '#f8fafc';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
+    drawBlendCurvePreview(canvas, sideState, {
+        sideLabel: side,
+        handleRadius: GRID_VISUAL_METRICS.blendCurvePointRadius + 1,
+        anchorRadius: GRID_VISUAL_METRICS.blendCurvePointRadius + 2
     });
-
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = '12px Consolas, monospace';
-    ctx.fillText(`BLEND ${side.toUpperCase()} · gamma=${params.gamma.toFixed(2)} gain=${params.anchor.toFixed(2)} slope=${params.slope.toFixed(2)}`, 24, 14);
 }

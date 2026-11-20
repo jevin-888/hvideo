@@ -2,4 +2,5 @@
 // 部署路径: frameworks/base/core/java/android/wfd_sink/WfdSinkStatus.aidl
 package android.wfd_sink;
 
+/** @hide */
 parcelable WfdSinkStatus;

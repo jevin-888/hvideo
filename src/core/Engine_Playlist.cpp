@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file Engine_Playlist.cpp（文件名）
  * @brief 引擎播放列表与默认播放、提示层、下一首逻辑
  *
@@ -12,7 +12,7 @@
 #include "core/Engine.h"
 #include "audio/AudioPlayerManager.h"
 #include "core/LicenseManager.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/PlaylistPlaybackPolicy.h"
 #include "core/SystemConfig.h"
 #include "database/PlaylistDatabase.h"
@@ -23,6 +23,7 @@
 #include "layer/LayerImage.h"
 #include "layer/LayerText.h"
 #include "layer/LayerVideo.h"
+#include "network/NetworkManager.h"
 #include "playcontrol/PlaybackRequestDispatcher.h"
 #include "playcontrol/PlaybackResult.h"
 #include "utils/FileUtils.h"
@@ -30,9 +31,11 @@
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
 #include "vod/LocalVodManager.h"
+#include "vod/LocalVodPlayer.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <future>
 #include <map>
 #include <set>
@@ -50,11 +53,14 @@ std::map<int, std::chrono::steady_clock::time_point> g_autoPlayRetryAfter;
 std::map<int, std::chrono::steady_clock::time_point> g_autoPlayStoppedSince;
 std::map<int, std::string> g_autoPlayStoppedPath;
 
+constexpr double kOnlineVodEndPositionToleranceSeconds = 0.10;
+constexpr auto kOnlineVodEndHoldDuration = std::chrono::milliseconds(750);
+
 bool isSupportedDefaultVodVideo(const std::string& path) {
   std::string ext = FileUtils::getExtension(path);
   std::transform(ext.begin(), ext.end(), ext.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return ext == "mp4" || ext == "mov" || ext == "mkv" || ext == "avi" ||
+  return ext == "hvideo" || ext == "mp4" || ext == "mov" || ext == "mkv" || ext == "avi" ||
          ext == "flv" || ext == "ts" || ext == "webm" || ext == "m4v";
 }
 
@@ -70,32 +76,86 @@ std::string findDefaultLocalVodVideo() {
   return "";
 }
 
-std::string normalizeOnlineVodMediaPathForCompare(std::string path) {
-  for (char& c : path) {
-    if (c == '\\') c = '/';
-  }
-  const size_t schemeEnd = path.find("://");
-  if (schemeEnd != std::string::npos) {
-    const size_t pathStart = path.find('/', schemeEnd + 3);
-    path = pathStart == std::string::npos ? "" : path.substr(pathStart);
-  }
-  const std::string apiPrefix = "/api/v1";
-  if (path.rfind(apiPrefix, 0) == 0) {
-    path = path.substr(apiPrefix.size());
-  }
-  return path;
-}
-
-bool isSameOnlineVodMediaPath(const std::string& a, const std::string& b) {
-  const std::string left = normalizeOnlineVodMediaPathForCompare(a);
-  const std::string right = normalizeOnlineVodMediaPathForCompare(b);
-  return !left.empty() && left == right;
-}
-
 bool isSkippableAutoPlayFailure(PlaybackResultCode code) {
   return code == PlaybackResultCode::UnsupportedFormat ||
          code == PlaybackResultCode::DecodeFailed ||
          code == PlaybackResultCode::OpenFailed;
+}
+
+std::string resolvePlaylistImagePath(const std::string &uri) {
+  std::string imagePath = FileUtils::normalizePath(uri);
+  if (imagePath.empty() || FileUtils::exists(imagePath)) {
+    return imagePath;
+  }
+
+  const std::string filename = FileUtils::getFilename(uri);
+  if (filename.empty()) {
+    return imagePath;
+  }
+
+  const std::string fallback =
+      FileUtils::normalizePath(IMAGE_DIR + filename);
+  return FileUtils::exists(fallback) ? fallback : imagePath;
+}
+
+bool resolveNextPlaylistImage(PlaylistManager *playlistManager,
+                              const std::string &playlistId, int layerId,
+                              int &nextIndex, std::string &nextPath) {
+  if (!playlistManager || playlistId.empty()) return false;
+  const std::vector<PlaylistItem> items =
+      playlistManager->getPlaylistItems(playlistId, layerId);
+  if (items.empty()) return false;
+
+  const int currentIndex = playlistManager->getCurrentIndex(playlistId);
+  if (currentIndex < 0 || currentIndex >= static_cast<int>(items.size())) {
+    nextIndex = 0;
+  } else {
+    nextIndex = currentIndex + 1;
+    if (nextIndex >= static_cast<int>(items.size())) nextIndex = 0;
+  }
+  nextPath = resolvePlaylistImagePath(items[nextIndex].uri);
+  return !nextPath.empty();
+}
+
+void preloadNextPlaylistImage(PlaylistManager *playlistManager,
+                              LayerImage *imageLayer,
+                              const std::string &playlistId, int layerId) {
+  int nextIndex = -1;
+  std::string nextPath;
+  if (!imageLayer ||
+      !resolveNextPlaylistImage(playlistManager, playlistId, layerId,
+                                nextIndex, nextPath)) return;
+  if (!FileUtils::exists(nextPath)) {
+    LOG_WARN("[AutoPlay] image layer %d preload target does not exist: %s",
+             layerId, nextPath.c_str());
+    return;
+  }
+  imageLayer->preloadImage(nextPath);
+}
+
+void restoreConfiguredImageLayerGeometry(const SystemConfig *systemConfig,
+                                         LayerImage *imageLayer, int layerId,
+                                         const char *source) {
+  if (!systemConfig || !imageLayer) {
+    return;
+  }
+
+  const LayerConfigData *layerConfig = systemConfig->getLayerConfig(layerId);
+  if (!layerConfig) {
+    return;
+  }
+
+  imageLayer->setPosition(layerConfig->position);
+  if (layerConfig->size.width > 0 && layerConfig->size.height > 0) {
+    imageLayer->setSize(layerConfig->size);
+  }
+
+  LOG_DEBUG(
+      "[AutoPlay] image layer %d restore configured geometry after %s: "
+      "position=(%d,%d) size=%dx%d",
+      layerId, source ? source : "load", layerConfig->position.x,
+      layerConfig->position.y, layerConfig->size.width,
+      layerConfig->size.height);
 }
 
 static std::vector<PlaylistItem> getHintPlaylistItems(PlaylistManager *playlistManager,
@@ -176,7 +236,178 @@ static bool applyPlaylistHintItems(PlaylistManager *playlistManager,
   return true;
 }
 
-} // 匿名命名空间
+template <typename QueueItem, typename NameGetter>
+static void applyVodQueueHintItems(const std::vector<QueueItem> &queue,
+                                   LayerText *hintLayer, int listType,
+                                   NameGetter getName) {
+  int showCount = hintLayer->getShowCount();
+  if (showCount <= 0)
+    showCount = 3;
+
+  std::vector<PlaylistItemInfo> hintItems;
+  int totalRemaining = 0;
+  auto appendItem = [&](const QueueItem &item) {
+    if (static_cast<int>(hintItems.size()) < showCount) {
+      PlaylistItemInfo info;
+      info.name = getName(item);
+      info.index = item.position;
+      hintItems.push_back(std::move(info));
+    } else {
+      ++totalRemaining;
+    }
+  };
+
+  bool foundPlaying = false;
+  for (const auto &item : queue) {
+    if (!foundPlaying && item.status == 1) {
+      foundPlaying = true;
+      continue;
+    }
+    if (foundPlaying)
+      appendItem(item);
+  }
+
+  // Queue state can lag behind playback startup. Fall back to the queue head so
+  // the selected-list binding still has useful content during synchronization.
+  if (!foundPlaying) {
+    hintItems.clear();
+    totalRemaining = 0;
+    for (const auto &item : queue)
+      appendItem(item);
+  }
+
+  hintLayer->getMessageHintRenderer()->setPlaylistHintListType(listType);
+  hintLayer->setPlaylistHintItems(hintItems, showCount, totalRemaining);
+}
+
+template <typename BuildHintItems>
+static void updateVodQueueHintLayer(LayerText *hintLayer,
+                                    LayerVideo *videoLayer, float startHintTime,
+                                    float endHintTime, float displayDuration,
+                                    const char *source,
+                                    BuildHintItems buildHintItems) {
+  auto *renderer = hintLayer->getMessageHintRenderer();
+  if (!videoLayer) {
+    renderer->setPlaylistHintVisible(false);
+    return;
+  }
+
+  const std::string currentPath =
+      FileUtils::normalizePath(videoLayer->getCurrentPath());
+  if (currentPath.empty()) {
+    renderer->setPlaylistHintVisible(false);
+    return;
+  }
+  if (currentPath != hintLayer->getLastVideoPath()) {
+    hintLayer->setLastVideoPath(currentPath);
+    hintLayer->setPlaylistHintState(0);
+    hintLayer->setLastRemainingTime(0.0);
+    hintLayer->setLastCurrentPos(0.0);
+    hintLayer->setPlaylistHintSuppressAfterSwitch(true);
+    hintLayer->recordPlaylistHintStartTime();
+    renderer->setPlaylistHintVisible(false);
+    LOG_DEBUG("L41[%s]: switch detected, reset. path=%s", source,
+              currentPath.c_str());
+    return;
+  }
+  if (videoLayer->getState() != LayerVideo::PlayState::PLAYING) {
+    renderer->setPlaylistHintVisible(false);
+    return;
+  }
+
+  const double duration = videoLayer->getDuration();
+  const double currentPos = videoLayer->getCurrentPosition();
+  if (duration <= 0) {
+    renderer->setPlaylistHintVisible(false);
+    return;
+  }
+
+  const double remaining = duration - currentPos;
+  const auto now = std::chrono::steady_clock::now();
+  float elapsed =
+      std::chrono::duration<float>(now - hintLayer->getPlaylistHintStartTime())
+          .count();
+  if (elapsed < 0)
+    elapsed = 0;
+
+  bool shouldShow = false;
+  int state = hintLayer->getPlaylistHintState();
+  if (elapsed >= endHintTime) {
+    hintLayer->setPlaylistHintSuppressAfterSwitch(false);
+  }
+  if (!hintLayer->getPlaylistHintSuppressAfterSwitch() &&
+      elapsed >= endHintTime && elapsed < endHintTime + displayDuration) {
+    if (state != 1) {
+      state = 1;
+      hintLayer->setPlaylistHintState(state);
+      buildHintItems(1);
+      LOG_DEBUG("L41[%s]: show START hint, elapsed=%.2f", source, elapsed);
+    }
+    shouldShow = true;
+  } else if (state == 1) {
+    state = 0;
+    hintLayer->setPlaylistHintState(state);
+  }
+
+  const double lastRemaining = hintLayer->getLastRemainingTime();
+  if (remaining <= startHintTime && remaining > 0 &&
+      lastRemaining > startHintTime && state == 0) {
+    state = 2;
+    hintLayer->setPlaylistHintState(state);
+    hintLayer->recordPlaylistHintStartTime();
+    buildHintItems(0);
+    LOG_DEBUG("L41[%s]: show END hint, remaining=%.2f", source, remaining);
+  }
+  hintLayer->setLastRemainingTime(remaining);
+  hintLayer->setLastCurrentPos(currentPos);
+
+  if (state == 2) {
+    const float displayElapsed =
+        std::chrono::duration<float>(now -
+                                     hintLayer->getPlaylistHintStartTime())
+            .count();
+    if (displayElapsed < displayDuration) {
+      shouldShow = true;
+    } else {
+      hintLayer->setPlaylistHintState(0);
+    }
+  }
+
+  const bool operationHintActive = renderer->isOperationHintActive();
+  const bool finalShow =
+      shouldShow && hintLayer->getShowList() && !operationHintActive;
+  if (finalShow || !operationHintActive)
+    hintLayer->setVisible(finalShow);
+  renderer->setPlaylistHintVisible(finalShow);
+}
+
+} // namespace
+
+std::string Engine::normalizeOnlineVodMediaPathForCompare(std::string path) {
+  for (char &c : path) {
+    if (c == '\\')
+      c = '/';
+  }
+  const size_t schemeEnd = path.find("://");
+  if (schemeEnd != std::string::npos) {
+    const size_t pathStart = path.find('/', schemeEnd + 3);
+    path = pathStart == std::string::npos ? "" : path.substr(pathStart);
+  }
+  const std::string apiPrefix = "/api/v1";
+  if (path.rfind(apiPrefix, 0) == 0) {
+    path = path.substr(apiPrefix.size());
+  }
+  return path;
+}
+
+bool Engine::isSameOnlineVodMediaPath(const std::string& left,
+                                      const std::string& right) {
+  const std::string normalizedLeft =
+      normalizeOnlineVodMediaPathForCompare(left);
+  const std::string normalizedRight =
+      normalizeOnlineVodMediaPathForCompare(right);
+  return !normalizedLeft.empty() && normalizedLeft == normalizedRight;
+}
 
 // 将 OnlineVod 音轨类型 (2-5) 2=主伴副原  3=主原副伴 4=左伴右原（伴唱）5=左伴右原（原唱）
 void Engine::applyOnlineVodTrackType(LayerVideo* vl, int trackType) {
@@ -247,81 +478,147 @@ std::string Engine::buildOnlineVodMediaUrl(const std::string& rawSongPath,
   }
 }
 
-bool Engine::tryPlayOnlineVodStateSongOnLayer(int layerId,
-                                           const VodDatabase::OnlineVodState& st) {
-  if (!systemConfig_ || !systemConfig_->isVodEnabled()) return false;
-  if (!mubu_ || st.currentSongId.empty()) return false;
+void Engine::applyOnlineVodLayerVolume(int layerId, LayerVideo* videoLayer,
+                                       bool idlePlayback,
+                                       const char* source) {
+  if (!videoLayer) return;
+
+  float configuredVolume = 1.0f;
+  bool hasLayerConfig = false;
+  if (systemConfig_) {
+    if (const LayerConfigData* cfg = systemConfig_->getLayerConfig(layerId)) {
+      configuredVolume = std::clamp(cfg->volume, 0.0f, 1.0f);
+      hasLayerConfig = true;
+    }
+  }
+
+  const float appliedVolume = idlePlayback ? configuredVolume : 1.0f;
+  {
+    std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+    onlineVodLastPlaybackWasIdle_ = idlePlayback;
+    videoLayer->setVolume(appliedVolume);
+  }
+  LOG_INFO(
+      "[OnlineVod] volume policy source=%s layer=%d mode=%s applied=%.2f "
+      "configured=%.2f hasConfig=%d",
+      source ? source : "unknown", layerId,
+      idlePlayback ? "idle" : "requested", appliedVolume, configuredVolume,
+      hasLayerConfig ? 1 : 0);
+}
+
+bool Engine::applyOnlineVodConfiguredLayerVolume(
+    int layerId, LayerVideo* videoLayer, float configuredVolume,
+    const char* source) {
+  if (!videoLayer || !isOnlineVodRuntimeEnabled()) {
+    return false;
+  }
+
+  int vodLayerId = systemConfig_->getVodLayerId();
+  if (vodLayerId < 1) vodLayerId = 1;
+  if (layerId != vodLayerId) return false;
+
+  configuredVolume = std::clamp(configuredVolume, 0.0f, 1.0f);
+  bool idlePlayback = false;
+  float appliedVolume = 1.0f;
+  {
+    std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+    idlePlayback = onlineVodLastPlaybackWasIdle_;
+    appliedVolume = idlePlayback ? configuredVolume : 1.0f;
+    videoLayer->setVolume(appliedVolume);
+  }
+
+  LOG_INFO(
+      "[OnlineVod] configured volume update source=%s layer=%d mode=%s "
+      "applied=%.2f configured=%.2f",
+      source ? source : "unknown", layerId,
+      idlePlayback ? "idle" : "requested", appliedVolume, configuredVolume);
+  return true;
+}
+
+PlaybackResult Engine::tryPlayOnlineVodStateSongOnLayer(
+    int layerId, const VodDatabase::OnlineVodState& st,
+    double resumePosition) {
+  PlaybackResult playResult;
+  if (!isOnlineVodRuntimeEnabled()) return playResult;
+  if (!mubu_ || st.currentSongId.empty()) return playResult;
 
   Layer* layer = mubu_->getLayer(layerId);
-  if (!layer || layer->getType() != LayerType::VIDEO) return false;
+  if (!layer || layer->getType() != LayerType::VIDEO) return playResult;
   LayerVideo* videoLayer = static_cast<LayerVideo*>(layer);
 
-  if (st.rawJson.empty()) return false;
+  if (st.rawJson.empty()) return playResult;
 
   Json::Value root;
   std::string err;
   if (!JsonUtils::parseJson(st.rawJson, root, err) || !root.isObject()) {
     LOG_WARN("[OnlineVod] roomState rawJson parse failed: %s", err.c_str());
-    return false;
+    return playResult;
   }
 
   const Json::Value playingNow =
       (root.isMember("playingNow") && root["playingNow"].isObject())
           ? root["playingNow"]
           : Json::Value(Json::nullValue);
-  if (playingNow.isNull()) return false;
+  if (playingNow.isNull()) return playResult;
 
   std::string songPath = playingNow.get("songPath", "").asString();
-  if (songPath.empty()) return false;
+  if (songPath.empty()) return playResult;
   for (char& c : songPath) if (c == '\\') c = '/';
   if (!songPath.empty() && songPath.back() == '/') {
     LOG_WARN("[OnlineVod] roomState current song path is directory: %s", songPath.c_str());
-    return false;
+    return playResult;
   }
 
   std::string serverHost;
   int serverPort = 80;
   resolveOnlineVodServerHostPort(serverHost, serverPort);
-  if (serverHost.empty()) return false;
+  if (serverHost.empty()) return playResult;
 
   std::string url = buildOnlineVodMediaUrl(songPath, serverHost, serverPort);
-  const bool isIdleFreesong =
-      st.currentSongId == "IDLE" ||
-      st.currentSongTitle.find("空闲") != std::string::npos;
+  const bool isIdleFreesong = st.currentSongId == "IDLE";
+
+  if (isIdleFreesong) {
+    // The server's first idle selection may arrive before the local list.
+    // Both EOF and an open failure must continue AFTER this file once scanned.
+    std::lock_guard<std::mutex> lock(onlineVodFreesongsMutex_);
+    onlineVodFreesongLastAttemptPath_ = url;
+  }
 
   LOG_DEBUG("[OnlineVod] roomState playback request: title=%s url=%s",
             st.currentSongTitle.c_str(), url.c_str());
-  PlaybackResult playResult =
+  playResult =
       PlaybackRequestDispatcher::requestPlay(
           mubu_.get(), layerId, url, 3, PlaybackSource::OnlineVod);
   if (!playResult.isSuccess()) {
     LOG_WARN("[OnlineVod] roomState playback request failed: %s result=%s",
              url.c_str(), toString(playResult.code));
-    return false;
+    return playResult;
+  }
+  if (playResult.code == PlaybackResultCode::Started &&
+      std::isfinite(resumePosition) && resumePosition > 0.0 &&
+      !videoLayer->isPlayingPureAudio()) {
+    if (!videoLayer->seek(resumePosition, "online-vod-reconnect")) {
+      LOG_WARN("[OnlineVod] media reopened but position restore failed: position=%.3f path=%s",
+               resumePosition, url.c_str());
+    }
   }
   {
     std::lock_guard<std::mutex> lk(onlineVodSwitchMutex_);
-    lastOnlineVodSongPath_ = url;
+    lastOnlineVodSongPath_ = normalizeOnlineVodMediaPathForCompare(url);
     onlineVodLastPlaybackWasIdle_ = isIdleFreesong;
+    onlineVodPlaybackMediaPath_ = lastOnlineVodSongPath_;
+    onlineVodPlaybackQueueItemId_ =
+        isIdleFreesong ? std::string() : st.currentQueueItemId;
   }
 
-  if (isIdleFreesong) {
-    float configVolume = 1.0f;
-    const LayerConfigData* cfg = systemConfig_->getLayerConfig(layerId);
-    if (cfg) configVolume = cfg->volume;
-    videoLayer->setVolume(configVolume);
-    LOG_DEBUG("[OnlineVod] roomState freesong volume set to %.2f (from config layer %d)",
-             configVolume, layerId);
-  } else {
-    videoLayer->setVolume(1.0f);
-  }
+  applyOnlineVodLayerVolume(layerId, videoLayer, isIdleFreesong, "room_state");
   const int track = playingNow.get("track", 0).asInt();
   if (track >= 2 && track <= 5) {
     applyOnlineVodTrackType(videoLayer, track);
   }
 
   LOG_DEBUG("[OnlineVod] playing from roomState directly: %s", st.currentSongTitle.c_str());
-  return true;
+  return playResult;
 }
 
 bool Engine::autoPlayPlaylistOnLayer(const PlaylistInfo &playlist,
@@ -451,21 +748,10 @@ bool Engine::autoPlayImagePlaylistOnLayer(const PlaylistInfo &playlist,
   }
 
   // 优先使用数据库 uri；若不存在则用 IMAGE_DIR+文件名（与 loadImage 命令一致，兼容跨设备路径差异）
-  std::string imagePath = FileUtils::normalizePath(items[0].uri);
+  const std::string imagePath = resolvePlaylistImagePath(items[0].uri);
   if (imagePath.empty()) {
     LOG_WARN("播放列表 '%s' 第一张图片 uri 为空", playlist.name.c_str());
     return false;
-  }
-  if (!FileUtils::exists(imagePath)) {
-    std::string fn = FileUtils::getFilename(items[0].uri);
-    if (!fn.empty()) {
-      std::string fallback = FileUtils::normalizePath(IMAGE_DIR + fn);
-      if (FileUtils::exists(fallback)) {
-        imagePath = fallback;
-        LOG_DEBUG("播放列表 '%s' uri 不可用，改用 IMAGE_DIR+文件名: %s",
-                  playlist.name.c_str(), imagePath.c_str());
-      }
-    }
   }
   if (!FileUtils::exists(imagePath)) {
     LOG_WARN("播放列表 '%s' 第一张图片不存在 (uri=%s)", playlist.name.c_str(),
@@ -476,23 +762,32 @@ bool Engine::autoPlayImagePlaylistOnLayer(const PlaylistInfo &playlist,
   LOG_INFO("在图层 60 上启动图片播放列表 '%s' (ID: %s)，共 %zu 张",
            playlist.name.c_str(), playlist.id.c_str(), items.size());
 
+  // 与正式 loadImage API 保持一对一语义：普通图片播放前退出照片墙模式。
+  imageLayer->setPhotoWallMode(false);
   if (!imageLayer->loadImage(imagePath)) {
     LOG_WARN("在图层 60 上加载图片失败: %s", imagePath.c_str());
     return false;
   }
+  restoreConfiguredImageLayerGeometry(systemConfig_.get(), imageLayer, layerId,
+                                      "initial playlist image");
 
   LOG_INFO("✓ 图层 60 开始播放图片: %s", imagePath.c_str());
 
   imageLayer->setVisible(true);
   playlistManager_->playVideo(playlist.id, IMAGE_LAYER_ID, 0);
+  preloadNextPlaylistImage(playlistManager_.get(), imageLayer, playlist.id,
+                           IMAGE_LAYER_ID);
 
   return true;
 }
 
 void Engine::checkAndPlayDefaultVideo() {
   if (licenseManager_->shouldBlockVideoPlayback()) {
-    if (licenseManager_->getWarningStage() == WarningStage::UNLICENSED) {
-      licenseManager_->reloadLicense();
+    if (licenseManager_->getWarningStage() == WarningStage::UNLICENSED &&
+        !isOnlineVodRuntimeEnabled()) {
+      const bool allowCloudSync =
+          !(systemConfig_ && systemConfig_->isNetworkVodEnabled());
+      licenseManager_->reloadLicense(allowCloudSync);
       if (licenseManager_->shouldBlockVideoPlayback()) {
         LOG_WARN("授权检查失败，跳过自动播放");
         return;
@@ -550,7 +845,7 @@ void Engine::checkAndPlayDefaultVideo() {
     }
 
     // VOD 图层由 roomStateChanged 驱动，不参与本地播放列表
-    const int vodLayerId = (systemConfig_ && systemConfig_->isVodEnabled())
+    const int vodLayerId = isVodRuntimeEnabled()
                            ? std::max(1, systemConfig_->getVodLayerId()) : -1;
 
     // config 中已启用的图层
@@ -654,124 +949,55 @@ void Engine::updatePlaylistHintLayer() {
   std::string playlistId = hintLayer->getPlaylistId();
   if (playlistId.empty()) { mhr->setPlaylistHintVisible(false); return; }
 
-  // =============================================
-  // OnlineVod 点歌模式：播放列表Id 以 "v1:" 开头，从 Vod数据库 读队列
-  // =============================================
-  const bool isOnlineVodMode = (playlistId.rfind("v1:", 0) == 0);
+  // VOD selected queues use reserved one-to-one playlist bindings.
+  const bool isOnlineVodMode = playlistId.rfind("v1:", 0) == 0;
+  const bool isLocalVodMode = playlistId == "local-vod:selected";
   if (isOnlineVodMode) {
     int vodLayerId = systemConfig_ ? systemConfig_->getVodLayerId() : 1;
-    if (vodLayerId < 1) vodLayerId = 1;
-    Layer *v1Layer = mubu_->getLayer(vodLayerId);
-    if (!v1Layer || v1Layer->getType() != LayerType::VIDEO) {
-      mhr->setPlaylistHintVisible(false); return;
-    }
-    LayerVideo *videoLayer = static_cast<LayerVideo *>(v1Layer);
+    if (vodLayerId < 1)
+      vodLayerId = 1;
+    Layer *layer = mubu_->getLayer(vodLayerId);
+    LayerVideo *videoLayer = layer && layer->getType() == LayerType::VIDEO
+                                 ? static_cast<LayerVideo *>(layer)
+                                 : nullptr;
+    updateVodQueueHintLayer(
+        hintLayer, videoLayer, startHintTime, endHintTime, displayDuration,
+        "OnlineVod", [&](int listType) {
+          std::vector<VodDatabase::OnlineVodQueueItem> queue;
+          {
+            std::lock_guard<std::mutex> lock(onlineVodQueueMutex_);
+            queue = onlineVodQueue_;
+          }
+          applyVodQueueHintItems(
+              queue, hintLayer, listType,
+              [](const VodDatabase::OnlineVodQueueItem &item) {
+                return item.songTitle.empty() ? item.songNo : item.songTitle;
+              });
+        });
+    return;
+  }
 
-    // 切歌检测
-    std::string currentPath = FileUtils::normalizePath(videoLayer->getCurrentPath());
-    if (currentPath.empty()) { mhr->setPlaylistHintVisible(false); return; }
-    if (currentPath != hintLayer->getLastVideoPath()) {
-      hintLayer->setLastVideoPath(currentPath);
-      hintLayer->setPlaylistHintState(0);
-      hintLayer->setLastRemainingTime(0.0);
-      hintLayer->setLastCurrentPos(0.0);
-      hintLayer->setPlaylistHintSuppressAfterSwitch(true);
-      hintLayer->recordPlaylistHintStartTime();
+  if (isLocalVodMode) {
+    if (!localVodManager_ || !localVodPlayer_ ||
+        !localVodPlayer_->isPlayingQueuedSong()) {
       mhr->setPlaylistHintVisible(false);
-      LOG_DEBUG("L41[OnlineVod]: switch detected, reset. path=%s", currentPath.c_str());
       return;
     }
-    if (videoLayer->getState() != LayerVideo::PlayState::PLAYING) {
-      mhr->setPlaylistHintVisible(false); return;
-    }
-
-    double duration = videoLayer->getDuration();
-    double currentPos = videoLayer->getCurrentPosition();
-    if (duration <= 0) { mhr->setPlaylistHintVisible(false); return; }
-    double remaining = duration - currentPos;
-    auto now = std::chrono::steady_clock::now();
-    float elapsed = std::chrono::duration<float>(now - hintLayer->getPlaylistHintStartTime()).count();
-    if (elapsed < 0) elapsed = 0;
-    int state = hintLayer->getPlaylistHintState();
-
-    // 从 Vod数据库 读队列，构造 播放列表ItemInfo
-    auto buildOnlineVodHintItems = [&]() {
-      std::vector<VodDatabase::OnlineVodQueueItem> qItems;
-      {
-        std::lock_guard<std::mutex> lock(onlineVodQueueMutex_);
-        qItems = onlineVodQueue_;
-      }
-      int showCount = hintLayer->getShowCount() > 0 ? hintLayer->getShowCount() : 3;
-      std::vector<PlaylistItemInfo> hintItems;
-      int totalRemaining = 0;
-      bool foundPlaying = false;
-      for (const auto& q : qItems) {
-        if (!foundPlaying && q.status == 1) { foundPlaying = true; continue; }
-        if (!foundPlaying) continue;
-        if (static_cast<int>(hintItems.size()) < showCount) {
-          PlaylistItemInfo info;
-          info.name = q.songTitle.empty() ? q.songNo : q.songTitle;
-          info.index = q.position;
-          hintItems.push_back(info);
-        } else {
-          totalRemaining++;
-        }
-      }
-      // 若队列中没有 status==1 的项（时序滞后/服务器未标记），回退到展示队首 N 项，
-      // 避免提示列表始终为空导致 UI 显示"空的即将播放列表"。
-      if (!foundPlaying && !qItems.empty()) {
-        hintItems.clear();
-        totalRemaining = 0;
-        for (const auto& q : qItems) {
-          if (static_cast<int>(hintItems.size()) < showCount) {
-            PlaylistItemInfo info;
-            info.name = q.songTitle.empty() ? q.songNo : q.songTitle;
-            info.index = q.position;
-            hintItems.push_back(info);
-          } else {
-            totalRemaining++;
-          }
-        }
-      }
-      hintLayer->setPlaylistHintItems(hintItems, showCount, totalRemaining);
-    };
-
-    bool shouldShow = false;
-    if (elapsed >= endHintTime) hintLayer->setPlaylistHintSuppressAfterSwitch(false);
-    if (!hintLayer->getPlaylistHintSuppressAfterSwitch() &&
-        elapsed >= endHintTime && elapsed < (endHintTime + displayDuration)) {
-      if (state != 1) {
-        hintLayer->setPlaylistHintState(1);
-        buildOnlineVodHintItems();
-        LOG_DEBUG("L41[OnlineVod]: show START hint, elapsed=%.2f", elapsed);
-      }
-      shouldShow = true;
-    } else if (state == 1) {
-      hintLayer->setPlaylistHintState(0);
-    }
-
-    double lastRem = hintLayer->getLastRemainingTime();
-    if (remaining <= startHintTime && remaining > 0 && lastRem > startHintTime && state == 0) {
-      hintLayer->setPlaylistHintState(2);
-      hintLayer->recordPlaylistHintStartTime();
-      buildOnlineVodHintItems();
-      LOG_DEBUG("L41[OnlineVod]: show END hint, remaining=%.2f", remaining);
-    }
-    hintLayer->setLastRemainingTime(remaining);
-    hintLayer->setLastCurrentPos(currentPos);
-
-    if (state == 2) {
-      float dispElapsed = std::chrono::duration<float>(now - hintLayer->getPlaylistHintStartTime()).count();
-      if (dispElapsed < displayDuration) shouldShow = true;
-      else hintLayer->setPlaylistHintState(0);
-    }
-
-    const bool operationHintActive = mhr->isOperationHintActive();
-    bool finalShow = shouldShow && hintLayer->getShowList() && !operationHintActive;
-    if (finalShow || !operationHintActive) {
-      hintLayer->setVisible(finalShow);
-    }
-    mhr->setPlaylistHintVisible(finalShow);
+    const int vodLayerId = localVodManager_->getTargetLayerId();
+    Layer *layer = mubu_->getLayer(vodLayerId);
+    LayerVideo *videoLayer = layer && layer->getType() == LayerType::VIDEO
+                                 ? static_cast<LayerVideo *>(layer)
+                                 : nullptr;
+    updateVodQueueHintLayer(
+        hintLayer, videoLayer, startHintTime, endHintTime, displayDuration,
+        "LocalVod", [&](int listType) {
+          const auto queue = localVodManager_->getSelectedQueue();
+          applyVodQueueHintItems(queue, hintLayer, listType,
+                                 [](const LocalVodDatabase::QueueItem &item) {
+                                   return item.songName.empty() ? item.songNo
+                                                                : item.songName;
+                                 });
+        });
     return;
   }
 
@@ -878,7 +1104,7 @@ void Engine::checkAndPlayNextVideo() {
   if (licenseManager_->shouldBlockVideoPlayback()) return;
 
   // VOD 图层完全由 roomStateChanged 驱动，不参与本地续播
-  const int vodLayerId = (systemConfig_ && systemConfig_->isVodEnabled())
+  const int vodLayerId = isVodRuntimeEnabled()
                          ? std::max(1, systemConfig_->getVodLayerId()) : -1;
 
   auto allLayerIds = mubu_->getAllLayerIds();
@@ -887,70 +1113,112 @@ void Engine::checkAndPlayNextVideo() {
     if (!layer) continue;
 
     if (layer->getType() == LayerType::VIDEO) {
-      // VOD 图层：点歌曲自然播完时通知服务器；空闲曲本地续播，不驱动服务器切歌。
+      // VOD：正常播完或明确解码失败都推进当前播放；手动停止不推进。
       if (layerId == vodLayerId) {
+        // A STOPPED snapshot taken during an asynchronous open is not EOF.
+        std::unique_lock<std::mutex> playbackLock(onlineVodPlaybackApplyMutex_,
+                                                  std::try_to_lock);
+        if (!playbackLock.owns_lock()) continue;
         LayerVideo *videoLayer = static_cast<LayerVideo *>(layer);
-        const LayerVideo::PlayState vodState = videoLayer->getState();
-        if (vodState == LayerVideo::PlayState::PLAYING ||
-            vodState == LayerVideo::PlayState::PAUSED) {
-          onlineVodLayerHasPlayed_ = true;
+        LayerVideo::PlayState vodState = videoLayer->getState();
+        if (onlineVodPauseRequested_.load()) {
+          onlineVodNearEndPath_.clear();
+          onlineVodNearEndSince_ = {};
+          continue;
         }
-        if (vodState == LayerVideo::PlayState::STOPPED && onlineVodLayerHasPlayed_) {
+        const uint64_t playbackGeneration = videoLayer->getPlaybackGeneration();
+        if (vodState == LayerVideo::PlayState::PLAYING) {
+          onlineVodLayerHasPlayed_ = true;
+          onlineVodDurationFinished_ = false;
+
+          // HTTP媒体偶尔到达最后一帧后不再返回EOF，解码器和图层会一直保持PLAYING。
+          // 仅当播放时钟在末尾持续停留一段时间后才兜底结束，避免正常播放、暂停或切歌被误判。
+          const std::string playingPath = videoLayer->getCurrentPath();
+          const double playingPosition = videoLayer->getCurrentPosition();
+          const double playingDuration = videoLayer->getDuration();
+          const bool reachedMediaEnd =
+              !playingPath.empty() && playingDuration > 1.0 &&
+              playingPosition >=
+                  playingDuration - kOnlineVodEndPositionToleranceSeconds;
+          const auto now = std::chrono::steady_clock::now();
+
+          if (!reachedMediaEnd) {
+            onlineVodNearEndPath_.clear();
+            onlineVodNearEndSince_ = {};
+          } else if (onlineVodNearEndPath_ != playingPath ||
+                     onlineVodNearEndSince_ ==
+                         std::chrono::steady_clock::time_point{}) {
+            onlineVodNearEndPath_ = playingPath;
+            onlineVodNearEndSince_ = now;
+          } else if (now - onlineVodNearEndSince_ >=
+                     kOnlineVodEndHoldDuration) {
+            if (videoLayer->markPlaybackFinishedRetainingPath(
+                    "online_vod_duration_overrun", playbackGeneration,
+                    -kOnlineVodEndPositionToleranceSeconds)) {
+              LOG_WARN("[OnlineVod] duration fallback accepted: layer=%d pos=%.3f duration=%.3f path=%s",
+                       vodLayerId, playingPosition, playingDuration, playingPath.c_str());
+              vodState = LayerVideo::PlayState::STOPPED;
+              onlineVodDurationFinished_ = true;
+            }
+            onlineVodNearEndPath_.clear();
+            onlineVodNearEndSince_ = {};
+          }
+        } else {
+          if (vodState == LayerVideo::PlayState::PAUSED) {
+            onlineVodLayerHasPlayed_ = true;
+          }
+          onlineVodNearEndPath_.clear();
+          onlineVodNearEndSince_ = {};
+        }
+        const bool decoderFailed = videoLayer->isPlaybackFailed();
+        if (vodState == LayerVideo::PlayState::STOPPED &&
+            (onlineVodLayerHasPlayed_ || decoderFailed)) {
           const std::string finishedPath = videoLayer->getCurrentPath();
           const bool decoderFinished = videoLayer->isPlaybackFinished();
           const double currentPosition = videoLayer->getCurrentPosition();
           const double duration = videoLayer->getDuration();
-          const bool nearMediaEnd =
-              duration > 1.0 && currentPosition >= duration - 0.75;
 
           // 切歌/重连会让旧解码器进入 STOPPED，但并非 EOF。日志里的 finished=0 就是这个场景。
-          if (!decoderFinished && !nearMediaEnd) {
+          if (!decoderFinished && !onlineVodDurationFinished_ && !decoderFailed) {
             onlineVodLayerHasPlayed_ = false;
             LOG_INFO("[OnlineVod] ignore VOD layer STOPPED before EOF layer=%d pos=%.3f duration=%.3f path=%s",
                      vodLayerId, currentPosition, duration, finishedPath.c_str());
             continue;
           }
 
-          onlineVodLayerHasPlayed_ = false;
-          if (!finishedPath.empty() && finishedPath != onlineVodLastFinishHandledPath_) {
-            onlineVodLastFinishHandledPath_ = finishedPath;
-            // 判断当前是否处于空闲曲模式：不能只看队列表是否为空，OnlineVod 队列可能保留已播放/已跳过的历史项。
-            bool hasActiveQueuedSong = false;
-            {
-              std::lock_guard<std::mutex> lock(onlineVodQueueMutex_);
-              for (const auto& item : onlineVodQueue_) {
-                if ((item.status == 0 || item.status == 1) &&
-                    !item.songPath.empty() && item.songPath.back() != '/') {
-                  hasActiveQueuedSong = true;
-                  break;
-                }
-              }
-            }
-
+          if (!finishedPath.empty()) {
             bool lastPlaybackWasIdle = false;
+            bool matchesBoundPlayback = false;
+            std::string finishedQueueItemId;
             {
               std::lock_guard<std::mutex> lk(onlineVodSwitchMutex_);
               lastPlaybackWasIdle = onlineVodLastPlaybackWasIdle_;
+              matchesBoundPlayback = isSameOnlineVodMediaPath(
+                  finishedPath, onlineVodPlaybackMediaPath_);
+              if (matchesBoundPlayback) {
+                finishedQueueItemId = onlineVodPlaybackQueueItemId_;
+              }
             }
 
-            if (!hasActiveQueuedSong || lastPlaybackWasIdle) {
-              // 空闲曲模式：直接本地续播下一首 freesong，不等服务器回推
-              LOG_INFO("[OnlineVod] 空闲曲播完，本地续播下一首 freesong (layer=%d activeQueued=%d idle=%d)",
-                       vodLayerId, hasActiveQueuedSong ? 1 : 0,
-                       lastPlaybackWasIdle ? 1 : 0);
-              const bool freesongStarted = tryPlayFreesongOnLayer(vodLayerId);
-              if (freesongStarted) {
-                // 续播成功后清空结束去重路径，避免 freesong 列表只有一首时第二次播完被拦截
-                onlineVodLastFinishHandledPath_.clear();
-                // 清除 lastOnlineVodSongPath_ 以避免去重逻辑拦截续播
-                {
-                  std::lock_guard<std::mutex> lk(onlineVodSwitchMutex_);
-                  lastOnlineVodSongPath_.clear();
-                }
-              }
+            if (!matchesBoundPlayback) {
+              onlineVodLayerHasPlayed_ = false;
+              LOG_WARN("[OnlineVod] ignore stale completion with no matching playback identity: path=%s",
+                       finishedPath.c_str());
+            } else if (lastPlaybackWasIdle) {
+              onlineVodLayerHasPlayed_ = false;
+              // Idle errors, like EOF, advance locally and never consume a queue row.
+              LOG_INFO("[OnlineVod] idle song %s; continuing local freesong playback (layer=%d)",
+                       decoderFailed ? "decode failed" : "finished", vodLayerId);
+              tryPlayFreesongOnLayer(vodLayerId);
+            } else if (finishedQueueItemId.empty()) {
+              onlineVodLayerHasPlayed_ = false;
+              LOG_ERROR("[OnlineVod] queued song completion has no queueItemId; server state is left unchanged: path=%s",
+                        finishedPath.c_str());
             } else {
-              requestOnlineVodSkipAsync("vod_layer_finished");
-              LOG_INFO("[OnlineVod] 视频播完，已请求服务器切下一首，由服务器回推驱动播放");
+              // Complete only the exact queue row bound when this media opened.
+              requestOnlineVodSkipAsync(decoderFailed ? "vod_layer_decode_failed"
+                                                     : "vod_layer_finished",
+                                        finishedQueueItemId);
             }
           }
         }
@@ -958,6 +1226,7 @@ void Engine::checkAndPlayNextVideo() {
       }
 
       LayerVideo *videoLayer = static_cast<LayerVideo *>(layer);
+      const uint64_t playbackGeneration = videoLayer->getPlaybackGeneration();
       if (!videoLayer->isVisible()) {
         continue;
       }
@@ -972,6 +1241,39 @@ void Engine::checkAndPlayNextVideo() {
       LOG_DEBUG("[AutoPlay] layer %d state=%d path='%s'",
                layerId, (int)curState, currentPath.c_str());
 
+      if (commandRouter_ && commandRouter_->isPlaybackLocked(layerId)) {
+        // Repeat only natural completion of the current material. Retain the
+        // original decoder loop mode: unlocking must resume the playlist's
+        // original progression, rather than leaving a forced single-item loop.
+        const double duration = videoLayer->getDuration();
+        const bool lockedAtMediaEnd =
+            curState == LayerVideo::PlayState::STOPPED
+                ? videoLayer->isPlaybackFinished()
+                : curState == LayerVideo::PlayState::PLAYING && duration > 1.0 &&
+                      videoLayer->getCurrentPosition() >= duration + 0.25;
+        if (currentPath.empty() || !lockedAtMediaEnd) continue;
+        const auto now = std::chrono::steady_clock::now();
+        const auto retry = g_autoPlayRetryAfter.find(layerId);
+        if (retry != g_autoPlayRetryAfter.end() && now < retry->second) continue;
+        const PlaybackResult replayResult =
+            PlaybackRequestDispatcher::requestPlay(
+                mubu_.get(), layerId, currentPath, videoLayer->getLoop(),
+                PlaybackSource::AutoPlay);
+        if (replayResult.isSuccess()) {
+          g_autoPlayStoppedSince.erase(layerId);
+          g_autoPlayStoppedPath.erase(layerId);
+          g_autoPlayRetryAfter.erase(layerId);
+          LOG_INFO("[AutoPlay] layer %d playback locked, replay current material: %s",
+                   layerId, currentPath.c_str());
+        } else {
+          LOG_WARN("[AutoPlay] layer %d playback locked, replay failed: %s result=%s",
+                   layerId, currentPath.c_str(), toString(replayResult.code));
+          g_autoPlayRetryAfter[layerId] =
+              std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+        }
+        continue;
+      }
+
       std::string playlistId;
       int playlistLoopMode = -1;
       std::vector<PlaylistItem> playlistItems;
@@ -985,8 +1287,7 @@ void Engine::checkAndPlayNextVideo() {
         const double playingDuration = videoLayer->getDuration();
         const bool durationOverrun =
             playingDuration > 1.0 && playingPosition >= playingDuration + 0.25;
-        if (durationOverrun && playlistManager_ &&
-            !(commandRouter_ && commandRouter_->isPlaybackLocked(layerId))) {
+        if (durationOverrun && playlistManager_) {
           playlistId = playlistManager_->getActivePlaylistId(layerId);
           if (!playlistId.empty()) {
             playlistLoopMode = playlistManager_->getPlayMode(playlistId).loop;
@@ -1000,12 +1301,14 @@ void Engine::checkAndPlayNextVideo() {
                   activePlaylistItemPath == normalizedCurrentPath;
             }
           }
-          if (playlistItems.size() > 1 && currentMatchesPlaylistItem) {
-            LOG_WARN("[AutoPlay] layer %d playlist item reached duration but layer is still PLAYING. "
-                     "Treat as natural finish. playlistId='%s' loop=%d pos=%.3f duration=%.3f path='%s'",
-                     layerId, playlistId.c_str(), playlistLoopMode,
-                     playingPosition, playingDuration, normalizedCurrentPath.c_str());
-            if (videoLayer->markPlaybackFinishedRetainingPath("playlist_duration_overrun")) {
+          // The decoder revalidates under its seek/drain lock. Normal internal
+          // loops cannot be stopped by a previously sampled end position.
+          if (!playlistItems.empty() && currentMatchesPlaylistItem) {
+            if (videoLayer->markPlaybackFinishedRetainingPath(
+                    "playlist_duration_overrun", playbackGeneration, 0.25)) {
+              LOG_WARN("[AutoPlay] duration fallback accepted: layer=%d playlistId='%s' loop=%d pos=%.3f duration=%.3f path='%s'",
+                       layerId, playlistId.c_str(), playlistLoopMode,
+                       playingPosition, playingDuration, normalizedCurrentPath.c_str());
               curState = LayerVideo::PlayState::STOPPED;
             }
           }
@@ -1030,10 +1333,6 @@ void Engine::checkAndPlayNextVideo() {
           continue;
         }
         g_autoPlayRetryAfter.erase(retryIt);
-      }
-      if (commandRouter_ && commandRouter_->isPlaybackLocked(layerId)) {
-        LOG_INFO("[AutoPlay] layer %d playback locked, skip auto next", layerId);
-        continue;
       }
       // currentPath 为空说明图层从未播放，跳过
       if (currentPath.empty()) continue;
@@ -1102,6 +1401,21 @@ void Engine::checkAndPlayNextVideo() {
 
       LOG_INFO("[AutoPlay] layer %d 播完，续播下一项", layerId);
 
+      // When group synchronization is active, only the leader is allowed to
+      // advance a playlist locally. Followers wait for the leader's
+      // synchronized playVideo command; otherwise each device can select and
+      // open the next item at a different instant.
+      SyncUdpGroup *syncGroup = NetworkManager::getInstance().getSyncUdpGroup();
+      const bool syncPlaybackEnabled =
+          syncGroup && syncGroup->isRunning();
+      if (syncPlaybackEnabled && !syncGroup->isLeader()) {
+        g_autoPlayRetryAfter[layerId] =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        LOG_DEBUG("[SyncPlayback] follower waiting for leader natural-EOF plan: layer=%d playlistId=%s",
+                  layerId, playlistId.c_str());
+        continue;
+      }
+
         // 清除歌词，并重置去重路径，确保下一首同名歌曲能重新触发加载
       if (systemConfig_->hasLayerConfig(21)) {
         Layer *lyricLayer = mubu_->getLayer(21);
@@ -1132,6 +1446,59 @@ void Engine::checkAndPlayNextVideo() {
 
       LOG_INFO("[AutoPlay] layer %d -> %s (playlistLoop=%d decoderLoop=%d)",
                layerId, nextItem.uri.c_str(), playlistLoopMode, decoderLoop);
+
+      // Re-enter the existing command path on the leader so the successful
+      // natural-EOF transition is observed by NetworkManager and published as
+      // the same sync_prepare/sync_start plan used for manual playback.
+      // The explicit index keeps playlist state identical on every node.
+      if (syncPlaybackEnabled && syncGroup->isLeader() && commandRouter_) {
+        Json::Value syncParam(Json::objectValue);
+        syncParam["action"] = "playVideo";
+        syncParam["playlistId"] = playlistId;
+        syncParam["layerId"] = layerId;
+        syncParam["index"] = playlistManager_->getCurrentIndex(playlistId);
+        syncParam["suppress_hint"] = true;
+
+        CommandRequest syncRequest;
+        syncRequest.type = 2;
+        syncRequest.code = 0x09;
+        syncRequest.requestId =
+            "autoplay-" + std::to_string(layerId) + "-" +
+            std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count());
+        syncRequest.timestamp = std::time(nullptr);
+        syncRequest.paramJson = JsonUtils::toString(syncParam);
+        const CommandResponse syncResponse =
+            commandRouter_->processCommand(syncRequest);
+        if (!syncResponse.ok) {
+          LOG_WARN("[SyncPlayback] leader natural-EOF playVideo failed: layer=%d playlistId=%s message=%s",
+                   layerId, playlistId.c_str(), syncResponse.message.c_str());
+          if (previousIndex >= 0) {
+            playlistManager_->playVideo(playlistId, layerId, previousIndex);
+          }
+          g_autoPlayRetryAfter[layerId] =
+              std::chrono::steady_clock::now() + std::chrono::seconds(2);
+          continue;
+        }
+
+        // Keep the natural-EOF watcher quiet while the synchronized command
+        // is being prepared/released. This prevents a still-STOPPED decoder
+        // from scheduling the same next item a second time on the next tick.
+        g_autoPlayRetryAfter[layerId] =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        g_autoPlayStoppedSince.erase(layerId);
+        g_autoPlayStoppedPath.erase(layerId);
+        if (nextItem.audioTrack >= 2 && nextItem.audioTrack <= 5) {
+          videoLayer->switchAudioTrack(nextItem.audioTrack);
+        }
+        LOG_INFO("[SyncPlayback] leader natural-EOF transition scheduled: layer=%d playlistId=%s index=%d uri=%s",
+                 layerId, playlistId.c_str(),
+                 playlistManager_->getCurrentIndex(playlistId),
+                 nextItem.uri.c_str());
+        continue;
+      }
+
       PlaybackResult playResult =
           PlaybackRequestDispatcher::requestPlay(
               mubu_.get(), layerId, nextItem.uri, decoderLoop, PlaybackSource::AutoPlay);
@@ -1209,22 +1576,45 @@ void Engine::checkAndPlayNextVideo() {
       if (layerId != 60) continue;
       LayerImage *imageLayer = static_cast<LayerImage *>(layer);
       if (!imageLayer->isFinished() || !playlistManager_) continue;
-      const std::string playlistId = playlistManager_->getActivePlaylistId(layerId);
+      const std::string playlistId =
+          playlistManager_->getActivePlaylistId(layerId);
       if (playlistId.empty()) continue;
-      PlaylistConfig playlistConfig = playlistManager_->getPlayMode(playlistId);
+      const PlaylistConfig playlistConfig =
+          playlistManager_->getPlayMode(playlistId);
       if (playlistConfig.loop == 4) continue;
-      if (!playlistManager_->playNextVideo(playlistId, layerId)) continue;
-      PlaylistItem nextItem = playlistManager_->getCurrentItem(playlistId, layerId);
-      if (!nextItem.uri.empty()) {
-        LOG_DEBUG("[AutoPlay] image layer %d -> %s", layerId, nextItem.uri.c_str());
-        imageLayer->loadImage(nextItem.uri);
+
+      int nextIndex = -1;
+      std::string imagePath;
+      if (!resolveNextPlaylistImage(playlistManager_.get(), playlistId, layerId,
+                                    nextIndex, imagePath)) continue;
+      if (!FileUtils::exists(imagePath)) {
+        LOG_WARN("[AutoPlay] image layer %d next image does not exist: %s",
+                 layerId, imagePath.c_str());
+        continue;
       }
+
+      imageLayer->setPhotoWallMode(false);
+      imageLayer->preloadImage(imagePath);
+      if (!imageLayer->activatePreloadedImage(imagePath)) continue;
+
+      if (!playlistManager_->playVideo(playlistId, layerId, nextIndex)) {
+        LOG_WARN("[AutoPlay] image layer %d failed to persist carousel index %d",
+                 layerId, nextIndex);
+        continue;
+      }
+      LOG_DEBUG("[AutoPlay] image layer %d switched to index=%d path=%s",
+                layerId, nextIndex, imagePath.c_str());
+      restoreConfiguredImageLayerGeometry(systemConfig_.get(), imageLayer,
+                                          layerId, "playlist advance");
+      preloadNextPlaylistImage(playlistManager_.get(), imageLayer, playlistId,
+                               layerId);
+
     }
   }
 }
 
 bool Engine::playOnlineVodMediaFromServerPayload(const Json::Value& p) {
-  if (!systemConfig_ || !systemConfig_->isVodEnabled() || !mubu_) return false;
+  if (!isOnlineVodRuntimeEnabled() || !mubu_) return false;
   int vodLayerId = systemConfig_->getVodLayerId();
   if (vodLayerId < 1) vodLayerId = 1;
   Layer* layer = mubu_->getLayer(vodLayerId);
@@ -1254,19 +1644,6 @@ bool Engine::playOnlineVodMediaFromServerPayload(const Json::Value& p) {
 
   std::string url = buildOnlineVodMediaUrl(songPath, serverHost, serverPort);
 
-  auto OnlineVodPostRoomNext = [this]() {
-    if (!vodDatabase_) return;
-    std::string host;
-    int port = 80;
-    resolveOnlineVodServerHostPort(host, port);
-    if (host.empty()) return;
-    const std::string roomId = "current";
-    std::string nextUrl = "http://" + host;
-    if (port != 80 && port > 0) nextUrl += ":" + std::to_string(port);
-    nextUrl += "/api/v1/rooms/" + roomId + "/skip";
-    LOG_INFO("[OnlineVod] command Play: POST %s (skip)", nextUrl.c_str());
-    httpPostJson(nextUrl, "{}", 3);
-  };
 
   auto OnlineVodShowPlayFailHint = [this](const std::string& title, const char* reason) {
     if (!systemConfig_ || !systemConfig_->hasLayerConfig(41) || !mubu_) return;
@@ -1302,11 +1679,11 @@ bool Engine::playOnlineVodMediaFromServerPayload(const Json::Value& p) {
           mubu_.get(), vodLayerId, url, 3, PlaybackSource::OnlineVodCommand, true);
   if (!playResult.isSuccess()) {
     LOG_WARN("[OnlineVod] command Play failed: result=%s", toString(playResult.code));
-    OnlineVodShowPlayFailHint(cmdTitle, " 无法解码播放，正在跳到下一首");
-    OnlineVodPostRoomNext();
+    OnlineVodShowPlayFailHint(cmdTitle, " 无法解码播放，队列状态保持不变");
+    LOG_WARN("[OnlineVod] command Play failure cannot advance queue without queueItemId");
     return false;
   }
-  videoLayer->setVolume(1.0f);
+  applyOnlineVodLayerVolume(vodLayerId, videoLayer, false, "play_command");
   const int trk = p.get("track", 0).asInt();
   if (trk >= 2 && trk <= 5) {
     applyOnlineVodTrackType(videoLayer, trk);
@@ -1315,13 +1692,23 @@ bool Engine::playOnlineVodMediaFromServerPayload(const Json::Value& p) {
     vodDatabase_->setOnlineVodSyncMeta("online_vod_local_last_play_item_id", p["id"].asString());
   {
     std::lock_guard<std::mutex> lk(onlineVodSwitchMutex_);
-    lastOnlineVodSongPath_ = url;
-    onlineVodLastPlaybackWasIdle_ = false;
+    lastOnlineVodSongPath_ = normalizeOnlineVodMediaPathForCompare(url);
+    onlineVodPlaybackMediaPath_ = lastOnlineVodSongPath_;
+    onlineVodPlaybackQueueItemId_.clear();
   }
   return true;
 }
 
-bool Engine::tryPlayFreesongOnLayer(int layerId) {
+bool Engine::tryPlayFreesongOnLayer(int layerId, uint64_t stateGeneration,
+                                   bool paused) {
+  if (stateGeneration == 0) {
+    stateGeneration = onlineVodRoomStateGeneration_.load();
+  }
+  const auto isCurrentState = [this, stateGeneration]() {
+    return !shuttingDown_.load() &&
+           stateGeneration == onlineVodRoomStateGeneration_.load();
+  };
+  if (!isCurrentState()) return false;
   if (!mubu_ || !systemConfig_) return false;
   Layer* layer = mubu_->getLayer(layerId);
   if (!layer || layer->getType() != LayerType::VIDEO) return false;
@@ -1332,43 +1719,29 @@ bool Engine::tryPlayFreesongOnLayer(int layerId) {
   {
     std::lock_guard<std::mutex> lock(onlineVodFreesongsMutex_);
     list = onlineVodFreesongsList_;
-    index = onlineVodFreesongsIndex_;
+    for (size_t i = 0; i < list.size(); ++i) {
+      if (isSameOnlineVodMediaPath(list[i], onlineVodFreesongLastAttemptPath_)) {
+        index = static_cast<int>((i + 1) % list.size());
+        break;
+      }
+    }
   }
 
   if (list.empty()) {
-    LOG_WARN("[OnlineVod] tryPlayFreesongOnLayer: freesongs list empty, retrying fetch");
-    // 列表为空（启动时拉取失败）：限制重试次数，避免网络持续故障时无限提交异步任务堆积
-    int retryCount = onlineVodFreesongFetchRetryCount_.fetch_add(1, std::memory_order_relaxed);
-    if (retryCount >= kOnlineVodFreesongMaxFetchRetry) {
-      LOG_WARN("[OnlineVod] tryPlayFreesongOnLayer: max fetch retries (%d) reached, giving up",
-               kOnlineVodFreesongMaxFetchRetry);
-      return false;
-    }
-    trackEngineAsyncTask(std::async(std::launch::async, [this, layerId]() {
-      if (shuttingDown_.load()) return;
-      fetchAndCacheFreesongs();
-      bool hasFreesongs = false;
-      {
-        std::lock_guard<std::mutex> lock(onlineVodFreesongsMutex_);
-        hasFreesongs = !onlineVodFreesongsList_.empty();
-      }
-      if (hasFreesongs) {
-        // 列表已填充，重置重试计数
-        onlineVodFreesongFetchRetryCount_.store(0, std::memory_order_relaxed);
-        tryPlayFreesongOnLayer(layerId);
-      }
-    }));
+    LOG_WARN("[OnlineVod] tryPlayFreesongOnLayer: freesongs list empty");
+    scheduleOnlineVodFreesongFetchAsync(
+        layerId, true, false, "idle_playback_needs_list", stateGeneration,
+        paused);
     return false;
   }
-  // 成功取到列表，重置重试计数
   onlineVodFreesongFetchRetryCount_.store(0, std::memory_order_relaxed);
 
   if (index < 0 || index >= static_cast<int>(list.size())) index = 0;
   for (size_t attempt = 0; attempt < list.size(); ++attempt) {
+    if (!isCurrentState()) return false;
     const int candidateIndex =
         (index + static_cast<int>(attempt)) % static_cast<int>(list.size());
     const std::string url = list[static_cast<size_t>(candidateIndex)];
-    const int nextIndex = (candidateIndex + 1) % static_cast<int>(list.size());
 
     std::string rememberedPath;
     {
@@ -1384,14 +1757,27 @@ bool Engine::tryPlayFreesongOnLayer(int layerId) {
                url.c_str());
       {
         std::lock_guard<std::mutex> lk(onlineVodSwitchMutex_);
-        lastOnlineVodSongPath_ = url;
-        onlineVodLastPlaybackWasIdle_ = true;
+        lastOnlineVodSongPath_ = normalizeOnlineVodMediaPathForCompare(url);
+        onlineVodPlaybackMediaPath_ = lastOnlineVodSongPath_;
+        onlineVodPlaybackQueueItemId_.clear();
+      }
+      applyOnlineVodLayerVolume(layerId, videoLayer, true,
+                                "freesong_duplicate");
+      if (paused && videoLayer->getState() == LayerVideo::PlayState::PLAYING) {
+        videoLayer->pause();
+      } else if (!paused &&
+                 videoLayer->getState() == LayerVideo::PlayState::PAUSED) {
+        videoLayer->resume();
       }
       return true;
     }
 
     LOG_INFO("[OnlineVod] playing freesong [%d/%zu]: %s", candidateIndex + 1,
              list.size(), url.c_str());
+    {
+      std::lock_guard<std::mutex> lock(onlineVodFreesongsMutex_);
+      onlineVodFreesongLastAttemptPath_ = url;
+    }
     PlaybackResult playResult =
         PlaybackRequestDispatcher::requestPlay(
             mubu_.get(), layerId, url, 3, PlaybackSource::Freesong);
@@ -1399,33 +1785,23 @@ bool Engine::tryPlayFreesongOnLayer(int layerId) {
       LOG_WARN("[OnlineVod] freesong play failed, skip to next [%d/%zu]: %s result=%s",
                candidateIndex + 1, list.size(), url.c_str(),
                toString(playResult.code));
-      {
-        std::lock_guard<std::mutex> lock(onlineVodFreesongsMutex_);
-        onlineVodFreesongsIndex_ = nextIndex;
-      }
       continue;
     }
+    if (!isCurrentState()) return false;
     {
       std::lock_guard<std::mutex> lk(onlineVodSwitchMutex_);
-      lastOnlineVodSongPath_ = url;
-      onlineVodLastPlaybackWasIdle_ = true;
+      lastOnlineVodSongPath_ = normalizeOnlineVodMediaPathForCompare(url);
+      onlineVodPlaybackMediaPath_ = lastOnlineVodSongPath_;
+      onlineVodPlaybackQueueItemId_.clear();
     }
-    {
-      std::lock_guard<std::mutex> lock(onlineVodFreesongsMutex_);
-      onlineVodFreesongsIndex_ = nextIndex;
-    }
-    // 空闲曲：使用配置文件中的图层音量，不覆盖用户设置
-    // 点播歌曲才强制 1.0f，空闲曲恢复到用户配置的值
-    {
-      float configVolume = 1.0f;
-      const LayerConfigData* cfg = systemConfig_->getLayerConfig(layerId);
-      if (cfg) configVolume = cfg->volume;
-      videoLayer->setVolume(configVolume);
-      LOG_INFO("[OnlineVod] freesong volume set to %.2f (from config layer %d)", configVolume, layerId);
+    applyOnlineVodLayerVolume(layerId, videoLayer, true, "freesong_start");
+    if (paused && videoLayer->getState() == LayerVideo::PlayState::PLAYING) {
+      videoLayer->pause();
     }
     return true;
   }
   LOG_WARN("[OnlineVod] all freesongs failed to play, list size=%zu", list.size());
+  deferOnlineVodFreesongPlayback(layerId, stateGeneration, paused);
   return false;
 }
 

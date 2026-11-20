@@ -4,9 +4,12 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.util.Log;
+import com.hsvj.engine.util.ScriptInstaller;
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 public class WatchdogAlarmReceiver extends BroadcastReceiver {
     private static final String TAG = "WatchdogAlarmReceiver";
@@ -16,9 +19,34 @@ public class WatchdogAlarmReceiver extends BroadcastReceiver {
     private static final String PACKAGE_UPDATE_GRACE_FILE = "/data/local/tmp/hsvj_package_update_grace";
     private static final int SUPPRESS_RESTART_TIMEOUT_SECONDS = 30;
     private static final int PACKAGE_UPDATE_GRACE_SECONDS = 60;
+    // Recovery must not queue behind startup work or accumulate repeated alarms.
+    private static final ThreadPoolExecutor EXECUTOR = new ThreadPoolExecutor(
+            0, 1, 10L, TimeUnit.SECONDS, new SynchronousQueue<>(), runnable -> {
+                Thread worker = new Thread(runnable, "WatchdogAlarm");
+                worker.setDaemon(true);
+                return worker;
+            });
 
     @Override
     public void onReceive(Context context, Intent intent) {
+        Context application = context.getApplicationContext();
+        Context taskContext = application != null ? application : context;
+        PendingResult pending = goAsync();
+        try {
+            EXECUTOR.execute(() -> {
+                try {
+                    handleAlarm(taskContext);
+                } finally {
+                    pending.finish();
+                }
+            });
+        } catch (RejectedExecutionException error) {
+            pending.finish();
+            Log.w(TAG, "watchdog alarm already running; skip duplicate");
+        }
+    }
+
+    private static void handleAlarm(Context context) {
         try {
             if (isRestartSuppressed()) {
                 Log.i(TAG, "planned restart suppression active, skip alarm launch");
@@ -29,41 +57,41 @@ public class WatchdogAlarmReceiver extends BroadcastReceiver {
                 return;
             }
 
-            String watchdogPath = copyAssetToCache(context, WATCHDOG_ASSET);
+            if (Thread.currentThread().isInterrupted()) return;
+            String watchdogPath = ScriptInstaller.copyAssetToCache(
+                    context, WATCHDOG_ASSET, WATCHDOG_ASSET);
             if (watchdogPath != null) {
-                runRootCommand("sh -c 'cp \"" + watchdogPath + "\" " + WATCHDOG_PATH
+                runRootCommand("cp '" + watchdogPath.replace("'", "'\"'\"'") + "' " + WATCHDOG_PATH
                         + " && chmod 755 " + WATCHDOG_PATH
-                        + " && setsid sh " + WATCHDOG_PATH
-                        + " alarm >> /data/local/tmp/hsvj_watchdog_launcher.log 2>&1 < /dev/null &'");
+                        + " && { setsid sh " + WATCHDOG_PATH
+                        + " alarm >> /data/local/tmp/hsvj_watchdog_launcher.log 2>&1 < /dev/null & }", 2000L);
             }
         } catch (Exception e) {
             Log.e(TAG, "watchdog alarm failed: " + e.getMessage(), e);
         }
     }
 
-    private static String copyAssetToCache(Context context, String assetName) {
-        File target = new File(context.getCacheDir(), assetName);
-        try (InputStream input = context.getAssets().open(assetName);
-             FileOutputStream output = new FileOutputStream(target)) {
-            byte[] buffer = new byte[8192];
-            int read;
-            while ((read = input.read(buffer)) != -1) {
-                output.write(buffer, 0, read);
-            }
-            output.flush();
-            target.setExecutable(true, false);
-            return target.getAbsolutePath();
-        } catch (Exception e) {
-            Log.e(TAG, "copy asset failed: " + assetName + ", " + e.getMessage(), e);
-            return null;
-        }
-    }
-
-    private static void runRootCommand(String command) {
+    private static boolean runRootCommand(String command, long timeoutMs) {
+        if (Thread.currentThread().isInterrupted()) return false;
+        Process process = null;
         try {
-            Runtime.getRuntime().exec(new String[] { "su", "0", "sh", "-c", command });
+            process = new ProcessBuilder("su", "0", "sh", "-c", command)
+                    .redirectInput(new File("/dev/null"))
+                    .redirectOutput(new File("/dev/null"))
+                    .redirectError(new File("/dev/null")).start();
+            if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                Log.e(TAG, "root command timed out");
+                return false;
+            }
+            return process.exitValue() == 0;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         } catch (Exception e) {
-            Log.e(TAG, "submit root command failed: " + command + ", " + e.getMessage(), e);
+            Log.e(TAG, "submit root command failed: " + e.getMessage(), e);
+            return false;
+        } finally {
+            if (process != null) process.destroyForcibly();
         }
     }
 
@@ -81,16 +109,9 @@ public class WatchdogAlarmReceiver extends BroadcastReceiver {
                 + "now=$(date +%s); "
                 + "case \"$ts\" in ''|*[!0-9]*) rm -f " + filePath + "; exit 1;; esac; "
                 + "age=$((now - ts)); "
-                + "if [ \"$age\" -lt " + timeoutSeconds + " ]; then exit 0; fi; "
+                + "if [ \"$age\" -ge 0 ] && [ \"$age\" -lt " + timeoutSeconds + " ]; then exit 0; fi; "
                 + "rm -f " + filePath + "; "
                 + "fi; exit 1";
-        try {
-            Process process = Runtime.getRuntime().exec(new String[] { "su", "0", "sh", "-c", command });
-            int exitCode = process.waitFor();
-            return exitCode == 0;
-        } catch (Exception e) {
-            Log.w(TAG, "check timestamp file failed: " + filePath + ", " + e.getMessage());
-            return false;
-        }
+        return runRootCommand(command, 2000L);
     }
 }

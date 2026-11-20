@@ -22,6 +22,10 @@ bool saveFusionFiles(const std::string &rootPath, const FusionProjectState &stat
                      int regionCount, int canvasWidth, int canvasHeight,
                      std::string *errorMessage = nullptr,
                      FusionFilePaths *savedPaths = nullptr);
+bool saveFusionCheckpoint(const std::string &rootPath,
+                          const FusionProjectState &state, int regionCount,
+                          std::string *errorMessage = nullptr,
+                          std::string *savedPath = nullptr);
 bool deleteFusionFiles(const std::string &rootPath,
                        std::string *errorMessage = nullptr,
                        FusionFilePaths *deletedPaths = nullptr);

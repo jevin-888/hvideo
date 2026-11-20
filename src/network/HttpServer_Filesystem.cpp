@@ -96,7 +96,7 @@ void HttpServer::registerFilesystemRoutes() {
     try {
       // 支持的视频/图片/音频扩展名（小写）
       const std::vector<std::string> videoExts = {
-          ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+          ".hvideo", ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
           ".mpg", ".mpeg", ".ts", ".vob", ".dat"};
       const std::vector<std::string> imageExts = {
           ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg"};
@@ -212,7 +212,9 @@ void HttpServer::registerFilesystemRoutes() {
 
             const fs::path &p = entry.path();
             std::string ext = p.extension().string();
-            for (auto &ch : ext) ch = static_cast<char>(::tolower(ch));
+            for (auto &ch : ext) {
+              ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
 
             std::string mediaType = inferMediaType(ext);
             bool match = false;

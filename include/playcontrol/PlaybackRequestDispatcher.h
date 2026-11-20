@@ -14,7 +14,9 @@ public:
   static PlaybackResult requestPlay(Mubu *mubu, int layerId,
                                     const std::string &path, int loop,
                                     PlaybackSource source,
-                                    bool userInitiated = false);
+                                    bool userInitiated = false,
+                                    double syncStartTime = 0.0,
+                                    bool restartFromBeginning = false);
   static PlaybackResult stopLayer(Mubu *mubu, int layerId);
 };
 

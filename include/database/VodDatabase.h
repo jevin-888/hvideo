@@ -42,7 +42,10 @@ public:
     int micStatus = 0;            // 数据.micStatus
     int muteStatus = 0;           // 数据.muteStatus
     std::string currentSongId;    // 数据.currentSongId
+    std::string currentQueueItemId; // playingNow.queueItemId; empty for idle/error
     std::string currentSongTitle; // 数据.currentSongTitle
+    std::string currentSongLightCode; // playingNow.lightCode
+    std::string currentSongCategoryCode; // playingNow.categoryCode
     std::string acStateJson;      // 数据.ac_state JSON
     std::string lightStateJson;   // 数据.light_state JSON
     std::string effectStateJson;  // 数据.effect_state JSON

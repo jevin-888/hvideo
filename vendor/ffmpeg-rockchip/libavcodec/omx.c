@@ -408,7 +408,7 @@ static av_cold int omx_component_init(AVCodecContext *avctx, const char *role)
 
     err = s->omx_context->ptr_GetHandle(&s->handle, s->component_name, s, (OMX_CALLBACKTYPE*) &callbacks);
     if (err != OMX_ErrorNone) {
-        av_log(avctx, AV_LOG_ERROR, "OMX_GetHandle(%s) ? failed: %x\n", s->component_name, err);
+        av_log(avctx, AV_LOG_ERROR, "OMX_GetHandle(%s) failed: %x\n", s->component_name, err);
         return AVERROR_UNKNOWN;
     }
 
@@ -807,7 +807,7 @@ static int omx_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
             config.bEnabled = OMX_TRUE;
             err = OMX_SetConfig(s->handle, OMX_IndexConfigBrcmVideoRequestIFrame, &config);
             if (err != OMX_ErrorNone) {
-                av_log(avctx, AV_LOG_ERROR, "OMX_SetConfig(RequestIFrame) ? failed: %x\n", err);
+                av_log(avctx, AV_LOG_ERROR, "OMX_SetConfig(RequestIFrame) failed: %x\n", err);
             }
 #else
             OMX_CONFIG_INTRAREFRESHVOPTYPE config = {0, };
@@ -816,7 +816,7 @@ static int omx_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
             config.IntraRefreshVOP = OMX_TRUE;
             err = OMX_SetConfig(s->handle, OMX_IndexConfigVideoIntraVOPRefresh, &config);
             if (err != OMX_ErrorNone) {
-                av_log(avctx, AV_LOG_ERROR, "OMX_SetConfig(IntraVOPRefresh) ? failed: %x\n", err);
+                av_log(avctx, AV_LOG_ERROR, "OMX_SetConfig(IntraVOPRefresh) failed: %x\n", err);
             }
 #endif
         }

@@ -4,9 +4,10 @@
  */
 
 #include "core/PeripheralManager.h"
+#include "core/VodForwardConfig.h"
 #include "core/CommandRouter.h"
 #include "core/Engine.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "network/Dmx512Receiver.h"
 #include "network/NetworkManager.h"
@@ -25,14 +26,29 @@
 #include "utils/Logger.h"
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <dirent.h>
+#include <fcntl.h>
 #include <initializer_list>
 #include <iostream>
+#include <netdb.h>
+#include <poll.h>
+#include <set>
 #include <sstream>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
 
 namespace hsvj {
+
+std::string callJavaControlBluetooth(
+    const std::string& action, const std::string& payload);
 
 namespace {
 std::string bytesToHexCompact(const uint8_t *data, size_t len) {
@@ -97,36 +113,411 @@ std::string hexPreview(const std::vector<uint8_t> &bytes) {
   return preview;
 }
 
-bool isSerialDeviceName(const std::string &name) {
-  return name.rfind("ttyS", 0) == 0 || name.rfind("ttyUSB", 0) == 0 ||
-         name.rfind("ttyACM", 0) == 0 || name.rfind("ttyRS", 0) == 0 ||
-         name.rfind("ttyAMA", 0) == 0 || name.rfind("ttyXRUSB", 0) == 0 ||
-         name.rfind("ttySWK", 0) == 0 || name.rfind("ttysWK", 0) == 0;
+std::string tcpSocketError(int code) {
+  switch (code) {
+  case ECONNREFUSED:
+    return "目标端口拒绝连接，请确认目标 IP、端口和设备网络控制服务已开启";
+  case ETIMEDOUT:
+    return "网络响应超时，请检查设备在线状态及网络连接";
+  case EHOSTUNREACH:
+  case ENETUNREACH:
+    return "无法到达目标网络或设备，请检查 IP、网关和网络连接";
+  case ECONNRESET:
+    return "设备重置了连接";
+  case EPIPE:
+    return "设备连接已断开，无法继续发送";
+  case EACCES:
+  case EPERM:
+    return "网络访问被权限或防火墙策略禁止";
+  default:
+    return "系统网络错误 " + std::to_string(code) + "（" + std::strerror(code) + "）";
+  }
 }
 
-int serialDevicePreference(const std::string &name) {
-  if (name.rfind("ttySWK", 0) == 0) return 0;
-  if (name.rfind("ttysWK", 0) == 0) return 10;
-  return 5;
+// One connection attempt. completed identifies the first unconfirmed payload,
+// so a protocol fallback never replays commands already acknowledged.
+bool sendTcpAttempt(const std::string &address, int port,
+                   const std::vector<std::string> &payloads,
+                    bool standardPjLink, bool inspectReply, size_t &completed,
+                    bool &retryable, std::string &error, std::string *reply) {
+  if (address.empty() || port <= 0 || port > 65535) {
+    retryable = false;
+    error = "目标地址为空或端口无效，请检查配置（端口范围 1–65535）";
+    return false;
+  }
+
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+
+  addrinfo *addresses = nullptr;
+  const std::string portText = std::to_string(port);
+  const int resolveResult =
+      getaddrinfo(address.c_str(), portText.c_str(), &hints, &addresses);
+  if (resolveResult != 0 || !addresses) {
+    error = "无法解析目标地址，请检查 IP 或域名：" +
+            std::string(gai_strerror(resolveResult));
+    return false;
+  }
+
+  constexpr int kIoTimeoutMs = 3000;
+  const auto attemptDeadline = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(kIoTimeoutMs);
+  auto remainingMs = [&]() {
+    return static_cast<int>(std::max<int64_t>(0,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            attemptDeadline - std::chrono::steady_clock::now()).count()));
+  };
+  int connectedFd = -1;
+  std::string connectError = "无法建立 TCP 连接";
+  for (addrinfo *entry = addresses; entry; entry = entry->ai_next) {
+    const int fd = socket(entry->ai_family, entry->ai_socktype,
+                          entry->ai_protocol);
+    if (fd < 0) {
+      connectError = "无法创建网络连接：" +
+                     tcpSocketError(errno);
+      continue;
+    }
+
+    const int originalFlags = fcntl(fd, F_GETFL, 0);
+    if (originalFlags < 0 ||
+        fcntl(fd, F_SETFL, originalFlags | O_NONBLOCK) < 0) {
+      connectError = "无法初始化网络连接：" +
+                     tcpSocketError(errno);
+      close(fd);
+      continue;
+    }
+
+    int connectResult = connect(fd, entry->ai_addr, entry->ai_addrlen);
+    if (connectResult < 0 && errno == EINPROGRESS) {
+      pollfd descriptor{fd, POLLOUT, 0};
+      do {
+        connectResult = poll(&descriptor, 1, remainingMs());
+      } while (connectResult < 0 && errno == EINTR);
+
+      if (connectResult > 0) {
+        int socketError = 0;
+        socklen_t errorLength = sizeof(socketError);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError,
+                       &errorLength) == 0 && socketError == 0) {
+          connectResult = 0;
+        } else {
+          if (socketError == 0) socketError = errno;
+          errno = socketError;
+          connectResult = -1;
+        }
+      } else if (connectResult == 0) {
+        connectError = "连接超时（3 秒内未建立连接），请检查设备供电、网络和端口";
+        close(fd);
+        continue;
+      }
+    }
+
+    if (connectResult == 0) {
+      connectedFd = fd;
+      break;
+    }
+
+    connectError = "连接失败：" + tcpSocketError(errno);
+    close(fd);
+  }
+  freeaddrinfo(addresses);
+
+  if (connectedFd < 0) {
+    error = connectError;
+    return false;
+  }
+
+#ifdef MSG_NOSIGNAL
+  constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+  constexpr int kSendFlags = 0;
+#endif
+
+  std::string pending;
+  auto receiveLine = [&](const char *stage, std::string &line,
+                         bool optional = false) {
+    line.clear();
+    auto deadline = optional && pending.empty()
+        ? std::min(attemptDeadline, std::chrono::steady_clock::now() +
+                   std::chrono::milliseconds(300)) : attemptDeadline;
+    while (true) {
+      const size_t terminator = pending.find('\r');
+      if (terminator != std::string::npos && terminator < 512) {
+        line = pending.substr(0, terminator);
+        pending.erase(0, terminator + 1);
+        // Accept CRLF devices as well as the standard CR terminator.
+        if (!line.empty() && line.front() == '\n') line.erase(0, 1);
+        return true;
+      }
+      if (pending.size() >= 512) {
+        error = std::string(stage) + "失败：设备响应超过长度限制";
+        return false;
+      }
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now()).count();
+      if (remaining <= 0) {
+        if (optional && pending.empty()) return true;
+        error = std::string(stage) + "超时（本次连接最多等待 3 秒）";
+        return false;
+      }
+      pollfd descriptor{connectedFd, POLLIN, 0};
+      const int pollResult = poll(&descriptor, 1, static_cast<int>(remaining));
+      if (pollResult < 0 && errno == EINTR) continue;
+      if (pollResult == 0) {
+        if (optional && pending.empty()) return true;
+        error = std::string(stage) + "超时（本次连接最多等待 3 秒）";
+        return false;
+      }
+      // POLLIN can coexist with POLLHUP: drain the final reply before closing.
+      if (pollResult < 0 ||
+          (!(descriptor.revents & POLLIN) &&
+           (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)))) {
+        error = std::string(stage) + "失败：连接中断或网络异常";
+        return false;
+      }
+
+      char buffer[128];
+      const ssize_t received = recv(connectedFd, buffer, sizeof(buffer), 0);
+      if (received > 0) {
+        if (optional) {
+          optional = false;
+          deadline = attemptDeadline;
+        }
+        pending.append(buffer, static_cast<size_t>(received));
+        continue;
+      }
+      if (received < 0 && errno == EINTR) continue;
+      if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+      error = received == 0 ? std::string(stage) + "失败：设备关闭了连接"
+                            : std::string(stage) + "读取失败：" +
+                                  tcpSocketError(errno);
+      return false;
+    }
+  };
+
+  auto acceptGreeting = [&](const std::string &greeting) {
+    if (greeting == "PJLINK ERRA") {
+      retryable = false;
+      error = "设备拒绝 PJLink 认证，请检查设备密码认证设置（PJLINK ERRA）";
+      return false;
+    }
+    if (greeting.rfind("PJLINK 1", 0) == 0) {
+      retryable = false;
+      error = "设备要求 PJLink 密码认证；当前仅支持无密码模式，请关闭设备的 PJLink 认证后重试";
+      return false;
+    }
+    if (greeting != "PJLINK 0") {
+      error = "设备握手内容不符合无密码 PJLink 协议：" + greeting;
+      return false;
+    }
+    return true;
+  };
+  bool pjLinkSeen = standardPjLink;
+  if (standardPjLink) {
+    std::string greeting;
+    if (!receiveLine("等待 PJLink 握手", greeting)) {
+      close(connectedFd);
+      return false;
+    }
+    LOG_INFO("[PeripheralManager]   PJLink 握手: %s", greeting.c_str());
+    if (!acceptGreeting(greeting)) {
+      close(connectedFd);
+      return false;
+    }
+  }
+
+  for (; completed < payloads.size(); ++completed) {
+    const auto &payload = payloads[completed];
+    size_t offset = 0;
+    while (offset < payload.size()) {
+      if (remainingMs() == 0) {
+        error = "发送超时（本次连接的 3 秒等待时间已用完）";
+        close(connectedFd);
+        return false;
+      }
+      const ssize_t sent =
+          send(connectedFd, payload.data() + offset, payload.size() - offset,
+               kSendFlags);
+      if (sent > 0) {
+        offset += static_cast<size_t>(sent);
+        continue;
+      }
+      if (sent < 0 && errno == EINTR) {
+        continue;
+      }
+      if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        pollfd descriptor{connectedFd, POLLOUT, 0};
+        int pollResult = 0;
+        do {
+          pollResult = poll(&descriptor, 1, remainingMs());
+        } while (pollResult < 0 && errno == EINTR);
+        if (pollResult > 0 && !(descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+          continue;
+        }
+        error = pollResult == 0 ? "发送超时（本次连接最多等待 3 秒）"
+            : pollResult > 0 ? "发送失败：设备连接已断开或出现网络异常"
+            : "发送等待失败：" + tcpSocketError(errno);
+      } else {
+        error = "发送失败：" + tcpSocketError(errno);
+      }
+      close(connectedFd);
+      return false;
+    }
+
+    if (inspectReply) {
+      std::string commandReply;
+      if (!receiveLine("等待直通发送回执", commandReply, !pjLinkSeen)) {
+        close(connectedFd);
+        return false;
+      }
+      if (commandReply.empty() && !pjLinkSeen) {
+        LOG_INFO("[PeripheralManager] TCP direct payload sent (no device acknowledgement)");
+        continue;
+      }
+      if (commandReply == "PJLINK ERRA") {
+        acceptGreeting(commandReply);
+        close(connectedFd);
+        return false;
+      }
+      if (!pjLinkSeen && commandReply.rfind("PJLINK", 0) == 0) {
+        pjLinkSeen = true;
+        if (!acceptGreeting(commandReply) ||
+            !receiveLine("等待 PJLink 指令回执", commandReply)) {
+          close(connectedFd);
+          return false;
+        }
+      }
+      // A raw TCP peer may acknowledge with its own protocol.
+      if (!pjLinkSeen && !commandReply.empty() && commandReply.front() != '%') {
+        if (reply) {
+          if (!reply->empty()) reply->append("; ");
+          reply->append(commandReply);
+        }
+        continue;
+      }
+      pjLinkSeen = true;
+      LOG_INFO("[PeripheralManager]   PJLink 回执: %s", commandReply.c_str());
+      if (reply) {
+        if (!reply->empty()) reply->append("; ");
+        reply->append(commandReply);
+      }
+      const std::string expectedPrefix = payload.substr(0, 6) + "=";
+      if (commandReply.rfind(expectedPrefix, 0) != 0) {
+        error = "设备回执与当前指令不匹配：" + commandReply;
+        close(connectedFd);
+        return false;
+      }
+      const std::string result = commandReply.substr(expectedPrefix.size());
+      if (result.rfind("ERR", 0) == 0) {
+        // A device rejection is definitive, not a failed handshake.
+        retryable = false;
+        const std::string reason = result == "ERR1" ? "设备不支持此指令" :
+            result == "ERR2" ? "指令参数不正确" :
+            result == "ERR3" ? "设备当前状态不允许执行（可能正在预热或冷却）" :
+            result == "ERR4" ? "设备内部故障，无法执行指令" :
+            result == "ERRA" ? "设备密码认证失败" : "设备拒绝执行指令";
+        error = reason + "（PJLink 回执：" + commandReply + "）";
+        close(connectedFd);
+        return false;
+      }
+      const bool isQuery = payload.find(" ?\r") != std::string::npos;
+      if (result.empty() || (!isQuery && result != "OK")) {
+        error = "设备回执与当前指令不匹配：" + commandReply;
+        close(connectedFd);
+        return false;
+      }
+    }
+  }
+
+  close(connectedFd);
+  return true;
 }
 
-std::string serialDeviceKey(const std::string &path) {
-  struct stat st;
-  if (stat(path.c_str(), &st) == 0 && S_ISCHR(st.st_mode)) {
-    return "chr:" + std::to_string(static_cast<unsigned long long>(st.st_rdev));
+bool sendTcpDirect(const std::string &address, int port,
+                   const std::vector<std::string> &payloads,
+                   std::string &error, std::string *reply) {
+  error.clear();
+  if (reply) reply->clear();
+  // Recognize configured PJLink commands on custom ports too. Generic TCP
+  // traffic keeps its existing write-only behavior outside the PJLink port.
+  const bool pjLinkCommands = !payloads.empty() &&
+      std::all_of(payloads.begin(), payloads.end(), [](const std::string &p) {
+        return p.size() >= 9 && p[0] == '%' && (p[1] == '1' || p[1] == '2') &&
+               std::all_of(p.begin() + 2, p.begin() + 6,
+                           [](char c) { return c >= 'A' && c <= 'Z'; }) &&
+               p[6] == ' ' && p.back() == '\r' &&
+               p.find('\r') == p.size() - 1;
+      });
+  const bool inspectReply = port == 4352 || pjLinkCommands;
+  const std::string endpoint = address + ":" + std::to_string(port);
+  size_t completed = 0;
+  constexpr int kMaxRounds = 4; // Initial attempt plus three retries.
+  for (int round = 1; round <= kMaxRounds; ++round) {
+    bool retryable = true;
+    error.clear();
+    if (reply) reply->clear();
+    LOG_INFO("[PeripheralManager] TCP target=%s round=%d/%d mode=direct",
+             endpoint.c_str(), round, kMaxRounds);
+    if (sendTcpAttempt(address, port, payloads, false, inspectReply, completed,
+                       retryable, error, reply)) return true;
+    std::string roundError = "直通发送失败：" + error;
+    if (inspectReply && retryable && !address.empty() && port > 0 && port <= 65535) {
+      LOG_WARN("[PeripheralManager] %s; target=%s round=%d/%d mode=PJLink",
+               roundError.c_str(), endpoint.c_str(), round, kMaxRounds);
+      error.clear();
+      if (reply) reply->clear();
+      if (sendTcpAttempt(address, port, payloads, true, true, completed,
+                         retryable, error, reply)) return true;
+      roundError += "；无密码 PJLink 发送失败：" + error;
+    }
+    error = "目标 " + endpoint + "，" + roundError;
+    if (!retryable || address.empty() || port <= 0 || port > 65535) {
+      error += "（第 " + std::to_string(round) + " 轮终止，非网络瞬时故障）";
+      return false;
+    }
+    LOG_WARN("[PeripheralManager] %s; round=%d/%d", error.c_str(), round, kMaxRounds);
+    if (round < kMaxRounds) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    } else {
+      error += "；已额外重试 3 轮，共 4 轮，仍未成功";
+    }
   }
-  return "path:" + path;
+  return false;
 }
 
-std::string serialDeviceType(const std::string &name) {
-  if (name == "ttySWK4" || name == "ttysWK4") {
-    return "rs232";
+Json::Value callBluetoothAction(const std::string &action,
+                                const Json::Value &param) {
+  Json::Value result;
+  std::string error;
+  const std::string payload = JsonUtils::toString(param);
+  const std::string response = callJavaControlBluetooth(action, payload);
+  if (!JsonUtils::parseJson(response, result, error) || !result.isObject()) {
+    result = Json::Value(Json::objectValue);
+    result["ok"] = false;
+    result["error"] = 0x0001;
+    result["message"] = "invalid bluetooth control response";
+    result["raw"] = response;
   }
-  if (name.rfind("ttySWK", 0) == 0 || name.rfind("ttysWK", 0) == 0 ||
-      name.rfind("ttyRS", 0) == 0 || name.rfind("ttyXRUSB", 0) == 0) {
-    return "rs485";
+  return result;
+}
+
+bool isSafeSerialDevicePath(const std::string &path) {
+  static constexpr char kPrefix[] = "/dev/tty";
+  constexpr size_t kPrefixLength = sizeof(kPrefix) - 1;
+  if (path.rfind(kPrefix, 0) != 0 || path.size() <= kPrefixLength) {
+    return false;
   }
-  return "rs232";
+  return std::all_of(path.begin() + static_cast<std::ptrdiff_t>(kPrefixLength),
+                     path.end(), [](unsigned char c) {
+                       return std::isalnum(c) || c == '_' || c == '-';
+                     });
+}
+
+bool ensureSerialDevicePermissions(const std::string &path) {
+  return isSafeSerialDevicePath(path) &&
+         access(path.c_str(), R_OK | W_OK) == 0;
 }
 
 std::string normalizeSerialTemplateType(const std::string &type) {
@@ -149,6 +540,13 @@ int clampDmxAddress(int address) {
 
 int normalizeBaudrate(int baudrate, int fallback) {
   return baudrate > 0 ? baudrate : fallback;
+}
+
+bool isSupportedSerialBaudrate(int baudrate) {
+  static constexpr std::array<int, 8> kSupported{
+      1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200};
+  return std::find(kSupported.begin(), kSupported.end(), baudrate) !=
+         kSupported.end();
 }
 
 int normalizeDataBits(int dataBits) {
@@ -226,6 +624,28 @@ Json::Value buildDefaultFunctionConfig() {
   lighting["items"] = lightItems;
   root["lighting"] = lighting;
 
+  Json::Value projector(Json::objectValue);
+  projector["enabled"] = true;
+  projector["title"] = "投影";
+  Json::Value projectorItems(Json::arrayValue);
+  Json::Value projectorPowerOn(Json::objectValue);
+  projectorPowerOn["id"] = "power_on";
+  projectorPowerOn["label"] = "开";
+  projectorPowerOn["kind"] = "power_on";
+  projectorPowerOn["enabled"] = true;
+  projectorPowerOn["functions"] = Json::Value(Json::arrayValue);
+  projectorItems.append(projectorPowerOn);
+
+  Json::Value projectorPowerOff(Json::objectValue);
+  projectorPowerOff["id"] = "power_off";
+  projectorPowerOff["label"] = "关";
+  projectorPowerOff["kind"] = "power_off";
+  projectorPowerOff["enabled"] = true;
+  projectorPowerOff["functions"] = Json::Value(Json::arrayValue);
+  projectorItems.append(projectorPowerOff);
+  projector["items"] = projectorItems;
+  root["projector"] = projector;
+
   return root;
 }
 
@@ -235,59 +655,18 @@ int readLe16(const uint8_t *data) {
 
 Json::Value listSerialDevices() {
   Json::Value ports(Json::arrayValue);
-  if (DIR *dir = opendir("/dev")) {
-    std::map<std::string, std::string> uniqueDevices;
-    while (dirent *entry = readdir(dir)) {
-      std::string name = entry->d_name;
-      if (!isSerialDeviceName(name)) {
-        continue;
-      }
-
-      std::string path = "/dev/" + name;
-      std::string key = serialDeviceKey(path);
-      auto existing = uniqueDevices.find(key);
-      if (existing == uniqueDevices.end()) {
-        uniqueDevices[key] = path;
-      } else {
-        std::string existingName = existing->second.substr(existing->second.find_last_of('/') + 1);
-        if (serialDevicePreference(name) < serialDevicePreference(existingName)) {
-          existing->second = path;
-        }
-      }
-    }
-    closedir(dir);
-
-    std::vector<std::string> devices;
-    devices.reserve(uniqueDevices.size());
-    for (const auto &kv : uniqueDevices) {
-      devices.push_back(kv.second);
-    }
-    std::sort(devices.begin(), devices.end());
-
-    int rs485Count = 0;
-    int rs232Count = 0;
-    for (const auto &device : devices) {
-      Json::Value portObj(Json::objectValue);
-      portObj["value"] = device;
-
-      const std::string name = device.substr(device.find_last_of('/') + 1);
-      const std::string type = serialDeviceType(name);
-      portObj["type"] = type;
-      portObj["role"] = type;
-
-      std::string displayName;
-      if (type == "rs485") {
-        rs485Count++;
-        displayName = "RS-485串口" + std::to_string(rs485Count);
-      } else if (type == "rs232") {
-        rs232Count++;
-        displayName = "RS-232串口" + std::to_string(rs232Count);
-      } else {
-        displayName = "调试串口(" + device + ")";
-      }
-      portObj["label"] = displayName;
-      ports.append(portObj);
-    }
+  // Only the three external board connectors are exposed to control pages.
+  for (const char *name : {"ttyS5", "ttyS7", "ttyS9"}) {
+    const std::string path = std::string("/dev/") + name;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || !S_ISCHR(st.st_mode)) continue;
+    const bool rs232 = std::strcmp(name, "ttyS5") == 0;
+    Json::Value port(Json::objectValue);
+    port["value"] = path;
+    port["type"] = rs232 ? "rs232" : "rs485";
+    port["role"] = port["type"];
+    port["label"] = std::string(rs232 ? "RS232" : "RS485") + " (" + path + ")";
+    ports.append(port);
   }
   return ports;
 }
@@ -296,6 +675,72 @@ Json::Value listSerialDevices() {
 PeripheralManager &PeripheralManager::getInstance() {
   static PeripheralManager instance;
   return instance;
+}
+
+Json::Value PeripheralManager::sendStageProtocol(const Json::Value &param) {
+  Json::Value result(Json::objectValue);
+  result["ok"] = false;
+
+  std::string protocol = param.get("protocol", "").asString();
+  if (protocol == "ws") protocol = "websocket";
+  if (protocol != "udp" && protocol != "tcp" &&
+      protocol != "websocket" && protocol != "rs232" &&
+      protocol != "rs485") {
+    result["message"] = "unsupported stage protocol: " + protocol;
+    return result;
+  }
+
+  const std::string encoding = param.get("encoding", "text").asString();
+  if (encoding != "text" && encoding != "hex") {
+    result["message"] = "stage protocol encoding must be text or hex";
+    return result;
+  }
+  const std::string data = param.get("payload", "").asString();
+  if (data.empty()) {
+    result["message"] = "stage protocol payload is empty";
+    return result;
+  }
+
+  Json::Value forward(Json::objectValue);
+  forward["forward_target"] = protocol;
+  forward["fixed_send"] = true;
+  forward["fixed_payload_type"] = encoding;
+
+  const std::string mode = param.get(
+      "mode", protocol == "websocket" ? "broadcast" :
+              ((protocol == "rs232" || protocol == "rs485") ? "serial"
+                                                                : "direct"))
+                               .asString();
+  forward["forward_mode"] = mode;
+
+  if (protocol == "rs232" || protocol == "rs485") {
+    forward["forward_port"] = param.get("serial_port", "").asString();
+    forward["forward_baudrate"] = param.get("baudrate", 9600).asInt();
+  } else {
+    forward["forward_port"] = param.get("port", 0).asInt();
+    forward["forward_address"] = param.get("address", "").asString();
+    if (protocol == "udp") {
+      forward["broadcast"] = mode == "broadcast";
+      forward["multicast"] = mode == "multicast";
+      forward["multicast_group"] =
+          param.get("multicast_group", "").asString();
+      forward["forward_ttl"] = param.get("ttl", 1).asInt();
+    }
+  }
+
+  std::string error;
+  const std::string payload = encoding == "text" ? data : std::string();
+  const std::string hex = encoding == "hex" ? data : std::string();
+  if (!forwardPayload(forward, payload, hex, error)) {
+    result["message"] = error.empty() ? "stage protocol send failed" : error;
+    return result;
+  }
+
+  result["ok"] = true;
+  result["message"] = "stage protocol sent";
+  result["protocol"] = protocol;
+  result["mode"] = mode;
+  return result;
 }
 
 std::string PeripheralManager::getDmxInputModeName() const {
@@ -309,25 +754,46 @@ bool PeripheralManager::isDmxExternalInputRunning() const {
 }
 
 PeripheralManager::~PeripheralManager() {
+  stopTriggerExecution();
   stopDmxExternalInput();
   stopSerialLearnThread();
+  std::lock_guard<std::mutex> lock(serialListenerMutex_);
+  serialWriteRs232_.clear();
+  serialWriteRs485_.clear();
+}
+
+void PeripheralManager::stopTriggerExecution() {
+  {
+    std::lock_guard<std::mutex> lock(triggerQueueMutex_);
+    triggerStopping_ = true;
+    triggerQueue_.clear();
+  }
+  triggerQueueCv_.notify_all();
+  if (triggerWorker_.joinable()) triggerWorker_.join();
+}
+
+void PeripheralManager::setCommandRouter(CommandRouter *router) {
+  stopTriggerExecution();
+  std::lock_guard<std::mutex> lock(triggerQueueMutex_);
+  commandRouter_ = router;
+  triggerStopping_ = router == nullptr;
 }
 
 void PeripheralManager::initialize() {
   std::lock_guard<std::mutex> lock(mutex_);
   LOG_DEBUG("PeripheralManager: Initializing native DMX & Peripheral system...");
 
-  rs232Config_.port = "";
-  rs232Config_.baudrate = 0;
+  rs232Config_.port = "/dev/ttyS5";
+  rs232Config_.baudrate = 9600;
   rs232Config_.enabled = false;
 
-  rs485Config_.port = "/dev/ttyRS485";
+  rs485Config_.port = "/dev/ttyS7";
   rs485Config_.baudrate = 9600;
 
   dmxConfig_.port = "artnet";
   dmxConfig_.protocol = DmxProtocol::ARTNET;
   dmxConfig_.inputMode = DmxInputMode::LOCAL;
-  dmxConfig_.externalPort = "/dev/ttySWK4";
+  dmxConfig_.externalPort = "/dev/ttyS5";
   dmxConfig_.externalBaudrate = 115200;
   dmxConfig_.externalDataBits = 8;
   dmxConfig_.externalStopBits = 1;
@@ -367,6 +833,65 @@ void PeripheralManager::initialize() {
   applyConfigs();
 }
 
+const Json::Value &PeripheralManager::builtinControlFunctions() {
+  static const Json::Value functions = [] {
+    Json::Value items(Json::arrayValue);
+    Json::Value delay(Json::objectValue);
+    delay["id"] = "control_delay";
+    delay["name"] = "延时 1000 毫秒";
+    delay["category"] = "协议控制";
+    delay["description"] = "在命令序列中等待指定毫秒数（双击可修改）";
+    delay["code"] = 0x50;
+    delay["action"] = "delay";
+    delay["param"]["action"] = "delay";
+    delay["param"]["delay_ms"] = 1000;
+    items.append(delay);
+    for (bool locked : {true, false}) {
+      Json::Value item(Json::objectValue);
+      const std::string action = locked ? "lockPlayback" : "unlockPlayback";
+      item["id"] = std::string("control_") + (locked ? "lockGlobalPlayback" : "unlockGlobalPlayback");
+      item["name"] = locked ? "全局锁定" : "全局解锁";
+      item["category"] = "播放控制";
+      item["description"] = locked ? "锁定所有播放图层" : "解除全局锁，保留单独设置的图层锁";
+      item["code"] = 0x02;
+      item["action"] = action;
+      item["param"]["action"] = action;
+      item["param"]["scope"] = "global";
+      items.append(item);
+    }
+    for (int layerId = 1; layerId <= 4; ++layerId) {
+      for (bool locked : {true, false}) {
+        Json::Value item(Json::objectValue);
+        const std::string action = locked ? "lockPlayback" : "unlockPlayback";
+        item["id"] = "control_layer" + std::to_string(layerId) + "_" + action;
+        item["name"] = "图层" + std::to_string(layerId) + (locked ? " 锁定" : " 解锁");
+        item["category"] = "播放控制";
+        item["description"] = "复用视频控制的图层播放锁定接口";
+        item["code"] = 0x02;
+        item["action"] = action;
+        item["layerId"] = layerId;
+        item["param"]["action"] = action;
+        item["param"]["layerId"] = layerId;
+        items.append(item);
+      }
+    }
+    for (bool screenOff : {true, false}) {
+      Json::Value item(Json::objectValue);
+      item["id"] = screenOff ? "control_screenOff" : "control_screenOn";
+      item["name"] = screenOff ? "息屏开" : "息屏关";
+      item["category"] = "屏幕控制";
+      item["description"] = screenOff ? "总控亮度设为 0，画面黑屏" : "总控亮度恢复为 255，画面亮屏";
+      item["code"] = 0x51;
+      item["action"] = "set_master";
+      item["param"]["action"] = "set_master";
+      item["param"]["value"] = screenOff ? 0 : 255;
+      items.append(item);
+    }
+    return items;
+  }();
+  return functions;
+}
+
 Json::Value
 PeripheralManager::processPeripheralCommand(const std::string &action,
                                             const Json::Value &param) {
@@ -375,9 +900,51 @@ PeripheralManager::processPeripheralCommand(const std::string &action,
   result["ok"] = true;
   bool sendDmxExternalAddressAfterUnlock = false;
 
-  if (action == "set_config") {
+  if (action == "delay") {
+    if (!param["delay_ms"].isInt() || param["delay_ms"].asInt() < 0 ||
+        param["delay_ms"].asInt() > 60000) {
+      result["ok"] = false;
+      result["error"] = 0x0001;
+      result["message"] = "delay_ms must be an integer from 0 to 60000";
+      return result;
+    }
+    const int delayMs = param["delay_ms"].asInt();
+    lock.unlock();
+    std::unique_lock<std::mutex> queueLock(triggerQueueMutex_);
+    const bool cancelled = triggerQueueCv_.wait_for(
+        queueLock, std::chrono::milliseconds(delayMs),
+        [this] { return triggerStopping_; });
+    result["ok"] = !cancelled;
+    result["delay_ms"] = delayMs;
+    result["message"] = cancelled ? "Delay cancelled during shutdown" : "Delay completed";
+    return result;
+  } else if (action == "bluetooth_get_status") {
+    lock.unlock();
+    result = callBluetoothAction("get_status", param);
+  } else if (action == "bluetooth_set_power") {
+    lock.unlock();
+    result = callBluetoothAction("set_power", param);
+  } else if (action == "bluetooth_set_role") {
+    lock.unlock();
+    result = callBluetoothAction("set_role", param);
+  } else if (action == "bluetooth_set_name") {
+    lock.unlock();
+    result = callBluetoothAction("set_name", param);
+  } else if (action == "set_config") {
     std::string type = param["peripheral_type"].asString();
-    if (type == "rs232") {
+    if (type == "bluetooth") {
+      lock.unlock();
+      if (param.isMember("name")) {
+        result = callBluetoothAction("set_name", param);
+      }
+      if (param.isMember("role")) {
+        result = callBluetoothAction("set_role", param);
+      }
+      if (param.isMember("enabled")) {
+        result = callBluetoothAction("set_power", param);
+      }
+      return result;
+    } else if (type == "rs232") {
       rs232Config_.port = param["port"].asString();
       rs232Config_.baudrate = param["baudrate"].asInt();
       rs232Config_.learnMode = param.get("learn_mode", rs232Config_.learnMode).asBool();
@@ -563,6 +1130,25 @@ PeripheralManager::processPeripheralCommand(const std::string &action,
       config.removeMember("type");
       functionConfig_ = config.isObject() ? config : buildDefaultFunctionConfig();
       LOG_DEBUG("PeripheralManager: Function config updated");
+    } else if (type == "vod_forward") {
+      Json::Value config = param;
+      config.removeMember("peripheral_type");
+      config.removeMember("action");
+      std::string error;
+      if (!validateVodForwardConfig(config, error)) {
+        result["ok"] = false;
+        result["error"] = 0x0002;
+        result["message"] = error;
+        return result;
+      }
+      const Json::Value previous = vodForwardConfig_;
+      vodForwardConfig_ = config;
+      if (!saveToDisk()) {
+        vodForwardConfig_ = previous;
+        result["ok"] = false;
+        result["message"] = "VOD转发配置写入失败";
+      }
+      return result;
     }
     if (type == "rs232" || type == "rs485") {
       const SerialConfig &cfg = (type == "rs485") ? rs485Config_ : rs232Config_;
@@ -594,6 +1180,13 @@ PeripheralManager::processPeripheralCommand(const std::string &action,
         stopDmxExternalInput();
       }
       lock.lock();
+    }
+    // Saved settings may remove or retarget forwarding rules. Release only
+    // output-only connections; active listeners retain their own lifecycle.
+    {
+      std::lock_guard<std::mutex> writerLock(serialListenerMutex_);
+      serialWriteRs232_.clear();
+      serialWriteRs485_.clear();
     }
     applyConfigs();
     // 写入磁盘（注意：当前已持有 mutex_，saveToDisk 内部不再重新加锁）
@@ -650,16 +1243,47 @@ PeripheralManager::processPeripheralCommand(const std::string &action,
     result["matched"] = static_cast<Json::UInt64>(matchedFunctions.size());
     if (!matchedFunctions.empty()) {
       lock.unlock();
-      executeTriggerFunctions(matchedFunctions, triggerLabel, "mobile_control",
-                              "", "");
-      result["executed"] = static_cast<Json::UInt64>(matchedFunctions.size());
+      const TriggerExecutionResult execution = executeTriggerFunctions(
+          matchedFunctions, triggerLabel, "mobile_control", "", "");
+      result["attempted"] = static_cast<Json::UInt64>(execution.attempted);
+      result["executed"] = static_cast<Json::UInt64>(execution.succeeded);
+      result["failed"] = static_cast<Json::UInt64>(execution.failed);
+      if (!execution.ok()) {
+        result["ok"] = false;
+        result["error"] = 0x0002;
+        result["message"] = execution.firstError.empty()
+                                 ? "one or more bound functions failed"
+                                 : execution.firstError;
+      }
       lock.lock();
     } else {
+      result["ok"] = false;
+      result["error"] = 0x0001;
       result["executed"] = 0;
       result["message"] = "button has no bound functions";
     }
+  } else if (action == "forward_payload") {
+    // Raw external input forwarding is also a first-class command.  The
+    // leader sends this normalized 0x50 command through the sync group so
+    // followers emit the same payload instead of relying on a local trigger.
+    lock.unlock();
+    const std::string payload = param.get("payload", "").asString();
+    const std::string hex = param.get("hex", "").asString();
+    std::string error;
+    std::string reply;
+    const bool ok = forwardPayload(param, payload, hex, error, &reply);
+    result["ok"] = ok;
+    result["error"] = ok ? 0 : 0x0002;
+    result["message"] = ok ? (reply.empty() ? "payload forwarded" : reply)
+                           : (error.empty() ? "payload forwarding failed" : error);
+    if (!reply.empty()) result["reply"] = reply;
+    return result;
   } else if (action == "get_config") {
     std::string type = param["peripheral_type"].asString();
+    if (type == "bluetooth") {
+      lock.unlock();
+      return callBluetoothAction("get_status", param);
+    }
     Json::Value cfg = buildGetConfigResponse(type);
     // 将配置业务字段合并到进程内执行结果，HTTP 层再包装唯一 API envelope。
     for (const auto &k : cfg.getMemberNames()) {
@@ -745,6 +1369,83 @@ PeripheralManager::processPeripheralCommand(const std::string &action,
     result["data"] = normalizedHex;
     result["name"] = serialTemplates_.back().name;
     result["type"] = type;
+  } else if (action == "import_templates") {
+    // Validate the complete batch before touching live templates or disk.
+    const auto failImport = [&](const std::string &message) {
+      result["ok"] = false;
+      result["message"] = message;
+      return result;
+    };
+    if (!param["peripheral_type"].isString() ||
+        (param["peripheral_type"].asString() != "rs485" &&
+         param["peripheral_type"].asString() != "rs232")) {
+      return failImport("peripheral_type must be rs485 or rs232");
+    }
+    const std::string type = param["peripheral_type"].asString();
+    const auto &rows = param["templates"];
+    if (!rows.isArray() || rows.empty() || rows.size() > 1000) {
+      return failImport("templates must contain 1 to 1000 rows");
+    }
+    std::vector<SerialTemplate> incoming;
+    std::set<std::string> codes;
+    for (Json::ArrayIndex i = 0; i < rows.size(); ++i) {
+      const auto &row = rows[i];
+      if (!row.isObject() || !row["data"].isString() ||
+          !row["name"].isString()) {
+        return failImport("row " + std::to_string(i + 1) + ": data and name must be strings");
+      }
+      SerialTemplate tpl;
+      std::string error;
+      if (row["data"].asString().size() > 4096 ||
+          !normalizeHexString(row["data"].asString(), tpl.data, error) ||
+          tpl.data.empty() || tpl.data.size() > 1024) {
+        return failImport("row " + std::to_string(i + 1) + ": invalid hex data (1 to 512 bytes)");
+      }
+      tpl.name = row["name"].asString();
+      const auto first = tpl.name.find_first_not_of(" \t\r\n");
+      const auto last = tpl.name.find_last_not_of(" \t\r\n");
+      if (first == std::string::npos || tpl.name.size() > 512 ||
+          tpl.name.find('\0') != std::string::npos) {
+        return failImport("row " + std::to_string(i + 1) + ": invalid name (1 to 512 UTF-8 bytes)");
+      }
+      tpl.name = tpl.name.substr(first, last - first + 1);
+      if (!codes.insert(tpl.data).second) {
+        return failImport("row " + std::to_string(i + 1) + ": duplicate hex data " + tpl.data);
+      }
+      tpl.type = type;
+      tpl.code = tpl.data;
+      tpl.functions = Json::Value(Json::arrayValue);
+      incoming.push_back(std::move(tpl));
+    }
+
+    auto previous = serialTemplates_;
+    int created = 0;
+    int updated = 0;
+    for (auto &tpl : incoming) {
+      auto it = std::find_if(serialTemplates_.begin(), serialTemplates_.end(),
+                             [&](const SerialTemplate &existing) {
+        return (existing.type.empty() || existing.type == type) &&
+               (existing.code == tpl.code || existing.data == tpl.data);
+      });
+      if (it == serialTemplates_.end()) {
+        serialTemplates_.push_back(std::move(tpl));
+        ++created;
+      } else {
+        // Keep existing functions and forwarding flags when renaming a code.
+        it->type = type;
+        it->code = tpl.code;
+        it->data = tpl.data;
+        it->name = tpl.name;
+        ++updated;
+      }
+    }
+    if (!saveToDisk()) {
+      serialTemplates_ = std::move(previous);
+      return failImport("failed to save imported templates");
+    }
+    result["created_count"] = created;
+    result["updated_count"] = updated;
+    result["imported_count"] = static_cast<int>(incoming.size());
   } else if (action == "clear_templates") {
     const std::string type =
         normalizeSerialTemplateType(param.get("peripheral_type", "rs232").asString());
@@ -933,6 +1634,10 @@ PeripheralManager::processPeripheralCommand(const std::string &action,
     lock.unlock();
     handleLegacyDmxCommand(param, result);
     return result;
+  } else {
+    result["ok"] = false;
+    result["error"] = 0x000A;
+    result["message"] = "unsupported peripheral action: " + action;
   }
 
   if (sendDmxExternalAddressAfterUnlock) {
@@ -1286,7 +1991,7 @@ bool PeripheralManager::dispatchNetworkTrigger(PeripheralType protocol,
     event["function_count"] = static_cast<Json::UInt64>(matchedFunctions.size());
     broadcastTriggerEvent(event);
   }
-  executeTriggerFunctions(matchedFunctions, triggerLabel, protoName, data, dataHex);
+  enqueueTrigger({std::move(matchedFunctions), triggerLabel, protoName, data, dataHex});
   return true;
 }
 
@@ -1363,16 +2068,57 @@ bool PeripheralManager::dispatchSerialTemplate(const std::string &type,
     return false;
   }
 
-  executeTriggerFunctions(matchedFunctions, triggerLabel, serialType, payload, hex);
+  enqueueTrigger({std::move(matchedFunctions), triggerLabel, serialType, payload, hex});
   return true;
 }
 
-void PeripheralManager::executeTriggerFunctions(
+void PeripheralManager::enqueueTrigger(TriggerJob job) {
+  std::unique_lock<std::mutex> lock(triggerQueueMutex_);
+  if (triggerStopping_ || triggerQueue_.size() >= 128) {
+    lock.unlock();
+    Json::Value event(Json::objectValue);
+    event["type"] = "peripheral_trigger";
+    event["source"] = job.source;
+    event["trigger"] = job.label;
+    event["status"] = "failed";
+    event["message"] = "命令队列已满或正在停止";
+    broadcastTriggerEvent(event);
+    return;
+  }
+  if (!triggerWorker_.joinable()) {
+    triggerWorker_ = std::thread([this] {
+      std::unique_lock<std::mutex> queueLock(triggerQueueMutex_);
+      while (!triggerStopping_) {
+        triggerQueueCv_.wait(queueLock, [this] {
+          return triggerStopping_ || !triggerQueue_.empty();
+        });
+        if (triggerStopping_) break;
+        TriggerJob next = std::move(triggerQueue_.front());
+        triggerQueue_.pop_front();
+        queueLock.unlock();
+        try {
+          executeTriggerFunctions(next.functions, next.label, next.source,
+                                  next.payload, next.hex);
+        } catch (const std::exception &error) {
+          LOG_ERROR("[PeripheralManager] trigger worker: %s", error.what());
+        }
+        queueLock.lock();
+      }
+    });
+  }
+  triggerQueue_.push_back(std::move(job));
+  lock.unlock();
+  triggerQueueCv_.notify_all();
+}
+
+PeripheralManager::TriggerExecutionResult
+PeripheralManager::executeTriggerFunctions(
     const std::vector<TriggerFunction> &functions,
     const std::string &triggerLabel,
     const std::string &source,
     const std::string &payload,
     const std::string &hex) {
+  TriggerExecutionResult execution;
   if (!commandRouter_) {
     LOG_WARN("[PeripheralManager] dispatchNetworkTrigger: CommandRouter 未就绪，"
              "跳过 trigger=%s",
@@ -1384,20 +2130,48 @@ void PeripheralManager::executeTriggerFunctions(
     event["trigger"] = triggerLabel;
     event["message"] = "CommandRouter 未就绪";
     broadcastTriggerEvent(event);
-    return;
+    execution.attempted = functions.size();
+    execution.failed = functions.size();
+    execution.firstError = "CommandRouter 未就绪";
+    return execution;
   }
 
   LOG_INFO("[PeripheralManager] 触发命中: %s -> %zu functions",
            triggerLabel.c_str(), functions.size());
 
   for (const auto &fn : functions) {
+    {
+      std::lock_guard<std::mutex> lock(triggerQueueMutex_);
+      if (triggerStopping_) {
+        execution.failed += functions.size() - execution.attempted;
+        execution.attempted = functions.size();
+        execution.firstError = "Command sequence cancelled during shutdown";
+        break;
+      }
+    }
+    ++execution.attempted;
     // 1) 起步参数：前端传来的 extraParam（layerId/时间/volume/...）
     Json::Value finalParam = fn.extraParam.isObject() ? fn.extraParam
                                                       : Json::Value(Json::objectValue);
 
-    // 2) 回查 CommandList/playback/{function_id}.json 补全默认参数
+    // 2) 内置功能在保存/重载后仍使用同一份参数，不依赖 CommandList 文件。
     int finalCode = fn.code;
-    if (!fn.functionId.empty()) {
+    bool builtin = false;
+    for (const auto &item : builtinControlFunctions()) {
+      if (item["id"].asString() != fn.functionId) continue;
+      builtin = true;
+      finalCode = item["code"].asInt();
+      for (const auto &key : item["param"].getMemberNames()) {
+        if (key != "delay_ms" || !finalParam.isMember(key)) {
+          finalParam[key] = item["param"][key];
+        }
+      }
+      break;
+    }
+    // 普通功能仍回查 CommandList/playback/{function_id}.json 补全默认参数。
+    if (!builtin && !fn.functionId.empty() &&
+        fn.functionId.find_first_of("/\\") == std::string::npos &&
+        fn.functionId.find("..") == std::string::npos) {
       const std::string filePath =
           COMMAND_LIST_DIR + "playback/" + fn.functionId + ".json";
       if (FileUtils::exists(filePath)) {
@@ -1430,6 +2204,36 @@ void PeripheralManager::executeTriggerFunctions(
       finalParam["action"] = fn.action;
     }
 
+    if (finalParam.get("action", "").asString() == "delay") {
+      const Json::Value delayResult = processPeripheralCommand("delay", finalParam);
+      if (!delayResult.get("ok", false).asBool()) {
+        ++execution.failed;
+        if (execution.firstError.empty()) {
+          execution.firstError = delayResult.get("message", "延时执行失败").asString();
+        }
+        Json::Value event(Json::objectValue);
+        event["type"] = "peripheral_trigger";
+        event["source"] = source;
+        event["status"] = "failed";
+        event["trigger"] = triggerLabel;
+        event["action"] = "delay";
+        event["message"] = execution.firstError;
+        broadcastTriggerEvent(event);
+      } else {
+        ++execution.succeeded;
+        Json::Value event(Json::objectValue);
+        event["type"] = "peripheral_trigger";
+        event["source"] = source;
+        event["status"] = "success";
+        event["trigger"] = triggerLabel;
+        event["action"] = "delay";
+        event["delay_ms"] = delayResult.get("delay_ms", 0);
+        event["message"] = delayResult.get("message", "延时完成");
+        broadcastTriggerEvent(event);
+      }
+      continue;
+    }
+
     // 播放列表触发应与网页“播放列表”按钮一致：不指定 index，
     // 让后端按 loop=3 等播放模式决定起点和自动续播。
     if (finalParam.get("isPlaylist", false).asBool() &&
@@ -1442,21 +2246,157 @@ void PeripheralManager::executeTriggerFunctions(
         fn.action == "forward_payload" ||
         finalParam.get("action", "").asString() == "forward_payload";
     if (isForwardFunction) {
-      std::string forwardPayloadData = payload;
-      if (forwardPayloadData.empty()) {
+      const bool fixedSend = finalParam.get("fixed_send", false).asBool();
+      std::string forwardPayloadData =
+          fixedSend ? finalParam.get("payload", "").asString() : payload;
+      std::string forwardHex =
+          fixedSend ? finalParam.get("hex", "").asString() : hex;
+      if (!fixedSend && forwardPayloadData.empty()) {
         forwardPayloadData = finalParam.get("payload", "").asString();
       }
-      std::string forwardHex = hex;
-      if (forwardHex.empty()) {
+      if (!fixedSend && forwardHex.empty()) {
         forwardHex = finalParam.get("hex", "").asString();
       }
-      if (forwardHex.empty()) {
-        forwardHex = normalizeHexTrigger(forwardPayloadData);
+      if (forwardHex.empty() && !forwardPayloadData.empty()) {
+        forwardHex = bytesToHex(forwardPayloadData);
       }
+      const std::string forwardTarget =
+          finalParam.get("forward_target", "").asString();
+      const std::string forwardAddress =
+          finalParam.get("forward_address", "").asString();
+      std::string sentHex = forwardHex;
+      if (!fixedSend && finalParam.get("command_mappings", Json::Value()).isArray()) {
+        const std::string incomingHex = normalizeHexTrigger(forwardHex);
+        for (const auto &mapping : finalParam["command_mappings"]) {
+          if (!mapping.isObject()) continue;
+          if (normalizeHexTrigger(mapping.get("source_hex", "").asString()) == incomingHex) {
+            sentHex = normalizeHexTrigger(mapping.get("target_hex", "").asString());
+            break;
+          }
+        }
+      }
+      const Json::Value forwardPortValue =
+          finalParam.get("forward_port", Json::Value());
+      const std::string forwardPort = forwardPortValue.isString()
+                                          ? forwardPortValue.asString()
+                                          : (forwardPortValue.isNumeric()
+                                                 ? std::to_string(
+                                                       forwardPortValue.asInt())
+                                                 : "");
+      LOG_INFO("[PeripheralManager]   固定指令发送: trigger=%s target=%s "
+               "address=%s port=%s hex=%s",
+               triggerLabel.c_str(), forwardTarget.c_str(),
+               forwardAddress.c_str(), forwardPort.c_str(),
+               forwardHex.c_str());
+      Json::Value sendingEvent(Json::objectValue);
+      sendingEvent["type"] = "peripheral_trigger";
+      sendingEvent["source"] = source;
+      sendingEvent["status"] = "executing";
+      sendingEvent["trigger"] = triggerLabel;
+      sendingEvent["action"] = "forward_payload";
+      sendingEvent["message"] = "正在发送固定指令";
+      sendingEvent["target"] = forwardTarget;
+      sendingEvent["hex"] = forwardHex;
+      sendingEvent["received_hex"] = hex;
+      sendingEvent["sent_hex"] = sentHex;
+      sendingEvent["forward_port"] = forwardPort;
+      sendingEvent["forward_baudrate"] = finalParam.get("forward_baudrate", 0);
+      sendingEvent["param"] = JsonUtils::toString(finalParam);
+      broadcastTriggerEvent(sendingEvent);
       std::string forwardError;
-      if (!forwardPayload(finalParam, forwardPayloadData, forwardHex, forwardError)) {
-        LOG_WARN("[PeripheralManager]   forward 执行失败: %s",
-                 forwardError.c_str());
+      std::string forwardReply;
+      bool forwardOk = false;
+      if (source != "mobile_control") {
+        // Network/serial input has no outer button command to replicate.
+        // Route it through CommandRouter so the leader observer publishes the
+        // exact payload and forwarding configuration to every follower.
+        Json::Value forwardParam = finalParam;
+        forwardParam["action"] = "forward_payload";
+        if (!fixedSend) {
+          // Carry the canonical hex representation on the sync bus. Raw
+          // serial/UDP bytes are not guaranteed to be valid UTF-8 JSON.
+          forwardParam.removeMember("payload");
+          forwardParam["hex"] = forwardHex;
+        }
+        if (!source.empty()) forwardParam["_source"] = source;
+
+        CommandRequest forwardRequest;
+        forwardRequest.type = 0;
+        forwardRequest.code = 0x50;
+        forwardRequest.requestId = "forward-" +
+            std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count());
+        forwardRequest.timestamp = static_cast<int64_t>(std::time(nullptr));
+        forwardRequest.paramJson = JsonUtils::toString(forwardParam);
+        const CommandResponse forwardResponse =
+            commandRouter_->processCommand(forwardRequest);
+        forwardOk = forwardResponse.ok;
+        if (!forwardOk) forwardError = forwardResponse.message;
+        if (!forwardResponse.dataJson.empty()) {
+          Json::Value responseData;
+          std::string parseError;
+          if (JsonUtils::parseJson(forwardResponse.dataJson, responseData,
+                                   parseError) &&
+              responseData.isMember("reply")) {
+            forwardReply = responseData["reply"].asString();
+          }
+        }
+      } else {
+        // A mobile button command is already replicated as its outer
+        // execute_function_button command; sending the nested forward command
+        // as well would execute it twice on followers.
+        forwardOk = forwardPayload(finalParam, forwardPayloadData, forwardHex,
+                                   forwardError, &forwardReply);
+      }
+      if (!forwardOk) {
+        ++execution.failed;
+        if (execution.firstError.empty()) execution.firstError = forwardError;
+        LOG_WARN("[PeripheralManager]   固定指令发送失败: trigger=%s "
+                 "target=%s hex=%s error=%s",
+                 triggerLabel.c_str(), forwardTarget.c_str(),
+                 forwardHex.c_str(), forwardError.c_str());
+        Json::Value event(Json::objectValue);
+        event["type"] = "peripheral_trigger";
+        event["source"] = source;
+        event["status"] = "failed";
+        event["trigger"] = triggerLabel;
+        event["action"] = "forward_payload";
+        event["message"] = "固定指令发送失败: " + forwardError;
+        event["target"] = forwardTarget;
+        event["hex"] = forwardHex;
+        event["received_hex"] = hex;
+        event["sent_hex"] = sentHex;
+        event["forward_port"] = forwardPort;
+        event["forward_baudrate"] = finalParam.get("forward_baudrate", 0);
+        event["param"] = JsonUtils::toString(finalParam);
+        broadcastTriggerEvent(event);
+      } else {
+        ++execution.succeeded;
+        LOG_INFO("[PeripheralManager]   固定指令发送成功: trigger=%s "
+                 "target=%s hex=%s",
+                 triggerLabel.c_str(), forwardTarget.c_str(),
+                 forwardHex.c_str());
+        Json::Value event(Json::objectValue);
+        event["type"] = "peripheral_trigger";
+        event["source"] = source;
+        event["status"] = "success";
+        event["trigger"] = triggerLabel;
+        event["action"] = "forward_payload";
+        event["message"] = forwardReply.empty()
+                               ? (forwardTarget == "tcp"
+                                      ? "固定指令数据已发送，未收到设备执行回执"
+                                      : "固定指令发送成功")
+                               : "固定指令发送成功，设备回执: " + forwardReply;
+        if (!forwardReply.empty()) event["reply"] = forwardReply;
+        event["target"] = forwardTarget;
+        event["hex"] = forwardHex;
+        event["received_hex"] = hex;
+        event["sent_hex"] = sentHex;
+        event["forward_port"] = forwardPort;
+        event["forward_baudrate"] = finalParam.get("forward_baudrate", 0);
+        event["param"] = JsonUtils::toString(finalParam);
+        broadcastTriggerEvent(event);
       }
       continue;
     }
@@ -1470,6 +2410,10 @@ void PeripheralManager::executeTriggerFunctions(
     req.requestId = "";
     req.timestamp = static_cast<int64_t>(std::time(nullptr));
     req.paramJson = JsonUtils::toString(finalParam);
+    // execute_function_button is itself the root command observed and
+    // replicated by NetworkManager. Its child function commands must execute
+    // locally without creating a second sync envelope.
+    req.fromSyncGroup = source == "mobile_control";
 
     LOG_INFO("[PeripheralManager]   -> code=0x%02X action=%s param=%s",
              finalCode, finalParam.get("action", fn.action).asString().c_str(),
@@ -1478,6 +2422,8 @@ void PeripheralManager::executeTriggerFunctions(
     try {
       CommandResponse resp = commandRouter_->processCommand(req);
       if (!resp.ok) {
+        ++execution.failed;
+        if (execution.firstError.empty()) execution.firstError = resp.message;
         LOG_WARN("[PeripheralManager]   function 执行失败: %s (err=0x%04X)",
                  resp.message.c_str(), resp.error);
         Json::Value event(Json::objectValue);
@@ -1492,6 +2438,7 @@ void PeripheralManager::executeTriggerFunctions(
         event["param"] = req.paramJson;
         broadcastTriggerEvent(event);
       } else {
+        ++execution.succeeded;
         LOG_INFO("[PeripheralManager]   function 执行成功: %s",
                  resp.message.c_str());
         Json::Value event(Json::objectValue);
@@ -1506,9 +2453,21 @@ void PeripheralManager::executeTriggerFunctions(
         broadcastTriggerEvent(event);
       }
     } catch (const std::exception &e) {
+      ++execution.failed;
+      if (execution.firstError.empty()) execution.firstError = e.what();
       LOG_ERROR("[PeripheralManager]   function 异常: %s", e.what());
+      Json::Value event(Json::objectValue);
+      event["type"] = "peripheral_trigger";
+      event["source"] = source;
+      event["status"] = "error";
+      event["trigger"] = triggerLabel;
+      event["action"] = finalParam.get("action", fn.action).asString();
+      event["message"] = e.what();
+      event["param"] = req.paramJson;
+      broadcastTriggerEvent(event);
     }
   }
+  return execution;
 }
 
 // =====================================================================
@@ -1572,11 +2531,17 @@ Json::Value PeripheralManager::buildGetConfigResponse(const std::string &type) {
     return buildNetworkConfigJson(websocketConfig_, /*includeMode= 包含模式*/false);
   } else if (type == "function_config") {
     return functionConfig_.isObject() ? functionConfig_ : buildDefaultFunctionConfig();
+  } else if (type == "vod_forward") {
+    return vodForwardConfig_.isObject() ? vodForwardConfig_ : defaultVodForwardConfig();
   } else if (type == "rs232") {
+    const bool running = isSerialListenerRunning("rs232");
+    const bool dmxOwnsPort = isDmxExternalInputRunning();
     result["port"] = rs232Config_.port;
     result["baudrate"] = rs232Config_.baudrate;
     result["enabled"] = rs232Config_.enabled;
     result["learn_mode"] = rs232Config_.learnMode;
+    result["running"] = running;
+    result["resource_owner"] = running ? "rs232" : (dmxOwnsPort ? "dmx512_external" : "none");
     Json::Value mappings(Json::arrayValue);
     for (const auto &kv : rs232Config_.cmdMap) {
       Json::Value m(Json::objectValue);
@@ -1586,11 +2551,14 @@ Json::Value PeripheralManager::buildGetConfigResponse(const std::string &type) {
     }
     result["mappings"] = mappings;
   } else if (type == "rs485") {
+    const bool running = isSerialListenerRunning("rs485");
     result["port"] = rs485Config_.port;
     result["baudrate"] = rs485Config_.baudrate;
     result["slave_id"] = rs485Config_.slaveId;
     result["enabled"] = rs485Config_.enabled;
     result["learn_mode"] = rs485Config_.learnMode;
+    result["running"] = running;
+    result["resource_owner"] = running ? "rs485" : "none";
   } else if (type == "dmx512") {
     result["mode"] = dmxInputModeToString(dmxConfig_.inputMode);
     result["port"] = dmxConfig_.port;
@@ -1671,6 +2639,14 @@ Json::Value PeripheralManager::setSerialLearnMode(const Json::Value &param) {
     saveToDisk();
   }
 
+  if (!enabled) {
+    result["learn_mode"] = false;
+    result["port"] = port;
+    result["baudrate"] = baudrate;
+    result["running"] = isSerialListenerRunning(type);
+    return result;
+  }
+
   if (port.empty()) {
     result["ok"] = false;
     result["message"] = "serial port is empty";
@@ -1693,6 +2669,7 @@ Json::Value PeripheralManager::setSerialLearnMode(const Json::Value &param) {
   result["learn_mode"] = enabled;
   result["port"] = port;
   result["baudrate"] = baudrate;
+  result["running"] = isSerialListenerRunning(type);
   return result;
 }
 
@@ -1701,10 +2678,31 @@ bool PeripheralManager::startSerialLearnThread(const std::string &type,
                                                int baudrate,
                                                std::string &error) {
   const std::string serialType = normalizeSerialTemplateType(type);
+  const int effectiveBaudrate = normalizeBaudrate(baudrate, 9600);
   if (port.empty()) {
     error = "serial port is empty";
     return false;
   }
+  if (!isSupportedSerialBaudrate(effectiveBaudrate)) {
+    error = "unsupported serial baudrate: " + std::to_string(effectiveBaudrate);
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(serialListenerMutex_);
+    if (serialType == "rs485") {
+      if (serialLearnRs485_ && serialLearnRs485_->isRunning() &&
+          serialLearnRs485_->getDevice() == port &&
+          serialLearnRs485_->getBaudRate() == effectiveBaudrate) {
+        return true;
+      }
+    } else if (serialLearnRs232_ && serialLearnRs232_->isRunning() &&
+               serialLearnRs232_->getDevice() == port &&
+               serialLearnRs232_->getBaudRate() == effectiveBaudrate) {
+      return true;
+    }
+  }
+
   if (serialType == "rs232") {
     stopDmxExternalInput();
   }
@@ -1712,6 +2710,9 @@ bool PeripheralManager::startSerialLearnThread(const std::string &type,
     if (frame.empty()) return;
     const std::string hex = bytesToHexCompact(frame.data(), frame.size());
     const std::string preview = hexPreview(frame);
+    LOG_INFO("[SerialReceive] %s RX port=%s bytes=%zu hex=%s preview=%s",
+             serialType.c_str(), port.c_str(), frame.size(), hex.c_str(),
+             preview.c_str());
     bool learnMode = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1722,51 +2723,106 @@ bool PeripheralManager::startSerialLearnThread(const std::string &type,
     if (learnMode) {
       rememberSerialTemplate(serialType, port, hex);
     }
-    dispatchSerialTemplate(serialType, hex);
+    const std::string rawPayload(
+        reinterpret_cast<const char *>(frame.data()), frame.size());
     broadcastSerialReceive(serialType, port, hex, preview, learnMode);
+    const bool dispatched = dispatchSerialTemplate(serialType, hex, rawPayload);
+    LOG_INFO("[SerialReceive] %s dispatch=%s port=%s hex=%s",
+             serialType.c_str(), dispatched ? "matched" : "unmatched",
+             port.c_str(), hex.c_str());
   };
 
   if (serialType == "rs485") {
-    serialLearnRs485_.reset();
-    auto server = std::make_unique<Rs485Server>(port, baudrate, 1);
+    auto server = std::make_unique<Rs485Server>(port, effectiveBaudrate, 1);
     server->setRawFrameCallback(onFrame);
     server->setFrameGapMs(120);
-    if (!server->start()) {
-      error = "failed to start RS485 listener on " + port;
-      return false;
+    std::unique_ptr<Rs485Server> oldServer;
+    {
+      std::lock_guard<std::mutex> lock(serialListenerMutex_);
+      serialWriteRs232_.erase(port);
+      serialWriteRs485_.erase(port);
+      if (!server->start()) {
+        error = "failed to start RS485 listener on " + port;
+        return false;
+      }
+      oldServer = std::move(serialLearnRs485_);
+      serialLearnRs485_ = std::move(server);
     }
-    serialLearnRs485_ = std::move(server);
+    oldServer.reset();
   } else {
-    serialLearnRs232_.reset();
-    auto server = std::make_unique<Rs232Server>(port, baudrate);
+    auto server = std::make_unique<Rs232Server>(port, effectiveBaudrate);
     server->setRawFrameCallback(onFrame);
     server->setFrameGapMs(120);
-    if (!server->start()) {
-      error = "failed to start RS232 listener on " + port;
-      return false;
+    std::unique_ptr<Rs232Server> oldServer;
+    {
+      std::lock_guard<std::mutex> lock(serialListenerMutex_);
+      serialWriteRs232_.erase(port);
+      serialWriteRs485_.erase(port);
+      if (!server->start()) {
+        error = "failed to start RS232 listener on " + port;
+        return false;
+      }
+      oldServer = std::move(serialLearnRs232_);
+      serialLearnRs232_ = std::move(server);
     }
-    serialLearnRs232_ = std::move(server);
+    oldServer.reset();
   }
 
-  LOG_INFO("[SerialListener] started on %s @ %d (%s)", port.c_str(), baudrate,
-           type.c_str());
+  LOG_INFO("[SerialListener] started on %s @ %d (%s)", port.c_str(),
+           effectiveBaudrate, type.c_str());
   return true;
 }
 
+bool PeripheralManager::isSerialListenerRunning(
+    const std::string &type) const {
+  const std::string serialType = normalizeSerialTemplateType(type);
+  std::lock_guard<std::mutex> lock(serialListenerMutex_);
+  if (serialType == "rs485") {
+    return serialLearnRs485_ && serialLearnRs485_->isRunning();
+  }
+  return serialLearnRs232_ && serialLearnRs232_->isRunning();
+}
+
 void PeripheralManager::stopSerialLearnThread() {
-  serialLearnRs232_.reset();
-  serialLearnRs485_.reset();
-  LOG_INFO("[SerialListener] stopped");
+  std::unique_ptr<Rs232Server> oldRs232;
+  std::unique_ptr<Rs485Server> oldRs485;
+  {
+    std::lock_guard<std::mutex> lock(serialListenerMutex_);
+    oldRs232 = std::move(serialLearnRs232_);
+    oldRs485 = std::move(serialLearnRs485_);
+  }
+  const bool hadListener = static_cast<bool>(oldRs232) ||
+                           static_cast<bool>(oldRs485);
+  oldRs232.reset();
+  oldRs485.reset();
+  if (hadListener) {
+    LOG_INFO("[SerialListener] stopped");
+  }
 }
 
 void PeripheralManager::stopSerialLearnThread(const std::string &type) {
   const std::string serialType = normalizeSerialTemplateType(type);
+  bool hadListener = false;
   if (serialType == "rs485") {
-    serialLearnRs485_.reset();
+    std::unique_ptr<Rs485Server> oldServer;
+    {
+      std::lock_guard<std::mutex> lock(serialListenerMutex_);
+      oldServer = std::move(serialLearnRs485_);
+    }
+    hadListener = static_cast<bool>(oldServer);
+    oldServer.reset();
   } else {
-    serialLearnRs232_.reset();
+    std::unique_ptr<Rs232Server> oldServer;
+    {
+      std::lock_guard<std::mutex> lock(serialListenerMutex_);
+      oldServer = std::move(serialLearnRs232_);
+    }
+    hadListener = static_cast<bool>(oldServer);
+    oldServer.reset();
   }
-  LOG_INFO("[SerialListener] stopped (%s)", serialType.c_str());
+  if (hadListener) {
+    LOG_INFO("[SerialListener] stopped (%s)", serialType.c_str());
+  }
 }
 
 void PeripheralManager::rememberSerialTemplate(const std::string &type,
@@ -1805,6 +2861,7 @@ void PeripheralManager::broadcastSerialReceive(const std::string &type,
   event["serial_type"] = normalizeSerialTemplateType(type);
   event["port"] = port;
   event["hex"] = hex;
+  event["byte_count"] = static_cast<Json::UInt64>(hex.size() / 2);
   event["preview"] = preview;
   event["learned"] = learned;
 
@@ -1820,9 +2877,9 @@ void PeripheralManager::broadcastSerialReceive(const std::string &type,
 bool PeripheralManager::forwardPayload(const Json::Value &param,
                                        const std::string &payload,
                                        const std::string &hex,
-                                       std::string &error) {
-  const std::string target =
-      param.get("forward_target", param.get("target", "")).asString();
+                                       std::string &error,
+                                       std::string *reply) {
+  const std::string target = param.get("forward_target", "").asString();
   if (target.empty()) {
     error = "forward target is empty";
     return false;
@@ -1831,92 +2888,95 @@ bool PeripheralManager::forwardPayload(const Json::Value &param,
   struct ForwardPayloadItem {
     std::string payload;
     std::string hex;
+    bool binary = false;
   };
 
   auto payloadFromHex = [](const std::string &hexValue) {
     std::string parseError;
     const std::vector<uint8_t> bytes = hexToBytes(hexValue, parseError);
-    if (bytes.empty()) return std::string();
+    if (!parseError.empty() || bytes.empty()) return std::string();
     return std::string(reinterpret_cast<const char *>(bytes.data()), bytes.size());
   };
 
-  auto getMappingString = [](const Json::Value &item,
-                             std::initializer_list<const char *> keys) {
-    for (const char *key : keys) {
-      if (item.isMember(key)) {
-        return item[key].asString();
-      }
-    }
-    return std::string();
+  auto isPrintableText = [](const std::string &value) {
+    return std::all_of(value.begin(), value.end(), [](unsigned char c) {
+      return (c >= 0x20 && c < 0x7F) || c == '\r' || c == '\n' || c == '\t';
+    });
   };
 
   auto buildForwardItems = [&]() {
     std::vector<ForwardPayloadItem> items;
     const Json::Value mappings =
-        param.get("command_mappings",
-                  param.get("forward_command_mappings", Json::Value(Json::arrayValue)));
+        param.get("command_mappings", Json::Value(Json::arrayValue));
 
-    std::string incomingHex = hex;
-    if (incomingHex.empty()) {
-      incomingHex = normalizeHexTrigger(payload);
-    }
-    if (incomingHex.empty() && !payload.empty()) {
+    std::string incomingHex;
+    if (!hex.empty()) {
+      incomingHex = normalizeHexTrigger(hex);
+    } else if (!payload.empty()) {
       incomingHex = bytesToHex(payload);
     }
-    incomingHex = normalizeHexTrigger(incomingHex);
 
-    if (mappings.isArray() && !incomingHex.empty()) {
+    const bool fixedSend = param.get("fixed_send", false).asBool();
+    if (!fixedSend && mappings.isArray() && !incomingHex.empty()) {
       for (const auto &mapping : mappings) {
         if (!mapping.isObject()) continue;
         const std::string sourceHex =
-            normalizeHexTrigger(getMappingString(
-                mapping, {"source_hex", "source", "from", "input_hex", "trigger"}));
+            normalizeHexTrigger(mapping.get("source_hex", "").asString());
         const std::string targetHex =
-            normalizeHexTrigger(getMappingString(
-                mapping, {"target_hex", "target", "to", "output_hex", "data", "hex"}));
+            normalizeHexTrigger(mapping.get("target_hex", "").asString());
         if (sourceHex.empty() || targetHex.empty() || sourceHex != incomingHex) {
           continue;
         }
-        items.push_back({payloadFromHex(targetHex), targetHex});
+        items.push_back({payloadFromHex(targetHex), targetHex, true});
       }
     }
 
     if (items.empty()) {
       std::string itemPayload = payload;
-      if (itemPayload.empty() && !hex.empty()) {
-        itemPayload = payloadFromHex(hex);
+      std::string itemHex = hex.empty() ? incomingHex : normalizeHexTrigger(hex);
+      const bool payloadCameFromHex = itemPayload.empty() && !itemHex.empty();
+      if (payloadCameFromHex) {
+        itemPayload = payloadFromHex(itemHex);
       }
-      items.push_back({itemPayload, hex});
+
+      bool binary = payloadCameFromHex;
+      if (fixedSend) {
+        binary = param.get("fixed_payload_type", "hex").asString() != "text";
+      } else if (!binary && !itemPayload.empty()) {
+        binary = !isPrintableText(itemPayload);
+      }
+      items.push_back({itemPayload, itemHex, binary});
     }
     return items;
   };
 
   const std::vector<ForwardPayloadItem> forwardItems = buildForwardItems();
+  if (forwardItems.empty() ||
+      std::any_of(forwardItems.begin(), forwardItems.end(),
+                  [](const ForwardPayloadItem &item) {
+                    return item.payload.empty();
+                  })) {
+    error = "forward payload is empty or invalid";
+    return false;
+  }
 
   if (target == "rs232" || target == "rs485") {
-    std::string port = param.get("forward_port", param.get("port", "")).asString();
-    int baudrate =
-        param.get("forward_baudrate", param.get("baudrate", 9600)).asInt();
-    if (port.empty()) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      const SerialConfig &cfg = (target == "rs485") ? rs485Config_ : rs232Config_;
-      port = cfg.port;
-      if (baudrate <= 0) baudrate = cfg.baudrate;
-    }
+    const std::string port = param.get("forward_port", "").asString();
+    const int baudrate = param.get("forward_baudrate", 9600).asInt();
     if (port.empty()) {
       error = "serial forward port is empty";
       return false;
     }
+    if (!isSupportedSerialBaudrate(baudrate)) {
+      error = "unsupported serial baudrate: " + std::to_string(baudrate);
+      return false;
+    }
     for (const auto &item : forwardItems) {
-      std::string normalizedHex = item.hex;
+      const std::string normalizedHex =
+          item.hex.empty() ? bytesToHex(item.payload)
+                           : normalizeHexTrigger(item.hex);
       if (normalizedHex.empty()) {
-        normalizedHex = normalizeHexTrigger(item.payload);
-      }
-      if (normalizedHex.empty() && !item.payload.empty()) {
-        normalizedHex = bytesToHex(item.payload);
-      }
-      if (normalizedHex.empty()) {
-        error = "serial forward requires hex payload";
+        error = "serial forward requires a valid payload";
         return false;
       }
       if (!writeHexToSerial(target, port, baudrate, normalizedHex, error)) {
@@ -1932,49 +2992,64 @@ bool PeripheralManager::forwardPayload(const Json::Value &param,
       error = "udp server unavailable";
       return false;
     }
-    std::string address =
-        param.get("forward_address", param.get("address", "")).asString();
-    int port = param.get("forward_port", param.get("port", 0)).asInt();
-    bool useBroadcast = param.get("broadcast", false).asBool();
-    bool useMulticast = param.get("multicast", false).asBool();
-    std::string multicastGroup =
-        param.get("multicast_group", "").asString();
-    int ttl = param.get("ttl", 1).asInt();
 
-    if (address.empty() || port <= 0) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (address.empty()) address = udpConfig_.targetAddress;
-      if (port <= 0) port = udpConfig_.targetPort;
-      if (multicastGroup.empty()) multicastGroup = udpConfig_.multicastGroup;
+    const std::string address = param.get("forward_address", "").asString();
+    int port = param.get("forward_port", 0).asInt();
+    const bool useBroadcast = param.get("broadcast", false).asBool();
+    const bool useMulticast = param.get("multicast", false).asBool();
+    const std::string multicastGroup =
+        param.get("multicast_group", "").asString();
+
+    if (useBroadcast && useMulticast) {
+      error = "udp broadcast and multicast cannot both be enabled";
+      return false;
     }
-    if (port <= 0) {
-      port = udp->getPort();
+    if (port < 0 || port > 65535) {
+      error = "udp target port is invalid";
+      return false;
     }
-    if (useMulticast || (!multicastGroup.empty() && address.empty())) {
+
+    if (useMulticast) {
       if (multicastGroup.empty()) {
-        error = "multicast group is empty";
+        error = "udp multicast group is empty";
+        return false;
+      }
+      if (port <= 0) {
+        error = "udp multicast port is invalid";
         return false;
       }
       for (const auto &item : forwardItems) {
-        if (!udp->sendToMulticastGroup(multicastGroup, port, item.payload, ttl)) {
+        if (!udp->sendToMulticastGroup(
+                multicastGroup, port, item.payload,
+                std::clamp(param.get("forward_ttl", 1).asInt(), 1, 255))) {
           error = "udp multicast send failed";
           return false;
         }
       }
       return true;
     }
+
     if (useBroadcast) {
+      if (port == 0) port = udp->getPort();
+      if (port <= 0 || port > 65535) {
+        error = "udp broadcast port is invalid";
+        return false;
+      }
       for (const auto &item : forwardItems) {
-        const size_t sent = udp->broadcastToClientIps(port, item.payload);
-        if (sent == 0) {
+        if (udp->broadcastToClientIps(port, item.payload) == 0) {
           error = "no udp clients available";
           return false;
         }
       }
       return true;
     }
+
     if (address.empty()) {
       error = "udp address is empty";
+      return false;
+    }
+    if (port <= 0) {
+      error = "udp target port is invalid";
       return false;
     }
     for (const auto &item : forwardItems) {
@@ -1987,26 +3062,39 @@ bool PeripheralManager::forwardPayload(const Json::Value &param,
   }
 
   if (target == "tcp") {
+    const std::string mode = param.get("forward_mode", "").asString();
+    if (mode == "direct") {
+      const std::string address =
+          param.get("forward_address", "").asString();
+      const int port = param.get("forward_port", 0).asInt();
+      if (address.empty()) {
+        error = "tcp direct address is empty";
+        return false;
+      }
+      if (port <= 0 || port > 65535) {
+        error = "tcp direct port is invalid";
+        return false;
+      }
+      std::vector<std::string> payloads;
+      payloads.reserve(forwardItems.size());
+      for (const auto &item : forwardItems) {
+        payloads.push_back(item.payload);
+      }
+      return sendTcpDirect(address, port, payloads, error, reply);
+    }
+
+    if (mode != "broadcast") {
+      error = "unsupported tcp forward mode: " + mode;
+      return false;
+    }
     auto *tcp = NetworkManager::getInstance().getTcpServer();
     if (!tcp || !tcp->isRunning()) {
       error = "tcp server unavailable";
       return false;
     }
-    const std::string mode = param.get("forward_mode", "broadcast").asString();
-    if (mode == "broadcast") {
-      for (const auto &item : forwardItems) {
-        tcp->broadcast(item.payload);
-      }
-      return true;
-    }
-    const int clientFd = param.get("client_fd", 0).asInt();
-    if (clientFd <= 0) {
-      error = "tcp client fd is invalid";
-      return false;
-    }
     for (const auto &item : forwardItems) {
-      if (!tcp->sendToClient(clientFd, item.payload)) {
-        error = "tcp send failed";
+      if (tcp->broadcast(item.payload) == 0) {
+        error = "no tcp clients available";
         return false;
       }
     }
@@ -2014,42 +3102,22 @@ bool PeripheralManager::forwardPayload(const Json::Value &param,
   }
 
   if (target == "websocket") {
+    const std::string mode = param.get("forward_mode", "").asString();
+    if (mode != "broadcast") {
+      error = "unsupported websocket forward mode: " + mode;
+      return false;
+    }
+
     auto *ws = NetworkManager::getInstance().getWebSocketServer();
-    if (!ws || !ws->isRunning()) {
+    if (!ws) {
       error = "websocket server unavailable";
       return false;
     }
-    const std::string mode = param.get("forward_mode", "broadcast").asString();
-    if (mode == "broadcast") {
-      for (const auto &item : forwardItems) {
-        std::string wsMessage = item.payload;
-        const bool printable =
-            std::all_of(wsMessage.begin(), wsMessage.end(), [](unsigned char c) {
-              return (c >= 0x20 && c < 0x7F) || c == '\r' || c == '\n' || c == '\t';
-            });
-        if (!printable && !item.hex.empty()) {
-          wsMessage = item.hex;
-        }
-        ws->broadcast(wsMessage);
-      }
-      return true;
-    }
-    const int clientId = param.get("client_id", 0).asInt();
-    if (clientId <= 0) {
-      error = "websocket client id is invalid";
-      return false;
-    }
     for (const auto &item : forwardItems) {
-      std::string wsMessage = item.payload;
-      const bool printable =
-          std::all_of(wsMessage.begin(), wsMessage.end(), [](unsigned char c) {
-            return (c >= 0x20 && c < 0x7F) || c == '\r' || c == '\n' || c == '\t';
-          });
-      if (!printable && !item.hex.empty()) {
-        wsMessage = item.hex;
-      }
-      if (!ws->sendToClient(clientId, wsMessage)) {
-        error = "websocket send failed";
+      const size_t sent = item.binary ? ws->broadcastBinary(item.payload)
+                                      : ws->broadcast(item.payload);
+      if (sent == 0) {
+        error = "no websocket clients available";
         return false;
       }
     }
@@ -2060,37 +3128,152 @@ bool PeripheralManager::forwardPayload(const Json::Value &param,
   return false;
 }
 
+Json::Value PeripheralManager::dispatchVodEvent(const std::string& event, const Json::Value& data) {
+  Json::Value result(Json::objectValue);
+  result["ok"] = true;
+  result["matched"] = 0;
+  result["sent"] = 0;
+  Json::Value config;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!systemConfig_ || !systemConfig_->isAnyVodEnabled() ||
+        !vodForwardConfig_.get("enabled", false).asBool()) return result;
+    config = vodForwardConfig_;
+  }
+  if (isCommandDispatchBlocked()) {
+    result["ok"] = false;
+    result["message"] = "投屏中，VOD转发已暂停";
+    return result;
+  }
+  for (const auto& rule : config["rules"]) {
+    if (!vodForwardRuleMatches(rule, event, data)) continue;
+    result["matched"] = result["matched"].asInt() + 1;
+    std::string error;
+    const bool ok = writeHexToSerial(config["protocol"].asString(), config["port"].asString(),
+                                     config["baudrate"].asInt(), rule["hex"].asString(), error);
+    if (ok) result["sent"] = result["sent"].asInt() + 1;
+    else { result["ok"] = false; result["message"] = error; }
+    Json::Value diagnostic(Json::objectValue);
+    diagnostic["type"] = "peripheral_trigger";
+    diagnostic["source"] = "VOD";
+    diagnostic["status"] = ok ? "success" : "error";
+    diagnostic["trigger"] = event + "." + rule["field"].asString() + "=" + rule["value"].asString();
+    diagnostic["hex"] = rule["hex"];
+    diagnostic["message"] = ok ? "VOD串口发送成功" : error;
+    broadcastTriggerEvent(diagnostic);
+    LOG_INFO("[VodForward] event=%s port=%s ok=%d hex=%s error=%s", event.c_str(),
+             config["port"].asCString(), ok ? 1 : 0, rule["hex"].asCString(), error.c_str());
+    if (!ok) break; // A partially written physical command must not be retried.
+  }
+  return result;
+}
+
 bool PeripheralManager::writeHexToSerial(const std::string &type,
                                          const std::string &port, int baudrate,
                                          const std::string &hex,
                                          std::string &error) {
   std::vector<uint8_t> bytes = hexToBytes(hex, error);
   if (bytes.empty()) return false;
-
-  if (type == "rs485") {
-    Rs485Server server(port, baudrate > 0 ? baudrate : 9600, 1);
-    if (!server.start()) {
-      error = "failed to start RS485 writer on " + port;
-      return false;
-    }
-    if (!server.writeRaw(bytes)) {
-      error = "RS485 write failed";
-      return false;
-    }
-    server.stop();
-  } else {
-    Rs232Server server(port, baudrate > 0 ? baudrate : 9600);
-    if (!server.start()) {
-      error = "failed to start RS232 writer on " + port;
-      return false;
-    }
-    if (!server.writeRaw(bytes)) {
-      error = "RS232 write failed";
-      return false;
-    }
-    server.stop();
+  if (port.empty()) {
+    error = "serial forward port is empty";
+    return false;
   }
-  return true;
+
+  const int effectiveBaudrate = normalizeBaudrate(baudrate, 9600);
+  if (!isSupportedSerialBaudrate(effectiveBaudrate)) {
+    error = "unsupported serial baudrate: " + std::to_string(effectiveBaudrate);
+    return false;
+  }
+
+  if (type != "rs232" && type != "rs485") {
+    error = "unsupported serial target: " + type;
+    return false;
+  }
+
+  // Serialize connection selection and the whole frame. Never open a second
+  // descriptor over an active listener with different terminal settings.
+  std::scoped_lock lock(serialListenerMutex_, dmxExternalMutex_);
+  auto writeListener = [&](auto &server, const char *owner) {
+    if (server->getBaudRate() != effectiveBaudrate) {
+      error = std::string(owner) + " baudrate conflicts with serial forwarding";
+      return false;
+    }
+    if (!server->writeRaw(bytes)) {
+      error = std::string(owner) + " write failed";
+      LOG_WARN("[SerialForward] TX failed owner=%s port=%s baud=%d bytes=%zu hex=%s",
+               owner, port.c_str(), effectiveBaudrate, bytes.size(), hex.c_str());
+      return false;
+    }
+    LOG_INFO("[SerialForward] TX sent owner=%s port=%s baud=%d bytes=%zu hex=%s",
+             owner, port.c_str(), effectiveBaudrate, bytes.size(), hex.c_str());
+    return true;
+  };
+  if (serialLearnRs232_ && serialLearnRs232_->isRunning() &&
+      serialLearnRs232_->getDevice() == port) {
+    if (type != "rs232") {
+      error = "serial port is occupied by an RS232 listener";
+      return false;
+    }
+    return writeListener(serialLearnRs232_, "RS232 listener");
+  }
+  if (serialLearnRs485_ && serialLearnRs485_->isRunning() &&
+      serialLearnRs485_->getDevice() == port) {
+    if (type != "rs485") {
+      error = "serial port is occupied by an RS485 listener";
+      return false;
+    }
+    return writeListener(serialLearnRs485_, "RS485 listener");
+  }
+  if (dmxExternalRs232_ && dmxExternalRs232_->isRunning() &&
+      dmxExternalRs232_->getDevice() == port) {
+    if (type != "rs232") {
+      error = "serial port is occupied by DMX external RS232";
+      return false;
+    }
+    return writeListener(dmxExternalRs232_, "DMX external RS232");
+  }
+
+  auto writePersistent = [&](auto &writers, auto createServer) {
+    auto &server = writers[port];
+    if (server && (!server->isRunning() ||
+                   server->getBaudRate() != effectiveBaudrate)) {
+      server.reset();
+    }
+    if (!server) {
+      server = createServer();
+      if (!server->start(false)) {
+        writers.erase(port);
+        error = "failed to start " + type + " writer on " + port;
+        return false;
+      }
+      LOG_INFO("[SerialForward] opened %s @ %d (%s)",
+               port.c_str(), effectiveBaudrate, type.c_str());
+    }
+    if (!server->writeRaw(bytes)) {
+      // Do not resend a possibly partially written command. The next request
+      // will create a fresh connection.
+      writers.erase(port);
+      error = type + " write failed on " + port;
+      LOG_WARN("[SerialForward] TX failed target=%s port=%s baud=%d bytes=%zu hex=%s",
+               type.c_str(), port.c_str(), effectiveBaudrate, bytes.size(),
+               bytesToHexCompact(bytes.data(), bytes.size()).c_str());
+      return false;
+    }
+    LOG_INFO("[SerialForward] sent %zu bytes to %s @ %d hex=%s",
+             bytes.size(), port.c_str(), effectiveBaudrate,
+             bytesToHexCompact(bytes.data(), bytes.size()).c_str());
+    return true;
+  };
+  if (type == "rs485") {
+    serialWriteRs232_.erase(port);
+    return writePersistent(serialWriteRs485_, [&] {
+      return std::make_unique<Rs485Server>(port, effectiveBaudrate, 1);
+    });
+  }
+  serialWriteRs485_.erase(port);
+  return writePersistent(serialWriteRs232_, [&] {
+    return std::make_unique<Rs232Server>(port, effectiveBaudrate);
+  });
 }
 
 bool PeripheralManager::startDmxExternalInput(const std::string &port,
@@ -2101,28 +3284,59 @@ bool PeripheralManager::startDmxExternalInput(const std::string &port,
     return false;
   }
 
+  if (access(port.c_str(), R_OK | W_OK) != 0) {
+    const int accessError = errno;
+    if (ensureSerialDevicePermissions(port)) {
+      LOG_INFO("[DMX512 External] repaired serial permissions: %s",
+               port.c_str());
+    } else {
+      LOG_WARN("[DMX512 External] serial port is not readable/writable: %s (%s)",
+               port.c_str(), std::strerror(accessError));
+    }
+  }
+
   stopSerialLearnThread("rs232");
 
   auto server = std::make_unique<Rs232Server>(
       port, normalizeBaudrate(baudrate, 115200));
+  int electronVersion;
+  bool handleEnabled;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     server->setDataBits(dmxConfig_.externalDataBits);
     server->setStopBits(dmxConfig_.externalStopBits);
+    electronVersion = dmxConfig_.electronVersion;
+    handleEnabled = dmxConfig_.externalHandleEnabled;
   }
   server->setRawFrameCallback(
       [this](const std::vector<uint8_t> &frame) { handleDmxExternalFrame(frame); });
   server->setFrameGapMs(40);
-  if (!server->start()) {
-    error = "failed to start DMX external RS232 listener on " + port;
-    return false;
-  }
-
-  writeDmxExternalStartupCommands(*server);
-
+  std::unique_ptr<Rs232Server> oldServer;
   {
-    std::lock_guard<std::mutex> lock(dmxExternalMutex_);
+    std::scoped_lock lock(serialListenerMutex_, dmxExternalMutex_);
+    serialWriteRs232_.erase(port);
+    serialWriteRs485_.erase(port);
+    if (!server->start()) {
+      error = "failed to start DMX external RS232 listener on " + port;
+      return false;
+    }
+    if (handleEnabled) {
+      if (electronVersion == 0) {
+        server->writeRaw(std::vector<uint8_t>{0xAA, 0xBB, 0xDA, 0x05, 0x01});
+      }
+      server->writeRaw(std::vector<uint8_t>{0xAA, 0xBB, 0xDA, 0x05, 0x00});
+      server->writeRaw(std::vector<uint8_t>{0xAA, 0xBB, 0xD2, 0x05, 0x01});
+    }
+    oldServer = std::move(dmxExternalRs232_);
     dmxExternalRs232_ = std::move(server);
+  }
+  oldServer.reset();
+
+  // The external 512 controller may reboot or lose its runtime address while
+  // the player keeps running.  Re-apply the persisted address after opening
+  // the listener so reconnects do not silently fall back to address 1.
+  if (handleEnabled) {
+    writeDmxExternalAddressCommand();
   }
 
   LOG_INFO("[DMX512 External] RS232 listener started on %s @ %d",
@@ -2140,24 +3354,6 @@ void PeripheralManager::stopDmxExternalInput() {
     oldServer.reset();
     LOG_INFO("[DMX512 External] RS232 listener stopped");
   }
-}
-
-void PeripheralManager::writeDmxExternalStartupCommands(Rs232Server &server) {
-  int electronVersion = 1;
-  bool enabled = true;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    electronVersion = dmxConfig_.electronVersion;
-    enabled = dmxConfig_.externalHandleEnabled;
-  }
-  if (!enabled) {
-    return;
-  }
-  if (electronVersion == 0) {
-    server.writeRaw(std::vector<uint8_t>{0xAA, 0xBB, 0xDA, 0x05, 0x01});
-  }
-  server.writeRaw(std::vector<uint8_t>{0xAA, 0xBB, 0xDA, 0x05, 0x00});
-  server.writeRaw(std::vector<uint8_t>{0xAA, 0xBB, 0xD2, 0x05, 0x01});
 }
 
 bool PeripheralManager::writeDmxExternalRaw(const std::vector<uint8_t> &data) {
@@ -2198,11 +3394,15 @@ void PeripheralManager::writeDmxExternalAddressCommand(Rs232Server *server) {
   const uint8_t hi = static_cast<uint8_t>((light / 256) & 0xFF);
   const uint8_t lo = static_cast<uint8_t>(light & 0xFF);
   std::vector<uint8_t> cmd{0xAA, 0xBB, 0xF0, 0x06, hi, lo};
+  bool sent = false;
   if (server) {
-    server->writeRaw(cmd);
+    sent = server->writeRaw(cmd);
   } else {
-    writeDmxExternalRaw(cmd);
+    sent = writeDmxExternalRaw(cmd);
   }
+  LOG_INFO("[DMX512 External] address command address=%d frame=%s sent=%d",
+           light, bytesToHexCompact(cmd.data(), cmd.size()).c_str(),
+           sent ? 1 : 0);
 }
 
 bool PeripheralManager::handleDmxExternalReplyFrame(
@@ -2574,6 +3774,7 @@ void PeripheralManager::handleDmxExternalFrame(
             packetCount, hex.c_str());
 }
 
+
 bool PeripheralManager::saveToDisk() {
   if (CONFIG_DIR.empty()) {
     LOG_WARN("[PeripheralManager] saveToDisk: CONFIG_DIR 未初始化，跳过");
@@ -2647,6 +3848,7 @@ bool PeripheralManager::saveToDisk() {
   root["function_config"] =
       functionConfig_.isObject() ? functionConfig_ : buildDefaultFunctionConfig();
   root["serial_templates"] = buildSerialTemplatesResponse();
+  root["vod_forward"] = vodForwardConfig_.isObject() ? vodForwardConfig_ : defaultVodForwardConfig();
 
   const std::string path = CONFIG_DIR + "peripherals.json";
   const std::string content = JsonUtils::toFormattedString(root, 2);
@@ -2713,8 +3915,8 @@ bool PeripheralManager::loadFromDisk() {
 
   if (root.isMember("rs232") && root["rs232"].isObject()) {
     const Json::Value &o = root["rs232"];
-    rs232Config_.port = o.get("port", "").asString();
-    rs232Config_.baudrate = o.get("baudrate", 0).asInt();
+    rs232Config_.port = o.get("port", rs232Config_.port).asString();
+    rs232Config_.baudrate = o.get("baudrate", rs232Config_.baudrate).asInt();
     rs232Config_.enabled = o.get("enabled", false).asBool();
     rs232Config_.learnMode = o.get("learn_mode", false).asBool();
     rs232Config_.cmdMap.clear();
@@ -2793,6 +3995,9 @@ bool PeripheralManager::loadFromDisk() {
   }
 
   loadNetwork("udp", udpConfig_, /*includeMode= 包含模式*/false);
+  std::string vodConfigError;
+  vodForwardConfig_ = validateVodForwardConfig(root["vod_forward"], vodConfigError)
+                          ? root["vod_forward"] : defaultVodForwardConfig();
   loadNetwork("tcp", tcpConfig_, /*includeMode= 包含模式*/true);
   loadNetwork("websocket", websocketConfig_, /*includeMode= 包含模式*/false);
   if (root.isMember("function_config") && root["function_config"].isObject()) {

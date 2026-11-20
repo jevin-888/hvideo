@@ -71,6 +71,15 @@ std::vector<LayerDefinition> getAuthorizedLayerDefinitions(const std::vector<int
       result.push_back(*definition);
     }
   }
+
+  // Startup status and the authorization entry must exist without license.dat.
+  // Otherwise the user cannot discover the device IP or open the authorization page.
+  for (const auto &definition : kKnownLayers) {
+    if (isSystemLayerAlwaysAvailable(definition.id) && seen.insert(definition.id).second) {
+      result.push_back(definition);
+    }
+  }
+
   std::sort(result.begin(), result.end(), [](const LayerDefinition &a, const LayerDefinition &b) {
     return a.id < b.id;
   });
@@ -113,6 +122,10 @@ bool isAuthorizedLayerId(const std::vector<int> &authorizedIds, int layerId) {
 }
 
 bool isSystemLayerAlwaysAvailable(int layerId) {
+  // Layer 41 displays startup/network/license hints; layer 71 displays the
+  // startup authorization QR code. Neither may depend on a license file.
+  if (layerId == 41 || layerId == 71) return true;
+
   // Layer 60 是内置图片层/图片播放列表目标。
   // 即使 license.enabled_layers 未显式列出，也必须保持可用。
   return layerId == 60;

@@ -3,7 +3,8 @@
  * @brief 路径配置类
  *
  * 本文件实现了路径配置类，负责：
- * - 数据根路径选择（优先可写 /huoshan/，不可写时才退到 /sdcard/huoshan/）
+ * - 数据根路径优先使用已挂载的 /huoshan/ 分区
+ * - /huoshan/ 不存在或不可写时回退到 /sdcard/huoshan/
  * - 与旧项目 VjConfig 一致的根路径选择逻辑
  * - 复制与保存均在 Java 层完成后再把根路径传给 Native
  */
@@ -13,12 +14,15 @@ package com.hsvj.engine;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
 import android.os.Looper;
 
 /**
  * 与旧项目 VjConfig 一致的根路径选择逻辑：
- * 优先可写 /huoshan/，不可写时才退到 /sdcard/huoshan/。
+ * 优先已挂载且可写的 /huoshan/ 分区，不可用时才退到 /sdcard/huoshan/。
  * 复制与保存均在 Java 层完成后再把根路径传给 Native。
  *
  * 重要：首次调用会执行磁盘 I/O（exists/testWritable 等），必须在后台线程调用，
@@ -27,7 +31,8 @@ import android.os.Looper;
 public final class PathConfig {
     private static final String TAG = "PathConfig";
     private static final String SYSTEM_ROOT = "/huoshan/";
-    private static final String SDCARD_ROOT = "/sdcard/huoshan/";
+    private static final String SD_CARD_ROOT = "/sdcard/huoshan/";
+
     private static String sRootPath;
 
     /** 是否为可调试构建（与 BuildConfig.DEBUG 等价，不依赖生成类） */
@@ -47,62 +52,67 @@ public final class PathConfig {
         if (isDebugBuild(context) && Looper.myLooper() == Looper.getMainLooper()) {
             android.util.Log.w(TAG, "getRootPath 首次调用在主线程，可能造成卡顿，建议在后台线程调用");
         }
-        // 1. 设备已预置且可写 /huoshan/ → 直接使用。若目录存在但权限异常，先尝试 root 修复。
-        if (systemRootExists()) {
-            if (testWritableExistingDir(SYSTEM_ROOT)) {
-                sRootPath = SYSTEM_ROOT;
-                return sRootPath;
-            }
-            android.util.Log.w(TAG, "/huoshan exists but is not writable, trying permission repair");
-            if (HuoshanStorageRepair.repairDirectory(context, new File(SYSTEM_ROOT))
-                    && testWritableExistingDir(SYSTEM_ROOT)) {
-                sRootPath = SYSTEM_ROOT;
-                return sRootPath;
-            }
-            android.util.Log.w(TAG, "/huoshan exists but is still not writable, falling back to /sdcard/huoshan/");
+        // 1. Use the real huoshan mount when it exists and is writable.
+        //    A same-named directory in the root filesystem is not sufficient.
+        if (isHuoshanPartitionMounted() && testWritableExistingDir(SYSTEM_ROOT)) {
+            sRootPath = SYSTEM_ROOT;
+        } else if (ensureWritableDirectory(SD_CARD_ROOT)) {
+            android.util.Log.w(TAG, "/huoshan unavailable; using external storage fallback: " + SD_CARD_ROOT);
+            sRootPath = SD_CARD_ROOT;
+        } else {
+            android.util.Log.e(TAG, "Neither /huoshan nor /sdcard/huoshan is writable; keeping /huoshan as the failure path");
+            sRootPath = SYSTEM_ROOT;
         }
-        // 2. /sdcard/huoshan/（与项目规范一致，/sdcard 是 /storage/emulated/0 的符号链接）
-        if (testWritableExistingDir(SDCARD_ROOT)) {
-            sRootPath = SDCARD_ROOT;
-            return sRootPath;
+
+        try {
+            // Run once per process, before resources/config/SQLite handles are opened.
+            // The helpers also serialize Activity/DRM processes.
+            String restore = com.hsvj.engine.util.ConfigBackupArchive.applyPendingRestore(
+                    java.nio.file.Paths.get(sRootPath));
+            if (!restore.isEmpty()) android.util.Log.i(TAG, "[ConfigRestore] " + restore);
+            String synced = com.hsvj.engine.util.DeviceSyncRestore.applyPending(
+                    java.nio.file.Paths.get(sRootPath));
+            if (!synced.isEmpty()) android.util.Log.i(TAG, "[ConfigSync] " + synced);
+        } catch (IOException error) {
+            throw new IllegalStateException("配置还原尚未安全完成，停止启动", error);
         }
-        if (ensureDir(SDCARD_ROOT) && testWritable(SDCARD_ROOT)) {
-            sRootPath = SDCARD_ROOT;
-            return sRootPath;
-        }
-        // 3. 默认回退到 /sdcard/huoshan/
-        sRootPath = SDCARD_ROOT;
-        android.util.Log.w(TAG, "fallback to: " + sRootPath);
         return sRootPath;
     }
 
-    private static boolean systemRootExists() {
-        File huoshan = new File(SYSTEM_ROOT);
-        if (huoshan.exists() && huoshan.isDirectory()) {
-            return true;
-        }
-        // 某些系统分区目录在应用沙箱视角下 exists() 可能不稳定，这里再用 su 做一次探测。
-        try {
-            Process process = new ProcessBuilder("su", "0", "sh", "-c", "test -d /huoshan").start();
-            int exitCode = process.waitFor();
-            if (exitCode == 0) {
-                android.util.Log.i(TAG, "Detected /huoshan via su probe");
-                return true;
+    /**
+     * 判断当前应用自己的 mount namespace 中是否真的挂载了 /huoshan。
+     * 不能只用 File.exists()：系统镜像可能预留了一个空目录，但并没有
+     * /dev/block/by-name/huoshan 分区挂载到这里。
+     */
+    private static boolean isHuoshanPartitionMounted() {
+        try (BufferedReader reader = new BufferedReader(new FileReader("/proc/self/mountinfo"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] fields = line.trim().split("\\s+");
+                // mountinfo 的第 5 列是 mount point；/huoshan 不包含转义空格。
+                if (fields.length > 4 && "/huoshan".equals(fields[4])) {
+                    return true;
+                }
             }
-        } catch (Throwable e) {
-            android.util.Log.w(TAG, "su probe for /huoshan failed: " + e.getMessage());
+        } catch (IOException e) {
+            android.util.Log.w(TAG, "failed to inspect mountinfo: " + e.getMessage());
         }
         return false;
     }
 
-    private static boolean ensureDir(String path) {
-        File f = new File(path);
-        return f.exists() && f.isDirectory() || f.mkdirs();
-    }
 
     private static boolean testWritableExistingDir(String path) {
         File f = new File(path);
         return f.exists() && f.isDirectory() && testWritable(path);
+    }
+
+    /** 创建外部存储目录（如有需要），并确认应用进程可以写入。 */
+    private static boolean ensureWritableDirectory(String path) {
+        File dir = new File(path);
+        if (!dir.exists() && !dir.mkdirs() && !dir.exists()) {
+            return false;
+        }
+        return dir.isDirectory() && testWritable(path);
     }
 
     /** 仅测试在目录下创建/删除文件（不足以保证能创建子目录） */

@@ -17,23 +17,22 @@ import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 import android.annotation.SuppressLint;
-import android.app.AlarmManager;
 import android.content.ActivityNotFoundException;
 import android.app.KeyguardManager;
-import android.app.PendingIntent;
 import android.content.ComponentCallbacks2;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.provider.Settings;
+import android.util.AtomicFile;
 import android.util.Log;
 import android.view.InputDevice;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
@@ -49,29 +48,24 @@ import android.widget.FrameLayout;
 import android.graphics.Point;
 import android.graphics.PixelFormat;
 import java.net.NetworkInterface;
-import java.util.Collections;
 import com.hsvj.ui.LoadingOverlayView;
 import com.hsvj.engine.resource.EmbeddedResourceManager;
-import com.hsvj.engine.resource.IncrementalUpdater;
-import com.hsvj.engine.resource.ResourceClassifier;
+import com.hsvj.engine.util.ProcessRunner;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.Locale;
 import org.json.JSONObject;
-import com.hsvj.engine.update.AppUpdateManager;
-import android.app.AlertDialog;
-import android.widget.LinearLayout;
-import android.widget.ProgressBar;
-import android.widget.TextView;
 import android.widget.Toast;
 import android.graphics.Color;
-import android.graphics.drawable.GradientDrawable;
 import com.hsvj.wfd.WfdSinkClient;
 
 /**
@@ -82,57 +76,29 @@ import com.hsvj.wfd.WfdSinkClient;
 public class MainActivity extends AppCompatActivity
         implements SurfaceHolder.Callback, StartupManager.StartupListener {
     private static final String TAG = "HSVJEngine";
-    private static final String ACTION_ETH_SETTING = "android.intent.action.ETH.SETTING";
-    private static final String EXTRA_ETH_SETTING = "eth.setting";
-    private static final int FLAG_ETH_SETTING_ROM_PRIVATE = 0x01000000;
-    /** 目标帧率：4K HDMI 输出固定 30fps，避免不支持 4K60 的线材/屏幕黑屏。 */
-    private static final int TARGET_FPS = 30;
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
+    private static final float DEFAULT_RENDER_FPS = 30.0f;
 
     // -------------------------------------------------------------------
     // [AdaptiveFPS] 自适应帧率（画面更新需求主导）
     //
-    // 核心原则：HDMI/Surface 输出保持 3840x2160@30。即使内容侧报告 50/60fps
-    // 动态需求，也不再把提交节奏升到 60fps，避免 4K60 模式触发黑屏或反复等屏。
-    //
-    // 档位表：
-    //   0: 16ms = legacy high-fps slot（保留索引兼容旧逻辑，4K30 模式不主动进入）
-    //   1: 33ms = 30 FPS（默认/目标档）
-    //   2: 40ms = 25 FPS（显示队列背压时的最低保护档，避免把 25fps 视频拖成 15fps）
-    //
-     // 选档策略（每 250ms 轻量轮询一次）：
-    //   1. 由 C++ engine.getRenderDemandFps() 汇总当前画面更新需求
-    //   2. 任何 demand 都钳到 30fps 输出节奏
-    //   3. display backpressure 正常保持 30fps；若真实 swapchain 无图像或
-    //      async present 被驱动阻塞，则临时降到 25fps，继续消费 25fps 视频帧。
-    //   4. 示例/字段：demand≈30 → 1(30)，严重背压 → 2(25)
+    // Native reports the highest demand from all visible dynamic layers. Java caps
+    // that demand to the active display refresh rate and schedules in nanoseconds.
+    // fixed30 remains available and is also capped on displays below 30 Hz.
     // -------------------------------------------------------------------
-    /** 自适应档位候选帧间隔 (ms)，从高到低 */
-    private static final long[] FRAME_INTERVAL_CANDIDATES_MS = {16, 33, 40};
-    /** 当前档位索引；启动默认 30fps，避免 Surface 刚创建时先请求 60fps 再回落导致显示模式抖动。 */
-    private volatile int frameIntervalIdx = 1;
-    /** 当前帧间隔（volatile，渲染线程每帧读一次） */
-    private volatile long frameIntervalMs = FRAME_INTERVAL_CANDIDATES_MS[1];
-    /** 滑动窗口样本数量 */
-    private static final int ADAPTIVE_WINDOW_SIZE = 60;
-    /** 近 N 帧 update 耗时（ms）环形缓冲 */
-    private final long[] recentUpdateMsRing = new long[ADAPTIVE_WINDOW_SIZE];
-    private int recentUpdateWriteIdx = 0;
-    private int recentUpdateValidCount = 0;
-    /** 上次档位调整时刻，避免频繁抖动（冷却期 3s） */
+    private volatile float targetRenderFps = DEFAULT_RENDER_FPS;
+    private volatile long frameIntervalNs = frameIntervalNsForFps(DEFAULT_RENDER_FPS);
+    private volatile long frameIntervalMs = Math.round(frameIntervalNs / 1_000_000.0);
+    /** 上次帧率调整时刻，避免频繁抖动（冷却期 3s） */
     private long lastFrameRateAdjustNs = 0;
+    private float pendingRenderFps = DEFAULT_RENDER_FPS;
+    private long pendingRenderFpsSinceNs = 0;
     /** 上次查询 Native 动态画面需求的时刻 */
     private long lastRenderDemandPollNs = 0;
     private static final long FRAME_RATE_ADJUST_COOLDOWN_NS = 3_000_000_000L;
-    /** Native 画面动态需求轮询间隔；当前只用于诊断，输出仍固定 30fps。 */
+    private static final long FRAME_RATE_DEMAND_STABLE_NS = 750_000_000L;
+    /** Native 画面动态需求轮询间隔。 */
     private static final long RENDER_DEMAND_POLL_INTERVAL_NS = 250_000_000L;
-    /** 旧 60fps 过载保护保留为诊断兜底；4K HDMI 输出默认已经固定在 30fps。 */
-    private static final double RENDER_OVERLOAD_AVG_UPDATE_MS = 40.0;
-    /**
-     * 过载后保持 30fps 一段时间。当前不再主动探测 60fps，避免 RK HDMI 链路 30/60 跳档。
-     */
-    private static final long RENDER_OVERLOAD_THROTTLE_HOLD_NS = 30_000_000_000L;
-    private static final int RENDER_OVERLOAD_TRIGGER_WINDOWS = 4;
     private static final long RENDER_STOP_DRAIN_TIMEOUT_MS = 700L;
     private static final int SETTINGS_MOUSE_CLICK_COUNT = 5;
     private static final long SETTINGS_MOUSE_CLICK_WINDOW_MS = 5000L;
@@ -140,10 +106,15 @@ public class MainActivity extends AppCompatActivity
     private static final String RENDER_LOOP_MODE_HANDLER = "handler";
     private static final String RENDER_LOOP_MODE_CHOREOGRAPHER = "choreographer";
     private static final String USB_MIRROR_PREFS_NAME = "usb_adb_mirror";
-    private static final String USB_MIRROR_AUTO_START_KEY = "auto_start";
-    private static final String USB_MIRROR_APP_SCENE_ENABLED_KEY = "app_scene_enabled";
-    private static final String USB_MIRROR_APP_SCENE_PACKAGE_KEY = "app_scene_package";
-    private static final String USB_MIRROR_APP_SCENE_NAME_KEY = "app_scene_name";
+    private static final String LEGACY_MIRROR_AUTO_START_MODE_KEY = "auto_start_mode";
+    private static final String LEGACY_USB_MIRROR_AUTO_START_KEY = "auto_start";
+    private static final String MIRROR_AUTO_START_NONE = "none";
+    private static final String MIRROR_AUTO_START_USB = "usb";
+    private static final String MIRROR_AUTO_START_ANDROID = "android";
+    private static final String MIRROR_AUTO_START_APPLE = "apple";
+    private static final String LEGACY_USB_MIRROR_APP_SCENE_ENABLED_KEY = "app_scene_enabled";
+    private static final String LEGACY_USB_MIRROR_APP_SCENE_PACKAGE_KEY = "app_scene_package";
+    private static final String LEGACY_USB_MIRROR_APP_SCENE_NAME_KEY = "app_scene_name";
     private static final String USB_MIRROR_APP_SCENE_DEFAULT_NAME = "默认配置";
     private static final String USB_MIRROR_VIVO_TV_ENTRY_PACKAGE =
             "com.vivo.newfeaturedemo.v2514";
@@ -151,7 +122,8 @@ public class MainActivity extends AppCompatActivity
             "com.android.newfeaturedemo.x300pro";
     private static final String USB_MIRROR_ANDROID_CAMERA_PACKAGE = "com.android.camera";
     private static final long USB_MIRROR_APP_SCENE_POLL_MS = 500L;
-    private static final long USB_MIRROR_AUTO_START_DELAY_MS = 1500L;
+    private static final long MIRROR_AUTO_START_DELAY_MS = 1500L;
+    private static final long ANDROID_WFD_STATUS_POLL_INTERVAL_MS = 750L;
     private static final long USB_MIRROR_AUTO_START_RETRY_DELAY_MS = 3000L;
     private static final int USB_MIRROR_AUTO_START_MAX_ATTEMPTS = 24;
     private static final long HANDLER_RENDER_RESET_LAG_NS = 250_000_000L;
@@ -168,26 +140,12 @@ public class MainActivity extends AppCompatActivity
     private static final String RENDER_QUALITY_NORMAL = "normal";
     private static final String RENDER_QUALITY_HIGH = "high";
     private static final String RENDER_QUALITY_ULTRA = "ultra";
-    /** 最近一次检测到高帧率需求的时间，仅用于诊断日志。 */
-    private long lastDynamicRenderDemandNs = 0;
-    private volatile float lastSurfaceFrameRateFps = 30.0f;
-    /** 最近一次检测到高帧率过载后，保持 30fps 到这个时刻。 */
-    private long renderOverloadThrottleUntilNs = 0;
-    private int renderOverloadWindowCount = 0;
+    private volatile float lastSurfaceFrameRateFps = DEFAULT_RENDER_FPS;
 
     /** present 被显示管线持续阻塞时的保护：典型现象是 CPU 只有几 ms，vkQueuePresentKHR 却 35-40ms。 */
-    private static final double DISPLAY_BACKPRESSURE_ENTER_PRESENT_MS = 28.0;
-    private static final double DISPLAY_BACKPRESSURE_EXIT_PRESENT_MS = 18.0;
-    private static final double DISPLAY_BACKPRESSURE_ENTER_ASYNC_PRESENT_MS = 42.0;
-    private static final double DISPLAY_BACKPRESSURE_EXIT_ASYNC_PRESENT_MS = 36.0;
-    private static final double DISPLAY_BACKPRESSURE_CPU_MAX_MS = 10.0;
-    private static final double DISPLAY_BACKPRESSURE_ENTER_BEGIN_FRAME_MS = 34.0;
-    private static final double DISPLAY_BACKPRESSURE_EXIT_BEGIN_FRAME_MS = 18.0;
-    private static final double DISPLAY_BACKPRESSURE_ENTER_FRAME_TOTAL_MS = 38.0;
-    private static final int DISPLAY_BACKPRESSURE_ENTER_FRAMES = 12;
+    private static final long DISPLAY_BACKPRESSURE_PRESENT_STALL_NS = 1_500_000_000L;
     private static final int DISPLAY_BACKPRESSURE_EXIT_FRAMES = 30;
-    private static final long DISPLAY_BACKPRESSURE_MIN_HOLD_NS = 8_000_000_000L;
-    private static final long DISPLAY_BACKPRESSURE_ACQUIRE_MIN_HOLD_NS = 5_000_000_000L;
+    private static final long DISPLAY_BACKPRESSURE_MIN_HOLD_NS = 3_000_000_000L;
     private static final long DISPLAY_BACKPRESSURE_STATE_PROBE_INTERVAL_MS = 30_000L;
     private volatile boolean displayBackpressureActive = false;
     private long displayBackpressureHoldUntilNs = 0;
@@ -203,10 +161,19 @@ public class MainActivity extends AppCompatActivity
     private volatile double lastNativeAsyncAcquireFenceMs = 0.0;
     private volatile long lastSwapchainNoImageSkipCount = 0;
     private boolean hasSwapchainNoImageCounter = false;
+    private volatile long lastSuccessfulPresentCount = 0;
+    private boolean hasSuccessfulPresentCounter = false;
+    private long lastSuccessfulPresentNs = 0;
     private long renderStatsNoImageSkips = 0;
+    private long renderStatsSuccessfulPresents = 0;
     private volatile int lastRenderDemandFps = 30;
     private volatile String lastDisplayBackpressureReason = "none";
     private volatile boolean displayStateProbeRunning = false;
+    private volatile Future<?> displayStateProbeFuture;
+    private volatile Future<?> startupBackgroundFuture;
+    private volatile Future<?> hotspotProvisionFuture;
+    private volatile Future<?> engineInitFuture;
+    private volatile Future<?> settingsSwitchFuture;
     private volatile long lastDisplayStateProbeMs = 0;
     private volatile String lastDisplayStateSummary = "unprobed";
     private volatile float activeDisplayRefreshRate = 60.0f;
@@ -226,13 +193,16 @@ public class MainActivity extends AppCompatActivity
     private long lastRenderTimeNs = 0;
 
     private static boolean nativeLibLoaded = false;
+    private boolean drmIdleHomeMode = false;
+    private boolean returnToDrmAfterSettings = false;
+    private BluetoothAudioModeController bluetoothAudioController;
 
     private SurfaceView surfaceView;
     private HSVJEngine engine;
     private LoadingOverlayView loadingOverlay;
     private MemoryMonitor memoryMonitor;
     private StartupManager startupManager;
-    private AppUpdateManager updateManager;
+    private AppUpdateCoordinator updateCoordinator;
     private MirrorManager mirrorManager;
     private UsbAdbScreenMirrorClient usbMirrorClient;
     /** True after USB mirror is explicitly started; cleared only by an explicit stop or Activity teardown. */
@@ -255,16 +225,45 @@ public class MainActivity extends AppCompatActivity
         }
     };
     private final Handler usbMirrorAutoStartHandler = new Handler(Looper.getMainLooper());
+    private boolean androidWfdStatusPolling = false;
+    private final Runnable androidWfdStatusPollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            synchronized (MainActivity.this) {
+                if (!androidWfdStatusPolling) {
+                    return;
+                }
+                WfdSinkClient.Status status = readAndroidWfdStatus();
+                if (status == null) {
+                    androidWfdStatusPolling = false;
+                    return;
+                }
+                syncAndroidWfdState(status);
+                if (status.serviceStarted && !isFinishing() && !isDestroyed()) {
+                    usbMirrorAutoStartHandler.postDelayed(this,
+                            ANDROID_WFD_STATUS_POLL_INTERVAL_MS);
+                } else {
+                    androidWfdStatusPolling = false;
+                }
+            }
+        }
+    };
     private final Runnable usbMirrorAutoStartRunnable = () -> {
         synchronized (MainActivity.this) {
             runUsbMirrorAutoStartAttempt();
         }
     };
-    private AlertDialog downloadProgressDialog;
-    private ProgressBar downloadProgressBar;
-    private TextView downloadProgressText;
-    private TextView downloadProgressPercentText;
-    private boolean mouseDownMayOpenSettings = false;
+    private volatile String mirrorAutoStartMode = MIRROR_AUTO_START_NONE;
+    private volatile boolean usbMirrorAppSceneEnabled = false;
+    private volatile String usbMirrorAppSceneName = "";
+    private String pendingMirrorAutoStartMode = MIRROR_AUTO_START_NONE;
+    private final Runnable mirrorAutoStartRunnable = () -> {
+        synchronized (MainActivity.this) {
+            runConfiguredMirrorAutoStart();
+        }
+    };
+    private boolean primaryMouseDownMayOpenSettings = false;
+    private boolean secondaryMouseDownConsumed = false;
     private int settingsMouseClickCount = 0;
     private long firstSettingsMouseClickMs = 0L;
     private long lastSettingsLaunchMs = 0L;
@@ -300,8 +299,7 @@ public class MainActivity extends AppCompatActivity
     private int renderStatsSkippedVsyncCount = 0;
     private final Handler heartbeatHandler = new Handler(Looper.getMainLooper());
     private volatile long heartbeatFrameSeq = 0;
-    private static final String HEARTBEAT_FILE_PATH = "/data/local/tmp/hsvj_heartbeat";
-    private long lastHeartbeatRootFallbackMs = 0;
+    private AtomicFile heartbeatFile;
     private final Runnable heartbeatRunnable = new Runnable() {
         @Override
         public void run() {
@@ -363,10 +361,10 @@ public class MainActivity extends AppCompatActivity
     };
 
     private boolean shouldRenderOnThisVsync(long vsyncNs) {
-        long targetIntervalNs = Math.max(1L, frameIntervalMs) * 1_000_000L;
+        long targetIntervalNs = targetFrameIntervalNs();
         long vsyncPeriodNs = displayPeriodNs();
-        if (targetIntervalNs <= FRAME_INTERVAL_CANDIDATES_MS[0] * 1_000_000L) {
-            nextRenderTargetNs = vsyncNs + vsyncPeriodNs;
+        if (targetIntervalNs <= vsyncPeriodNs + 500_000L) {
+            nextRenderTargetNs = vsyncNs + targetIntervalNs;
             return true;
         }
 
@@ -408,6 +406,7 @@ public class MainActivity extends AppCompatActivity
         double nativeAsyncPresentMs = 0.0;
         double nativeAsyncAcquireMs = 0.0;
         double nativeAsyncAcquireFenceMs = 0.0;
+        long successfulPresentCount = lastSuccessfulPresentCount;
         long swapchainNoImageSkipCount = lastSwapchainNoImageSkipCount;
         try {
             nativeFrameMs = activeEngine.getLastFrameTotalMs();
@@ -417,6 +416,7 @@ public class MainActivity extends AppCompatActivity
             nativeAsyncPresentMs = activeEngine.getLastAsyncPresentMs();
             nativeAsyncAcquireMs = activeEngine.getLastAsyncAcquireMs();
             nativeAsyncAcquireFenceMs = activeEngine.getLastAsyncAcquireFenceMs();
+            successfulPresentCount = activeEngine.getSuccessfulPresentCount();
             swapchainNoImageSkipCount = activeEngine.getSwapchainNoImageSkipCount();
         } catch (Throwable ignored) {
         }
@@ -427,6 +427,17 @@ public class MainActivity extends AppCompatActivity
             hasSwapchainNoImageCounter = true;
         }
         lastSwapchainNoImageSkipCount = swapchainNoImageSkipCount;
+        long successfulPresentDelta = 0;
+        if (hasSuccessfulPresentCounter && successfulPresentCount >= lastSuccessfulPresentCount) {
+            successfulPresentDelta = successfulPresentCount - lastSuccessfulPresentCount;
+        } else {
+            hasSuccessfulPresentCounter = true;
+            lastSuccessfulPresentNs = lastRenderTimeNs;
+        }
+        lastSuccessfulPresentCount = successfulPresentCount;
+        if (successfulPresentDelta > 0) {
+            lastSuccessfulPresentNs = lastRenderTimeNs;
+        }
         lastNativeFrameTotalMs = nativeFrameMs;
         lastNativeCpuWorkMs = nativeCpuMs;
         lastNativeBeginFrameMs = nativeBeginFrameMs;
@@ -434,14 +445,8 @@ public class MainActivity extends AppCompatActivity
         lastNativeAsyncPresentMs = nativeAsyncPresentMs;
         lastNativeAsyncAcquireMs = nativeAsyncAcquireMs;
         lastNativeAsyncAcquireFenceMs = nativeAsyncAcquireFenceMs;
-        updateDisplayBackpressure(lastRenderTimeNs, frameElapsedMs,
-                nativeFrameMs, nativeCpuMs, nativePresentMs, nativeBeginFrameMs,
-                nativeAsyncPresentMs, noImageSkipDelta);
-
-        // [AdaptiveFPS] 写入环形缓冲（线程内交替，无锁即可）
-        recentUpdateMsRing[recentUpdateWriteIdx] = frameElapsedMs;
-        recentUpdateWriteIdx = (recentUpdateWriteIdx + 1) % ADAPTIVE_WINDOW_SIZE;
-        if (recentUpdateValidCount < ADAPTIVE_WINDOW_SIZE) recentUpdateValidCount++;
+        updateDisplayBackpressure(lastRenderTimeNs, successfulPresentDelta,
+                noImageSkipDelta);
 
         if (lastRenderTimeNs - lastRenderDemandPollNs >= RENDER_DEMAND_POLL_INTERVAL_NS) {
             maybeAdjustFrameRate(lastRenderTimeNs, activeEngine);
@@ -449,7 +454,7 @@ public class MainActivity extends AppCompatActivity
 
         long frameWallMs = (System.nanoTime() - frameStart) / 1_000_000L;
         maybeLogRenderLoopStats(lastRenderTimeNs, frameElapsedMs, frameWallMs,
-                noImageSkipDelta);
+                successfulPresentDelta, noImageSkipDelta);
     }
 
     private void postRenderFrameCallbackOnRenderThread() {
@@ -505,7 +510,7 @@ public class MainActivity extends AppCompatActivity
         if (RENDER_LOOP_MODE_CHOREOGRAPHER.equals(activeRenderLoopMode)) {
             return 0L;
         }
-        if (intervalNs < FRAME_INTERVAL_CANDIDATES_MS[1] * 1_000_000L) {
+        if (intervalNs < frameIntervalNsForFps(DEFAULT_RENDER_FPS) - 500_000L) {
             return 0L;
         }
         double presentMs = lastNativePresentMs;
@@ -536,15 +541,18 @@ public class MainActivity extends AppCompatActivity
         if (refresh > 1.0f && Float.isFinite(refresh)) {
             return Math.max(1L, Math.round(NANOS_PER_SECOND / (double) refresh));
         }
-        return NANOS_PER_SECOND / TARGET_FPS;
+        return frameIntervalNsForFps(DEFAULT_RENDER_FPS);
+    }
+
+    private static long frameIntervalNsForFps(float fps) {
+        if (!Float.isFinite(fps) || fps <= 0.0f) {
+            fps = DEFAULT_RENDER_FPS;
+        }
+        return Math.max(1L, Math.round(NANOS_PER_SECOND / (double) fps));
     }
 
     private long targetFrameIntervalNs() {
-        if (frameIntervalIdx == 1 && activeDisplayRefreshRate > 20.0f &&
-                activeDisplayRefreshRate <= 35.0f) {
-            return displayPeriodNs();
-        }
-        return Math.max(1L, frameIntervalMs) * 1_000_000L;
+        return Math.max(1L, frameIntervalNs);
     }
 
     private void maybeLogPresentPacing(long nowNs, long delayMs) {
@@ -579,34 +587,50 @@ public class MainActivity extends AppCompatActivity
      */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        final boolean drmKmsSelected = OutputBackendController.isDrmKmsSelected();
+        if (drmKmsSelected) {
+            // The HOME activity remains present while the dedicated process owns DRM.
+            // It must not create an HWUI RenderThread that swaps after SurfaceFlinger stops.
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED);
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
         super.onCreate(savedInstanceState);
+        PortForwardManager.start(this);
+        // Hotspot provisioning is a boot/network concern, not a rendering
+        // backend concern. Start it before the DRM/KMS early-return path so a
+        // direct-KMS boot cannot silently skip the hotspot handshake.
+        startDebugHotspotProvisioning();
 
-        if (OutputBackendController.isDrmKmsSelected()) {
-            Log.i(TAG, "DRM/KMS 产品模式不创建 Android Surface，转交独占输出服务");
-            OutputBackendController.installAndStart(this, "activity-redirect");
-            finishAndRemoveTask();
+        if (drmKmsSelected) {
+            drmIdleHomeMode = true;
+            Log.i(TAG, "DRM/KMS HOME holder created without HWUI, Surface or renderer initialization");
             return;
         }
 
-        Log.i(TAG, "MainActivity 开始初始化");
+        PlatformControlGateway.initialize(this);
+        bluetoothAudioController = new BluetoothAudioModeController(this, "surface");
+        bluetoothAudioController.start("activity_create");
+        initializeSurfaceBackend();
+    }
+
+    private void initializeSurfaceBackend() {
+        Log.i(TAG, "MainActivity 开始初始化 Surface 输出后端");
         startHeartbeat();
         Log.i(TAG, "[投屏] App 启动，默认关闭 WFD Sink");
         WfdSinkClient.stop();
 
         // [双重保险] 执行系统优化与看门狗守护脚本
-        new Thread(() -> {
+        startupBackgroundFuture = StartupExecutor.get().submit(() -> {
             try {
                 prepareHeartbeatFile();
-                applyNetworkIpConfigFromSavedConfig();
-                DebugHotspotManager.ensureDebugHotspot(getApplicationContext());
-                refreshHttpPortForward();
+                PortForwardManager.refresh(getApplicationContext(), "hotspot_configured");
+                applyStartupNetworkIpConfigWhenSafe();
 
                 // 先从 assets 拷贝脚本到应用缓存目录（有写权限）
                 String scriptPath = copyAssetToCache("hsvj_optimize.sh", "hsvj_optimize.sh");
 
                 if (scriptPath != null) {
                     runOptimizeScript(scriptPath);
-                    refreshHttpPortForward();
                 } else {
                     Log.e(TAG, "[优化] 脚本拷贝失败，无法执行优化");
                 }
@@ -623,22 +647,11 @@ public class MainActivity extends AppCompatActivity
                     installRestartScript(restartPath);
                 }
 
-                if (OutputBackendController.isDrmKmsSelected()) {
-                    String drmTakeoverPath = copyAssetToCache("hsvj_drm_takeover.sh", "hsvj_drm_takeover.sh");
-                    String drmTakeoverInstallerPath = copyAssetToCache(
-                            "hsvj_drm_takeover_installer.sh", "hsvj_drm_takeover_installer.sh");
-                    if (drmTakeoverPath != null && drmTakeoverInstallerPath != null) {
-                        installDrmTakeoverService(drmTakeoverInstallerPath, drmTakeoverPath);
-                    } else {
-                        Log.e(TAG, "[DRM接管] 脚本拷贝失败，无法安装系统接管守护");
-                    }
-                } else {
-                    Log.i(TAG, "[DRM接管] 当前为 Surface 模式，不安装或启动 DRM takeover 守护");
-                }
+
             } catch (Exception e) {
                 Log.e(TAG, "[优化] 触发优化脚本失败: " + e.getMessage());
             }
-        }).start();
+        });
 
         // 设置窗口标志
         Window window = getWindow();
@@ -660,11 +673,9 @@ public class MainActivity extends AppCompatActivity
         requestHighRefreshRate();
 
         // 解锁屏幕
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            KeyguardManager keyguardManager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
-            if (keyguardManager != null && keyguardManager.isKeyguardLocked()) {
-                keyguardManager.requestDismissKeyguard(this, null);
-            }
+        KeyguardManager keyguardManager = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        if (keyguardManager != null && keyguardManager.isKeyguardLocked()) {
+            keyguardManager.requestDismissKeyguard(this, null);
         }
 
         FrameLayout rootLayout = new FrameLayout(this);
@@ -749,12 +760,21 @@ public class MainActivity extends AppCompatActivity
         loadingOverlay.postDelayed(this::loadNativeAndContinueStartup, 50);
     }
 
+    private void startDebugHotspotProvisioning() {
+        final Context appContext = getApplicationContext();
+        hotspotProvisionFuture = StartupExecutor.get().submit(() -> {
+            Log.i(TAG, "[网络] 启动热点配置线程");
+            DebugHotspotManager.ensureDebugHotspot(appContext);
+            Log.i(TAG, "[网络] 启动热点配置线程结束");
+        });
+    }
+
     private void loadNativeAndContinueStartup() {
-        if (isFinishing() || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && isDestroyed())) {
+        if (isFinishing() || isDestroyed()) {
             return;
         }
         loadingOverlay.updateProgress(5, "正在加载引擎库...");
-        new Thread(() -> {
+        StartupExecutor.get().submit(() -> {
             boolean loaded = HSVJEngine.ensureNativeLibraryLoaded();
             runOnUiThread(() -> {
                 nativeLibLoaded = loaded;
@@ -766,11 +786,11 @@ public class MainActivity extends AppCompatActivity
                 }
                 continueStartupAfterNativeLibraryLoaded();
             });
-        }, "NativeLibLoadThread").start();
+        });
     }
 
     private void continueStartupAfterNativeLibraryLoaded() {
-        if (isFinishing() || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && isDestroyed())) {
+        if (isFinishing() || isDestroyed()) {
             return;
         }
         // 创建引擎实例
@@ -782,7 +802,10 @@ public class MainActivity extends AppCompatActivity
         engine.setInitializationListener(new HSVJEngine.InitializationListener() {
             @Override
             public void onProgress(int stage, int step, int progressPercent, String message) {
-                // 进度回调已由 Startup管理器 处理，此处无需重复更新 UI
+                if (loadingOverlay != null && !nativeEngineReady) {
+                    int progress = 30 + Math.max(0, Math.min(100, progressPercent)) * 69 / 100;
+                    loadingOverlay.updateProgress(progress, message);
+                }
             }
 
             @Override
@@ -791,23 +814,30 @@ public class MainActivity extends AppCompatActivity
                 runOnUiThread(() -> {
                     engineInitialized = true;
                     nativeEngineReady = true;
+                    if (bluetoothAudioController != null) {
+                        bluetoothAudioController.setNativeEngineReady(true, "engine_ready");
+                    }
                     engineInitializing = false;
                     if (loadingOverlay != null) {
+                        loadingOverlay.updateProgress(100, "启动完成");
                         fadeOutAndRemoveLoadingOverlay();
                     }
                     startRenderLoop();
                     if (surfaceView != null)
                         surfaceView.requestFocus();
                     getWindow().getDecorView().requestFocus();
-                    new Handler(Looper.getMainLooper()).postDelayed(MainActivity.this::checkAppUpdate, 8000);
-                    Log.i(TAG, "[投屏] C++ 引擎初始化完成，投屏服务默认关闭，等待用户选择苹果或安卓投屏");
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    if (updateCoordinator != null) updateCoordinator.checkForUpdate();
+                }, 8000);
+                    Log.i(TAG, "[投屏] C++ 引擎初始化完成，投屏服务默认关闭，准备应用启动自启配置");
                     WfdSinkClient.stop();
                     if (mirrorManager != null && mirrorManager.isStarted()) {
                         mirrorManager.stop();
                     }
                     projectionServiceBusy = false;
                     HSVJEngine.setMirroringState(false);
-                    scheduleUsbMirrorAutoStartIfEnabled();
+                    loadMirrorControlConfigFromNative();
+                    scheduleConfiguredMirrorAutoStart();
                 });
             }
 
@@ -842,7 +872,7 @@ public class MainActivity extends AppCompatActivity
         // 未启用 MIRROR 图层则不启动 Lymp 服务。
 
         // 初始化App更新管理器
-        initUpdateManager();
+        updateCoordinator = new AppUpdateCoordinator(this);
 
         maybeInitEngine();
     }
@@ -853,16 +883,19 @@ public class MainActivity extends AppCompatActivity
 
     @Override
     public void onStageChanged(String stage, int progress) {
-        if (loadingOverlay != null) {
-            loadingOverlay.updateProgress(progress, stage);
-        }
+        updateResourcePreparationProgress(progress, stage);
     }
 
     @Override
     public void onProgress(String message, int progress) {
-        if (loadingOverlay != null) {
-            loadingOverlay.updateProgress(progress, message);
-        }
+        updateResourcePreparationProgress(progress, message);
+    }
+
+    private void updateResourcePreparationProgress(int progress, String message) {
+        if (loadingOverlay == null || engineInitializing || nativeEngineReady) return;
+        int displayedProgress = Math.max(0, Math.min(100, progress)) * 30 / 100;
+        loadingOverlay.updateProgress(displayedProgress,
+                progress >= 100 ? "资源准备完成，正在启动引擎..." : message);
     }
 
     @Override
@@ -907,8 +940,7 @@ public class MainActivity extends AppCompatActivity
             surfaceReady = true;
             pendingSurfaceHolder = holder;
             surfaceGeneration++;
-            setSurfaceFrameRateIfSupported(holder.getSurface(),
-                    surfaceFrameRateForIntervalIdx(frameIntervalIdx),
+            setSurfaceFrameRateIfSupported(holder.getSurface(), targetRenderFps,
                     "surfaceChanged");
         }
 
@@ -921,16 +953,6 @@ public class MainActivity extends AppCompatActivity
         if (!nativeEngineReady && surfaceReady) {
             maybeInitEngine();
         }
-    }
-
-    private float surfaceFrameRateForIntervalIdx(int idx) {
-        if (idx == 1 && activeDisplayRefreshRate > 20.0f &&
-                activeDisplayRefreshRate <= 35.0f) {
-            return activeDisplayRefreshRate;
-        }
-        if (idx <= 0) return 30.0f;
-        if (idx >= 2) return 25.0f;
-        return 30.0f;
     }
 
     private void setSurfaceFrameRateIfSupported(Surface surface, float fps, String reason) {
@@ -1039,11 +1061,11 @@ public class MainActivity extends AppCompatActivity
         final long initStartTime = System.currentTimeMillis();
         engineInitializing = true;
 
-        new Thread(() -> {
+        engineInitFuture = StartupExecutor.get().submit(() -> {
             try {
                 boolean lowMemoryMode = memoryMonitor.checkMemoryStatus();
                 long availMemMB = memoryMonitor.getAvailableMemoryMB();
-                Log.i(TAG, String.format("[内存检查] 可用内存: %dMB, 低内存模式: %b",
+                Log.i(TAG, String.format(Locale.ROOT, "[内存检查] 可用内存: %dMB, 低内存模式: %b",
                         availMemMB, lowMemoryMode));
 
                 String[] deviceInfo = getDeviceInfoForReport();
@@ -1054,31 +1076,7 @@ public class MainActivity extends AppCompatActivity
                 String rootPath = PathConfig.getRootPath(getApplicationContext());
 
                 try {
-                    EmbeddedResourceManager embeddedResourceManager = new EmbeddedResourceManager(getApplicationContext(), false);
-                    ResourceClassifier resourceClassifier = new ResourceClassifier(getApplicationContext());
-                    IncrementalUpdater incrementalUpdater = new IncrementalUpdater(getApplicationContext(), rootPath);
-
-                    boolean needsResourceSync = incrementalUpdater.needsIncrementalUpdate();
-                    boolean criticalReady = embeddedResourceManager.areCriticalResourcesExtracted(rootPath);
-
-                    if (needsResourceSync || !criticalReady) {
-                        Log.i(TAG, String.format("[资源同步] %s，开始同步到: %s",
-                                needsResourceSync ? "检测到首次安装或 APK 资源变更" : "关键资源缺失，强制补齐",
-                                rootPath));
-                        embeddedResourceManager.extractCriticalResources(rootPath);
-                        if (needsResourceSync) {
-                            resourceClassifier.scanAndClassifyResources();
-                            IncrementalUpdater.UpdateResult updateResult = incrementalUpdater.performIncrementalUpdate(resourceClassifier);
-                            Log.i(TAG, String.format("[资源同步] 增量同步完成 success=%b added=%d updated=%d deleted=%d failed=%d cost=%dms",
-                                    updateResult.success, updateResult.addedFiles, updateResult.updatedFiles,
-                                    updateResult.deletedFiles, updateResult.failedFiles, updateResult.totalTime));
-                        }
-                        if (!embeddedResourceManager.areCriticalResourcesExtracted(rootPath)) {
-                            throw new IllegalStateException("关键资源缺失: " + rootPath);
-                        }
-                    } else {
-                        Log.i(TAG, "[资源同步] 资源清单未变化且关键资源完整，跳过同步");
-                    }
+                    EmbeddedResourceManager.prepareForEngine(getApplicationContext(), rootPath);
                 } catch (Exception e) {
                     Log.e(TAG, "[资源同步] 资源初始化失败，停止启动 Native: " + e.getMessage(), e);
                     runOnUiThread(() -> {
@@ -1096,6 +1094,7 @@ public class MainActivity extends AppCompatActivity
                     Thread.sleep(500);
                 }
 
+                PlatformControlGateway.prepareOnboardSerialAccess();
                 boolean result = engine.initialize(
                         holder.getSurface(), getAssets(), appDataDir, rootPath, lowMemoryMode,
                         BuildConfig.VERSION_NAME);
@@ -1133,7 +1132,7 @@ public class MainActivity extends AppCompatActivity
                 Log.e(TAG, "Throwable during engine initialization: " + t.getMessage(), t);
                 runOnUiThread(() -> engineInitializing = false);
             }
-        }, "EngineInitThread").start();
+        });
     }
 
     // ----------------------------------------------------------------
@@ -1144,16 +1143,31 @@ public class MainActivity extends AppCompatActivity
     protected void onResume() {
         super.onResume();
 
+        if (drmIdleHomeMode) {
+            if (returnToDrmAfterSettings) {
+                returnToDrmAfterSettings = false;
+                settingsSwitchFuture = StartupExecutor.get().submit(() ->
+                        OutputBackendController.requestDrmKms("tv_settings_closed"));
+            }
+            return;
+        }
+
         // 重新应用全屏设置（防止系统UI重新出现）
         hideSystemUI();
 
         if (engine != null && nativeEngineReady) {
             startRenderLoop();
         }
+        if (bluetoothAudioController != null) {
+            bluetoothAudioController.start("activity_resume");
+        }
     }
 
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
+        if (isBluetoothAudioInteractionLocked()) {
+            return true;
+        }
         if (handleMouseClickForSettings(event)) {
             return true;
         }
@@ -1162,35 +1176,109 @@ public class MainActivity extends AppCompatActivity
 
     @Override
     public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        if (isBluetoothAudioInteractionLocked()) {
+            return true;
+        }
+        if (isSecondaryMouseEvent(event)) {
+            resetMouseButtonTracking();
+            Log.d(TAG, "Ignore secondary mouse button on playback surface");
+            return true;
+        }
         if (handleMouseClickForSettings(event)) {
             return true;
         }
         return super.dispatchGenericMotionEvent(event);
     }
 
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (isBluetoothAudioInteractionLocked()) {
+            return true;
+        }
+        if (event != null
+                && event.getKeyCode() == KeyEvent.KEYCODE_BACK
+                && isMouseLikeKeyEvent(event)) {
+            Log.d(TAG, "播放画面已忽略鼠标右键返回事件");
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    private boolean isBluetoothAudioInteractionLocked() {
+        return bluetoothAudioController != null && bluetoothAudioController.isActive();
+    }
+
     private boolean handleMouseClickForSettings(MotionEvent event) {
         if (!isMouseLikeSettingsEvent(event)) {
-            mouseDownMayOpenSettings = false;
+            resetMouseButtonTracking();
             return false;
         }
 
         int action = event.getActionMasked();
         if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_BUTTON_PRESS) {
-            mouseDownMayOpenSettings = true;
-            return true;
+            if (isMouseButtonEvent(event, MotionEvent.BUTTON_SECONDARY)) {
+                primaryMouseDownMayOpenSettings = false;
+                secondaryMouseDownConsumed = true;
+                return true;
+            }
+            if (isMouseButtonEvent(event, MotionEvent.BUTTON_PRIMARY)) {
+                secondaryMouseDownConsumed = false;
+                primaryMouseDownMayOpenSettings = true;
+                return true;
+            }
+            return false;
         }
 
-        if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_BUTTON_RELEASE)
-                && mouseDownMayOpenSettings) {
-            mouseDownMayOpenSettings = false;
-            recordSettingsMouseClick();
-            return true;
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_BUTTON_RELEASE) {
+            if (secondaryMouseDownConsumed
+                    || isMouseButtonEvent(event, MotionEvent.BUTTON_SECONDARY)) {
+                if (action == MotionEvent.ACTION_UP) {
+                    secondaryMouseDownConsumed = false;
+                }
+                primaryMouseDownMayOpenSettings = false;
+                return true;
+            }
+            if (primaryMouseDownMayOpenSettings) {
+                primaryMouseDownMayOpenSettings = false;
+                recordSettingsMouseClick();
+                return true;
+            }
+            return false;
         }
 
         if (action == MotionEvent.ACTION_CANCEL) {
-            mouseDownMayOpenSettings = false;
+            resetMouseButtonTracking();
         }
         return false;
+    }
+
+    private boolean isMouseButtonEvent(MotionEvent event, int button) {
+        return event.getActionButton() == button || (event.getButtonState() & button) != 0;
+    }
+
+    private boolean isSecondaryMouseEvent(MotionEvent event) {
+        return event != null
+                && isMouseLikeSettingsEvent(event)
+                && isMouseButtonEvent(event, MotionEvent.BUTTON_SECONDARY);
+    }
+
+    private void resetMouseButtonTracking() {
+        primaryMouseDownMayOpenSettings = false;
+        secondaryMouseDownConsumed = false;
+    }
+
+    private boolean isMouseLikeKeyEvent(KeyEvent event) {
+        if (isMouseLikeInputSource(event.getSource())) {
+            return true;
+        }
+        InputDevice device = event.getDevice();
+        return device != null && isMouseLikeInputSource(device.getSources());
+    }
+
+    private boolean isMouseLikeInputSource(int source) {
+        return (source & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
+                || (source & InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD
+                || (source & InputDevice.SOURCE_TRACKBALL) == InputDevice.SOURCE_TRACKBALL;
     }
 
     private boolean isMouseLikeSettingsEvent(MotionEvent event) {
@@ -1231,18 +1319,47 @@ public class MainActivity extends AppCompatActivity
         }
         lastSettingsLaunchMs = nowMs;
 
+        if (!drmIdleHomeMode) {
+            launchTvSettings();
+            return;
+        }
+
+        settingsSwitchFuture = StartupExecutor.get().submit(() -> {
+            if (!OutputBackendController.requestSurface("tv_settings_open")) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "无法切换到系统设置显示模式", Toast.LENGTH_SHORT).show());
+                return;
+            }
+            if (!OutputBackendController.waitForSurfaceStack(15_000L)) {
+                Log.e(TAG, "Surface display stack did not recover for TV Settings");
+                runOnUiThread(() -> Toast.makeText(this,
+                        "系统设置显示服务启动失败", Toast.LENGTH_SHORT).show());
+                return;
+            }
+            runOnUiThread(() -> {
+                if (launchTvSettings()) {
+                    returnToDrmAfterSettings = true;
+                }
+            });
+        });
+    }
+
+    private boolean launchTvSettings() {
         try {
             Intent intent = new Intent(Settings.ACTION_SETTINGS);
+            intent.setClassName("com.android.tv.settings", "com.android.tv.settings.MainSettings");
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             startActivity(intent);
-            Log.i(TAG, "鼠标左键连续点击 5 次，打开系统设置");
-        } catch (ActivityNotFoundException e) {
-            Log.e(TAG, "无法打开系统设置: " + e.getMessage(), e);
+            Log.i(TAG, "Opened TV Settings");
+            return true;
+        } catch (ActivityNotFoundException error) {
+            Log.e(TAG, "TV Settings activity not found", error);
             Toast.makeText(this, "无法打开系统设置", Toast.LENGTH_SHORT).show();
-        } catch (Exception e) {
-            Log.e(TAG, "打开系统设置失败: " + e.getMessage(), e);
+        } catch (Exception error) {
+            Log.e(TAG, "Failed to open TV Settings", error);
             Toast.makeText(this, "打开系统设置失败", Toast.LENGTH_SHORT).show();
         }
+        return false;
     }
 
     @Override
@@ -1304,10 +1421,6 @@ public class MainActivity extends AppCompatActivity
                 return;
             }
             activeDisplayRefreshRate = resolveActiveDisplayRefreshRate(display);
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-                getWindow().getAttributes().preferredRefreshRate = activeDisplayRefreshRate;
-                return;
-            }
             Display.Mode[] modes = display.getSupportedModes();
             Display.Mode bestMode = null;
             for (Display.Mode mode : modes) {
@@ -1339,7 +1452,19 @@ public class MainActivity extends AppCompatActivity
     }
 
     private float resolveActiveDisplayRefreshRate(Display display) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && display != null) {
+        // Rockchip HWC may expose a fixed 1080p60 logical display even when the
+        // physical HDMI connector is running at 4K30. Prefer the connector mode
+        // so render pacing follows the real scanout clock instead of the logical one.
+        float hdmiRefresh = parseRefreshRateFromModeProperty(
+                getSystemProperty("persist.vendor.resolution.HDMI-A-0", ""));
+        if (!(hdmiRefresh > 1.0f)) {
+            hdmiRefresh = parseRefreshRateFromModeProperty(
+                    getSystemProperty("persist.vendor.resolution.HDMI-A-1", ""));
+        }
+        if (hdmiRefresh > 1.0f) {
+            return hdmiRefresh;
+        }
+        if (display != null) {
             try {
                 Display.Mode mode = display.getMode();
                 if (mode != null && mode.getRefreshRate() > 1.0f) {
@@ -1351,30 +1476,26 @@ public class MainActivity extends AppCompatActivity
         if (display != null && display.getRefreshRate() > 1.0f) {
             return display.getRefreshRate();
         }
-        float hdmiRefresh = parseRefreshRateFromModeProperty(
-                getSystemProperty("persist.vendor.resolution.HDMI-A-1", ""));
-        if (hdmiRefresh > 20.0f && hdmiRefresh <= 35.0f) {
-            return hdmiRefresh;
-        }
         return 30.0f;
     }
 
     private Point chooseSurfaceBufferSize(Point windowSize) {
-        String configuredQuality = readRenderQualityFromSavedConfig();
-        String defaultSurfaceSize = surfaceSizeForRenderQuality(configuredQuality);
         String override = getSystemProperty("debug.hsvj.surface_size", "").trim();
+        String sizeSource = "debug.hsvj.surface_size=" + override;
         if (override.isEmpty()) {
-            override = defaultSurfaceSize;
+            String renderQuality = readRenderQualityFromSavedConfig();
+            override = surfaceSizeForRenderQuality(renderQuality);
+            sizeSource = "renderQuality=" + renderQuality;
         }
         Point framebufferSize = getFramebufferBackedSurfaceSize(windowSize);
         Point modeSize = getActiveDisplayModeSize();
         Point explicitSize = parseSizeProperty(override);
         if (explicitSize.x > 0 && explicitSize.y > 0) {
             Point safeSize = coerceSurfaceSizeToDisplay(
-                    explicitSize, windowSize, framebufferSize, modeSize,
-                    "debug.hsvj.surface_size=" + override);
+                    explicitSize, windowSize, framebufferSize, modeSize, sizeSource);
             if (safeSize.x == explicitSize.x && safeSize.y == explicitSize.y) {
-                Log.i(TAG, "Surface size override from debug.hsvj.surface_size=" + override);
+                Log.i(TAG, "Surface size " + explicitSize.x + "x" + explicitSize.y
+                        + " selected from " + sizeSource);
             }
             return safeSize;
         }
@@ -1402,16 +1523,20 @@ public class MainActivity extends AppCompatActivity
             return safeSize;
         }
 
-        if (framebufferSize.x > 0 && framebufferSize.y > 0) {
-            Log.i(TAG, "Surface size uses framebuffer size: " + framebufferSize.x + "x"
-                    + framebufferSize.y + " (window=" + windowSize.x + "x" + windowSize.y + ")");
-            return framebufferSize;
-        }
-
         if (modeSize.x > 0 && modeSize.y > 0) {
             Log.i(TAG, "Surface size uses active display mode: " + modeSize.x + "x"
                     + modeSize.y + " (window=" + windowSize.x + "x" + windowSize.y + ")");
             return modeSize;
+        }
+
+        // fb0/virtual_size describes allocation/virtual-pan capacity on this
+        // platform, not necessarily the CRTC scanout mode. Use it only when the
+        // Android Display.Mode API is unavailable.
+        if (framebufferSize.x > 0 && framebufferSize.y > 0) {
+            Log.w(TAG, "Display mode unavailable; Surface size falls back to framebuffer capacity: "
+                    + framebufferSize.x + "x" + framebufferSize.y
+                    + " (window=" + windowSize.x + "x" + windowSize.y + ")");
+            return framebufferSize;
         }
 
         Log.i(TAG, "Surface size falls back to window bounds: "
@@ -1431,9 +1556,11 @@ public class MainActivity extends AppCompatActivity
                 data = new byte[(int) configFile.length()];
                 int read = 0;
                 while (read < data.length) {
-                    int n = fis.read(data, read, data.length - read);
-                    if (n < 0) break;
-                    read += n;
+                    int count = fis.read(data, read, data.length - read);
+                    if (count < 0) {
+                        break;
+                    }
+                    read += count;
                 }
             }
             String text = new String(data, StandardCharsets.UTF_8).trim();
@@ -1441,9 +1568,11 @@ public class MainActivity extends AppCompatActivity
                 return RENDER_QUALITY_NORMAL;
             }
             JSONObject json = new JSONObject(text);
-            return normalizeRenderQuality(json.optString("renderQuality", RENDER_QUALITY_NORMAL));
-        } catch (Throwable t) {
-            Log.w(TAG, "[渲染质量] 读取配置失败，使用正常档: " + t.getMessage());
+            return normalizeRenderQuality(
+                    json.optString("renderQuality", RENDER_QUALITY_NORMAL));
+        } catch (Throwable error) {
+            Log.w(TAG, "[RenderQuality] Failed to read saved config; using normal: "
+                    + error.getMessage());
             return RENDER_QUALITY_NORMAL;
         }
     }
@@ -1473,9 +1602,12 @@ public class MainActivity extends AppCompatActivity
 
     private Point coerceSurfaceSizeToDisplay(Point requested, Point windowSize,
             Point framebufferSize, Point modeSize, String source) {
-        Point displayBound = framebufferSize.x > 0 && framebufferSize.y > 0
-                ? framebufferSize
-                : (modeSize.x > 0 && modeSize.y > 0 ? modeSize : windowSize);
+        // Display.Mode is the physical scanout contract. fb0/virtual_size can
+        // be larger (for example 3840x2160 while CRTC is 1920x1080) and must not
+        // authorize supersampling by itself.
+        Point displayBound = modeSize.x > 0 && modeSize.y > 0
+                ? modeSize
+                : (windowSize.x > 0 && windowSize.y > 0 ? windowSize : framebufferSize);
         if (requested.x <= 0 || requested.y <= 0 ||
                 displayBound.x <= 0 || displayBound.y <= 0) {
             return requested;
@@ -1484,19 +1616,31 @@ public class MainActivity extends AppCompatActivity
         long displayPixels = (long) displayBound.x * (long) displayBound.y;
         if (requested.x > displayBound.x || requested.y > displayBound.y ||
                 requestedPixels > displayPixels * 3L / 2L) {
-            Log.w(TAG, "Surface size " + requested.x + "x" + requested.y
-                    + " from " + source + " exceeds active framebuffer "
+            long extraPercent = displayPixels > 0
+                    ? Math.max(0L, (requestedPixels - displayPixels) * 100L / displayPixels)
+                    : 0L;
+            Log.w(TAG, "Internal render " + requested.x + "x" + requested.y
+                    + " from " + source + " exceeds physical output "
                     + displayBound.x + "x" + displayBound.y
-                    + ", using window " + windowSize.x + "x" + windowSize.y
-                    + " to avoid SurfaceFlinger scaling/backpressure");
-            return new Point(windowSize);
+                    + " (extraPixels=" + extraPercent + "%), clamping to physical output; "
+                    + "framebufferCapacity=" + framebufferSize.x + "x" + framebufferSize.y
+                    + ", window=" + windowSize.x + "x" + windowSize.y);
+            return new Point(displayBound);
         }
+        double scaleX = (double) requested.x / (double) displayBound.x;
+        double scaleY = (double) requested.y / (double) displayBound.y;
+        Log.i(TAG, "Internal render=" + requested.x + "x" + requested.y
+                + ", physical output=" + displayBound.x + "x" + displayBound.y
+                + ", scale=" + String.format(Locale.ROOT, "%.3fx%.3f", scaleX, scaleY)
+                + ", source=" + source
+                + ", framebufferCapacity=" + framebufferSize.x + "x" + framebufferSize.y);
         return requested;
     }
 
     private Point getConfiguredOutputModeSize() {
         String[] keys = {
                 "debug.hsvj.surface_size",
+                "persist.vendor.resolution.HDMI-A-0",
                 "persist.vendor.resolution.HDMI-A-1",
                 "persist.vendor.resolution.main",
                 "persist.sys.resolution.main"
@@ -1575,9 +1719,6 @@ public class MainActivity extends AppCompatActivity
     }
 
     private Point getActiveDisplayModeSize() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-            return new Point(0, 0);
-        }
         try {
             Display display = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
                     ? getDisplay()
@@ -1602,7 +1743,7 @@ public class MainActivity extends AppCompatActivity
         if (value == null) {
             return new Point(0, 0);
         }
-        String normalized = value.trim().toLowerCase()
+        String normalized = value.trim().toLowerCase(Locale.ROOT)
                 .replace('*', 'x')
                 .replace(',', 'x');
         int sep = normalized.indexOf('x');
@@ -1624,7 +1765,7 @@ public class MainActivity extends AppCompatActivity
         if (value == null) {
             return new Point(0, 0);
         }
-        String normalized = value.trim().toLowerCase()
+        String normalized = value.trim().toLowerCase(Locale.ROOT)
                 .replace('*', 'x')
                 .replace(',', 'x');
         int sep = normalized.indexOf('x');
@@ -1654,7 +1795,7 @@ public class MainActivity extends AppCompatActivity
         if (value == null) {
             return 0.0f;
         }
-        String normalized = value.trim().toLowerCase();
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
         int at = normalized.indexOf('@');
         if (at < 0 || at >= normalized.length() - 1) {
             return 0.0f;
@@ -1745,10 +1886,31 @@ public class MainActivity extends AppCompatActivity
 
     @Override
     protected void onDestroy() {
+        Future<?> startupFuture = startupBackgroundFuture;
+        startupBackgroundFuture = null;
+        if (startupFuture != null) startupFuture.cancel(true);
+        Future<?> probeFuture = displayStateProbeFuture;
+        displayStateProbeFuture = null;
+        if (probeFuture != null) probeFuture.cancel(true);
+        Future<?> hotspotFuture = hotspotProvisionFuture;
+        hotspotProvisionFuture = null;
+        if (hotspotFuture != null) hotspotFuture.cancel(true);
+        Future<?> initFuture = engineInitFuture;
+        engineInitFuture = null;
+        if (initFuture != null) initFuture.cancel(true);
+        Future<?> settingsFuture = settingsSwitchFuture;
+        settingsSwitchFuture = null;
+        if (settingsFuture != null) settingsFuture.cancel(true);
+        if (bluetoothAudioController != null) {
+            bluetoothAudioController.stop("activity_destroy");
+            bluetoothAudioController = null;
+        }
         usbMirrorReconnectRequested = false;
         stopHeartbeat();
         stopUsbMirrorAppSceneThread();
         usbMirrorAutoStartHandler.removeCallbacksAndMessages(null);
+        androidWfdStatusPolling = false;
+        syncMirrorTvModeActive(engine != null ? engine.getFirstMirrorLayerId() : -1, false);
 
         if (mirrorManager != null) {
             mirrorManager.stop();
@@ -1806,13 +1968,9 @@ public class MainActivity extends AppCompatActivity
         renderHandler = null;
         renderThread = null;
         startupManager = null;
-
-        // 清理更新相关资源
-        if (downloadProgressDialog != null) {
-            downloadProgressDialog.dismiss();
-            downloadProgressDialog = null;
-            downloadProgressBar = null;
-            downloadProgressText = null;
+        if (updateCoordinator != null) {
+            updateCoordinator.destroy();
+            updateCoordinator = null;
         }
 
         super.onDestroy();
@@ -1858,33 +2016,118 @@ public class MainActivity extends AppCompatActivity
         }
     }
 
-    private boolean isUsbMirrorAutoStartEnabled() {
-        return getUsbMirrorPrefs().getBoolean(USB_MIRROR_AUTO_START_KEY, false);
+    private String normalizeMirrorAutoStartMode(String mode) {
+        if (MIRROR_AUTO_START_USB.equals(mode)
+                || MIRROR_AUTO_START_ANDROID.equals(mode)
+                || MIRROR_AUTO_START_APPLE.equals(mode)) {
+            return mode;
+        }
+        return MIRROR_AUTO_START_NONE;
     }
 
-    private void setUsbMirrorAutoStartEnabled(boolean enabled) {
-        getUsbMirrorPrefs().edit().putBoolean(USB_MIRROR_AUTO_START_KEY, enabled).apply();
+    private synchronized void loadMirrorControlConfigFromNative() {
+        if (engine == null) {
+            return;
+        }
+        try {
+            JSONObject config = new JSONObject(engine.getMirrorControlConfigJson());
+            if (config.optBoolean("configured", false)) {
+                mirrorAutoStartMode = normalizeMirrorAutoStartMode(
+                        config.optString("mode", MIRROR_AUTO_START_NONE));
+                usbMirrorAppSceneEnabled = config.optBoolean("enabled", false);
+                usbMirrorAppSceneName = normalizeSceneName(config.optString("sceneName", ""));
+                removeLegacyMirrorControlPrefs();
+                return;
+            }
+
+            SharedPreferences prefs = getUsbMirrorPrefs();
+            boolean hasLegacyConfig = prefs.contains(LEGACY_MIRROR_AUTO_START_MODE_KEY)
+                    || prefs.contains(LEGACY_USB_MIRROR_AUTO_START_KEY)
+                    || prefs.contains(LEGACY_USB_MIRROR_APP_SCENE_ENABLED_KEY)
+                    || prefs.contains(LEGACY_USB_MIRROR_APP_SCENE_PACKAGE_KEY)
+                    || prefs.contains(LEGACY_USB_MIRROR_APP_SCENE_NAME_KEY);
+            if (!hasLegacyConfig) {
+                return;
+            }
+
+            String migratedMode;
+            if (prefs.contains(LEGACY_MIRROR_AUTO_START_MODE_KEY)) {
+                migratedMode = normalizeMirrorAutoStartMode(prefs.getString(
+                        LEGACY_MIRROR_AUTO_START_MODE_KEY, MIRROR_AUTO_START_NONE));
+            } else {
+                migratedMode = prefs.getBoolean(LEGACY_USB_MIRROR_AUTO_START_KEY, false)
+                        ? MIRROR_AUTO_START_USB
+                        : MIRROR_AUTO_START_NONE;
+            }
+            boolean migratedEnabled = prefs.getBoolean(
+                    LEGACY_USB_MIRROR_APP_SCENE_ENABLED_KEY, false);
+            String migratedSceneName = normalizeSceneName(prefs.getString(
+                    LEGACY_USB_MIRROR_APP_SCENE_NAME_KEY, ""));
+            if (migratedEnabled && (migratedSceneName.isEmpty()
+                    || USB_MIRROR_APP_SCENE_DEFAULT_NAME.equals(migratedSceneName))) {
+                Log.w(TAG, "[投屏] 旧版自动场景配置无效，迁移时关闭自动切换");
+                migratedEnabled = false;
+            }
+
+            if (!engine.saveMirrorControlConfig(
+                    migratedMode, migratedEnabled, migratedSceneName)) {
+                Log.e(TAG, "[投屏] 旧版投屏配置迁移到 " + PathConfig.getRootPath(this) + "config/config.json 失败");
+                return;
+            }
+            mirrorAutoStartMode = migratedMode;
+            usbMirrorAppSceneEnabled = migratedEnabled;
+            usbMirrorAppSceneName = migratedSceneName;
+            removeLegacyMirrorControlPrefs();
+            Log.i(TAG, "[投屏] 已将旧版投屏配置迁移到 " + PathConfig.getRootPath(this) + "config/config.json");
+        } catch (Throwable t) {
+            Log.e(TAG, "[投屏] 从 C++ SystemConfig 加载投屏配置失败", t);
+        }
+    }
+
+    private void removeLegacyMirrorControlPrefs() {
+        SharedPreferences prefs = getUsbMirrorPrefs();
+        if (!prefs.contains(LEGACY_MIRROR_AUTO_START_MODE_KEY)
+                && !prefs.contains(LEGACY_USB_MIRROR_AUTO_START_KEY)
+                && !prefs.contains(LEGACY_USB_MIRROR_APP_SCENE_ENABLED_KEY)
+                && !prefs.contains(LEGACY_USB_MIRROR_APP_SCENE_PACKAGE_KEY)
+                && !prefs.contains(LEGACY_USB_MIRROR_APP_SCENE_NAME_KEY)) {
+            return;
+        }
+        boolean removed = prefs.edit()
+                .remove(LEGACY_MIRROR_AUTO_START_MODE_KEY)
+                .remove(LEGACY_USB_MIRROR_AUTO_START_KEY)
+                .remove(LEGACY_USB_MIRROR_APP_SCENE_ENABLED_KEY)
+                .remove(LEGACY_USB_MIRROR_APP_SCENE_PACKAGE_KEY)
+                .remove(LEGACY_USB_MIRROR_APP_SCENE_NAME_KEY)
+                .commit();
+        if (!removed) {
+            Log.w(TAG, "[投屏] 旧版 SharedPreferences 配置清理失败");
+        }
+    }
+
+    private String getMirrorAutoStartMode() {
+        return mirrorAutoStartMode;
+    }
+
+    private void setMirrorAutoStartMode(String mode) {
+        mirrorAutoStartMode = normalizeMirrorAutoStartMode(mode);
+    }
+
+    private boolean isUsbMirrorAutoStartEnabled() {
+        return MIRROR_AUTO_START_USB.equals(getMirrorAutoStartMode());
     }
 
     private boolean isUsbMirrorAppSceneEnabled() {
-        return getUsbMirrorPrefs().getBoolean(USB_MIRROR_APP_SCENE_ENABLED_KEY, false);
-    }
-
-    private String getUsbMirrorAppScenePackage() {
-        return "";
+        return usbMirrorAppSceneEnabled;
     }
 
     private String getUsbMirrorAppSceneName() {
-        return normalizeSceneName(getUsbMirrorPrefs().getString(
-                USB_MIRROR_APP_SCENE_NAME_KEY, ""));
+        return usbMirrorAppSceneName;
     }
 
     private void setUsbMirrorAppSceneConfig(boolean enabled, String sceneName) {
-        getUsbMirrorPrefs().edit()
-                .putBoolean(USB_MIRROR_APP_SCENE_ENABLED_KEY, enabled)
-                .putString(USB_MIRROR_APP_SCENE_PACKAGE_KEY, "")
-                .putString(USB_MIRROR_APP_SCENE_NAME_KEY, normalizeSceneName(sceneName))
-                .apply();
+        usbMirrorAppSceneEnabled = enabled;
+        usbMirrorAppSceneName = normalizeSceneName(sceneName);
         usbMirrorLastAppSceneMatched = null;
         usbMirrorLastAppSceneRequestedScene = "";
         usbMirrorLastAppSceneSwitchSucceeded = false;
@@ -1905,10 +2148,44 @@ public class MainActivity extends AppCompatActivity
     }
 
     public synchronized String controlMirrorService(String action, int layerId, String payload) {
+        if ("autostart_set".equals(action)) {
+            return updateMirrorAutoStartMode(payload);
+        }
         if ("usb_app_scene_config".equals(action)) {
             return updateUsbMirrorAppSceneConfig(payload, layerId);
         }
         return controlMirrorService(action, layerId);
+    }
+
+    private String updateMirrorAutoStartMode(String payload) {
+        try {
+            JSONObject body = payload == null || payload.trim().isEmpty()
+                    ? new JSONObject()
+                    : new JSONObject(payload);
+            String requestedMode = body.optString("mode", "").trim()
+                    .toLowerCase(Locale.ROOT);
+            String normalizedMode = normalizeMirrorAutoStartMode(requestedMode);
+            if (!requestedMode.equals(normalizedMode)) {
+                return "{\"ok\":false,\"message\":\"自启动类型仅支持 none、usb、android、apple\"}";
+            }
+            setMirrorAutoStartMode(normalizedMode);
+            removeLegacyMirrorControlPrefs();
+            usbMirrorAutoStartHandler.removeCallbacks(mirrorAutoStartRunnable);
+            if (!MIRROR_AUTO_START_USB.equals(normalizedMode)) {
+                cancelUsbMirrorAutoStartAttempts();
+            }
+            scheduleConfiguredMirrorAutoStart();
+            return buildMirrorAutoStartStatusResponse();
+        } catch (Throwable t) {
+            Log.e(TAG, "[投屏] 更新启动自启配置失败", t);
+            String message = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
+            return "{\"ok\":false,\"message\":\"" + jsonEscape(message) + "\"}";
+        }
+    }
+
+    private String buildMirrorAutoStartStatusResponse() {
+        String mode = getMirrorAutoStartMode();
+        return "{\"ok\":true,\"data\":{\"mode\":\"" + mode + "\"}}";
     }
 
     private String updateUsbMirrorAppSceneConfig(String payload, int layerId) {
@@ -1916,10 +2193,8 @@ public class MainActivity extends AppCompatActivity
             JSONObject body = payload == null || payload.trim().isEmpty()
                     ? new JSONObject()
                     : new JSONObject(payload);
-            boolean enabled = body.optBoolean(
-                    "enabled", body.optBoolean("appSceneDetectEnabled", false));
-            String sceneName = normalizeSceneName(body.optString("sceneName",
-                    body.optString("appSceneName", "")));
+            boolean enabled = body.getBoolean("enabled");
+            String sceneName = normalizeSceneName(body.getString("sceneName"));
             if (enabled && sceneName.isEmpty()) {
                 return "{\"ok\":false,\"message\":\"请选择电视投屏对应场景\"}";
             }
@@ -1936,8 +2211,9 @@ public class MainActivity extends AppCompatActivity
                         "app_scene_disabled");
             }
             setUsbMirrorAppSceneConfig(enabled, sceneName);
+            removeLegacyMirrorControlPrefs();
             if (usbMirrorClient != null) {
-                usbMirrorClient.setForegroundAppMonitorEnabled(enabled);
+                usbMirrorClient.setForegroundAppMonitorEnabled(usbMirrorClient.isRunning());
             }
             if (enabled) {
                 startUsbMirrorAppSceneMonitorIfNeeded();
@@ -1975,6 +2251,12 @@ public class MainActivity extends AppCompatActivity
         usbMirrorLastForegroundPackage = safePackage;
         usbMirrorLastForegroundRawFocus = safeRaw;
         usbMirrorLastForegroundLaunchPackage = safeLaunch;
+        int layerId = engine != null ? engine.getFirstMirrorLayerId() : -1;
+        boolean tvModeActive = usbMirrorClient != null
+                && usbMirrorClient.isRunning()
+                && usbMirrorClient.isConnected()
+                && isUsbMirrorTvSceneSample(safePackage, safeLaunch);
+        syncMirrorTvModeActive(layerId, tvModeActive);
         if (changed) {
             Log.i(TAG, "[投屏] USB检测前台APP package=" + usbMirrorLastForegroundPackage
                     + " entryPackage=" + usbMirrorLastForegroundLaunchPackage);
@@ -2120,6 +2402,74 @@ public class MainActivity extends AppCompatActivity
                 USB_MIRROR_APP_SCENE_DEFAULT_NAME, "usb_mirror_stop");
     }
 
+    private void syncMirrorTvModeActive(int layerId, boolean active) {
+        if (layerId <= 0 && engine != null) {
+            layerId = engine.getFirstMirrorLayerId();
+        }
+        if (layerId <= 0 || !nativeLibLoaded) {
+            return;
+        }
+        try {
+            HSVJEngine.setMirrorTvModeActive(layerId, active);
+        } catch (Throwable t) {
+            Log.w(TAG, "[投屏] 同步 SUB-TV 裁剪状态失败 layer=" + layerId
+                    + " active=" + active, t);
+        }
+    }
+
+    private void syncUsbMirrorReadyState(int layerId, boolean started, boolean connected) {
+        if (layerId <= 0 || !nativeLibLoaded) {
+            return;
+        }
+        String deviceName = Build.MODEL;
+        HSVJEngine.setMirrorServiceState(layerId, "USB", started, connected, deviceName, 8888);
+        if (!started || !connected) {
+            syncMirrorTvModeActive(layerId, false);
+        }
+    }
+
+    private void scheduleConfiguredMirrorAutoStart() {
+        usbMirrorAutoStartHandler.removeCallbacks(mirrorAutoStartRunnable);
+        String mode = getMirrorAutoStartMode();
+        pendingMirrorAutoStartMode = mode;
+        if (MIRROR_AUTO_START_USB.equals(mode)) {
+            scheduleUsbMirrorAutoStartIfEnabled();
+            return;
+        }
+        if (MIRROR_AUTO_START_NONE.equals(mode)) {
+            return;
+        }
+        usbMirrorAutoStartHandler.postDelayed(
+                mirrorAutoStartRunnable, MIRROR_AUTO_START_DELAY_MS);
+    }
+
+    private void runConfiguredMirrorAutoStart() {
+        String mode = pendingMirrorAutoStartMode;
+        if (!mode.equals(getMirrorAutoStartMode())
+                || MIRROR_AUTO_START_NONE.equals(mode)
+                || MIRROR_AUTO_START_USB.equals(mode)
+                || isFinishing() || isDestroyed()) {
+            return;
+        }
+        if (!nativeEngineReady || engine == null) {
+            Log.w(TAG, "[投屏] " + mode + " 启动自启跳过：引擎未就绪");
+            return;
+        }
+        int layerId = engine.getFirstMirrorLayerId();
+        if (layerId <= 0) {
+            Log.w(TAG, "[投屏] " + mode + " 启动自启跳过：未启用投屏图层");
+            return;
+        }
+        syncProjectionServiceBusyState();
+        if (isAnyMirrorServiceActuallyRunning()) {
+            Log.i(TAG, "[投屏] " + mode + " 启动自启跳过：已有投屏服务运行");
+            return;
+        }
+        String action = MIRROR_AUTO_START_ANDROID.equals(mode) ? "android_start" : "start";
+        String result = controlMirrorService(action, layerId);
+        Log.i(TAG, "[投屏] " + mode + " 启动自启结果：" + result);
+    }
+
     private boolean shouldMaintainUsbMirrorSession() {
         return usbMirrorReconnectRequested || isUsbMirrorAutoStartEnabled();
     }
@@ -2129,6 +2479,8 @@ public class MainActivity extends AppCompatActivity
             synchronized (MainActivity.this) {
                 projectionServiceBusy = false;
                 HSVJEngine.setMirroringState(false);
+                int mirrorLayerId = engine != null ? engine.getFirstMirrorLayerId() : -1;
+                syncUsbMirrorReadyState(mirrorLayerId, false, false);
                 if (!shouldMaintainUsbMirrorSession()) {
                     Log.i(TAG, "[投屏] USB 镜像意外断开，未请求自动重连");
                     return;
@@ -2145,7 +2497,7 @@ public class MainActivity extends AppCompatActivity
         }
         usbMirrorAutoStartInProgress = true;
         usbMirrorAutoStartAttemptCount = 0;
-        scheduleUsbMirrorAutoStartAttempt(USB_MIRROR_AUTO_START_DELAY_MS);
+        scheduleUsbMirrorAutoStartAttempt(MIRROR_AUTO_START_DELAY_MS);
     }
 
     private void scheduleUsbMirrorAutoStartAttempt(long delayMs) {
@@ -2163,8 +2515,7 @@ public class MainActivity extends AppCompatActivity
         if (!usbMirrorAutoStartInProgress) {
             return;
         }
-        if (isFinishing()
-                || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && isDestroyed())) {
+        if (isFinishing() || isDestroyed()) {
             cancelUsbMirrorAutoStartAttempts();
             return;
         }
@@ -2226,15 +2577,12 @@ public class MainActivity extends AppCompatActivity
             if (engine != null) {
                 configuredMirrorLayerId = engine.getFirstMirrorLayerId();
             }
+            if ("autostart_status".equals(action)) {
+                return buildMirrorAutoStartStatusResponse();
+            }
             if (action != null && action.startsWith("usb_")) {
                 String usbAction = action.substring("usb_".length());
-                if ("autostart_on".equals(usbAction)) {
-                    setUsbMirrorAutoStartEnabled(true);
-                    scheduleUsbMirrorAutoStartIfEnabled();
-                } else if ("autostart_off".equals(usbAction)) {
-                    setUsbMirrorAutoStartEnabled(false);
-                    cancelUsbMirrorAutoStartAttempts();
-                } else if ("start".equals(usbAction)) {
+                if ("start".equals(usbAction)) {
                     boolean usbAlreadyStarted = usbMirrorClient != null && usbMirrorClient.isRunning();
                     if (!usbAlreadyStarted && isMirrorServiceActive()) {
                         return buildMirrorBusyResponse("usb");
@@ -2257,19 +2605,22 @@ public class MainActivity extends AppCompatActivity
                             onUsbMirrorForegroundAppChanged(packageName, rawFocusLine, launchPackage);
                         }
                     });
-                    usbMirrorClient.setForegroundAppMonitorEnabled(isUsbMirrorAppSceneEnabled());
+                    usbMirrorClient.setForegroundAppMonitorEnabled(true);
+                    syncMirrorTvModeActive(layerId, false);
                     startUsbMirrorAppSceneMonitorIfNeeded();
                     if (!usbAlreadyStarted && !usbMirrorClient.start(
                             preferredSize[0], preferredSize[1])) {
                         stopUsbMirrorAppSceneMonitor();
                         projectionServiceBusy = false;
                         HSVJEngine.setMirroringState(false);
+                        syncUsbMirrorReadyState(layerId, false, false);
                         return "{\"ok\":false,\"message\":\""
                                 + jsonEscape(usbMirrorClient.getLastMessage()) + "\"}";
                     }
                     projectionServiceBusy = true;
                     HSVJEngine.setMirroringState(true);
                 } else if ("stop".equals(usbAction)) {
+                    syncMirrorTvModeActive(layerId > 0 ? layerId : configuredMirrorLayerId, false);
                     usbMirrorReconnectRequested = false;
                     cancelUsbMirrorAutoStartAttempts();
                     resetUsbMirrorAppSceneToDefaultIfNeeded();
@@ -2291,6 +2642,7 @@ public class MainActivity extends AppCompatActivity
                     if (configuredMirrorLayerId <= 0) {
                         return "{\"ok\":false,\"message\":\"未启用投屏图层\"}";
                     }
+                    syncMirrorTvModeActive(configuredMirrorLayerId, false);
                     if (!WfdSinkClient.isNativeAvailable()) {
                         projectionServiceBusy = false;
                         HSVJEngine.setMirroringState(false);
@@ -2311,6 +2663,7 @@ public class MainActivity extends AppCompatActivity
                         HSVJEngine.setMirroringState(false);
                         return "{\"ok\":false,\"message\":\"投屏图层 Surface 创建失败\"}";
                     }
+                    WfdSinkClient.setDeviceName(Build.MODEL);
                     mirrorManager.startAndroidSurfaceSink();
                     if (!WfdSinkClient.startWithSurface(mirrorSurface)) {
                         mirrorManager.stop();
@@ -2320,7 +2673,10 @@ public class MainActivity extends AppCompatActivity
                     }
                     projectionServiceBusy = true;
                     HSVJEngine.setMirroringState(true);
+                    startAndroidWfdStatusPolling();
                 } else if ("stop".equals(androidAction)) {
+                    stopAndroidWfdStatusPolling();
+                    syncMirrorTvModeActive(configuredMirrorLayerId, false);
                     WfdSinkClient.stop();
                     if (mirrorManager != null) {
                         mirrorManager.stop();
@@ -2329,6 +2685,9 @@ public class MainActivity extends AppCompatActivity
                     HSVJEngine.setMirroringState(false);
                 }
                 WfdSinkClient.Status status = WfdSinkClient.getStatus();
+                if (mirrorManager != null) {
+                    mirrorManager.syncAndroidReadyState(status.serviceStarted, status.connected);
+                }
                 return "{\"ok\":true,\"data\":{\"mode\":\"android\""
                         + ",\"exclusiveMode\":true"
                         + ",\"serviceStarted\":" + status.serviceStarted
@@ -2341,22 +2700,26 @@ public class MainActivity extends AppCompatActivity
                         + ",\"message\":\"" + status.message.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}}";
             }
             if ("stop".equals(action)) {
+                syncMirrorTvModeActive(layerId > 0 ? layerId : configuredMirrorLayerId, false);
                 cancelUsbMirrorAutoStartAttempts();
                 resetUsbMirrorAppSceneToDefaultIfNeeded();
                 stopUsbMirrorAppSceneMonitor();
                 if (usbMirrorClient != null) {
                     usbMirrorClient.stop();
                 }
+                stopAndroidWfdStatusPolling();
                 WfdSinkClient.stop();
                 if (mirrorManager != null) {
                     mirrorManager.stop();
                 }
                 projectionServiceBusy = false;
                 HSVJEngine.setMirroringState(false);
+                syncUsbMirrorReadyState(
+                        layerId > 0 ? layerId : configuredMirrorLayerId, false, false);
                 boolean started = mirrorManager != null && mirrorManager.isAppleServerStarted();
                 boolean connected = mirrorManager != null && mirrorManager.isConnected();
                 int pin = mirrorManager != null ? mirrorManager.getPinCode() : 8888;
-                String name = mirrorManager != null ? mirrorManager.getDeviceName() : ("HSVJ-Mirror-" + Build.MODEL);
+                String name = mirrorManager != null ? mirrorManager.getDeviceName() : Build.MODEL;
                 long ip = mirrorManager != null ? mirrorManager.getConnectedIp() : 0;
                 return "{\"ok\":true,\"data\":{\"layerId\":" + layerId
                         + ",\"started\":" + started
@@ -2378,11 +2741,12 @@ public class MainActivity extends AppCompatActivity
                 if (isMirrorServiceActive()) {
                     return buildMirrorBusyResponse("apple");
                 }
+                syncMirrorTvModeActive(layerId, false);
                 if (mirrorManager == null) {
                     mirrorManager = new MirrorManager(this, layerId);
                 }
                 if (!mirrorManager.isAppleServerStarted()) {
-                    mirrorManager.start("HSVJ-Mirror-" + Build.MODEL, 8888);
+                    mirrorManager.start(Build.MODEL, 8888);
                 }
                 projectionServiceBusy = true;
             } else if ("reset_pin".equals(action)) {
@@ -2397,7 +2761,7 @@ public class MainActivity extends AppCompatActivity
             boolean started = mirrorManager != null && mirrorManager.isAppleServerStarted();
             boolean connected = mirrorManager != null && mirrorManager.isConnected();
             int pin = mirrorManager != null ? mirrorManager.getPinCode() : 8888;
-            String name = mirrorManager != null ? mirrorManager.getDeviceName() : ("HSVJ-Mirror-" + Build.MODEL);
+            String name = mirrorManager != null ? mirrorManager.getDeviceName() : Build.MODEL;
             long ip = mirrorManager != null ? mirrorManager.getConnectedIp() : 0;
             return "{\"ok\":true,\"data\":{\"layerId\":" + layerId
                     + ",\"started\":" + started
@@ -2418,7 +2782,10 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void syncProjectionServiceBusyState() {
-        boolean active = isAnyMirrorServiceActuallyRunning();
+        applyProjectionServiceBusyState(isAnyMirrorServiceActuallyRunning());
+    }
+
+    private void applyProjectionServiceBusyState(boolean active) {
         if (projectionServiceBusy == active) {
             return;
         }
@@ -2442,6 +2809,39 @@ public class MainActivity extends AppCompatActivity
             Log.w(TAG, "[投屏] 获取安卓投屏状态失败", t);
         }
         return appleStarted || androidStarted || usbStarted;
+    }
+
+    private WfdSinkClient.Status readAndroidWfdStatus() {
+        try {
+            return WfdSinkClient.getStatus();
+        } catch (Throwable t) {
+            Log.w(TAG, "[投屏] 获取安卓投屏状态失败", t);
+            return null;
+        }
+    }
+
+    private void syncAndroidWfdState(WfdSinkClient.Status status) {
+        if (status == null) {
+            return;
+        }
+        if (mirrorManager != null) {
+            mirrorManager.syncAndroidReadyState(status.serviceStarted, status.connected);
+        }
+        boolean appleStarted = mirrorManager != null && mirrorManager.isAppleServerStarted();
+        boolean usbStarted = usbMirrorClient != null && usbMirrorClient.isRunning();
+        applyProjectionServiceBusyState(appleStarted || status.serviceStarted || usbStarted);
+    }
+
+    private void startAndroidWfdStatusPolling() {
+        androidWfdStatusPolling = true;
+        usbMirrorAutoStartHandler.removeCallbacks(androidWfdStatusPollRunnable);
+        usbMirrorAutoStartHandler.postDelayed(androidWfdStatusPollRunnable,
+                ANDROID_WFD_STATUS_POLL_INTERVAL_MS);
+    }
+
+    private void stopAndroidWfdStatusPolling() {
+        androidWfdStatusPolling = false;
+        usbMirrorAutoStartHandler.removeCallbacks(androidWfdStatusPollRunnable);
     }
 
     private String buildMirrorBusyResponse(String requestedMode) {
@@ -2478,8 +2878,8 @@ public class MainActivity extends AppCompatActivity
         syncProjectionServiceBusyState();
         boolean started = usbMirrorClient != null && usbMirrorClient.isRunning();
         boolean connected = usbMirrorClient != null && usbMirrorClient.isConnected();
+        syncUsbMirrorReadyState(layerId, started, connected);
         boolean awaitingAuthorization = usbMirrorClient != null && usbMirrorClient.isAwaitingAuthorization();
-        boolean autoStart = isUsbMirrorAutoStartEnabled();
         String name = usbMirrorClient != null ? usbMirrorClient.getDeviceName() : "";
         String message = usbMirrorClient != null ? usbMirrorClient.getLastMessage() : "idle";
         int width = usbMirrorClient != null ? usbMirrorClient.getVideoWidth() : 0;
@@ -2504,12 +2904,10 @@ public class MainActivity extends AppCompatActivity
         }
         foregroundPackage = foregroundPackage != null ? foregroundPackage.trim() : "";
         foregroundLaunchPackage = foregroundLaunchPackage != null ? foregroundLaunchPackage.trim() : "";
+        recordUsbMirrorForeground(foregroundPackage, foregroundRawFocus, foregroundLaunchPackage);
         boolean appSceneEnabled = isUsbMirrorAppSceneEnabled();
-        String appScenePackage = getUsbMirrorAppScenePackage();
         String appSceneName = getUsbMirrorAppSceneName();
         boolean appSceneMatched = Boolean.TRUE.equals(usbMirrorLastAppSceneMatched);
-        boolean appScenePackageRunning = appSceneEnabled
-                && isUsbMirrorTvSceneSample(foregroundPackage, foregroundLaunchPackage);
         String suggestedAppPackage = !foregroundLaunchPackage.isEmpty()
                 ? foregroundLaunchPackage
                 : foregroundPackage;
@@ -2519,13 +2917,10 @@ public class MainActivity extends AppCompatActivity
                 + ",\"started\":" + started
                 + ",\"connected\":" + connected
                 + ",\"awaitingAuthorization\":" + awaitingAuthorization
-                + ",\"autoStart\":" + autoStart
                 + ",\"appSceneDetectEnabled\":" + appSceneEnabled
-                + ",\"appScenePackage\":\"" + jsonEscape(appScenePackage) + "\""
                 + ",\"appSceneName\":\"" + jsonEscape(appSceneName) + "\""
                 + ",\"appSceneDefaultName\":\"" + jsonEscape(USB_MIRROR_APP_SCENE_DEFAULT_NAME) + "\""
                 + ",\"appSceneMatched\":" + appSceneMatched
-                + ",\"appScenePackageRunning\":" + appScenePackageRunning
                 + ",\"appSceneMatchSource\":\"" + jsonEscape(usbMirrorLastAppSceneMatchSource) + "\""
                 + ",\"appSceneRequestedScene\":\"" + jsonEscape(usbMirrorLastAppSceneRequestedScene) + "\""
                 + ",\"appSceneSwitchSucceeded\":" + usbMirrorLastAppSceneSwitchSucceeded
@@ -2603,57 +2998,32 @@ public class MainActivity extends AppCompatActivity
         String model = Build.MODEL != null ? Build.MODEL : "";
         String mac = "";
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                serial = Build.getSerial();
-            } else {
-                serial = Build.SERIAL;
-            }
+            serial = Build.getSerial();
         } catch (Throwable t) {
             serial = "";
         }
         try {
-            String[] preferredNames = {"eth0", "wlan0", "eth1", "wlan1"};
-            for (String preferred : preferredNames) {
-                NetworkInterface ni = NetworkInterface.getByName(preferred);
-                if (ni != null && !ni.isLoopback() && ni.isUp()) {
-                    byte[] addr = ni.getHardwareAddress();
-                    if (addr != null && addr.length == 6) {
-                        StringBuilder sb = new StringBuilder(18);
-                        for (int i = 0; i < addr.length; i++) {
-                            if (i > 0)
-                                sb.append(':');
-                            sb.append(String.format("%02x", addr[i]));
-                        }
-                        mac = sb.toString();
-                        break;
-                    }
-                }
-            }
-            if (mac.isEmpty()) {
-                for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                    if (ni.isLoopback() || !ni.isUp())
-                        continue;
-                    String name = ni.getName();
-                    if (name != null && name.startsWith("dummy"))
-                        continue;
-                    byte[] addr = ni.getHardwareAddress();
-                    if (addr == null || addr.length != 6)
-                        continue;
+            // The built-in Ethernet MAC is the terminal identity even when its
+            // link is down. Never substitute a Wi-Fi, hotspot or virtual NIC.
+            NetworkInterface ni = NetworkInterface.getByName("eth0");
+            if (ni != null && !ni.isLoopback()) {
+                byte[] addr = ni.getHardwareAddress();
+                if (addr != null && addr.length == 6 && (addr[0] & 1) == 0) {
                     StringBuilder sb = new StringBuilder(18);
                     for (int i = 0; i < addr.length; i++) {
                         if (i > 0)
                             sb.append(':');
-                        sb.append(String.format("%02x", addr[i]));
+                        sb.append(String.format(Locale.ROOT, "%02x", addr[i] & 0xff));
                     }
                     mac = sb.toString();
-                    break;
+                    if (mac.equals("00:00:00:00:00:00") || mac.equals("02:00:00:00:00:00")) {
+                        mac = "";
+                    }
                 }
             }
         } catch (Throwable t) {
-            // 忽略
+            // Native code retries reading eth0 after the interface appears.
         }
-        if (mac.isEmpty())
-            mac = "-";
         return new String[] { serial != null ? serial : "", model, mac };
     }
 
@@ -2667,6 +3037,19 @@ public class MainActivity extends AppCompatActivity
             isRunning = true;
             lastFrameTime = 0;
             nextRenderTargetNs = 0;
+            hasSuccessfulPresentCounter = false;
+            lastSuccessfulPresentCount = 0;
+            lastSuccessfulPresentNs = 0;
+            hasSwapchainNoImageCounter = false;
+            lastSwapchainNoImageSkipCount = 0;
+            displayBackpressureActive = false;
+            displayBackpressureSlowFrames = 0;
+            displayBackpressureGoodFrames = 0;
+            displayBackpressureHoldUntilNs = 0;
+            displayBackpressureSinceNs = 0;
+            lastDisplayBackpressureReason = "none";
+            renderStatsWindowStartNs = 0;
+            renderStatsSuccessfulPresents = 0;
             activeRenderLoopMode = chooseRenderLoopMode();
             handler.removeCallbacks(renderRunnable);
             handler.post(() -> {
@@ -2749,227 +3132,187 @@ public class MainActivity extends AppCompatActivity
                 + "nativeEngineReady=" + (nativeEngineReady ? 1 : 0) + "\n"
                 + "renderRunning=" + (isRunning ? 1 : 0) + "\n"
                 + "lastRenderAgeMs=" + lastRenderAgeMs + "\n";
-        content += "frameIntervalMs=" + frameIntervalMs + "\n"
+        content += "targetRenderFps=" + oneDecimal(targetRenderFps) + "\n"
+                + "frameIntervalNs=" + frameIntervalNs + "\n"
+                + "frameIntervalMs=" + frameIntervalMs + "\n"
                 + "displayBackpressure=" + (displayBackpressureActive ? 1 : 0) + "\n"
                 + "nativeFrameMs=" + oneDecimal(lastNativeFrameTotalMs) + "\n"
                 + "nativeCpuMs=" + oneDecimal(lastNativeCpuWorkMs) + "\n"
                 + "nativeBeginFrameMs=" + oneDecimal(lastNativeBeginFrameMs) + "\n"
                 + "nativePresentMs=" + oneDecimal(lastNativePresentMs) + "\n";
+        AtomicFile file = getHeartbeatFile();
+        FileOutputStream output = null;
         try {
-            try (FileOutputStream output = new FileOutputStream(HEARTBEAT_FILE_PATH, false)) {
-                output.write(content.getBytes(StandardCharsets.UTF_8));
-                output.flush();
-            }
+            output = file.startWrite();
+            output.write(content.getBytes(StandardCharsets.UTF_8));
+            file.finishWrite(output);
         } catch (Exception e) {
-            long nowMs = System.currentTimeMillis();
-            if (nowMs - lastHeartbeatRootFallbackMs < 30_000L) {
-                Log.w(TAG, "[Heartbeat] direct write failed: " + e.getMessage());
-                return;
+            if (output != null) {
+                file.failWrite(output);
             }
-            lastHeartbeatRootFallbackMs = nowMs;
-            String cmd = "su 0 sh -c 'printf \"" + content.replace("\n", "\\n")
-                    + "\" > " + HEARTBEAT_FILE_PATH + " && chmod 666 " + HEARTBEAT_FILE_PATH + "'";
-            try {
-                Runtime.getRuntime().exec(new String[] { "sh", "-c", cmd });
-                Log.w(TAG, "[Heartbeat] direct write failed, submitted root fallback: " + e.getMessage());
-            } catch (Exception fallbackError) {
-                Log.w(TAG, "[Heartbeat] write failed: " + fallbackError.getMessage());
-            }
+            Log.w(TAG, "[Heartbeat] write failed: " + e.getMessage());
         }
     }
 
-    /**
-     * [AdaptiveFPS] 画面更新需求主导的档位选择。
-     *
-     * 注意：当前 HDMI 目标是 3840x2160@30。engine.update() 的耗时包含
-     * vkAcquire/vkQueuePresent 等待显示节拍的时间，30ms 左右是 4K30 正常等屏，
-     * 不能当作 CPU/GPU 过载。
-     *
-     * Native 仍会综合视频、采集、投屏、APNG、漫游、字幕/提示和音频联动后返回需求帧率，
-     * 这里只记录诊断值，输出节奏统一钳到 30fps，避免 HDMI 链路被带到 4K60。
-     */
+    private synchronized AtomicFile getHeartbeatFile() {
+        if (heartbeatFile == null) {
+            File directory = getFilesDir();
+            if (!directory.exists() && !directory.mkdirs()) {
+                Log.w(TAG, "[Heartbeat] unable to create app files directory: " + directory);
+            }
+            heartbeatFile = new AtomicFile(new File(directory, "hsvj_heartbeat"));
+        }
+        return heartbeatFile;
+    }
+    /** Select a render cadence from native content demand and the active display. */
     private void maybeAdjustFrameRate(long nowNs, HSVJEngine activeEngine) {
         lastRenderDemandPollNs = nowNs;
 
         int demandFps = 30;
+        double activeVideoFps = 0.0;
+        String configuredMode = RENDER_FRAME_RATE_MODE_AUTO;
         if (activeEngine != null && nativeEngineReady) {
             try {
                 demandFps = activeEngine.getRenderDemandFps();
             } catch (Throwable ignored) {
                 demandFps = 30;
             }
-        }
-        lastRenderDemandFps = demandFps;
-        if (demandFps >= 50) {
-            lastDynamicRenderDemandNs = nowNs;
-        }
-        applyFixed30FrameRate(nowNs);
-        return;
-
-    }
-
-    private void applyFixed30FrameRate(long nowNs) {
-        if (!RENDER_FRAME_RATE_MODE_FIXED30.equals(renderFrameRateMode)) {
-            renderFrameRateMode = RENDER_FRAME_RATE_MODE_FIXED30;
-            renderOverloadThrottleUntilNs = 0;
-            renderOverloadWindowCount = 0;
-            Log.i(TAG, "[AdaptiveFPS] renderFrameRateMode=fixed30");
-        }
-
-        boolean displayBackpressureHeld =
-                displayBackpressureActive || nowNs < displayBackpressureHoldUntilNs;
-        int targetIdx = displayBackpressureHeld ? backpressureIntervalIdx() : 1;
-        float targetSurfaceFps = surfaceFrameRateForIntervalIdx(targetIdx);
-        String surfaceReason = displayBackpressureHeld
-                ? "fixed30-" + lastDisplayBackpressureReason + "-hold" + Math.round(targetSurfaceFps)
-                : "fixed30";
-
-        if (frameIntervalIdx != targetIdx || frameIntervalMs != FRAME_INTERVAL_CANDIDATES_MS[targetIdx]) {
-            int oldIdx = frameIntervalIdx;
-            long oldIntervalMs = frameIntervalMs;
-            frameIntervalIdx = targetIdx;
-            frameIntervalMs = FRAME_INTERVAL_CANDIDATES_MS[targetIdx];
-            lastFrameRateAdjustNs = nowNs;
-            updateRenderSurfaceFrameRate(targetSurfaceFps, surfaceReason);
-            long displayBackpressureHoldMs = displayBackpressureHeld
-                    ? Math.max(0L, (displayBackpressureHoldUntilNs - nowNs) / 1_000_000L)
-                    : 0L;
-            Log.i(TAG, "[AdaptiveFPS] interval "
-                    + oldIntervalMs + "ms(idx=" + oldIdx + ") -> "
-                    + frameIntervalMs + "ms(idx=" + targetIdx + ")"
-                    + ", renderFrameRateMode=fixed30"
-                    + ", displayBackpressure=" + (displayBackpressureActive ? 1 : 0)
-                    + ", displayBackpressureReason=" + lastDisplayBackpressureReason
-                    + ", displayBackpressureHoldMs=" + displayBackpressureHoldMs
-                    + ", surfaceFps=" + oneDecimal(targetSurfaceFps));
-        } else {
-            updateRenderSurfaceFrameRate(targetSurfaceFps, surfaceReason);
-        }
-    }
-
-    private int backpressureIntervalIdx() {
-        if ("swapchain-no-image".equals(lastDisplayBackpressureReason)
-                || "async-present".equals(lastDisplayBackpressureReason)) {
-            return 2;
-        }
-        if ("beginFrame-acquire".equals(lastDisplayBackpressureReason)) {
-            return 2;
-        }
-        return 1;
-    }
-
-    /**
-     * [AdaptiveFPS] 把 Native 画面更新需求映射到档位索引。
-     *
-     * 关键原则：按 Native 汇总出的真实画面需求选档，减少 FIFO present 等屏抖动。
-     *
-     *   所有 demand → 1 (30 FPS, 33ms)
-     */
-    private int demandFpsToIntervalIdx(int demandFps, long nowNs) {
-        return 1;
-    }
-
-    private double recentAverageUpdateMs() {
-        if (recentUpdateValidCount <= 0) return 0.0;
-        long total = 0;
-        for (int i = 0; i < recentUpdateValidCount; i++) {
-            total += recentUpdateMsRing[i];
-        }
-        return total / (double) recentUpdateValidCount;
-    }
-
-    private long recentMaxUpdateMs() {
-        long max = 0;
-        for (int i = 0; i < recentUpdateValidCount; i++) {
-            if (recentUpdateMsRing[i] > max) max = recentUpdateMsRing[i];
-        }
-        return max;
-    }
-
-    private void updateDisplayBackpressure(long nowNs, long javaUpdateMs,
-            double nativeFrameMs, double nativeCpuMs, double nativePresentMs,
-            double nativeBeginFrameMs, double nativeAsyncPresentMs,
-            long noImageSkipDelta) {
-        double refreshPeriodMs = activeDisplayRefreshRate > 1.0f
-                ? 1000.0 / activeDisplayRefreshRate
-                : 16.7;
-        boolean expectedDisplayWait =
-                activeDisplayRefreshRate <= 35.0f &&
-                nativePresentMs > 0.0 &&
-                nativePresentMs <= refreshPeriodMs + 6.0 &&
-                nativeCpuMs > 0.0 &&
-                nativeCpuMs <= DISPLAY_BACKPRESSURE_CPU_MAX_MS;
-        boolean presentBound = nativePresentMs >= DISPLAY_BACKPRESSURE_ENTER_PRESENT_MS
-                && !expectedDisplayWait
-                && nativeCpuMs > 0.0
-                && nativeCpuMs <= DISPLAY_BACKPRESSURE_CPU_MAX_MS;
-        boolean asyncPresentBound = nativeAsyncPresentMs >= DISPLAY_BACKPRESSURE_ENTER_ASYNC_PRESENT_MS
-                && nativeCpuMs > 0.0
-                && nativeCpuMs <= DISPLAY_BACKPRESSURE_CPU_MAX_MS + 6.0;
-        boolean swapchainNoImageBound = noImageSkipDelta > 0;
-        double effectiveFrameMs = nativeFrameMs > 0.0 ? nativeFrameMs : Math.max(javaUpdateMs, nativeCpuMs);
-        boolean expectedAcquireWait =
-                activeDisplayRefreshRate <= 35.0f &&
-                nativeBeginFrameMs > 0.0 &&
-                nativeBeginFrameMs <= refreshPeriodMs + 8.0 &&
-                nativeCpuMs > 0.0 &&
-                nativeCpuMs <= refreshPeriodMs + 8.0;
-        boolean beginFrameBound = nativeBeginFrameMs >= DISPLAY_BACKPRESSURE_ENTER_BEGIN_FRAME_MS
-                && !expectedAcquireWait
-                && effectiveFrameMs >= DISPLAY_BACKPRESSURE_ENTER_FRAME_TOTAL_MS
-                && nativePresentMs <= DISPLAY_BACKPRESSURE_EXIT_PRESENT_MS
-                && nativeBeginFrameMs >= nativePresentMs + 6.0;
-        if (swapchainNoImageBound || asyncPresentBound || presentBound || beginFrameBound) {
-            displayBackpressureSlowFrames++;
-            displayBackpressureGoodFrames = 0;
-        } else if ((nativeAsyncPresentMs <= 0.0 ||
-                nativeAsyncPresentMs <= DISPLAY_BACKPRESSURE_EXIT_ASYNC_PRESENT_MS)
-                && (expectedAcquireWait || expectedDisplayWait
-                || (nativePresentMs > 0.0
-                && nativePresentMs <= DISPLAY_BACKPRESSURE_EXIT_PRESENT_MS
-                && (nativeBeginFrameMs <= 0.0
-                || nativeBeginFrameMs <= DISPLAY_BACKPRESSURE_EXIT_BEGIN_FRAME_MS)))) {
-            displayBackpressureGoodFrames++;
-            if (displayBackpressureSlowFrames > 0) {
-                displayBackpressureSlowFrames--;
+            try {
+                activeVideoFps = activeEngine.getActiveVideoFps();
+            } catch (Throwable ignored) {
+                activeVideoFps = 0.0;
             }
+            try {
+                configuredMode = activeEngine.getRenderFrameRateMode();
+            } catch (Throwable ignored) {
+                configuredMode = RENDER_FRAME_RATE_MODE_AUTO;
+            }
+        }
+
+        lastRenderDemandFps = demandFps;
+        configuredMode = RENDER_FRAME_RATE_MODE_FIXED30.equalsIgnoreCase(configuredMode)
+                ? RENDER_FRAME_RATE_MODE_FIXED30 : RENDER_FRAME_RATE_MODE_AUTO;
+        if (!configuredMode.equals(renderFrameRateMode)) {
+            renderFrameRateMode = configuredMode;
+            pendingRenderFpsSinceNs = 0;
+            Log.i(TAG, "[AdaptiveFPS] renderFrameRateMode=" + renderFrameRateMode);
+        }
+
+        float requestedFps = RENDER_FRAME_RATE_MODE_FIXED30.equals(renderFrameRateMode)
+                ? DEFAULT_RENDER_FPS : normalizeRenderDemandFps(demandFps);
+        if (RENDER_FRAME_RATE_MODE_AUTO.equals(renderFrameRateMode)
+                && demandFps <= 27
+                && Double.isFinite(activeVideoFps)
+                && activeVideoFps >= 20.0
+                && activeVideoFps <= 27.0) {
+            requestedFps = (float) activeVideoFps;
+        }
+        String reason = renderFrameRateMode + "-demand" + demandFps;
+        if (displayBackpressureActive && requestedFps > DEFAULT_RENDER_FPS) {
+            requestedFps = DEFAULT_RENDER_FPS;
+            reason += "-" + lastDisplayBackpressureReason;
+        }
+        float desiredFps = capRenderFpsToDisplay(requestedFps);
+
+        if (RENDER_FRAME_RATE_MODE_FIXED30.equals(renderFrameRateMode)) {
+            pendingRenderFps = desiredFps;
+            pendingRenderFpsSinceNs = nowNs;
+            applyTargetFrameRate(desiredFps, nowNs, reason);
+            return;
+        }
+
+        if (Math.abs(desiredFps - targetRenderFps) < 0.25f) {
+            pendingRenderFps = desiredFps;
+            pendingRenderFpsSinceNs = nowNs;
+            updateRenderSurfaceFrameRate(desiredFps, reason);
+            return;
+        }
+
+        if (Math.abs(desiredFps - pendingRenderFps) >= 0.25f) {
+            pendingRenderFps = desiredFps;
+            pendingRenderFpsSinceNs = nowNs;
+            return;
+        }
+        if (pendingRenderFpsSinceNs <= 0
+                || nowNs - pendingRenderFpsSinceNs < FRAME_RATE_DEMAND_STABLE_NS
+                || (lastFrameRateAdjustNs > 0
+                && nowNs - lastFrameRateAdjustNs < FRAME_RATE_ADJUST_COOLDOWN_NS)) {
+            return;
+        }
+
+        applyTargetFrameRate(desiredFps, nowNs, reason);
+    }
+
+    private static float normalizeRenderDemandFps(int demandFps) {
+        if (demandFps <= 0) return DEFAULT_RENDER_FPS;
+        if (demandFps <= 27) return 25.0f;
+        if (demandFps < 45) return DEFAULT_RENDER_FPS;
+        return 60.0f;
+    }
+
+    private float capRenderFpsToDisplay(float requestedFps) {
+        float refreshRate = activeDisplayRefreshRate;
+        if (Float.isFinite(refreshRate) && refreshRate > 1.0f) {
+            return Math.max(1.0f, Math.min(requestedFps, refreshRate));
+        }
+        return Math.max(1.0f, requestedFps);
+    }
+
+    private void applyTargetFrameRate(float fps, long nowNs, String reason) {
+        float cappedFps = capRenderFpsToDisplay(fps);
+        long newIntervalNs = frameIntervalNsForFps(cappedFps);
+        if (Math.abs(targetRenderFps - cappedFps) < 0.25f
+                && frameIntervalNs == newIntervalNs) {
+            updateRenderSurfaceFrameRate(cappedFps, reason);
+            return;
+        }
+
+        float oldFps = targetRenderFps;
+        long oldIntervalNs = frameIntervalNs;
+        targetRenderFps = cappedFps;
+        frameIntervalNs = newIntervalNs;
+        frameIntervalMs = Math.round(newIntervalNs / 1_000_000.0);
+        lastFrameRateAdjustNs = nowNs;
+        nextRenderTargetNs = 0;
+        updateRenderSurfaceFrameRate(cappedFps, reason);
+        Log.i(TAG, "[AdaptiveFPS] target " + oneDecimal(oldFps) + "fps/"
+                + oldIntervalNs + "ns -> " + oneDecimal(cappedFps) + "fps/"
+                + newIntervalNs + "ns"
+                + ", demand=" + lastRenderDemandFps
+                + ", display=" + oneDecimal(activeDisplayRefreshRate)
+                + ", mode=" + renderFrameRateMode
+                + ", reason=" + reason);
+    }
+
+    private void updateDisplayBackpressure(long nowNs, long successfulPresentDelta,
+            long noImageSkipDelta) {
+        if (successfulPresentDelta > 0) {
+            displayBackpressureGoodFrames++;
+            displayBackpressureSlowFrames = 0;
         } else {
             displayBackpressureGoodFrames = 0;
         }
 
-        if (!displayBackpressureActive
-                && displayBackpressureSlowFrames >= DISPLAY_BACKPRESSURE_ENTER_FRAMES) {
+        boolean presentStalled = hasSuccessfulPresentCounter
+                && lastSuccessfulPresentNs > 0
+                && nowNs - lastSuccessfulPresentNs >= DISPLAY_BACKPRESSURE_PRESENT_STALL_NS;
+        if (presentStalled) {
+            displayBackpressureSlowFrames++;
+        }
+
+        if (!displayBackpressureActive && presentStalled) {
             displayBackpressureActive = true;
             displayBackpressureSinceNs = nowNs;
             displayBackpressureGoodFrames = 0;
-            lastDisplayBackpressureReason = swapchainNoImageBound ? "swapchain-no-image"
-                    : (asyncPresentBound ? "async-present"
-                    : (beginFrameBound ? "beginFrame-acquire" : "present"));
-            boolean queueBound = swapchainNoImageBound || asyncPresentBound;
-            long minHoldNs = (beginFrameBound || queueBound)
-                    ? DISPLAY_BACKPRESSURE_ACQUIRE_MIN_HOLD_NS
-                    : DISPLAY_BACKPRESSURE_MIN_HOLD_NS;
-            displayBackpressureHoldUntilNs = nowNs + minHoldNs;
-            int backpressureIdx = queueBound ? 2 : (lastRenderDemandFps <= 27 ? 2 : 1);
-            frameIntervalIdx = backpressureIdx;
-            frameIntervalMs = FRAME_INTERVAL_CANDIDATES_MS[backpressureIdx];
-            lastFrameRateAdjustNs = nowNs;
-            updateRenderSurfaceFrameRate(surfaceFrameRateForIntervalIdx(backpressureIdx),
-                    lastDisplayBackpressureReason + "-backpressure");
+            lastDisplayBackpressureReason = noImageSkipDelta > 0
+                    ? "present-stall-no-image" : "present-stall";
+            displayBackpressureHoldUntilNs = nowNs + DISPLAY_BACKPRESSURE_MIN_HOLD_NS;
             requestDisplayStateProbe("enter", true);
             Log.w(TAG, "[DisplayBackpressure] enter"
                     + ", reason=" + lastDisplayBackpressureReason
-                    + ", javaUpdateMs=" + javaUpdateMs
-                    + ", nativeFrameMs=" + oneDecimal(nativeFrameMs)
-                    + ", cpuMs=" + oneDecimal(nativeCpuMs)
-                    + ", beginFrameMs=" + oneDecimal(nativeBeginFrameMs)
-                    + ", presentMs=" + oneDecimal(nativePresentMs)
-                    + ", asyncPresentMs=" + oneDecimal(nativeAsyncPresentMs)
+                    + ", stalledMs=" + ((nowNs - lastSuccessfulPresentNs) / 1_000_000L)
+                    + ", successfulPresentDelta=" + successfulPresentDelta
                     + ", noImageSkipDelta=" + noImageSkipDelta
-                    + ", slowFrames=" + displayBackpressureSlowFrames
-                    + ", minHoldMs=" + (minHoldNs / 1_000_000L)
-                    + ", intervalMs=" + frameIntervalMs
-                    + ", surfaceFps=" + oneDecimal(lastSurfaceFrameRateFps)
                     + ", state=" + lastDisplayStateSummary);
         } else if (displayBackpressureActive
                 && nowNs >= displayBackpressureHoldUntilNs
@@ -2984,12 +3327,7 @@ public class MainActivity extends AppCompatActivity
             Log.i(TAG, "[DisplayBackpressure] exit"
                     + ", reason=" + lastDisplayBackpressureReason
                     + ", activeMs=" + activeMs
-                    + ", javaUpdateMs=" + javaUpdateMs
-                    + ", nativeFrameMs=" + oneDecimal(nativeFrameMs)
-                    + ", cpuMs=" + oneDecimal(nativeCpuMs)
-                    + ", beginFrameMs=" + oneDecimal(nativeBeginFrameMs)
-                    + ", presentMs=" + oneDecimal(nativePresentMs)
-                    + ", asyncPresentMs=" + oneDecimal(nativeAsyncPresentMs)
+                    + ", successfulPresentDelta=" + successfulPresentDelta
                     + ", state=" + lastDisplayStateSummary);
             lastDisplayBackpressureReason = "none";
         } else if (displayBackpressureActive) {
@@ -3007,7 +3345,7 @@ public class MainActivity extends AppCompatActivity
         }
         displayStateProbeRunning = true;
         lastDisplayStateProbeMs = nowMs;
-        new Thread(() -> {
+        displayStateProbeFuture = StartupExecutor.get().submit(() -> {
             String summary = "probe_failed";
             try {
                 summary = queryDisplayStateSummary(reason);
@@ -3019,11 +3357,11 @@ public class MainActivity extends AppCompatActivity
             }
             Log.w(TAG, "[DisplayBackpressure] stateProbe reason=" + reason
                     + ", " + summary);
-        }, "HSVJ-DisplayStateProbe").start();
+        });
     }
 
     private String queryDisplayStateSummary(String reason) {
-        String cmd = "su 0 sh -c '"
+        String cmd = "sh -c '"
                 + "printf \"reason=" + shellQuoteForDoubleQuoted(reason) + " \"; "
                 + "printf \"status=\"; cat /sys/class/drm/card0-HDMI-A-1/status 2>/dev/null | tr -d \"\\n\"; "
                 + "printf \" enabled=\"; cat /sys/class/drm/card0-HDMI-A-1/enabled 2>/dev/null | tr -d \"\\n\"; "
@@ -3041,13 +3379,14 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void maybeLogRenderLoopStats(long nowNs, long updateMs, long wallMs,
-            long noImageSkipDelta) {
+            long successfulPresentDelta, long noImageSkipDelta) {
         if (renderStatsWindowStartNs == 0) {
             renderStatsWindowStartNs = nowNs;
         }
         renderStatsFrameCount++;
         renderStatsUpdateTotalMs += updateMs;
         renderStatsWallTotalMs += wallMs;
+        renderStatsSuccessfulPresents += successfulPresentDelta;
         renderStatsNoImageSkips += noImageSkipDelta;
         if (updateMs > renderStatsMaxUpdateMs) renderStatsMaxUpdateMs = updateMs;
         if (wallMs > renderStatsMaxWallMs) renderStatsMaxWallMs = wallMs;
@@ -3057,13 +3396,17 @@ public class MainActivity extends AppCompatActivity
             return;
         }
 
-        double actualFps = renderStatsFrameCount * 1_000_000_000.0 / elapsedNs;
+        double actualFps = renderStatsSuccessfulPresents * 1_000_000_000.0 / elapsedNs;
+        double updateFps = renderStatsFrameCount * 1_000_000_000.0 / elapsedNs;
         double avgUpdateMs = renderStatsUpdateTotalMs / (double) renderStatsFrameCount;
         double avgWallMs = renderStatsWallTotalMs / (double) renderStatsFrameCount;
         Log.i(TAG, "[RenderLoopStats] actualFps=" + oneDecimal(actualFps)
+                + ", updateFps=" + oneDecimal(updateFps)
+                + ", successfulPresents=" + renderStatsSuccessfulPresents
                 + ", mode=" + activeRenderLoopMode
+                + ", targetFps=" + oneDecimal(targetRenderFps)
+                + ", intervalNs=" + frameIntervalNs
                 + ", intervalMs=" + frameIntervalMs
-                + ", idx=" + frameIntervalIdx
                 + ", displayBackpressure=" + (displayBackpressureActive ? 1 : 0)
                 + ", vsyncCallbacks=" + renderStatsVsyncCount
                 + ", skippedVsync=" + renderStatsSkippedVsyncCount
@@ -3088,6 +3431,7 @@ public class MainActivity extends AppCompatActivity
         renderStatsFrameCount = 0;
         renderStatsUpdateTotalMs = 0;
         renderStatsWallTotalMs = 0;
+        renderStatsSuccessfulPresents = 0;
         renderStatsNoImageSkips = 0;
         renderStatsMaxUpdateMs = 0;
         renderStatsMaxWallMs = 0;
@@ -3148,7 +3492,7 @@ public class MainActivity extends AppCompatActivity
     }
 
     private boolean runOptimizeScript(String scriptPath) {
-        String cmd = "su 0 sh " + scriptPath;
+        String cmd = "sh " + scriptPath;
         CommandResult result = runCommandWithResult(cmd, 30_000);
         Log.i(TAG, "[优化] 执行结果: cmd=" + cmd
                 + ", exitCode=" + result.exitCode
@@ -3163,63 +3507,27 @@ public class MainActivity extends AppCompatActivity
         return false;
     }
 
-    private boolean refreshHttpPortForward() {
-        String scriptPath = copyAssetToCache("hsvj_port_forward.sh", "hsvj_port_forward.sh");
-        if (scriptPath == null) {
-            Log.e(TAG, "[网络] 端口转发脚本拷贝失败");
-            return false;
-        }
-        String cmd = "su 0 sh \"" + shellQuoteForDoubleQuoted(scriptPath) + "\"";
-        CommandResult result = runCommandWithResult(cmd, 5_000);
-        Log.i(TAG, "[网络] 端口转发刷新结果: exitCode=" + result.exitCode
+    private boolean runBackgroundScript(String label, String scriptPath) {
+        String logPath = "/data/local/tmp/hsvj_" + label + ".log";
+        String cmd = "sh -c 'setsid sh \"" + scriptPath + "\" >> \"" + logPath + "\" 2>&1 < /dev/null &'";
+        CommandResult result = runCommandWithResult(cmd, 10_000);
+        Log.i(TAG, "[" + label + "] 后台脚本提交结果: exitCode=" + result.exitCode
                 + ", timedOut=" + result.timedOut
                 + ", output=" + summarizeCommandOutput(result.output));
         return !result.timedOut && result.exitCode == 0;
     }
 
-    private boolean runBackgroundScript(String label, String scriptPath) {
-        String logPath = "/data/local/tmp/hsvj_" + label + ".log";
-        String cmd = "su 0 sh -c 'setsid sh \"" + scriptPath + "\" >> \"" + logPath + "\" 2>&1 < /dev/null &'";
-        try {
-            Runtime.getRuntime().exec(new String[] { "sh", "-c", cmd });
-            Log.i(TAG, "[" + label + "] 后台脚本已提交: " + cmd);
-            return true;
-        } catch (Exception e) {
-            Log.e(TAG, "[" + label + "] 后台脚本提交失败: " + cmd + ", " + e.getMessage(), e);
-            return false;
-        }
-    }
-
     private boolean installAndRunWatchdog(String scriptPath) {
-        String cmd = "su 0 sh -c '"
-                + "OLD_PIDS=\"\"; "
-                + "for CMDLINE in /proc/[0-9]*/cmdline; do "
-                + "PID=${CMDLINE#/proc/}; PID=${PID%/cmdline}; "
-                + "if tr \"\\0\" \"\\n\" < \"$CMDLINE\" 2>/dev/null | grep -qx \"/data/local/tmp/hsvj_watchdog.sh\"; then "
-                + "OLD_PIDS=\"$OLD_PIDS $PID\"; fi; done; "
-                + "if [ -n \"$OLD_PIDS\" ]; then kill $OLD_PIDS 2>/dev/null; sleep 1; fi; "
-                + "LIVE_PIDS=\"\"; "
-                + "for PID in $OLD_PIDS; do "
-                + "if [ -d \"/proc/$PID\" ] && tr \"\\0\" \"\\n\" < \"/proc/$PID/cmdline\" 2>/dev/null | grep -qx \"/data/local/tmp/hsvj_watchdog.sh\"; then "
-                + "LIVE_PIDS=\"$LIVE_PIDS $PID\"; fi; done; "
-                + "if [ -n \"$LIVE_PIDS\" ]; then kill -9 $LIVE_PIDS 2>/dev/null; sleep 1; fi; "
-                + "rm -f /data/local/tmp/hsvj_watchdog.pid 2>/dev/null; "
-                + "rmdir /data/local/tmp/hsvj_watchdog.lock 2>/dev/null; "
-                + "cp \"" + scriptPath + "\" /data/local/tmp/hsvj_watchdog.sh && "
-                + "chmod 755 /data/local/tmp/hsvj_watchdog.sh && "
-                + "setsid sh /data/local/tmp/hsvj_watchdog.sh app >> /data/local/tmp/hsvj_watchdog_launcher.log 2>&1 < /dev/null &'";
-        try {
-            Runtime.getRuntime().exec(new String[] { "sh", "-c", cmd });
-            Log.i(TAG, "[守护] 独立守护脚本已提交: " + cmd);
-            return true;
-        } catch (Exception e) {
-            Log.e(TAG, "[守护] 独立守护脚本提交失败: " + cmd + ", " + e.getMessage(), e);
-            return false;
-        }
+        String cmd = "sh \"" + scriptPath + "\" --install";
+        CommandResult result = runCommandWithResult(cmd, 20_000);
+        Log.i(TAG, "[守护] 独立守护脚本提交结果: exitCode=" + result.exitCode
+                + ", timedOut=" + result.timedOut
+                + ", output=" + summarizeCommandOutput(result.output));
+        return !result.timedOut && result.exitCode == 0;
     }
 
     private boolean installRestartScript(String scriptPath) {
-        String cmd = "su 0 sh -c '"
+        String cmd = "sh -c '"
                 + "cp \"" + scriptPath + "\" /data/local/tmp/hsvj_restart.sh && "
                 + "chmod 755 /data/local/tmp/hsvj_restart.sh'";
         CommandResult result = runCommandWithResult(cmd, 10_000);
@@ -3229,35 +3537,20 @@ public class MainActivity extends AppCompatActivity
         return !result.timedOut && result.exitCode == 0;
     }
 
-    private boolean installAndRunRestartScript(String scriptPath) {
-        String cmd = "su 0 sh -c '"
-                + "cp \"" + scriptPath + "\" /data/local/tmp/hsvj_restart.sh && "
-                + "chmod 755 /data/local/tmp/hsvj_restart.sh && "
-                + "setsid sh /data/local/tmp/hsvj_restart.sh manual:direct "
-                + ">> /data/local/tmp/hsvj_restart_launcher.log 2>&1 < /dev/null &'";
+    private boolean prepareHeartbeatFile() {
         try {
-            Runtime.getRuntime().exec(new String[] { "sh", "-c", cmd });
-            Log.i(TAG, "[重启] 重启脚本已异步提交: " + cmd);
-            return true;
-        } catch (Exception e) {
-            Log.e(TAG, "[重启] 重启脚本异步提交失败: " + cmd + ", " + e.getMessage(), e);
+            File heartbeatFile = getHeartbeatFile().getBaseFile();
+            if (!heartbeatFile.exists() && !heartbeatFile.createNewFile()) {
+                return false;
+            }
+            return heartbeatFile.canWrite();
+        } catch (IOException e) {
+            Log.w(TAG, "[Heartbeat] prepare failed: " + e.getMessage());
             return false;
         }
     }
-
-    private boolean prepareHeartbeatFile() {
-        String cmd = "su 0 sh -c '"
-                + "touch " + HEARTBEAT_FILE_PATH + " && "
-                + "chmod 666 " + HEARTBEAT_FILE_PATH + "'";
-        CommandResult result = runCommandWithResult(cmd, 5_000);
-        Log.i(TAG, "[Heartbeat] 准备结果: exitCode=" + result.exitCode
-                + ", timedOut=" + result.timedOut
-                + ", output=" + summarizeCommandOutput(result.output));
-        return !result.timedOut && result.exitCode == 0;
-    }
-
     private boolean installSystemWatchdog(String installerPath, String watchdogPath) {
-        String cmd = "su 0 sh \"" + installerPath + "\" \"" + watchdogPath + "\"";
+        String cmd = "sh \"" + installerPath + "\" \"" + watchdogPath + "\"";
         CommandResult result = runCommandWithResult(cmd, 20_000);
         Log.i(TAG, "[守护] 系统级守护安装结果: cmd=" + cmd
                 + ", exitCode=" + result.exitCode
@@ -3266,15 +3559,6 @@ public class MainActivity extends AppCompatActivity
         return !result.timedOut && result.exitCode == 0;
     }
 
-    private boolean installDrmTakeoverService(String installerPath, String takeoverPath) {
-        String cmd = "su 0 sh \"" + installerPath + "\" \"" + takeoverPath + "\"";
-        CommandResult result = runCommandWithResult(cmd, 20_000);
-        Log.i(TAG, "[DRM接管] 系统守护安装结果: cmd=" + cmd
-                + ", exitCode=" + result.exitCode
-                + ", timedOut=" + result.timedOut
-                + ", output=" + summarizeCommandOutput(result.output));
-        return !result.timedOut && result.exitCode == 0;
-    }
 
     private boolean installFrpAssets() {
         String frpcPath = copyAssetToCache("frp/frpc", "frpc");
@@ -3288,7 +3572,7 @@ public class MainActivity extends AppCompatActivity
             return false;
         }
 
-        String cmd = "su 0 sh -c '"
+        String cmd = "sh -c '"
                 + "mkdir -p /data/local/tmp/frp && "
                 + "cp \"" + frpcConfigPath + "\" /data/local/tmp/frp/frpc.toml && "
                 + "chmod 644 /data/local/tmp/frp/frpc.toml && "
@@ -3304,209 +3588,47 @@ public class MainActivity extends AppCompatActivity
         return !result.timedOut && result.exitCode == 0;
     }
 
-    private boolean isEth0CarrierUp() {
-        try (BufferedReader reader = new BufferedReader(new FileReader("/sys/class/net/eth0/carrier"))) {
-            String line = reader.readLine();
-            return line != null && line.trim().equals("1");
-        } catch (Exception e) {
-            Log.w(TAG, "[网络] 读取 eth0 carrier 失败: " + e.getMessage());
-            return false;
-        }
+    public boolean applyNetworkIpConfig(String mode, String staticIp, String gateway, String dns) {
+        return PlatformControlGateway.applyNetworkIpConfig(mode, staticIp, gateway, dns);
     }
 
-    private void clearStaleEth0Route() {
-        String cleanupCmd = "su 0 sh -c 'ip route del default dev eth0 2>/dev/null; "
-                + "ip route del default via 192.168.1.1 dev eth0 2>/dev/null; "
-                + buildStopDhcpClientCommand()
-                + "ip addr flush dev eth0 2>/dev/null; "
-                + "ip route show; ip addr show dev eth0'";
-        CommandResult cleanupResult = runCommandWithResult(cleanupCmd, 10_000);
-        Log.i(TAG, "[网络] 已清理无链路 eth0 残留配置: exitCode=" + cleanupResult.exitCode
-                + ", timedOut=" + cleanupResult.timedOut
-                + ", output=" + summarizeCommandOutput(cleanupResult.output));
-    }
-
-    public void applyNetworkIpConfig(String mode, String staticIp, String gateway, String dns) {
-        new Thread(() -> {
-            String normalizedMode = "static".equals(mode) ? "static" : "dynamic";
-            String ip = staticIp != null ? staticIp.trim() : "";
-            String gw = gateway != null ? gateway.trim() : "";
-            String dnsServer = dns != null ? dns.trim() : "";
-            boolean eth0CarrierUp = isEth0CarrierUp();
-            if (!eth0CarrierUp) {
-                clearStaleEth0Route();
-            }
-            if ("static".equals(normalizedMode)) {
-                if (!isValidIpv4(ip) || !isValidIpv4(gw) || !isValidIpv4(dnsServer)) {
-                    Log.e(TAG, "[网络] 固定网络配置无效: ip=" + ip + ", gateway=" + gw + ", dns=" + dnsServer);
-                    return;
-                }
-                if (!eth0CarrierUp) {
-                    Log.w(TAG, "[网络] eth0 未插网线，跳过固定IP应用: ip=" + ip + ", gateway=" + gw + ", dns=" + dnsServer);
-                    return;
-                }
-            }
-            String cmd;
-            if ("static".equals(normalizedMode)) {
-                if (applyEthernetConfigBroadcast(normalizedMode, ip, gw, dnsServer)
-                        && waitForEth0StaticIp(ip, 6_000)) {
-                    Log.i(TAG, "[网络] ROM广播固定IP已生效: ip=" + ip
-                            + ", gateway=" + gw + ", dns=" + dnsServer);
-                    refreshHttpPortForward();
-                    return;
-                }
-                Log.w(TAG, "[网络] ROM广播固定IP未确认生效，切换到root命令兜底: ip=" + ip);
-                cmd = "su 0 sh -c '"
-                        + buildStopDhcpClientCommand()
-                        + "ip route del default dev eth0 2>/dev/null; "
-                        + "ip route del default via 192.168.1.1 dev eth0 2>/dev/null; "
-                        + "ip -4 addr flush dev eth0; "
-                        + "ip addr add " + ip + "/24 dev eth0; "
-                        + "ip link set eth0 up; "
-                        + "ifconfig eth0 up; "
-                        + "ip route add default via " + gw + " dev eth0; "
-                        + "setprop net.dns1 " + dnsServer + "; "
-                        + "setprop net.eth0.dns1 " + dnsServer + "; "
-                        + "printf \"nameserver " + dnsServer + "\\n\" > /etc/resolv.conf; "
-                        + "ip addr show dev eth0; "
-                        + "ip route show; "
-                        + "getprop net.dns1'";
-            } else {
-                applyEthernetConfigBroadcast(normalizedMode, "", "", "");
-                cmd = "su 0 sh -c 'ip route del default dev eth0 2>/dev/null; "
-                        + "ip route del default via 192.168.1.1 dev eth0 2>/dev/null; "
-                        + buildStopDhcpClientCommand()
-                        + "ip addr flush dev eth0; "
-                        + "dhcpcd eth0; "
-                        + "ip addr show dev eth0; ip route show'";
-            }
-            CommandResult result = runCommandWithResult(cmd, 15_000);
-            Log.i(TAG, "[网络] IP配置应用结果: mode=" + normalizedMode
-                    + ", ip=" + ip
-                    + ", gateway=" + gw
-                    + ", dns=" + dnsServer
-                    + ", exitCode=" + result.exitCode
-                    + ", timedOut=" + result.timedOut
-                    + ", output=" + summarizeCommandOutput(result.output));
-            refreshHttpPortForward();
-        }, "hsvj-network-ip-config").start();
-    }
-
-    private boolean applyEthernetConfigBroadcast(String mode, String staticIp, String gateway, String dns) {
-        try {
-            Intent intent = new Intent();
-            intent.addFlags(FLAG_ETH_SETTING_ROM_PRIVATE);
-            intent.setAction(ACTION_ETH_SETTING);
-            if ("static".equals(mode)) {
-                String dnsValue = dns != null && !dns.trim().isEmpty() ? dns.trim() : gateway;
-                intent.putExtra(EXTRA_ETH_SETTING,
-                        "static:" + staticIp + ":255.255.255.0:" + gateway + ":" + dnsValue);
-            }
-            sendBroadcast(intent);
-            Log.i(TAG, "[网络] 已发送ROM以太网配置广播: mode=" + mode
-                    + ", ip=" + staticIp + ", gateway=" + gateway + ", dns=" + dns);
-            return true;
-        } catch (Throwable t) {
-            Log.w(TAG, "[网络] ROM以太网配置广播发送失败: " + t.getMessage(), t);
-            return false;
-        }
-    }
-
-    private boolean waitForEth0StaticIp(String expectedIp, long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (System.currentTimeMillis() < deadline) {
-            if (eth0HasOnlyIpv4(expectedIp)) {
-                return true;
-            }
-            try {
-                Thread.sleep(500);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
-        }
-        return eth0HasOnlyIpv4(expectedIp);
-    }
-
-    private boolean eth0HasOnlyIpv4(String expectedIp) {
-        CommandResult result = runCommandWithResult(
-                "su 0 sh -c 'ip -4 -o addr show dev eth0 2>/dev/null'",
-                2_000);
-        if (result.timedOut || result.exitCode != 0) {
-            return false;
-        }
-        String output = result.output != null ? result.output.trim() : "";
-        if (output.isEmpty()) {
-            return false;
-        }
-        String[] lines = output.split("\\r?\\n");
-        int inetCount = 0;
-        boolean hasExpected = false;
-        for (String line : lines) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty()) continue;
-            inetCount++;
-            if (trimmed.contains(" inet " + expectedIp + "/")) {
-                hasExpected = true;
-            }
-        }
-        return inetCount == 1 && hasExpected;
-    }
-
-    private String buildStopDhcpClientCommand() {
-        return "if command -v dhcpcd >/dev/null 2>&1; then dhcpcd -k eth0 2>/dev/null || true; fi; "
-                + "for PID in $(pidof udhcpc dhclient 2>/dev/null); do "
-                + "CMD=$(tr \"\\0\" \" \" < /proc/$PID/cmdline 2>/dev/null); "
-                + "case \"$CMD\" in *eth0*) kill $PID 2>/dev/null || true;; esac; "
-                + "done; "
-                + "if command -v dhclient >/dev/null 2>&1; then dhclient -r eth0 2>/dev/null || true; fi; ";
-    }
-
-    public void applyPowerSchedule(boolean scheduleEnabled, boolean powerOnEnabled,
+    public boolean applyPowerSchedule(boolean scheduleEnabled, boolean powerOnEnabled,
             String powerOnDate, String powerOnTime, boolean powerOffEnabled,
             String powerOffDate, String powerOffTime) {
-        new Thread(() -> {
-            try {
-                if (!scheduleEnabled) {
-                    sendBroadcast(new Intent("android.poweron.cancel"));
-                    sendBroadcast(new Intent("android.poweroff.cancel"));
-                    Log.i(TAG, "[定时开关机] 已取消定时开机和定时关机");
-                    return;
-                }
+        return PlatformControlGateway.applyPowerSchedule(scheduleEnabled, powerOnEnabled,
+                powerOnDate, powerOnTime, powerOffEnabled, powerOffDate, powerOffTime);
+    }
 
-                if (powerOnEnabled) {
-                    if (isValidDate(powerOnDate) && isValidTime(powerOnTime)) {
-                        Intent intent = new Intent("android.poweron.setting");
-                        intent.putExtra("powerondate", powerOnDate.trim());
-                        intent.putExtra("powerontime", powerOnTime.trim());
-                        sendBroadcast(intent);
-                        Log.i(TAG, "[定时开关机] 已设置定时开机: " + powerOnDate + " " + powerOnTime);
-                    } else {
-                        Log.e(TAG, "[定时开关机] 定时开机参数无效: date=" + powerOnDate + ", time=" + powerOnTime);
-                    }
-                } else {
-                    sendBroadcast(new Intent("android.poweron.cancel"));
-                    Log.i(TAG, "[定时开关机] 已取消定时开机");
-                }
+    private void applyStartupNetworkIpConfigWhenSafe() {
+        // This config applies to eth0; persistent SoftAP must not block wired setup.
 
-                if (powerOffEnabled) {
-                    if (isValidDate(powerOffDate) && isValidTime(powerOffTime)) {
-                        Intent intent = new Intent("android.poweroff.setting");
-                        intent.putExtra("poweroffdate", powerOffDate.trim());
-                        intent.putExtra("powerofftime", powerOffTime.trim());
-                        sendBroadcast(intent);
-                        Log.i(TAG, "[定时开关机] 已设置定时关机: " + powerOffDate + " " + powerOffTime);
-                    } else {
-                        Log.e(TAG, "[定时开关机] 定时关机参数无效: date=" + powerOffDate + ", time=" + powerOffTime);
-                    }
-                } else {
-                    sendBroadcast(new Intent("android.poweroff.cancel"));
-                    Log.i(TAG, "[定时开关机] 已取消定时关机");
-                }
-            } catch (Throwable t) {
-                Log.e(TAG, "[定时开关机] 应用配置失败: " + t.getMessage(), t);
+        applyNetworkIpConfigFromSavedConfig();
+    }
+
+
+    private String readSystemProperty(String name) {
+        Process process = null;
+        try {
+            process = new ProcessBuilder("getprop", name).redirectErrorStream(true).start();
+            if (!process.waitFor(1500L, TimeUnit.MILLISECONDS)) {
+                process.destroyForcibly();
+                return "";
             }
-        }, "hsvj-power-schedule").start();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                String line = reader.readLine();
+                return line == null ? "" : line.trim();
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return "";
+        } catch (Throwable ignored) {
+            return "";
+        } finally {
+            if (process != null) {
+                process.destroy();
+            }
+        }
     }
 
     private void applyNetworkIpConfigFromSavedConfig() {
@@ -3528,9 +3650,6 @@ public class MainActivity extends AppCompatActivity
             }
             String text = new String(data, StandardCharsets.UTF_8).trim();
             if (text.isEmpty() || !text.startsWith("{")) {
-                if (!isEth0CarrierUp()) {
-                    clearStaleEth0Route();
-                }
                 return;
             }
             JSONObject json = new JSONObject(text);
@@ -3538,12 +3657,14 @@ public class MainActivity extends AppCompatActivity
             String ip = json.optString("networkStaticIp", "");
             String gateway = json.optString("networkGateway", "");
             String dns = json.optString("networkDns", "");
-            if (!isEth0CarrierUp()) {
-                clearStaleEth0Route();
-            }
             if ("static".equals(mode)) {
-                Log.i(TAG, "[网络] 启动读取配置并应用固定IP: ip=" + ip + ", gateway=" + gateway + ", dns=" + dns);
+                Log.i(TAG, "Applying saved static network config: ip=" + ip
+                        + ", gateway=" + gateway + ", dns=" + dns);
                 applyNetworkIpConfig(mode, ip, gateway, dns);
+            } else {
+                // DHCP 由系统开机网络服务维护。应用每次启动都重新广播 dynamic
+                // 并刷新 eth0 会中断 ADB TCP、设备上报和开机热点初始化。
+                Log.i(TAG, "Saved network mode is dynamic; keep current DHCP lease on app startup");
             }
             boolean powerScheduleEnabled = json.optBoolean("powerScheduleEnabled", false);
             boolean powerOnScheduleEnabled = json.optBoolean("powerOnScheduleEnabled", false);
@@ -3559,51 +3680,6 @@ public class MainActivity extends AppCompatActivity
             }
         } catch (Throwable t) {
             Log.w(TAG, "[网络] 启动读取网络配置失败: " + t.getMessage());
-        }
-    }
-
-    private boolean isValidIpv4(String ip) {
-        if (ip == null || ip.isEmpty()) return false;
-        String[] parts = ip.split("\\.");
-        if (parts.length != 4) return false;
-        for (String part : parts) {
-            if (part.isEmpty() || part.length() > 3) return false;
-            for (int i = 0; i < part.length(); i++) {
-                char c = part.charAt(i);
-                if (c < '0' || c > '9') return false;
-            }
-            int value;
-            try {
-                value = Integer.parseInt(part);
-            } catch (NumberFormatException e) {
-                return false;
-            }
-            if (value < 0 || value > 255) return false;
-        }
-        return true;
-    }
-
-    private boolean isValidDate(String value) {
-        if (value == null || !value.matches("\\d{4}-\\d{2}-\\d{2}")) return false;
-        String[] parts = value.split("-");
-        try {
-            int month = Integer.parseInt(parts[1]);
-            int day = Integer.parseInt(parts[2]);
-            return month >= 1 && month <= 12 && day >= 1 && day <= 31;
-        } catch (NumberFormatException e) {
-            return false;
-        }
-    }
-
-    private boolean isValidTime(String value) {
-        if (value == null || !value.matches("\\d{2}:\\d{2}")) return false;
-        String[] parts = value.split(":");
-        try {
-            int hour = Integer.parseInt(parts[0]);
-            int minute = Integer.parseInt(parts[1]);
-            return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
-        } catch (NumberFormatException e) {
-            return false;
         }
     }
 
@@ -3632,30 +3708,15 @@ public class MainActivity extends AppCompatActivity
     }
 
     private CommandResult runCommandWithResult(String command, long timeoutMs) {
-        Process process = null;
-        StringBuilder output = new StringBuilder();
         try {
-            process = Runtime.getRuntime().exec(new String[] { "sh", "-c", command });
-            StreamCollector stdout = new StreamCollector(process.getInputStream(), output);
-            StreamCollector stderr = new StreamCollector(process.getErrorStream(), output);
-            stdout.start();
-            stderr.start();
-
-            boolean finished = process.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                stdout.join(500);
-                stderr.join(500);
-                return new CommandResult(-1, true, output.toString());
-            }
-
-            stdout.join(500);
-            stderr.join(500);
-            return new CommandResult(process.exitValue(), false, output.toString());
+            ProcessRunner.Result result = ProcessRunner.run(timeoutMs, "su", "0", "sh", "-c", command);
+            String output = result.output;
+            if (result.outputLimitExceeded) output += "\n[output truncated]";
+            return new CommandResult(result.outputLimitExceeded ? -1 : result.exitCode, result.timedOut, output);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new CommandResult(-1, true, "interrupted");
         } catch (Exception e) {
-            if (process != null) {
-                process.destroyForcibly();
-            }
             return new CommandResult(-1, false, e.getMessage());
         }
     }
@@ -3690,70 +3751,15 @@ public class MainActivity extends AppCompatActivity
         }
     }
 
-    private static final class StreamCollector extends Thread {
-        private final java.io.InputStream inputStream;
-        private final StringBuilder output;
-
-        StreamCollector(java.io.InputStream inputStream, StringBuilder output) {
-            this.inputStream = inputStream;
-            this.output = output;
-            setDaemon(true);
-        }
-
-        @Override
-        public void run() {
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    synchronized (output) {
-                        output.append(line).append('\n');
-                    }
-                }
-            } catch (Exception ignored) {
-            }
-        }
-    }
-
     /**
      * 执行重启脚本
      */
-    public void executeRestartScript() {
-        new Thread(() -> {
-            try {
-                String scriptPath = copyAssetToCache("hsvj_restart.sh", "hsvj_restart.sh");
-
-                if (scriptPath != null) {
-                    installAndRunRestartScript(scriptPath);
-                } else {
-                    Log.e(TAG, "[重启] 脚本拷贝失败，无法执行重启");
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "[重启] 触发重启脚本失败: " + e.getMessage(), e);
-            }
-        }).start();
+    public boolean executeRestartScript() {
+        return PlatformControlGateway.executeRestart();
     }
 
-    public void scheduleWatchdogRestartByAlarm() {
-        try {
-            Intent intent = new Intent(this, WatchdogAlarmReceiver.class);
-            int flags = PendingIntent.FLAG_CANCEL_CURRENT;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                flags |= PendingIntent.FLAG_IMMUTABLE;
-            }
-            PendingIntent restartIntent = PendingIntent.getBroadcast(
-                    getApplicationContext(), 1001, intent, flags);
-            AlarmManager alarmManager = (AlarmManager) getSystemService(ALARM_SERVICE);
-            if (alarmManager != null) {
-                alarmManager.set(AlarmManager.RTC_WAKEUP,
-                        System.currentTimeMillis() + 3000,
-                        restartIntent);
-                Log.i(TAG, "[重启] AlarmManager 已预约 3 秒后拉起守护和应用");
-            } else {
-                Log.e(TAG, "[重启] AlarmManager 不可用，无法预约拉起应用");
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "[重启] AlarmManager 预约拉起失败: " + e.getMessage(), e);
-        }
+    public boolean scheduleWatchdogRestartByAlarm() {
+        return PlatformControlGateway.scheduleWatchdogAlarm();
     }
 
 
@@ -3765,304 +3771,5 @@ public class MainActivity extends AppCompatActivity
     /**
      * 初始化App更新管理器
      */
-    private void initUpdateManager() {
-        updateManager = new AppUpdateManager(this);
-        updateManager.setUpdateListener(new AppUpdateManager.UpdateListener() {
-            @Override
-            public void onCheckStart() {
-                Log.i(TAG, "[更新检查] 开始检查更新...");
-            }
 
-            @Override
-            public void onNewVersionAvailable(String versionName, String versionCode,
-                                             String downloadUrl, String releaseNotes, boolean forceUpdate) {
-                Log.i(TAG, "[更新检查] 发现新版本: " + versionName + "(" + versionCode + "), forceUpdate=" + forceUpdate);
-                runOnUiThread(() -> {
-                    if (forceUpdate) {
-                        Toast.makeText(MainActivity.this, "发现强制更新，开始自动下载...", Toast.LENGTH_SHORT).show();
-                        String fileName = buildUpdateApkFileName(versionName);
-                        if (updateManager != null) {
-                            updateManager.downloadApk(downloadUrl, fileName);
-                        }
-                    } else {
-                        showUpdateDialog(versionName, releaseNotes, downloadUrl, false);
-                    }
-                });
-            }
-
-            @Override
-            public void onNoNewVersion(String currentVersionName, int currentVersionCode,
-                                       String serverVersionName, int serverVersionCode, boolean forceUpdate) {
-                Log.i(TAG, "[更新检查] 当前已是最新版本 current=" + currentVersionName + "(" + currentVersionCode + ")"
-                        + ", server=" + serverVersionName + "(" + serverVersionCode + ")"
-                        + ", forceUpdate=" + forceUpdate);
-            }
-
-            @Override
-            public void onCheckFailed(String error) {
-                Log.w(TAG, "[更新检查] 检查更新失败，已跳过: " + error);
-            }
-
-            @Override
-            public void onDownloadStart(long totalBytes) {
-                Log.i(TAG, "[更新下载] 开始下载更新...");
-                runOnUiThread(() -> showDownloadProgressDialog());
-            }
-
-            @Override
-            public void onDownloadProgress(long downloadedBytes, long totalBytes, int progress) {
-                runOnUiThread(() -> updateDownloadProgress(progress));
-            }
-
-            @Override
-            public void onDownloadComplete(Uri fileUri) {
-                Log.i(TAG, "[更新下载] 下载完成，准备安装");
-                runOnUiThread(() -> {
-                    hideDownloadProgressDialog();
-                    // 自动安装
-                    if (updateManager != null) {
-                        updateManager.installApk(fileUri);
-                    }
-                });
-            }
-
-            @Override
-            public void onDownloadFailed(String error) {
-                Log.e(TAG, "[更新下载] 下载失败: " + error);
-                runOnUiThread(() -> {
-                    hideDownloadProgressDialog();
-                    Toast.makeText(MainActivity.this, "下载失败: " + error, Toast.LENGTH_LONG).show();
-                });
-            }
-
-            @Override
-            public void onInstallStart() {
-                Log.i(TAG, "[更新安装] 开始安装更新...");
-                runOnUiThread(() -> Toast.makeText(MainActivity.this, "正在安装更新...", Toast.LENGTH_SHORT).show());
-            }
-        });
-    }
-
-    /**
-     * 检查App更新（Native 初始化完成后延迟检测）
-     */
-    private void checkAppUpdate() {
-        if (updateManager == null) {
-            return;
-        }
-
-        // 读取 config.json 中的 appUpdateEnabled 开关，默认开启
-        if (!isAppUpdateEnabledInConfig()) {
-            Log.i(TAG, "[更新检查] config.json appUpdateEnabled=false，跳过自动更新检查");
-            return;
-        }
-
-        // 版本检查API地址
-        String checkUrl = "http://60.205.127.117:8080/api/version/check";
-
-        Log.i(TAG, "[更新检查] Native 初始化完成后延迟检查更新");
-        updateManager.checkForUpdate(checkUrl);
-    }
-
-    /**
-     * 读取 config.json 的 appUpdateEnabled 开关。文件不存在或解析失败时按默认开启返回 true。
-     */
-    private boolean isAppUpdateEnabledInConfig() {
-        try {
-            String root = PathConfig.getRootPath(this);
-            File configFile = new File(root, "config/config.json");
-            if (!configFile.exists() || !configFile.isFile()) {
-                return true;
-            }
-            byte[] data;
-            try (FileInputStream fis = new FileInputStream(configFile)) {
-                data = new byte[(int) configFile.length()];
-                int read = 0;
-                while (read < data.length) {
-                    int n = fis.read(data, read, data.length - read);
-                    if (n < 0) break;
-                    read += n;
-                }
-            }
-            String text = new String(data, StandardCharsets.UTF_8).trim();
-            if (text.isEmpty() || !text.startsWith("{")) {
-                return true;
-            }
-            JSONObject json = new JSONObject(text);
-            return json.optBoolean("appUpdateEnabled", true);
-        } catch (Throwable t) {
-            Log.w(TAG, "[更新检查] 读取 appUpdateEnabled 失败，按默认开启处理: " + t.getMessage());
-            return true;
-        }
-    }
-
-    /**
-     * 显示更新对话框
-     */
-    private void showUpdateDialog(String versionName, String releaseNotes, String downloadUrl, boolean forceUpdate) {
-        if (isFinishing() || isDestroyed()) {
-            return;
-        }
-
-        AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setTitle((forceUpdate ? "发现强制更新 " : "发现新版本 ") + versionName);
-
-        // 显示更新说明
-        if (releaseNotes != null && !releaseNotes.isEmpty()) {
-            builder.setMessage((forceUpdate ? "此版本为强制更新。\n\n" : "") + "更新内容：\n" + releaseNotes);
-        } else {
-            builder.setMessage(forceUpdate ? "发现强制更新，请立即更新后继续使用。" : "发现新版本，建议更新以获得更好的体验。");
-        }
-
-        // 立即下载按钮
-        builder.setPositiveButton("立即下载", (dialog, which) -> {
-            String fileName = buildUpdateApkFileName(versionName);
-            if (updateManager != null) {
-                updateManager.downloadApk(downloadUrl, fileName);
-            }
-        });
-
-        if (!forceUpdate) {
-            // 跳过此版本按钮
-            builder.setNeutralButton("跳过此版本", (dialog, which) -> {
-                if (updateManager != null) {
-                    updateManager.skipVersion(versionName);
-                }
-                dialog.dismiss();
-            });
-
-            // 稍后再说按钮
-            builder.setNegativeButton("稍后再说", (dialog, which) -> {
-                dialog.dismiss();
-            });
-        }
-
-        builder.setCancelable(!forceUpdate);
-        builder.show();
-    }
-
-    private String buildUpdateApkFileName(String versionName) {
-        String safeVersion = versionName == null ? "unknown" : versionName.replaceAll("[^A-Za-z0-9._-]", "_");
-        return "hsvj-engine-" + BuildConfig.HARDWARE + "-v" + safeVersion + ".apk";
-    }
-
-    /**
-     * 显示下载进度对话框
-     */
-    private void showDownloadProgressDialog() {
-        if (isFinishing() || isDestroyed()) {
-            return;
-        }
-
-        if (downloadProgressDialog == null) {
-            LinearLayout layout = new LinearLayout(this);
-            layout.setOrientation(LinearLayout.VERTICAL);
-            float density = getResources().getDisplayMetrics().density;
-            int paddingH = (int) (48 * density);
-            int paddingV = (int) (36 * density);
-            layout.setPadding(paddingH, paddingV, paddingH, paddingV);
-
-            GradientDrawable background = new GradientDrawable(
-                    GradientDrawable.Orientation.TOP_BOTTOM,
-                    new int[] { Color.rgb(30, 34, 42), Color.rgb(16, 19, 26) });
-            background.setCornerRadius(24 * density);
-            background.setStroke((int) (1 * density), Color.argb(120, 90, 210, 255));
-            layout.setBackground(background);
-
-            TextView titleText = new TextView(this);
-            titleText.setText("正在更新系统");
-            titleText.setTextColor(Color.WHITE);
-            titleText.setTextSize(24);
-            titleText.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-            layout.addView(titleText, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT));
-
-            downloadProgressText = new TextView(this);
-            downloadProgressText.setText("正在下载新版本，请勿断电或退出");
-            downloadProgressText.setTextColor(Color.rgb(190, 199, 214));
-            downloadProgressText.setTextSize(15);
-            LinearLayout.LayoutParams descParams = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT);
-            descParams.topMargin = (int) (12 * density);
-            descParams.bottomMargin = (int) (24 * density);
-            layout.addView(downloadProgressText, descParams);
-
-            downloadProgressPercentText = new TextView(this);
-            downloadProgressPercentText.setText("0%");
-            downloadProgressPercentText.setTextColor(Color.rgb(88, 214, 255));
-            downloadProgressPercentText.setTextSize(42);
-            downloadProgressPercentText.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-            downloadProgressPercentText.setGravity(android.view.Gravity.CENTER);
-            layout.addView(downloadProgressPercentText, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT));
-
-            downloadProgressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-            downloadProgressBar.setMax(100);
-            LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    (int) (18 * density));
-            barParams.topMargin = (int) (22 * density);
-            layout.addView(downloadProgressBar, barParams);
-
-            downloadProgressDialog = new AlertDialog.Builder(this)
-                    .setView(layout)
-                    .create();
-            downloadProgressDialog.setCancelable(false);
-            downloadProgressDialog.setOnShowListener(dialog -> {
-                Window window = downloadProgressDialog.getWindow();
-                if (window != null) {
-                    window.setBackgroundDrawableResource(android.R.color.transparent);
-                    WindowManager.LayoutParams params = new WindowManager.LayoutParams();
-                    params.copyFrom(window.getAttributes());
-                    params.width = (int) (620 * density);
-                    params.height = WindowManager.LayoutParams.WRAP_CONTENT;
-                    window.setAttributes(params);
-                    window.setDimAmount(0.72f);
-                }
-            });
-        }
-
-        if (downloadProgressBar != null) {
-            downloadProgressBar.setProgress(0);
-        }
-        if (downloadProgressText != null) {
-            downloadProgressText.setText("正在下载新版本，请勿断电或退出");
-        }
-        if (downloadProgressPercentText != null) {
-            downloadProgressPercentText.setText("0%");
-        }
-        downloadProgressDialog.show();
-    }
-
-    /**
-     * 更新下载进度
-     */
-    private void updateDownloadProgress(int progress) {
-        if (downloadProgressDialog != null && downloadProgressDialog.isShowing()) {
-            if (downloadProgressBar != null) {
-                downloadProgressBar.setProgress(progress);
-            }
-            if (downloadProgressText != null) {
-                downloadProgressText.setText(progress >= 100 ? "下载完成，正在准备安装..." : "正在下载新版本，请勿断电或退出");
-            }
-            if (downloadProgressPercentText != null) {
-                downloadProgressPercentText.setText(progress + "%");
-            }
-        }
-    }
-
-    /**
-     * 隐藏下载进度对话框
-     */
-    private void hideDownloadProgressDialog() {
-        if (downloadProgressDialog != null && downloadProgressDialog.isShowing()) {
-            downloadProgressDialog.dismiss();
-        }
-        downloadProgressBar = null;
-        downloadProgressText = null;
-        downloadProgressPercentText = null;
-    }
 }

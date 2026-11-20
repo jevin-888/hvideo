@@ -19,6 +19,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Locale;
 
 /**
  * 资源分类管理器
@@ -230,7 +231,7 @@ public class ResourceClassifier {
      * 根据文件扩展名分类
      */
     private Priority classifyByExtension(String resourcePath) {
-        String lowerPath = resourcePath.toLowerCase();
+        String lowerPath = resourcePath.toLowerCase(Locale.ROOT);
         
         // 关键配置文件
         if (lowerPath.endsWith(".json") || lowerPath.endsWith(".dat") || lowerPath.endsWith(".cfg")) {
@@ -254,7 +255,7 @@ public class ResourceClassifier {
         }
         
         // 大媒体文件
-        if (lowerPath.endsWith(".mp4") || lowerPath.endsWith(".avi") || 
+        if (lowerPath.endsWith(".hvideo") || lowerPath.endsWith(".mp4") || lowerPath.endsWith(".avi") || 
             lowerPath.endsWith(".mp3") || lowerPath.endsWith(".wav")) {
             return Priority.DEFERRED;
         }
@@ -299,7 +300,7 @@ public class ResourceClassifier {
         
         for (Priority priority : Priority.values()) {
             List<ResourceInfo> resources = resourcesByPriority.get(priority);
-            Log.i(TAG, String.format("%s: %d 个资源", priority.name(), resources.size()));
+            Log.i(TAG, String.format(Locale.ROOT, "%s: %d 个资源", priority.name(), resources.size()));
         }
     }
     

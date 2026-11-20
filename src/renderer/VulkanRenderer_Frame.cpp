@@ -15,6 +15,8 @@ namespace {
 constexpr uint64_t kAcquireNextImageTimeoutNs = 100000000ULL; // 4K30 can legitimately 等待 ~33ms.
 constexpr int64_t kPerfWarnLogIntervalMs = 10000;
 constexpr int kBeginFrameAsyncAcquireWaitMs = 24;
+constexpr size_t kAsyncAcquireReadyLimit = 1;
+constexpr int64_t kAsyncWsiRecreateThresholdMs = 100;
 
 int64_t elapsedMillisSince(std::chrono::steady_clock::time_point start) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -51,7 +53,7 @@ void VulkanRenderer::configureAsyncPresent() {
   asyncPresentEnabled_ =
       !(prop == "0" || prop == "false" || prop == "off" || prop == "no");
 #endif
-  if (graphicsQueue_ == presentQueue_) {
+  if (graphicsQueue_ == presentQueue_ || sharedPresentMode_) {
     asyncPresentEnabled_ = false;
   }
 #ifdef __ANDROID__
@@ -198,6 +200,9 @@ void VulkanRenderer::performQueuedPresent(const PendingPresent &present) {
   lastAsyncPresentUs_.store(static_cast<long long>(queuePresentMs) * 1000LL,
                             std::memory_order_relaxed);
   asyncPresentCount_.fetch_add(1, std::memory_order_relaxed);
+  if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+    successfulPresentCount_.fetch_add(1, std::memory_order_relaxed);
+  }
   if (queuePresentMs >= 16) {
     static int asyncSlowCount = 0;
     static auto s_lastAsyncSlowLog =
@@ -215,7 +220,17 @@ void VulkanRenderer::performQueuedPresent(const PendingPresent &present) {
     }
   }
 
+  if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) &&
+      shouldRecoverAsyncPresent(queuePresentMs)) {
+    asyncPresentNeedsRecreate_.store(true, std::memory_order_release);
+    asyncAcquireCv_.notify_all();
+    LOG_WARN("[Vulkan] prolonged async present=%lldms; request swapchain recovery",
+             static_cast<long long>(queuePresentMs));
+  }
+
   if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+    asyncPresentNeedsRecreate_.store(true, std::memory_order_release);
+    asyncAcquireCv_.notify_all();
     static int asyncOutOfDateCount = 0;
     if (++asyncOutOfDateCount <= 10) {
       LOG_WARN("[Vulkan] async vkQueuePresentKHR returned %d; "
@@ -233,6 +248,38 @@ void VulkanRenderer::performQueuedPresent(const PendingPresent &present) {
                result, present.frameIndex, asyncPresentErrorCount);
     }
   }
+}
+
+bool VulkanRenderer::shouldRecoverAsyncPresent(int64_t costMs) {
+  asyncPresentStallStreak_ = costMs >= kAsyncWsiRecreateThresholdMs
+      ? std::min(3, asyncPresentStallStreak_ + 1) : 0;
+  if (costMs < 1000 && asyncPresentStallStreak_ < 3) return false;
+  const auto now = std::chrono::steady_clock::now();
+  // Slow display hardware must not turn into a swapchain recreation loop.
+  if (lastAsyncWsiRecoveryRequest_.time_since_epoch().count() != 0 &&
+      now - lastAsyncWsiRecoveryRequest_ < std::chrono::seconds(30)) return false;
+  lastAsyncWsiRecoveryRequest_ = now;
+  asyncPresentStallStreak_ = 0;
+  return true;
+}
+
+bool VulkanRenderer::recoverPendingSwapchain() {
+  if (!asyncPresentNeedsRecreate_.load(std::memory_order_acquire) &&
+      !asyncAcquireNeedsRecreate_.load(std::memory_order_acquire)) return false;
+  asyncAcquireCv_.notify_all();
+  // Do not join a worker still inside a driver call from the render thread.
+  // Keep servicing updates until both workers have left WSI; no GPU objects
+  // are reset or destroyed while they are in use.
+  {
+    std::lock_guard<std::mutex> lk(asyncAcquireMutex_);
+    if (asyncAcquireInFlight_) return true;
+  }
+  {
+    std::lock_guard<std::mutex> lk(asyncPresentMutex_);
+    if (asyncPresentInFlight_ || !pendingPresents_.empty()) return true;
+  }
+  (void)recreateSwapchain();
+  return true;
 }
 
 void VulkanRenderer::configureAsyncAcquire() {
@@ -334,12 +381,13 @@ void VulkanRenderer::asyncAcquireLoop() {
       std::unique_lock<std::mutex> lk(asyncAcquireMutex_);
       asyncAcquireCv_.wait(lk, [&]() {
         if (asyncAcquireStop_ || deviceLostFatal_.load(std::memory_order_acquire) ||
+            asyncPresentNeedsRecreate_.load(std::memory_order_acquire) ||
             asyncAcquireNeedsRecreate_.load(std::memory_order_acquire) ||
             asyncAcquireSurfaceLost_.load(std::memory_order_acquire)) {
           return true;
         }
         const size_t maxReady =
-            std::max<size_t>(1, std::min<size_t>(2, swapchainImages_.size()));
+            std::min(kAsyncAcquireReadyLimit, swapchainImages_.size());
         if (readyAcquires_.size() >= maxReady) {
           return false;
         }
@@ -353,12 +401,13 @@ void VulkanRenderer::asyncAcquireLoop() {
       if (asyncAcquireStop_ || deviceLostFatal_.load(std::memory_order_acquire)) {
         break;
       }
-      if (asyncAcquireNeedsRecreate_.load(std::memory_order_acquire) ||
+      if (asyncPresentNeedsRecreate_.load(std::memory_order_acquire) ||
+          asyncAcquireNeedsRecreate_.load(std::memory_order_acquire) ||
           asyncAcquireSurfaceLost_.load(std::memory_order_acquire)) {
         break;
       }
       const size_t maxReady =
-          std::max<size_t>(1, std::min<size_t>(2, swapchainImages_.size()));
+          std::min(kAsyncAcquireReadyLimit, swapchainImages_.size());
       if (readyAcquires_.size() >= maxReady) {
         continue;
       }
@@ -409,9 +458,11 @@ void VulkanRenderer::asyncAcquireLoop() {
       acquireFenceMs = elapsedMillisSince(fenceWaitStart);
       if (fenceResult == VK_ERROR_DEVICE_LOST) {
         result = VK_ERROR_DEVICE_LOST;
-      } else if (fenceResult != VK_SUCCESS) {
-        result = fenceResult;
+      } else if (fenceResult != VK_SUCCESS && fenceResult != VK_TIMEOUT) {
+        LOG_WARN("[Vulkan] acquire fence wait returned %d; retain acquired image", fenceResult);
       }
+      // A fence timeout does not undo a successful acquire. Its semaphore and
+      // image remain owned; the submit will wait on that semaphore as usual.
     }
     if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
       lastAsyncAcquireUs_.store(static_cast<long long>(acquireMs) * 1000LL,
@@ -486,6 +537,16 @@ void VulkanRenderer::asyncAcquireLoop() {
     if (shouldBreak) {
       break;
     }
+    // A timeout means the compositor still owns all swapchain images.  Avoid
+    // turning that normal back-pressure into a tight retry loop on RK356x.
+    if (result == VK_TIMEOUT || result == VK_NOT_READY) {
+      std::unique_lock<std::mutex> lk(asyncAcquireMutex_);
+      asyncAcquireCv_.wait_for(lk, std::chrono::milliseconds(2), [&]() {
+        return asyncAcquireStop_ ||
+            asyncPresentNeedsRecreate_.load(std::memory_order_acquire) ||
+            asyncAcquireNeedsRecreate_.load(std::memory_order_acquire);
+      });
+    }
   }
 }
 
@@ -520,9 +581,18 @@ bool VulkanRenderer::consumeReadyAsyncAcquire(int waitMs) {
   }
 
   const int64_t waitCostMs = elapsedMillisSince(waitStart);
-  if (waitCostMs >= 4) {
+  // A FIFO swapchain normally waits for the next 60 Hz presentation slot.
+  // Only warn after that expected pacing window has been exceeded.
+  if (waitCostMs >= 20) {
     static int asyncReadyWaitLogCount = 0;
-    if (++asyncReadyWaitLogCount <= 10 || asyncReadyWaitLogCount % 60 == 0) {
+    static auto s_lastAsyncReadyWaitLog =
+        std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (++asyncReadyWaitLogCount <= 10 ||
+        s_lastAsyncReadyWaitLog.time_since_epoch().count() == 0 ||
+        now - s_lastAsyncReadyWaitLog >=
+            std::chrono::milliseconds(kPerfWarnLogIntervalMs)) {
+      s_lastAsyncReadyWaitLog = now;
       LOG_WARN("[VulkanAcquirePerf] asyncAcquireReadyWait=%lldms frame=%zu "
                "slot=%d image=%u count=%d",
                static_cast<long long>(waitCostMs), currentFrame_, ready.slot,
@@ -704,6 +774,8 @@ bool VulkanRenderer::beginFrame() {
     }
   }
 
+  if (!drmKmsPresentActive && recoverPendingSwapchain()) return false;
+
   // 保护：rebuildVulkanAfterDeviceLost() 期间 device_ 可能为 VK_NULL_HANDLE
   const bool outputHandleInvalid =
       drmKmsPresentActive ? false
@@ -736,11 +808,14 @@ bool VulkanRenderer::beginFrame() {
   if (asyncPresentEnabled_) {
     const auto asyncWaitStart = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> asyncLock(asyncPresentMutex_);
-    asyncPresentCv_.wait(asyncLock, [&]() {
-      return asyncPresentStop_ ||
-             currentFrame_ >= MAX_FRAMES_IN_FLIGHT ||
-             !asyncPresentFrameInUse_[currentFrame_];
-    });
+    if (!asyncPresentCv_.wait_for(asyncLock, std::chrono::milliseconds(4), [&]() {
+          return asyncPresentStop_ ||
+                 currentFrame_ >= MAX_FRAMES_IN_FLIGHT ||
+                 !asyncPresentFrameInUse_[currentFrame_];
+        })) {
+      markRenderBackpressure(180);
+      return false;
+    }
     logRendererStallIfSlow("beginFrame_async_present_wait",
                            elapsedMillisSince(asyncWaitStart), 16);
   }
@@ -793,7 +868,7 @@ bool VulkanRenderer::beginFrame() {
   } else {
     fenceResult =
         vkWaitForFences(device_, 1, &inFlightFences_[currentFrame_], VK_TRUE,
-                        1000000000ULL); // 1 秒
+                        4000000ULL); // Preserve in-flight resources; retry next tick.
   }
   auto fenceDone = std::chrono::steady_clock::now();
   const int64_t fenceWaitMs =
@@ -808,49 +883,8 @@ bool VulkanRenderer::beginFrame() {
       fenceWaitMs,
       24);
   if (fenceResult == VK_TIMEOUT) {
-    static int timeoutCount = 0;
-    if (++timeoutCount <= 10) {
-      LOG_ERROR("[Vulkan] vkWaitForFences timeout: GPU may be hung (frame=%d, "
-                "currentFrame_=%d, count=%d)",
-                frameCount, static_cast<int>(currentFrame_), timeoutCount);
-      if (frameCount == 1) {
-        LOG_ERROR(
-            "[Vulkan] This is the first frame! fence should be SIGNALED, should not timeout!");
-        LOG_ERROR("[Vulkan] Possible issues: 1) fence not SIGNALED when created 2) "
-                  "fence reset somewhere during initialization");
-        LOG_ERROR("[Vulkan] 3) Command buffer submitted during init but not properly waited");
-      } else {
-        LOG_ERROR(
-            "[Vulkan] This usually means previous frame's command buffer has issues, causing GPU hang");
-        LOG_ERROR("[Vulkan] Please check: 1) Texture created inside render pass 2) "
-                  "Command buffer not properly ended");
-        LOG_ERROR("[Vulkan] 3) Uncommitted command buffer 4) "
-                  "Render pass not properly ended");
-      }
-    }
-    // Use a finite 时间out (10s) instead of UINT64_MAX to prevent
-    // the 渲染 thread from hanging indefinitely and causing ANR if this
-    // 说明：线程恰好是主线程。
-    fenceResult =
-        vkWaitForFences(device_, 1, &inFlightFences_[currentFrame_], VK_TRUE,
-                        10000000000ULL); // 10 秒
-    if (fenceResult == VK_TIMEOUT) {
-      LOG_ERROR("[Vulkan] vkWaitForFences still timed out after 10s; "
-                "skip this frame to avoid resetting an in-flight command buffer "
-                "(frame=%d, currentFrame_=%d)",
-                frameCount, static_cast<int>(currentFrame_));
-      return false;
-    }
-    if (fenceResult == VK_ERROR_DEVICE_LOST) {
-      markDeviceLostFatal("vkWaitForFences(timeout retry)", fenceResult);
-      return false;
-    }
-    if (fenceResult != VK_SUCCESS) {
-      LOG_ERROR("[Vulkan] vkWaitForFences retry failed: result=%d frame=%d "
-                "currentFrame_=%d",
-                fenceResult, frameCount, static_cast<int>(currentFrame_));
-      return false;
-    }
+    markRenderBackpressure(180);
+    return false; // No reset, retirement, or command-buffer reuse before completion.
   } else if (fenceResult != VK_SUCCESS) {
     static int errorCount = 0;
     if (++errorCount <= 10) {
@@ -899,16 +933,13 @@ bool VulkanRenderer::beginFrame() {
     return false;
   }
 
-  std::vector<std::function<void()>> gpuCompletionCallbacks;
-  {
-    std::lock_guard<std::mutex> lk(gpuCompletionCallbacksMutex_);
-    gpuCompletionCallbacks.swap(gpuCompletionCallbacks_[currentFrame_]);
-  }
-  for (auto &callback : gpuCompletionCallbacks) {
-    if (callback) {
-      callback();
-    }
-  }
+  const auto retireStart = std::chrono::steady_clock::now();
+  retireCompletedFrameSlot(currentFrame_);
+  // This slot's fence has completed, so its host upload ranges can be reused.
+  assMaskFrameBuffers_[currentFrame_].stagingUsed = 0;
+  assMaskFrameBuffers_[currentFrame_].instanceUsed = 0;
+  const int64_t retireMs = elapsedMillisSince(retireStart);
+  logRendererStallIfSlow("beginFrame_retireCompletedFrameSlot", retireMs, 4);
 
   // 兼容少数旧路径显式请求的全量 reset。普通切歌不再设置此 flag，
   // 旧资源通过延迟销毁预算回收，避免起播热帧 vkDeviceWaitIdle。
@@ -941,6 +972,9 @@ bool VulkanRenderer::beginFrame() {
   if (currentFrame_ < frameAcquireSlots_.size()) {
     frameAcquireSlots_[currentFrame_] = -1;
   }
+  abandonRecordingCallbacks(currentFrame_, nullptr);
+
+  if (recoverPendingSwapchain()) return false;
 
   if (asyncAcquireEnabled_ && !sharedPresentMode_) {
     const auto preAcquireStart = std::chrono::steady_clock::now();
@@ -975,6 +1009,10 @@ bool VulkanRenderer::beginFrame() {
   vkResetFences(device_, 1, &inFlightFences_[currentFrame_]);
 
   commandBufferRecording_ = true;
+  {
+    std::lock_guard<std::mutex> lk(submissionStateMutex_);
+    frameSubmissionPending_ = true;
+  }
   renderPassStarted_ = false;
   ++kawaseBlurFrameId_;
 
@@ -998,9 +1036,10 @@ bool VulkanRenderer::beginFrame() {
               std::chrono::seconds(5)))) {
       s_lastStartupBeginFrameLog = startupBeginLogNow;
       LOG_INFO("[StartupVulkan] stage=beginFrame total=%lldms fence=%lldms "
-               "pendingDestroy=%lldms commandBegin=%lldms "
+               "retire=%lldms pendingDestroy=%lldms commandBegin=%lldms "
                "frame=%zu shared=%d count=%d",
                static_cast<long long>(totalMs), static_cast<long long>(fenceMs),
+               static_cast<long long>(retireMs),
                static_cast<long long>(pendingDestructionsMs),
                static_cast<long long>(commandBeginMs), currentFrame_,
                sharedPresentMode_ ? 1 : 0, s_startupBeginFrameLogs);
@@ -1193,6 +1232,11 @@ bool VulkanRenderer::endFrame() {
     vkCmdEndRenderPass(commandBuffers_[currentFrame_]);
     renderPassStarted_ = false;
   }
+#ifdef __ANDROID__
+  if (isDrmKmsPresentActive()) {
+    releaseDrmKmsImageForCurrentFrame();
+  }
+#endif
   // 注意：renderPassStarted_ 为 false 可能表示：
   // 1. This 帧 did not start any 渲染 pass
   // 2. 渲染 paths manage their own 渲染 pass
@@ -1221,6 +1265,7 @@ bool VulkanRenderer::endFrame() {
 }
 
 void VulkanRenderer::signalCurrentFenceAndAdvance(const char *reason) {
+  abandonRecordingCallbacks(currentFrame_, reason);
   if (device_ != VK_NULL_HANDLE && graphicsQueue_ != VK_NULL_HANDLE &&
       currentFrame_ < inFlightFences_.size() &&
       inFlightFences_[currentFrame_] != VK_NULL_HANDLE) {
@@ -1289,6 +1334,7 @@ void VulkanRenderer::submitCurrentFrameCommandsNoPresent(const char *reason) {
     signalCurrentFenceAndAdvance(reason);
     return;
   }
+  registerSuccessfulSubmission(currentFrame_);
   currentFrame_ = (currentFrame_ + 1) % MAX_FRAMES_IN_FLIGHT;
   currentFrameHasSwapchainImage_ = false;
   currentImageAvailableSemaphore_ = VK_NULL_HANDLE;
@@ -1349,7 +1395,7 @@ void VulkanRenderer::presentLocked() {
   if (device_ == VK_NULL_HANDLE || graphicsQueue_ == VK_NULL_HANDLE ||
       presentQueue_ == VK_NULL_HANDLE || swapchain_ == VK_NULL_HANDLE ||
       currentFrame_ >= imageAvailableSemaphores_.size() ||
-      currentFrame_ >= renderFinishedSemaphores_.size() ||
+      currentSwapchainImageIndex_ >= renderFinishedSemaphores_.size() ||
       currentFrame_ >= inFlightFences_.size() ||
       currentFrame_ >= commandBuffers_.size()) {
     static int invalidStateCount = 0;
@@ -1374,7 +1420,10 @@ void VulkanRenderer::presentLocked() {
       currentImageAvailableSemaphore_ != VK_NULL_HANDLE
           ? currentImageAvailableSemaphore_
           : imageAvailableSemaphores_[frameIndex];
-  VkSemaphore renderFinishedSemaphore = renderFinishedSemaphores_[frameIndex];
+  // Reacquisition and the image-available wait order this signal after the
+  // previous present wait. A graphics frame fence alone does not do that.
+  VkSemaphore renderFinishedSemaphore =
+      renderFinishedSemaphores_[currentSwapchainImageIndex_];
   VkCommandBuffer submitCommandBuffer = commandBuffers_[frameIndex];
   VkSwapchainKHR presentSwapchain = swapchain_;
   uint32_t presentImageIndex = currentSwapchainImageIndex_;
@@ -1439,9 +1488,11 @@ void VulkanRenderer::presentLocked() {
   submitInfo.commandBufferCount = 1;
   submitInfo.pCommandBuffers = &submitCommandBuffer;
 
+  const bool shouldQueuePresent =
+      !sharedPresentMode_ || !sharedPresentInitialRefreshSubmitted_;
   VkSemaphore signalSemaphores[] = {renderFinishedSemaphore};
-  submitInfo.signalSemaphoreCount = 1;
-  submitInfo.pSignalSemaphores = signalSemaphores;
+  submitInfo.signalSemaphoreCount = shouldQueuePresent ? 1 : 0;
+  submitInfo.pSignalSemaphores = shouldQueuePresent ? signalSemaphores : nullptr;
 
   auto submitStart = std::chrono::steady_clock::now();
   VkResult submitResult = vkQueueSubmit(graphicsQueue_, 1, &submitInfo,
@@ -1475,6 +1526,7 @@ void VulkanRenderer::presentLocked() {
     }
     return;
   }
+  registerSuccessfulSubmission(frameIndex);
   sharedPresentNeedsAcquireWait_ = false;
   (void)frameAcquireSlot;
 
@@ -1494,8 +1546,6 @@ void VulkanRenderer::presentLocked() {
   VkResult result = VK_SUCCESS;
   auto presentStart = std::chrono::steady_clock::now();
   auto presentEnd = presentStart;
-  const bool shouldQueuePresent =
-      !sharedPresentMode_ || !sharedPresentInitialRefreshSubmitted_;
   if (shouldQueuePresent) {
     if (asyncPresentEnabled_) {
       PendingPresent pending{};
@@ -1522,11 +1572,19 @@ void VulkanRenderer::presentLocked() {
 
       result = vkQueuePresentKHR(presentQueue_, &presentInfo);
       presentEnd = std::chrono::steady_clock::now();
+      if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+        successfulPresentCount_.fetch_add(1, std::memory_order_relaxed);
+      }
       if (sharedPresentMode_ && result == VK_SUCCESS) {
         sharedPresentInitialRefreshSubmitted_ = true;
         LOG_INFO("[Vulkan] shared present initial refresh submitted");
       }
     }
+  } else if (sharedPresentMode_) {
+    // Shared-present swapchains expose later successful GPU submissions without
+    // another vkQueuePresentKHR call. Count those visible updates as presents so
+    // Java-side stall detection keeps the same one-to-one frame semantics.
+    successfulPresentCount_.fetch_add(1, std::memory_order_relaxed);
   }
   const auto submitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                             submitEnd - submitStart)
@@ -1611,27 +1669,129 @@ void VulkanRenderer::present() {
   presentLocked();
 }
 
-void VulkanRenderer::deferUntilCurrentFrameFence(std::function<void()> callback) {
-  if (!callback) {
-    return;
+SubmissionSerial
+VulkanRenderer::registerSuccessfulSubmission(size_t frameIndex) {
+  if (frameIndex >= MAX_FRAMES_IN_FLIGHT) {
+    return 0;
   }
-  if (currentFrame_ >= MAX_FRAMES_IN_FLIGHT) {
-    callback();
-    return;
+
+  const SubmissionSerial serial =
+      nextSubmissionSerial_.fetch_add(1, std::memory_order_relaxed);
+  size_t callbackCount = 0;
+  size_t textureCount = 0;
+  {
+    std::lock_guard<std::mutex> lk(submissionStateMutex_);
+    frameSlotSubmissionSerial_[frameIndex] = serial;
+    frameSubmissionPending_ = false;
+    auto &callbacks = recordingCallbacks_[frameIndex];
+    callbackCount = callbacks.size();
+    if (!callbacks.empty()) {
+      submissionCallbacks_[serial] = std::move(callbacks);
+      callbacks.clear();
+    }
+    auto &textureIds = recordingTextureIds_[frameIndex];
+    textureCount = textureIds.size();
+    for (uint32_t textureId : textureIds) {
+      auto textureIt = textures_.find(textureId);
+      if (textureIt != textures_.end()) {
+        textureIt->second.lastUsageSubmissionSerial = serial;
+      }
+    }
+    textureIds.clear();
   }
-  std::lock_guard<std::mutex> lk(gpuCompletionCallbacksMutex_);
-  gpuCompletionCallbacks_[currentFrame_].push_back(std::move(callback));
+  submissionStateCv_.notify_all();
+
+  const uint64_t submitted =
+      submittedCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (submitted <= 3 || submitted % 600 == 0) {
+    LOG_INFO("[VulkanSubmission] submitted serial=%llu slot=%zu callbacks=%zu "
+             "textures=%zu submitted=%llu",
+             static_cast<unsigned long long>(serial), frameIndex,
+             callbackCount, textureCount,
+             static_cast<unsigned long long>(submitted));
+  }
+  return serial;
 }
 
-void VulkanRenderer::flushDeferredFrameFenceCallbacks() {
+void VulkanRenderer::retireCompletedFrameSlot(size_t frameIndex) {
+  if (frameIndex >= MAX_FRAMES_IN_FLIGHT) {
+    return;
+  }
+
   std::vector<std::function<void()>> callbacks;
+  SubmissionSerial retiredSerial = 0;
+  SubmissionSerial previousCompleted = 0;
   {
-    std::lock_guard<std::mutex> lk(gpuCompletionCallbacksMutex_);
-    for (auto &slotCallbacks : gpuCompletionCallbacks_) {
-      for (auto &callback : slotCallbacks) {
+    std::lock_guard<std::mutex> lk(submissionStateMutex_);
+    retiredSerial = frameSlotSubmissionSerial_[frameIndex];
+    if (retiredSerial == 0) {
+      return;
+    }
+
+    previousCompleted =
+        completedSubmissionSerial_.load(std::memory_order_relaxed);
+    const SubmissionSerial completed =
+        std::max(previousCompleted, retiredSerial);
+    completedSubmissionSerial_.store(completed, std::memory_order_release);
+
+    // Graphics submissions share one ordered queue: completing N also proves
+    // completion of every earlier serial, regardless of its original slot.
+    for (SubmissionSerial &slotSerial : frameSlotSubmissionSerial_) {
+      if (slotSerial != 0 && slotSerial <= completed) {
+        slotSerial = 0;
+      }
+    }
+    auto callbackIt = submissionCallbacks_.begin();
+    while (callbackIt != submissionCallbacks_.end() &&
+           callbackIt->first <= completed) {
+      for (auto &callback : callbackIt->second) {
         callbacks.push_back(std::move(callback));
       }
-      slotCallbacks.clear();
+      callbackIt = submissionCallbacks_.erase(callbackIt);
+    }
+  }
+
+  if (retiredSerial > previousCompleted) {
+    completedCount_.fetch_add(retiredSerial - previousCompleted,
+                              std::memory_order_relaxed);
+  }
+  for (auto &callback : callbacks) {
+    if (callback) {
+      callback();
+    }
+  }
+}
+
+void VulkanRenderer::abandonRecordingCallbacks(size_t frameIndex,
+                                                const char *reason) {
+  if (frameIndex >= MAX_FRAMES_IN_FLIGHT) {
+    return;
+  }
+
+  std::vector<std::function<void()>> callbacks;
+  size_t textureCount = 0;
+  {
+    std::lock_guard<std::mutex> lk(submissionStateMutex_);
+    frameSubmissionPending_ = false;
+    callbacks.swap(recordingCallbacks_[frameIndex]);
+    textureCount = recordingTextureIds_[frameIndex].size();
+    recordingTextureIds_[frameIndex].clear();
+  }
+  submissionStateCv_.notify_all();
+  if (callbacks.empty() && textureCount == 0) {
+    return;
+  }
+
+  abandonedCount_.fetch_add(callbacks.size(), std::memory_order_relaxed);
+  if (reason) {
+    static std::atomic<uint64_t> abandonLogCount{0};
+    const uint64_t logCount =
+        abandonLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (logCount <= 10 || logCount % 120 == 0) {
+      LOG_WARN("[VulkanSubmission] abandoned recording slot=%zu callbacks=%zu "
+               "textures=%zu reason=%s count=%llu",
+               frameIndex, callbacks.size(), textureCount, reason,
+               static_cast<unsigned long long>(logCount));
     }
   }
   for (auto &callback : callbacks) {
@@ -1639,6 +1799,232 @@ void VulkanRenderer::flushDeferredFrameFenceCallbacks() {
       callback();
     }
   }
+}
+
+void VulkanRenderer::drainSubmissionCallbacks(bool deviceIdle,
+                                              const char *reason) {
+  std::vector<std::function<void()>> callbacks;
+  size_t abandonedCount = 0;
+  SubmissionSerial previousCompleted = 0;
+  SubmissionSerial completed = 0;
+  {
+    std::lock_guard<std::mutex> lk(submissionStateMutex_);
+    previousCompleted =
+        completedSubmissionSerial_.load(std::memory_order_relaxed);
+    completed = previousCompleted;
+    if (deviceIdle) {
+      const SubmissionSerial next =
+          nextSubmissionSerial_.load(std::memory_order_relaxed);
+      completed = next > 0 ? next - 1 : 0;
+      completedSubmissionSerial_.store(completed, std::memory_order_release);
+    }
+
+    for (auto &entry : submissionCallbacks_) {
+      if (!deviceIdle) {
+        abandonedCount += entry.second.size();
+      }
+      for (auto &callback : entry.second) {
+        callbacks.push_back(std::move(callback));
+      }
+    }
+    submissionCallbacks_.clear();
+    frameSlotSubmissionSerial_.fill(0);
+    frameSubmissionPending_ = false;
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+      abandonedCount += recordingCallbacks_[i].size();
+      for (auto &callback : recordingCallbacks_[i]) {
+        callbacks.push_back(std::move(callback));
+      }
+      recordingCallbacks_[i].clear();
+      recordingTextureIds_[i].clear();
+    }
+  }
+  submissionStateCv_.notify_all();
+
+  if (deviceIdle && completed > previousCompleted) {
+    completedCount_.fetch_add(completed - previousCompleted,
+                              std::memory_order_relaxed);
+  }
+  if (abandonedCount != 0) {
+    abandonedCount_.fetch_add(abandonedCount, std::memory_order_relaxed);
+  }
+  for (auto &callback : callbacks) {
+    if (callback) {
+      callback();
+    }
+  }
+  if (!callbacks.empty() || completed > previousCompleted) {
+    LOG_INFO("[VulkanSubmission] drain idle=%d callbacks=%zu completed=%llu "
+             "abandoned=%zu reason=%s",
+             deviceIdle ? 1 : 0, callbacks.size(),
+             static_cast<unsigned long long>(completed), abandonedCount,
+             reason ? reason : "unspecified");
+  }
+}
+
+bool VulkanRenderer::isSubmissionComplete(SubmissionSerial serial) const {
+  return serial == 0 ||
+         serial <= completedSubmissionSerial_.load(std::memory_order_acquire);
+}
+
+bool VulkanRenderer::waitForSubmissionCompletion(SubmissionSerial serial,
+                                                 uint64_t timeoutNs,
+                                                 bool waitIdleOnTimeout,
+                                                 const char *reason) {
+  if (isSubmissionComplete(serial)) {
+    return true;
+  }
+
+  if (device_ == VK_NULL_HANDLE ||
+      deviceLostFatal_.load(std::memory_order_acquire)) {
+    return false;
+  }
+
+  size_t ownerSlot = MAX_FRAMES_IN_FLIGHT;
+  {
+    std::lock_guard<std::mutex> lk(submissionStateMutex_);
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+      if (frameSlotSubmissionSerial_[i] == serial) {
+        ownerSlot = i;
+        break;
+      }
+    }
+  }
+  if (ownerSlot >= inFlightFences_.size() ||
+      inFlightFences_[ownerSlot] == VK_NULL_HANDLE) {
+    return isSubmissionComplete(serial);
+  }
+
+  VkResult waitResult = vkWaitForFences(device_, 1,
+                                        &inFlightFences_[ownerSlot], VK_TRUE,
+                                        timeoutNs);
+  if (waitResult == VK_SUCCESS) {
+    retireCompletedFrameSlot(ownerSlot);
+    return isSubmissionComplete(serial);
+  }
+  if (waitResult == VK_ERROR_DEVICE_LOST) {
+    markDeviceLostFatal(reason ? reason : "vkWaitForFences(submission)",
+                        waitResult);
+    drainSubmissionCallbacks(false, reason);
+    return false;
+  }
+  if (waitResult != VK_TIMEOUT || !waitIdleOnTimeout) {
+    return false;
+  }
+
+  waitResult = vkDeviceWaitIdle(device_);
+  if (waitResult == VK_ERROR_DEVICE_LOST) {
+    markDeviceLostFatal(reason ? reason : "vkDeviceWaitIdle(submission)",
+                        waitResult);
+    drainSubmissionCallbacks(false, reason);
+    return false;
+  }
+  if (waitResult != VK_SUCCESS) {
+    return false;
+  }
+  for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+    retireCompletedFrameSlot(i);
+  }
+  return isSubmissionComplete(serial);
+}
+
+void VulkanRenderer::recordTextureUsage(uint32_t textureId) {
+  if (currentFrame_ >= MAX_FRAMES_IN_FLIGHT) {
+    return;
+  }
+  std::lock_guard<std::mutex> lk(submissionStateMutex_);
+  if (!frameSubmissionPending_) {
+    return;
+  }
+  recordingTextureIds_[currentFrame_].insert(textureId);
+}
+
+void VulkanRenderer::deferUntilCurrentFrameFence(std::function<void()> callback) {
+  if (!callback) {
+    return;
+  }
+
+  bool runImmediately = false;
+  {
+    std::lock_guard<std::mutex> lk(submissionStateMutex_);
+    if (frameSubmissionPending_ && currentFrame_ < MAX_FRAMES_IN_FLIGHT) {
+      recordingCallbacks_[currentFrame_].push_back(std::move(callback));
+      return;
+    }
+
+    const SubmissionSerial latestSubmitted =
+        nextSubmissionSerial_.load(std::memory_order_relaxed) - 1;
+    const SubmissionSerial completed =
+        completedSubmissionSerial_.load(std::memory_order_acquire);
+    if (latestSubmitted > completed) {
+      submissionCallbacks_[latestSubmitted].push_back(std::move(callback));
+      return;
+    }
+    runImmediately = true;
+  }
+
+  if (runImmediately) {
+    callback();
+  }
+}
+
+void VulkanRenderer::flushDeferredFrameFenceCallbacks(const char *reason) {
+  if (device_ == VK_NULL_HANDLE ||
+      deviceLostFatal_.load(std::memory_order_acquire)) {
+    drainSubmissionCallbacks(false, reason ? reason : "flush after device loss");
+    return;
+  }
+
+  const auto waitStart = std::chrono::steady_clock::now();
+  SubmissionSerial targetSerial = 0;
+  bool recordingResolved = true;
+  {
+    std::unique_lock<std::mutex> lk(submissionStateMutex_);
+    const SubmissionSerial observedNext =
+        nextSubmissionSerial_.load(std::memory_order_acquire);
+    if (frameSubmissionPending_) {
+      recordingResolved = submissionStateCv_.wait_for(
+          lk, std::chrono::milliseconds(250), [&]() {
+            return deviceLostFatal_.load(std::memory_order_acquire) ||
+                   !frameSubmissionPending_ ||
+                   nextSubmissionSerial_.load(std::memory_order_acquire) !=
+                       observedNext;
+          });
+    }
+    const SubmissionSerial next =
+        nextSubmissionSerial_.load(std::memory_order_acquire);
+    targetSerial = next > 0 ? next - 1 : 0;
+  }
+
+  if (recordingResolved &&
+      waitForSubmissionCompletion(targetSerial, 250000000ULL, false,
+                                  reason ? reason : "flush callbacks")) {
+    const int64_t waitMs = elapsedMillisSince(waitStart);
+    if (waitMs >= 8) {
+      LOG_INFO("[VulkanSubmission] scoped flush serial=%llu wait=%lldms "
+               "reason=%s",
+               static_cast<unsigned long long>(targetSerial),
+               static_cast<long long>(waitMs),
+               reason ? reason : "unspecified");
+    }
+    return;
+  }
+
+  // Lifecycle teardown must not release DMA-BUF ownership early. This fallback
+  // is intentionally exceptional; routine capture retries never reach it.
+  LOG_WARN("[VulkanSubmission] scoped flush timeout, fallback to device idle "
+           "serial=%llu reason=%s",
+           static_cast<unsigned long long>(targetSerial),
+           reason ? reason : "unspecified");
+  const VkResult idleResult = vkDeviceWaitIdle(device_);
+  if (idleResult == VK_SUCCESS) {
+    drainSubmissionCallbacks(true, reason ? reason : "flush idle fallback");
+    return;
+  }
+  if (idleResult == VK_ERROR_DEVICE_LOST) {
+    markDeviceLostFatal("vkDeviceWaitIdle(flush callbacks)", idleResult);
+  }
+  drainSubmissionCallbacks(false, reason ? reason : "flush wait failed");
 }
 
 void VulkanRenderer::setScreenRotate(int angle) {

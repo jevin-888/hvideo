@@ -172,7 +172,7 @@ struct vp56_context {
     int has_alpha;
 
     /* upside-down flipping hints */
-    int flip;  /* are we flipping */
+    int flip;  /* are we flipping ? */
     int frbi;  /* first row block index in MB */
     int srbi;  /* second row block index in MB */
     ptrdiff_t stride[4];  /* stride for each plan */

@@ -914,7 +914,7 @@ static av_cold int on2avc_decode_init(AVCodecContext *avctx)
     c->avctx = avctx;
     avctx->sample_fmt     = AV_SAMPLE_FMT_FLTP;
     av_channel_layout_uninit(&avctx->ch_layout);
-    avctx->ch_layout = (channels == 2) ? (AVChannelLayout)? AV_CHANNEL_LAYOUT_STEREO :
+    avctx->ch_layout = (channels == 2) ? (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO :
                                          (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
     c->is_av500 = (avctx->codec_tag == 0x500);

@@ -16,6 +16,7 @@
 #include <map>
 #include <string>
 #include <unistd.h>
+#include <sys/sysinfo.h>
 #include <sys/system_properties.h>
 #include <malloc.h>
 
@@ -77,6 +78,20 @@ MemoryMonitor::MemoryInfo MemoryMonitor::getMemoryInfo() {
 
         info.totalMemory = memTotal;
         info.freeMemory = memFree + buffers + cached;
+    }
+
+    // Some production SELinux policies deny /proc/meminfo to app processes.
+    // sysinfo() exposes a smaller but reliable fallback for the free-memory
+    // decision used by the decoder buffer policy.
+    if (info.freeMemory == 0) {
+        struct sysinfo systemInfo = {};
+        if (sysinfo(&systemInfo) == 0) {
+            const uint64_t unit = systemInfo.mem_unit == 0 ? 1 : systemInfo.mem_unit;
+            info.totalMemory = (static_cast<uint64_t>(systemInfo.totalram) * unit) / 1024;
+            info.freeMemory =
+                (static_cast<uint64_t>(systemInfo.freeram) +
+                 static_cast<uint64_t>(systemInfo.bufferram)) * unit / 1024;
+        }
     }
 
     return info;

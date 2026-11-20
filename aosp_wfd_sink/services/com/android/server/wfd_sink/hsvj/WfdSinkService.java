@@ -10,6 +10,7 @@ import android.net.NetworkInfo;
 import android.net.wifi.WifiManager;
 import android.net.wifi.p2p.WifiP2pDevice;
 import android.net.wifi.p2p.WifiP2pDeviceList;
+import android.net.wifi.p2p.WifiP2pGroup;
 import android.net.wifi.p2p.WifiP2pInfo;
 import android.net.wifi.p2p.WifiP2pManager;
 import android.net.wifi.p2p.WifiP2pWfdInfo;
@@ -28,8 +29,10 @@ import android.wfd_sink.IWfdSinkService;
 import android.wfd_sink.WfdSinkStatus;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * WFD Miracast Sink 系统服务。
@@ -60,8 +63,8 @@ public final class WfdSinkService extends SystemService {
     private final Handler mMainHandler;
     private final PowerManager mPowerManager;
     private final WifiManager mWifiManager;
-    private final WifiP2pManager mWifiP2pManager;
-    private final WifiP2pManager.Channel mChannel;
+    private WifiP2pManager mWifiP2pManager;
+    private WifiP2pManager.Channel mChannel;
     private final PowerManager.WakeLock mWakeLock;
 
     // 状态字段（原子/volatile，跨线程可见）
@@ -70,6 +73,7 @@ public final class WfdSinkService extends SystemService {
     private final AtomicBoolean mWfdEnabled = new AtomicBoolean(false);
     private final AtomicBoolean mConnected = new AtomicBoolean(false);
     private final AtomicBoolean mSinkRunning = new AtomicBoolean(false);
+    private final AtomicInteger mSinkGeneration = new AtomicInteger(0);
     private volatile String mDeviceAddress = "";
     private volatile String mPeerInfo = "";
     private volatile String mMessage = "idle";
@@ -218,13 +222,9 @@ public final class WfdSinkService extends SystemService {
         mPowerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
         mWifiManager = (WifiManager) context.getApplicationContext()
                 .getSystemService(Context.WIFI_SERVICE);
-        mWifiP2pManager = (WifiP2pManager) context.getSystemService(Context.WIFI_P2P_SERVICE);
-        if (mWifiP2pManager != null) {
-            mChannel = mWifiP2pManager.initialize(context, context.getMainLooper(), null);
-        } else {
-            mChannel = null;
-            Log.e(TAG, "WifiP2pManager unavailable");
-        }
+        mWifiP2pManager = null;
+        mChannel = null;
+        ensureWifiP2pReady();
         if (mPowerManager != null) {
             mWakeLock = mPowerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
             mWakeLock.setReferenceCounted(false);
@@ -260,7 +260,7 @@ public final class WfdSinkService extends SystemService {
     // ----------------------- 权限校验 -----------------------
 
     /**
-     * 仅允许 system uid（含 root）调用，引擎 app 用 platform 签名即满足。
+     * 仅允许 system uid（含 root）调用；引擎 app 必须以 android.uid.system 运行，且须使用匹配的 platform 证书。
      */
     private void enforceCallerPermission() {
         int callingUid = Binder.getCallingUid();
@@ -295,6 +295,25 @@ public final class WfdSinkService extends SystemService {
         return SystemProperties.getBoolean(PROP_IGNORE_STOP, false);
     }
 
+    private boolean ensureWifiP2pReady() {
+        if (mWifiP2pManager == null) {
+            mWifiP2pManager = (WifiP2pManager) mContext.getSystemService(Context.WIFI_P2P_SERVICE);
+        }
+        if (mWifiP2pManager != null && mChannel == null) {
+            try {
+                mChannel = mWifiP2pManager.initialize(mContext, mContext.getMainLooper(), null);
+            } catch (Throwable t) {
+                Log.e(TAG, "WifiP2pManager initialize failed", t);
+                mChannel = null;
+            }
+        }
+        boolean ready = mWifiP2pManager != null && mChannel != null;
+        if (!ready) {
+            Log.w(TAG, "WifiP2pManager unavailable, will retry later");
+        }
+        return ready;
+    }
+
     private boolean isSurfaceOutputSupportedInternal() {
         try {
             return WifiDisplayService.isSurfaceOutputSupported();
@@ -318,7 +337,7 @@ public final class WfdSinkService extends SystemService {
             }
             return;
         }
-        if (mWifiP2pManager == null || mChannel == null) {
+        if (!ensureWifiP2pReady()) {
             mMessage = "WifiP2pManager unavailable";
             mServiceStarted.set(false);
             return;
@@ -340,6 +359,7 @@ public final class WfdSinkService extends SystemService {
 
     private void stopInternal() {
         mServiceStarted.set(false);
+        mSinkGeneration.incrementAndGet();
         mWfdEnabled.set(false);
         mConnected.set(false);
         mSinkRunning.set(false);
@@ -377,7 +397,7 @@ public final class WfdSinkService extends SystemService {
      * 该 API 是 hide 的，system_server 有权限调用。
      */
     private void applyDeviceName() {
-        if (mWifiP2pManager == null || mChannel == null) {
+        if (!ensureWifiP2pReady()) {
             return;
         }
         try {
@@ -401,7 +421,7 @@ public final class WfdSinkService extends SystemService {
     // ----------------------- WFD Sink 协商 -----------------------
 
     private void enableWfdInfo() {
-        if (mWifiP2pManager == null || mChannel == null) return;
+        if (!ensureWifiP2pReady()) return;
         WifiP2pWfdInfo wfdInfo = new WifiP2pWfdInfo();
         wfdInfo.setEnabled(true);
         wfdInfo.setDeviceType(WifiP2pWfdInfo.DEVICE_TYPE_PRIMARY_SINK);
@@ -434,7 +454,7 @@ public final class WfdSinkService extends SystemService {
 
     private void disableWfdInfo() {
         mWfdEnabled.set(false);
-        if (mWifiP2pManager == null || mChannel == null) return;
+        if (!ensureWifiP2pReady()) return;
         if (mWifiManager != null && !mWifiManager.isWifiEnabled()) {
             mMessage = "WFD sink disabled";
             return;
@@ -466,7 +486,7 @@ public final class WfdSinkService extends SystemService {
     }
 
     private void requestPeers() {
-        if (mWifiP2pManager == null || mChannel == null) return;
+        if (!ensureWifiP2pReady()) return;
         mWifiP2pManager.requestPeers(mChannel,
                 new WifiP2pManager.PeerListListener() {
                     @Override
@@ -484,14 +504,14 @@ public final class WfdSinkService extends SystemService {
     }
 
     private void scheduleDiscoverPeers(long delayMs) {
-        if (!mServiceStarted.get() || mWifiP2pManager == null || mChannel == null) return;
+        if (!mServiceStarted.get() || !ensureWifiP2pReady()) return;
         mMainHandler.removeCallbacks(mDiscoverPeersRunnable);
         mMainHandler.postDelayed(mDiscoverPeersRunnable, delayMs);
     }
 
     private void discoverPeers() {
         if (!mServiceStarted.get() || mConnected.get()
-                || mWifiP2pManager == null || mChannel == null) {
+                || !ensureWifiP2pReady()) {
             return;
         }
         mWifiP2pManager.discoverPeers(mChannel, new WifiP2pManager.ActionListener() {
@@ -530,29 +550,61 @@ public final class WfdSinkService extends SystemService {
             scheduleDiscoverPeers(DISCOVER_PEERS_DELAY_MS);
             return;
         }
-        if (!mWfdEnabled.get() || mWifiP2pManager == null || mChannel == null) return;
+        if (!mWfdEnabled.get() || !ensureWifiP2pReady()) return;
         mMainHandler.removeCallbacks(mDiscoverPeersRunnable);
         mWifiP2pManager.stopPeerDiscovery(mChannel, null);
         mWifiP2pManager.requestConnectionInfo(mChannel,
                 new WifiP2pManager.ConnectionInfoListener() {
                     @Override
                     public void onConnectionInfoAvailable(WifiP2pInfo info) {
-                        WifiP2pDevice connectedDevice = findConnectedWfdDevice();
-                        if (connectedDevice == null || connectedDevice.getWfdInfo() == null) {
-                            mMessage = "connected device is not WFD source";
-                            return;
-                        }
-                        WifiP2pWfdInfo wfdInfo = connectedDevice.getWfdInfo();
-                        String address = info.isGroupOwner
-                                ? connectedDevice.deviceAddress
-                                : String.valueOf(info.groupOwnerAddress);
-                        String peerInfo = address + ":" + wfdInfo.getControlPort();
-                        mDeviceAddress = connectedDevice.deviceAddress;
-                        mPeerInfo = peerInfo;
-                        mConnected.set(true);
-                        startSinkThread(peerInfo, info.isGroupOwner);
+                        handleConnectionInfoAvailable(info);
                     }
                 });
+    }
+
+
+    private void handleConnectionInfoAvailable(final WifiP2pInfo info) {
+        if (info == null || !info.groupFormed) {
+            mMessage = "P2P group not formed";
+            Log.w(TAG, "connection info unavailable or group not formed: " + info);
+            return;
+        }
+        mWifiP2pManager.requestGroupInfo(mChannel, new WifiP2pManager.GroupInfoListener() {
+            @Override
+            public void onGroupInfoAvailable(WifiP2pGroup group) {
+                startSinkForGroup(info, group);
+            }
+        });
+    }
+
+    private void startSinkForGroup(WifiP2pInfo info, WifiP2pGroup group) {
+        WifiP2pDevice sourceDevice = findBestWfdDevice(group);
+        if (sourceDevice == null) {
+            mMessage = "WFD source device not found";
+            Log.w(TAG, "P2P group has no WFD source: " + describeGroup(group));
+            requestPeers();
+            return;
+        }
+        String peerAddress = info.isGroupOwner
+                ? sourceDevice.deviceAddress
+                : String.valueOf(info.groupOwnerAddress);
+        if (peerAddress == null || peerAddress.isEmpty() || "null".equals(peerAddress)) {
+            mMessage = "WFD peer address not found";
+            Log.w(TAG, "P2P group has no usable peer address: info=" + info
+                    + ", group=" + describeGroup(group));
+            return;
+        }
+        int port = getWfdControlPort(sourceDevice);
+        String peerInfo = peerAddress + ":" + port;
+        Log.i(TAG, "P2P group ready: isGO=" + info.isGroupOwner
+                + ", go=" + info.groupOwnerAddress
+                + ", group=" + describeGroup(group)
+                + ", source=" + describeDevice(sourceDevice)
+                + ", nativePeerInfo=" + peerInfo);
+        mDeviceAddress = sourceDevice.deviceAddress;
+        mPeerInfo = peerInfo;
+        mConnected.set(true);
+        startSinkThread(peerInfo, info.isGroupOwner);
     }
 
     private WifiP2pDevice findConnectedWfdDevice() {
@@ -566,15 +618,71 @@ public final class WfdSinkService extends SystemService {
         return null;
     }
 
+
+    private WifiP2pDevice findBestWfdDevice(WifiP2pGroup group) {
+        WifiP2pDevice connected = findConnectedWfdDevice();
+        if (connected != null) {
+            return connected;
+        }
+        if (group != null) {
+            Collection<WifiP2pDevice> clients = group.getClientList();
+            if (clients != null) {
+                for (WifiP2pDevice device : clients) {
+                    if (isWifiDisplaySource(device)) {
+                        return device;
+                    }
+                }
+            }
+            WifiP2pDevice owner = group.getOwner();
+            if (isWifiDisplaySource(owner)) {
+                return owner;
+            }
+        }
+        synchronized (mWifiDisplayPeers) {
+            for (WifiP2pDevice device : mWifiDisplayPeers) {
+                if (isWifiDisplaySource(device)) {
+                    return device;
+                }
+            }
+        }
+        return null;
+    }
+
+    private int getWfdControlPort(WifiP2pDevice device) {
+        if (device == null || device.getWfdInfo() == null) {
+            return WFD_CONTROL_PORT;
+        }
+        int port = device.getWfdInfo().getControlPort();
+        return port > 0 ? port : WFD_CONTROL_PORT;
+    }
+
+
+    private static String describeGroup(WifiP2pGroup group) {
+        if (group == null) {
+            return "null";
+        }
+        return "iface=" + group.getInterface()
+                + ", owner=" + describeDevice(group.getOwner())
+                + ", clients=" + group.getClientList();
+    }
+
+    private static String describeDevice(WifiP2pDevice device) {
+        if (device == null) {
+            return "null";
+        }
+        return device.deviceName + "/" + device.deviceAddress + "/status=" + device.status;
+    }
+
     private void startSinkThread(final String peerInfo, final boolean groupOwner) {
-        if (mSinkRunning.get()) return;
-        mSinkRunning.set(true);
+        if (!mSinkRunning.compareAndSet(false, true)) return;
+        final int generation = mSinkGeneration.incrementAndGet();
         mMessage = "starting native sink";
         acquireWakeLock();
         mSinkThread = new Thread("wfdSink") {
             @Override
             public void run() {
                 int ret;
+                String failureMessage = null;
                 Surface surface = mVideoSurface;
                 try {
                     if (surface != null && surface.isValid()) {
@@ -588,19 +696,43 @@ public final class WfdSinkService extends SystemService {
                     }
                 } catch (Throwable t) {
                     ret = -1;
-                    mMessage = "native sink failed: " + t.getMessage();
+                    failureMessage = "native sink failed: " + t.getMessage();
                     Log.e(TAG, "native_startWFDSink failed", t);
                 }
-                if (ret < 0) {
-                    mMessage = "native sink exited with error";
-                } else {
-                    mMessage = "native sink exited";
-                }
-                mSinkRunning.set(false);
-                releaseWakeLock();
+                final int result = ret;
+                final String error = failureMessage;
+                mMainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        handleSinkThreadExit(generation, result, error);
+                    }
+                });
             }
         };
         mSinkThread.start();
+    }
+
+    private void handleSinkThreadExit(int generation, int result, String failureMessage) {
+        if (generation != mSinkGeneration.get()) {
+            Log.i(TAG, "ignore stale native sink exit, generation=" + generation);
+            return;
+        }
+        mSinkRunning.set(false);
+        mConnected.set(false);
+        mDeviceAddress = "";
+        mPeerInfo = "";
+        releaseWakeLock();
+        if (!mServiceStarted.get()) {
+            return;
+        }
+        mMessage = failureMessage != null
+                ? failureMessage
+                : (result < 0 ? "native sink exited with error" : "native sink exited");
+        Log.i(TAG, mMessage + ", resetting P2P session");
+        if (mWifiP2pManager != null && mChannel != null) {
+            mWifiP2pManager.removeGroup(mChannel, null);
+        }
+        scheduleDiscoverPeers(DISCOVER_PEERS_DELAY_MS);
     }
 
     private static boolean isWifiDisplaySource(WifiP2pDevice device) {

@@ -175,6 +175,7 @@ public:
    * @param path 字体文件路径
    */
   void setFontPath(const std::string &path) {
+    if (layerId_ == 21 && fontPath_ == path) return;
     if (layerId_ == 40 && fontPath_ != path) {
       resetLayer40ScrollState();
       layer40TextureDirty_ = true;
@@ -184,10 +185,7 @@ public:
       }
     }
     fontPath_ = path;
-    // 只有在 lyric渲染器_ 已初始化时才设置字体路径
-    // 否则字体路径会在 initialize() 时应用
-
-    if (layerId_ == 21 && !path.empty() && lyricRenderer_ && lyricRenderer_->isInitialized()) {
+    if (layerId_ == 21 && lyricRenderer_) {
       lyricRenderer_->setFontPath(path);
     }
   }
@@ -226,12 +224,16 @@ public:
    * @param color 文本颜色
    */
   void setTextColor(const Color &color) {
-    if (layerId_ == 40 && textColor_ != color) {
+    if (textColor_ == color) return;
+    if (layerId_ == 40) {
       layer40TextureDirty_ = true;
       layer40RedrawDirty_ = true;
       if (vtoBridge_) vtoBridge_->invalidateCache();
     }
     textColor_ = color;
+    if (layerId_ == 41 && messageHintRenderer_) {
+      messageHintRenderer_->setTextColor(color.r, color.g, color.b, color.a);
+    }
   }
   
   /**
@@ -245,10 +247,14 @@ public:
    * @param color 背景颜色
    */
   void setBgColor(const Color &color) {
-    if (layerId_ == 40 && bgColor_ != color) {
+    if (bgColor_ == color) return;
+    if (layerId_ == 40) {
       layer40RedrawDirty_ = true;
     }
     bgColor_ = color;
+    if (layerId_ == 41 && messageHintRenderer_) {
+      messageHintRenderer_->setBgColor(color.r, color.g, color.b, color.a);
+    }
   }
   
   /**
@@ -356,12 +362,14 @@ public:
   void setCurrentTimeCallback(std::function<double()> callback);
 
   /**
-   * @brief 自动加载歌词（仅图层21）
+   * @brief 优先加载内嵌 ASS，失败后查找歌词目录（仅图层21）
    * @param lyricDir 歌词目录
    * @param videoPath 视频路径（用于匹配歌词文件名）
+   * @param embeddedAss 后台读取的完整 ASS 内容，空值时仅查找歌词目录
    * @return 是否加载成功
    */
-  bool autoLoadLyric(const std::string &lyricDir, const std::string &videoPath  = "");
+  bool autoLoadLyric(const std::string &lyricDir, const std::string &videoPath,
+                    const std::string &embeddedAss);
 
   /**
    * @brief 加载字幕/歌词（仅图层21）
@@ -534,7 +542,8 @@ public:
    * @param type 提示类型
    * @param customText 自定义文本（可选）
    */
-  void showProtectedOperationHint(HintType type, const std::string& customText = "");
+  bool showProtectedOperationHint(HintType type, const std::string& customText = "",
+                                  bool interruptible = false, bool refreshOnly = false);
 
   /**
    * @brief 获取消息提示渲染器 (Layer 41)

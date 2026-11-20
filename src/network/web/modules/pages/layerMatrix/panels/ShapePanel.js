@@ -1,4 +1,5 @@
 import { SHAPE_TYPES } from '../utils.js';
+import { createNumInput } from './CommonControls.js';
 
 /**
  * 生成图形类型选项HTML
@@ -19,24 +20,15 @@ export function generateShapeTypeOptions(selectedValue) {
  */
 export function generateShapeParamHTML(shapeType, shapeParam, prefix = 'layer', displayType = 'block') {
     const isVisible = (shapeType === 3 || shapeType === 4 || shapeType === 8);
-    const label = shapeType === 3 ? '圆角半径:' : shapeType === 4 ? '角的数量:' : shapeType === 8 ? '花瓣数量:' : '参数:';
+    const label = shapeType === 3 ? '圆角半径' : shapeType === 4 ? '角的数量' : shapeType === 8 ? '花瓣数量' : '参数';
     const min = shapeType === 3 ? '0.0' : (shapeType === 4 || shapeType === 8) ? '3' : '0.0';
     const max = shapeType === 3 ? '0.5' : (shapeType === 4 || shapeType === 8) ? '8' : '1.0';
     const step = shapeType === 3 ? '0.01' : (shapeType === 4 || shapeType === 8) ? '1' : '0.01';
 
-    return `
-        <div id="${prefix}-shape-param-item" class="setting-item" style="grid-column: span 1; display: ${isVisible ? displayType : 'none'};">
-            <label for="${prefix}-shape-param">${label}</label>
-            <div class="number-input-wrapper horizontal layer-param-input">
-                <button type="button" class="number-btn minus" data-target="${prefix}-shape-param">-</button>
-                <input type="number" id="${prefix}-shape-param" 
-                    min="${min}" max="${max}" step="${step}" 
-                    value="${shapeParam}" data-default="${shapeParam}" class="form-control number-input">
-                <button type="button" class="number-btn plus" data-target="${prefix}-shape-param">+</button>
-                <button type="button" class="number-btn number-reset" data-target="${prefix}-shape-param" title="恢复默认">↻</button>
-            </div>
-        </div>
-    `;
+    return createNumInput(`${prefix}-shape-param`, label, shapeParam, min, max, step, 1, {
+        itemId: `${prefix}-shape-param-item`,
+        display: isVisible ? displayType : 'none'
+    });
 }
 
 /**

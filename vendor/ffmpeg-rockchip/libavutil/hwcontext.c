@@ -79,7 +79,9 @@ static const char *const hw_type_names[] = {
     [AV_HWDEVICE_TYPE_VAAPI]  = "vaapi",
     [AV_HWDEVICE_TYPE_VDPAU]  = "vdpau",
     [AV_HWDEVICE_TYPE_VIDEOTOOLBOX] = "videotoolbox",
+#if CONFIG_MEDIACODEC
     [AV_HWDEVICE_TYPE_MEDIACODEC] = "mediacodec",
+#endif
     [AV_HWDEVICE_TYPE_VULKAN] = "vulkan",
     [AV_HWDEVICE_TYPE_RKMPP] = "rkmpp",
 };

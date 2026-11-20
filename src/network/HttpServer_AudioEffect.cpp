@@ -25,7 +25,7 @@
 #include "core/Engine.h"
 #include "core/LicenseManager.h"
 #include "core/Mubu.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "effect/AudioReactiveEngine.h"
 #include "effect/EffectManager.h"

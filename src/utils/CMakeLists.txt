@@ -3,9 +3,11 @@
     FileUtils.cpp
     HttpClient.cpp
     JsonUtils.cpp
-    SliceConfigJson.cpp
+    Sha256.cpp
     MemoryMonitor.cpp
     SystemUtils.cpp
+    FactorySerial.cpp
+    ProcessRunner.cpp
     MediaUtils.cpp
     VideoTranscoder.cpp
     V4L2DeviceDetector.cpp
@@ -42,7 +44,9 @@ if(ANDROID)
     endif()
 endif()
 
-target_link_libraries(hsvj_utils
+target_link_libraries(hsvj_utils PUBLIC
+    hsvj_foundation
+    hsvj_jsoncpp
     ${log-lib}
     $<$<PLATFORM_ID:Windows>:ws2_32>
     # Android平台需要链接android库以支持线程
@@ -52,4 +56,10 @@ target_link_libraries(hsvj_utils
     $<$<BOOL:${ANDROID}>:z>
     # Rockchip MPP 运行时由系统 /vendor/lib64/libmpp.so 提供
     $<$<BOOL:${ANDROID}>:rkmpp_system>
+)
+
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_utils PRIVATE
+    hsvj_foundation
+    hsvj_jsoncpp
 )

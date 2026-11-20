@@ -16,8 +16,6 @@ HEADERS = ac3_parser.h                                                  \
           dirac.h                                                       \
           dv_profile.h                                                  \
           dxva2.h                                                       \
-          jni.h                                                         \
-          mediacodec.h                                                  \
           packet.h                                                      \
           qsv.h                                                         \
           vdpau.h                                                       \
@@ -46,9 +44,7 @@ OBJS = ac3_parser.o                                                     \
        encode.o                                                         \
        get_buffer.o                                                     \
        imgconvert.o                                                     \
-       jni.o                                                            \
        mathtables.o                                                     \
-       mediacodec.o                                                     \
        mpeg12framerate.o                                                \
        options.o                                                        \
        parser.o                                                         \

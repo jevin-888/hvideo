@@ -3,7 +3,8 @@
  * @brief 连接管理模块 - 断线重连、心跳检测、网络状态监听
  */
 
-import { addToCommandLog } from './commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
+import { handleUnauthorized, isAuthRedirecting } from '/shared/authSession.js';
 
 // 连接状态
 export const ConnectionState = {
@@ -45,9 +46,13 @@ function handleStatusMessage(dataStr) {
 function getSSEUrl() {
     const base = (typeof window !== 'undefined' && window.apiBaseUrl) ? window.apiBaseUrl : '/api/v1';
     const path = base + '/events';
+    const token = typeof localStorage !== 'undefined'
+        ? localStorage.getItem('hvideo_auth_token') : null;
+    const authenticatedPath = token
+        ? `${path}?token=${encodeURIComponent(token)}` : path;
     return (typeof window !== 'undefined' && window.location && window.location.origin)
-        ? (window.location.origin + path)
-        : path;
+        ? (window.location.origin + authenticatedPath)
+        : authenticatedPath;
 }
 
 function attachSharedSSEListeners(source) {
@@ -57,6 +62,7 @@ function attachSharedSSEListeners(source) {
 }
 
 function scheduleSharedSSEReconnect() {
+    if (isAuthRedirecting()) return;
     if (sharedSSEReconnectTimer) return;
     sharedSSEReconnectTimer = setTimeout(() => {
         sharedSSEReconnectTimer = null;
@@ -67,6 +73,7 @@ function scheduleSharedSSEReconnect() {
 }
 
 function ensureSharedEventSource() {
+    if (isAuthRedirecting()) return null;
     if (typeof EventSource === 'undefined') {
         return null;
     }
@@ -141,6 +148,7 @@ function subscribeStatusSSE() {
  * 初始化连接管理器
  */
 export function initConnectionManager() {
+    if (isAuthRedirecting()) return;
     // 防止重复初始化
     if (isInitialized) {
         return;
@@ -160,6 +168,7 @@ export function initConnectionManager() {
     // 监听浏览器在线/离线事件
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    window.addEventListener('authSessionExpired', destroyConnectionManager);
 
     // 监听页面可见性变化（从后台切回时检查连接）
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -286,15 +295,16 @@ function stopHeartbeat() {
  * 检查连接状态（心跳）
  */
 async function checkConnection() {
+    if (isAuthRedirecting()) return false;
     // 如果是file://协议，不进行连接检测
     if (window.location.protocol === 'file:') {
         setConnectionState(ConnectionState.DISCONNECTED);
         return false;
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CONFIG.heartbeatTimeoutMs);
     try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), CONFIG.heartbeatTimeoutMs);
 
         // 使用专门的心跳端点，不触发任何业务逻辑
         const base = (typeof window !== 'undefined' && window.apiBaseUrl) ? window.apiBaseUrl : '/api/v1';
@@ -307,7 +317,7 @@ async function checkConnection() {
             signal: controller.signal
         });
 
-        clearTimeout(timeoutId);
+        if (handleUnauthorized(response, token) || isAuthRedirecting()) return false;
 
         if (response.ok) {
             heartbeatFailures = 0;
@@ -323,6 +333,7 @@ async function checkConnection() {
             throw new Error(`HTTP ${response.status}`);
         }
     } catch (error) {
+        if (isAuthRedirecting()) return false;
         // 连接失败（网络错误或超时）
         // 静默处理，避免控制台噪音，连接状态指示器会显示状态
         heartbeatFailures++;
@@ -333,6 +344,8 @@ async function checkConnection() {
             attemptReconnect();
         }
         return false;
+    } finally {
+        clearTimeout(timeoutId);
     }
 }
 
@@ -340,6 +353,7 @@ async function checkConnection() {
  * 尝试重连
  */
 function attemptReconnect() {
+    if (isAuthRedirecting()) return;
     if (reconnectTimeout) {
         return; // 已经在重连中
     }
@@ -514,6 +528,7 @@ export function destroyConnectionManager() {
 
     window.removeEventListener('online', handleOnline);
     window.removeEventListener('offline', handleOffline);
+    window.removeEventListener('authSessionExpired', destroyConnectionManager);
     document.removeEventListener('visibilitychange', handleVisibilityChange);
 
     // 移除连接指示器和相关样式

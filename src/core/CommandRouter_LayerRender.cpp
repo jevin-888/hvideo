@@ -7,10 +7,10 @@
  */
 
 #include "core/CommandRouter.h"
-#include "utils/SliceConfigJson.h"
+#include "core/SliceConfigJson.h"
 #include "core/Engine.h"
 #include "core/Mubu.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "layer/LayerImage.h"
 #include "layer/LayerText.h"
@@ -120,6 +120,8 @@ CommandResponse CommandRouter::handleLayerRender(const std::string &paramJson) {
           // 使缓存失效，强制重新加载（因为路径不变但文件内容已更新）
           LOG_INFO("[QRCode] Invalidating cache for layer %d before reload", layerId);
           imageLayer->invalidateCache();
+          // Engine verifies device identity and regenerates from these parameters.
+          imageLayer->setContentReady(false);
           
           // 加载图片到图层（新保存的图片会覆盖原来的图片）
           LOG_INFO("[QRCode] Loading new QR image: %s", fullPath.c_str());
@@ -272,13 +274,9 @@ CommandResponse CommandRouter::handleLayerRender(const std::string &paramJson) {
               }
               if (param.isMember("qr_text") && param["qr_text"].isString()) {
                 config.qrText = param["qr_text"].asString();
-              } else if (param.isMember("qrText") && param["qrText"].isString()) {
-                config.qrText = param["qrText"].asString();
               }
               if (param.isMember("qr_size") && param["qr_size"].isInt()) {
                 config.qrSize = param["qr_size"].asInt();
-              } else if (param.isMember("qrSize") && param["qrSize"].isInt()) {
-                config.qrSize = param["qrSize"].asInt();
               }
               if (param.isMember("error_correction") &&
                   param["error_correction"].isInt()) {
@@ -289,8 +287,6 @@ CommandResponse CommandRouter::handleLayerRender(const std::string &paramJson) {
               }
               if (param.isMember("bg_color") && param["bg_color"].isString()) {
                 config.qrBgColor = param["bg_color"].asString();
-              } else if (param.isMember("bgColor") && param["bgColor"].isString()) {
-                config.qrBgColor = param["bgColor"].asString();
               }
             });
 

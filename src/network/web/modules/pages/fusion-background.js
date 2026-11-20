@@ -28,6 +28,13 @@
         debugOperation: Promise.resolve()
     };
 
+    function authHeaders(headers) {
+        var result = Object.assign({}, headers || {});
+        var token = localStorage.getItem('hvideo_auth_token');
+        if (token) result.Authorization = 'Bearer ' + token;
+        return result;
+    }
+
     function postModuleAction(moduleName, action, payload, keepalive) {
         var allowedModules = ['layers', 'playback', 'rendering'];
         if (allowedModules.indexOf(moduleName) === -1 ||
@@ -36,7 +43,7 @@
         }
         return fetch('/api/v1/' + moduleName + '/actions/' + encodeURIComponent(action), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: authHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify(payload),
             keepalive: !!keepalive
         }).then(readApiData);
@@ -232,7 +239,9 @@
     }
 
     function requestJson(url, options) {
-        return fetch(url, options).then(readApiData);
+        var requestOptions = Object.assign({}, options || {});
+        requestOptions.headers = authHeaders(requestOptions.headers);
+        return fetch(url, requestOptions).then(readApiData);
     }
 
     function createBackgroundRuntimeLayer() {

@@ -295,7 +295,7 @@ void HardwareManager::detectVP9Decoders() {
 const AVCodec *HardwareManager::selectBestDecoder(AVCodecID codecId) {
   auto it = decoderMap_.find(codecId);
   if (it == decoderMap_.end() || it->second.empty()) {
-    LOG_WARN("[HardwareManager] No hardware decoder in map for codecId=%d, falling back to system default", codecId);
+    LOG_WARN("[HardwareManager] No RKMPP decoder registered for codecId=%d; format unsupported by current decoder policy", codecId);
     return nullptr;
   }
 
@@ -347,7 +347,7 @@ bool HardwareManager::configureHardwareDecoding(const AVCodec *codec,
     // 设置 output pixel 格式 to DRM_PRIME
     codecCtx->pix_fmt = AV_PIX_FMT_DRM_PRIME;
     // 尝试预创建硬件设备 context（可选，失败不影响解码）
-    if (createHardwareDeviceContext(codec, codecCtx)) {
+    if (createHardwareDeviceContext(codec)) {
       if (hwDeviceCtx_) {
         codecCtx->hw_device_ctx = av_buffer_ref(hwDeviceCtx_);
       }
@@ -363,8 +363,7 @@ bool HardwareManager::configureHardwareDecoding(const AVCodec *codec,
 #endif
 }
 
-bool HardwareManager::createHardwareDeviceContext(const AVCodec *codec,
-                                                  AVCodecContext *codecCtx) {
+bool HardwareManager::createHardwareDeviceContext(const AVCodec *codec) {
 #ifdef __ANDROID__
   if (hwDeviceCtx_ && strstr(codec->name, "rkmpp")) {
     av_buffer_unref(&hwDeviceCtx_);
@@ -397,7 +396,6 @@ bool HardwareManager::createHardwareDeviceContext(const AVCodec *codec,
   return false;
 #else
   (void)codec;
-  (void)codecCtx;
   return false;
 #endif
 }
@@ -446,8 +444,7 @@ bool HardwareManager::isHardwareDecoder(const AVCodec *codec) const {
   if (!codec) {
     return false;
   }
-  return strstr(codec->name, "rkmpp") != nullptr ||
-         false;
+  return strstr(codec->name, "rkmpp") != nullptr;
 }
 
 std::vector<HardwareManager::DecoderInfo>

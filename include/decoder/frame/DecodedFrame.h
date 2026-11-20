@@ -26,37 +26,87 @@ namespace hsvj {
  * 示例/字段：AVFrame(DRM_PRIME) → AVDRMFrameDescriptor → DrmPrimeData → Vulkan VkImage
  */
 struct DrmPrimeData {
-  int fd = -1;           // DMA-BUF 文件描述符
-  uint32_t width = 0;    // 帧宽度
-  uint32_t height = 0;   // 帧高度
-  uint32_t format = 0;   // DRM 像素格式（如 DRM_FORMAT_NV12）
-  uint64_t modifier = 0; // DRM 修饰符（用于 tiling 等）
-
-  // 平面信息（NV12 最多2个平面：Y 和 UV）
+  // Keep the AVDRMFrameDescriptor object/plane relationship intact. A DRM
+  // format is only meaningful together with its modifier, object index,
+  // offset and pitch; silently collapsing those fields turns AFBC/tiled
+  // buffers into fake linear NV12 buffers.
+  static constexpr int MAX_OBJECTS = 4;
   static constexpr int MAX_PLANES = 4;
+
+  uint32_t visibleWidth = 0;
+  uint32_t visibleHeight = 0;
+  uint32_t codedWidth = 0;
+  uint32_t codedHeight = 0;
+  uint32_t format = 0;
+
+  int numObjects = 0;
+  struct Object {
+    int fd = -1;
+    uint64_t size = 0;
+    uint64_t modifier = 0;
+  } objects[MAX_OBJECTS];
+
   int numPlanes = 0;
   struct Plane {
-    uint32_t offset = 0; // 平面在缓冲区中的偏移
-    uint32_t pitch = 0;  // 行距（步幅）
+    int objectIndex = -1;
+    uint32_t offset = 0;
+    uint32_t pitch = 0;
   } planes[MAX_PLANES];
 
-  /** @brief 重置所有数据 */
   void reset() {
-    fd = -1;
-    width = 0;
-    height = 0;
+    visibleWidth = 0;
+    visibleHeight = 0;
+    codedWidth = 0;
+    codedHeight = 0;
     format = 0;
-    modifier = 0;
+    numObjects = 0;
     numPlanes = 0;
-    for (int i = 0; i < MAX_PLANES; i++) {
-      planes[i].offset = 0;
-      planes[i].pitch = 0;
+    for (int i = 0; i < MAX_OBJECTS; ++i) {
+      objects[i] = Object{};
+    }
+    for (int i = 0; i < MAX_PLANES; ++i) {
+      planes[i] = Plane{};
     }
   }
 
-  /** @brief 检查数据是否有效 */
   bool isValid() const {
-    return fd >= 0 && width > 0 && height > 0 && numPlanes > 0;
+    if (format == 0 || visibleWidth == 0 || visibleHeight == 0 ||
+        numObjects <= 0 || numObjects > MAX_OBJECTS || numPlanes <= 0 ||
+        numPlanes > MAX_PLANES) {
+      return false;
+    }
+    for (int i = 0; i < numPlanes; ++i) {
+      const int objectIndex = planes[i].objectIndex;
+      if (objectIndex < 0 || objectIndex >= numObjects ||
+          objects[objectIndex].fd < 0 || planes[i].pitch == 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  int planeFd(int planeIndex) const {
+    if (planeIndex < 0 || planeIndex >= numPlanes) return -1;
+    const int objectIndex = planes[planeIndex].objectIndex;
+    return objectIndex >= 0 && objectIndex < numObjects
+               ? objects[objectIndex].fd
+               : -1;
+  }
+
+  uint64_t planeModifier(int planeIndex) const {
+    if (planeIndex < 0 || planeIndex >= numPlanes) return 0;
+    const int objectIndex = planes[planeIndex].objectIndex;
+    return objectIndex >= 0 && objectIndex < numObjects
+               ? objects[objectIndex].modifier
+               : 0;
+  }
+
+  bool isLinear() const {
+    if (!isValid()) return false;
+    for (int i = 0; i < numPlanes; ++i) {
+      if (planeModifier(i) != 0) return false; // DRM_FORMAT_MOD_LINEAR
+    }
+    return true;
   }
 };
 

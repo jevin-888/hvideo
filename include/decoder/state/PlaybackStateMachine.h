@@ -97,6 +97,8 @@ private:
   bool isTransitionAllowed(State from, State to) const;
 
   std::atomic<State> currentState_;
+  // SEEK_COMPLETED must restore whether playback was paused or playing.
+  State stateBeforeSeek_;
   mutable std::mutex mutex_;
   StateChangeCallback stateChangeCallback_;
 

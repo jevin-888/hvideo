@@ -15,6 +15,7 @@
 #include "utils/FileUtils.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
+#include <algorithm>
 namespace hsvj {
 
 namespace {
@@ -69,6 +70,13 @@ CommandResponse CommandRouter::handlePlaylist(const std::string &paramJson) {
   if (!parseParam(paramJson, param, response)) return response;
   if (!param.isMember("action") || !param["action"].isString()) { setParamError(response, "Missing action"); return response; }
   std::string action = param["action"].asString();
+  double syncStartTime = 0.0;
+  if (param.isMember("syncStartTime") && param["syncStartTime"].isNumeric()) {
+    syncStartTime = std::max(0.0, param["syncStartTime"].asDouble());
+  } else if (param.isMember("sync_start_time") &&
+             param["sync_start_time"].isNumeric()) {
+    syncStartTime = std::max(0.0, param["sync_start_time"].asDouble());
+  }
   Json::Value data;
   if (action == "createPlayList") {
     if (!param.isMember("playlistId")||!param["playlistId"].isString()) { response.ok=false;response.error=0x0001;response.message="Missing playlistId";return response; }
@@ -184,7 +192,7 @@ CommandResponse CommandRouter::handlePlaylist(const std::string &paramJson) {
     LayerVideo *videoLayer=getVideoLayer(layerId,response);
     if (!videoLayer) return response;
     // VOD layer protection: prevent local 播放列表 from overriding VOD layer
-    if (engine_ && engine_->getSystemConfig().isVodEnabled()) {
+    if (engine_ && engine_->isVodRuntimeEnabled()) {
       int vodLayerId = engine_->getSystemConfig().getVodLayerId();
       if (vodLayerId > 0 && layerId == vodLayerId) {
         response.ok=false;response.error=0x0409;
@@ -213,7 +221,8 @@ CommandResponse CommandRouter::handlePlaylist(const std::string &paramJson) {
     // can reuse the 解码器 with seek(0) and avoid a close/open spike.
     int decoderLoop=chooseDecoderLoopForPlaylist(config.loop,layerItems.size());
     PlaybackResult playResult=PlaybackRequestDispatcher::requestPlay(
-        mubu_,layerId,item.uri,decoderLoop,PlaybackSource::Playlist,true);
+        mubu_,layerId,item.uri,decoderLoop,PlaybackSource::Playlist,true,
+        syncStartTime);
     if (playResult.softBlocked) {
       response = buildSoftBlockedPlaylistResponse(this, layerId, playlistId,
                                                   item.uri, index, playResult);

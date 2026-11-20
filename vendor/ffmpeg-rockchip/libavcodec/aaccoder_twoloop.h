@@ -71,7 +71,7 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
 {
     int start = 0, i, w, w2, g, recomprd;
     int destbits = avctx->bit_rate * 1024.0 / avctx->sample_rate
-        / ((avctx->flags & AV_CODEC_FLAG_QSCALE) 2.0f : avctx->ch_layout.nb_channels)
+        / ((avctx->flags & AV_CODEC_FLAG_QSCALE) ? 2.0f : avctx->ch_layout.nb_channels)
         * (lambda / 120.f);
     int refbits = destbits;
     int toomanybits, toofewbits;
@@ -184,7 +184,8 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
          * AAC_CUTOFF_FROM_BITRATE is calibrated for effective bitrate.
          */
         float rate_bandwidth_multiplier = 1.5f;
-        int frame_bit_rate = (avctx->flags & AV_CODEC_FLAG_QSCALE) (refbits * rate_bandwidth_multiplier * avctx->sample_rate / 1024)
+        int frame_bit_rate = (avctx->flags & AV_CODEC_FLAG_QSCALE)
+            ? (refbits * rate_bandwidth_multiplier * avctx->sample_rate / 1024)
             : (avctx->bit_rate / avctx->ch_layout.nb_channels);
 
         /** Compensate for extensions that increase efficiency */
@@ -320,7 +321,7 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
     memcpy(euplims, uplims, sizeof(euplims));
     for (w = 0; w < sce->ics.num_windows; w += sce->ics.group_len[w]) {
         /** psy already priorizes transients to some extent */
-        float de_psy_factor = (sce->ics.num_windows > 1) 8.0f / sce->ics.group_len[w] : 1.0f;
+        float de_psy_factor = (sce->ics.num_windows > 1) ? 8.0f / sce->ics.group_len[w] : 1.0f;
         start = w*128;
         for (g = 0;  g < sce->ics.num_swb; g++) {
             if (nzs[g] > 0) {
@@ -546,8 +547,8 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
                          * quality, we don't want PNS when doing VHQ), PNS allowed, and within
                          * the lowest ranking percentile.
                          */
-                        float loopovrfactor = (zloop) 1.0f : ovrfactor;
-                        int loopminsf = (zloop) (SCALE_ONE_POS - SCALE_DIV_512) : SCALE_ONE_POS;
+                        float loopovrfactor = (zloop) ? 1.0f : ovrfactor;
+                        int loopminsf = (zloop) ? (SCALE_ONE_POS - SCALE_DIV_512) : SCALE_ONE_POS;
                         int mcb;
                         for (g = sce->ics.num_swb-1; g > 0 && zeroed < maxzeroed; g--) {
                             if (sce->ics.swb_offset[g] < pns_start_pos)
@@ -587,10 +588,10 @@ static void search_for_quantizers_twoloop(AVCodecContext *avctx,
         prev = -1;
         for (w = 0; w < sce->ics.num_windows; w += sce->ics.group_len[w]) {
             /** Start with big steps, end up fine-tunning */
-            int depth = (its > maxits/2) ((its > maxits*2/3) ? 1 : 3) : 10;
+            int depth = (its > maxits/2) ? ((its > maxits*2/3) ? 1 : 3) : 10;
             int edepth = depth+2;
             float uplmax = its / (maxits*0.25f) + 1.0f;
-            uplmax *= (tbits > destbits) FFMIN(2.0f, tbits / (float)FFMAX(1,destbits)) : 1.0f;
+            uplmax *= (tbits > destbits) ? FFMIN(2.0f, tbits / (float)FFMAX(1,destbits)) : 1.0f;
             start = w * 128;
             for (g = 0; g < sce->ics.num_swb; g++) {
                 int prevsc = sce->sf_idx[w*16+g];

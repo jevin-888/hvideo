@@ -129,7 +129,7 @@ void ff_diff_pixels_mmi(int16_t *av_restrict block, const uint8_t *src1,
           RESTRICT_ASM_ALL64
           [block]"+&r"(block),              [src1]"+&r"(src1),
           [src2]"+&r"(src2)
-        : [stride]"r"((mips_reg)? stride)
+        : [stride]"r"((mips_reg)stride)
         : "memory"
     );
 }

@@ -2,11 +2,9 @@
 PACKAGE_NAME="com.hsvj.engine"
 DRM_PROCESS_NAME="com.hsvj.engine:drmkms"
 BACKEND_PROP="persist.hsvj.output.backend"
-TAKEOVER_SCRIPT="/data/local/tmp/hsvj_drm_takeover.sh"
+TAKEOVER_SCRIPT="/vendor/bin/hsvj_drm_takeover.sh"
 WATCHDOG_SCRIPT="/data/local/tmp/hsvj_watchdog.sh"
-PID_FILE="/data/local/tmp/hsvj_watchdog.pid"
-WATCHDOG_LOCK_DIR="/data/local/tmp/hsvj_watchdog.lock"
-HEARTBEAT_FILE="/data/local/tmp/hsvj_heartbeat"
+HEARTBEAT_FILE="/data/user/0/${PACKAGE_NAME}/files/hsvj_heartbeat"
 DRM_STATUS_FILE="/data/user/0/com.hsvj.engine/files/drm_kms_engine.status"
 SUPPRESS_RESTART_FILE="/data/local/tmp/hsvj_no_watchdog_restart"
 PACKAGE_UPDATE_GRACE_FILE="/data/local/tmp/hsvj_package_update_grace"
@@ -17,6 +15,9 @@ RESTART_MAX_DELAY_SECONDS=10
 PACKAGE_UPDATE_GRACE_SECONDS=60
 BACKEND_READY_TIMEOUT_SECONDS=60
 SOURCE="${1:-manual}"
+case "$SOURCE" in
+    *[!A-Za-z0-9_:.-]*) exit 2 ;;
+esac
 
 log() {
     echo "$(date '+%F %T') [$SOURCE] $*" >> "$RESTART_LOG_FILE"
@@ -38,7 +39,7 @@ backend_effective() {
     VALUE="$(getprop "$BACKEND_PROP" 2>/dev/null)"
     case "$VALUE" in
         surface|drm-kms) echo "$VALUE" ;;
-        *) echo drm-kms ;;
+        *) echo surface ;;
     esac
 }
 
@@ -53,8 +54,13 @@ drm_pid_alive() {
         ''|*[!0-9]*) return 1 ;;
     esac
     [ -d "/proc/$PID" ] || return 1
+
+    for LIVE_PID in $(pidof "$DRM_PROCESS_NAME" 2>/dev/null); do
+        [ "$LIVE_PID" = "$PID" ] && return 0
+    done
+
     CMDLINE="$(tr '\000' '\n' < "/proc/$PID/cmdline" 2>/dev/null)"
-    [ -z "$CMDLINE" ] || echo "$CMDLINE" | grep -Fxq "$DRM_PROCESS_NAME"
+    [ -n "$CMDLINE" ] && echo "$CMDLINE" | grep -Fxq "$DRM_PROCESS_NAME"
 }
 
 app_pids() {
@@ -168,6 +174,10 @@ is_package_update_grace_active() {
             ;;
     esac
     NOW="$(date +%s)"
+    if [ "${#TS}" -gt 10 ] || [ "$TS" -gt "$NOW" ]; then
+        rm -f "$PACKAGE_UPDATE_GRACE_FILE" 2>/dev/null
+        return 1
+    fi
     AGE=$((NOW - TS))
     if [ "$AGE" -lt "$PACKAGE_UPDATE_GRACE_SECONDS" ]; then
         log "package update grace active age=${AGE}s"
@@ -197,6 +207,8 @@ apply_restart_backoff() {
     fi
     case "$LAST_TS" in ''|*[!0-9]*) LAST_TS=0 ;; esac
     case "$COUNT" in ''|*[!0-9]*) COUNT=0 ;; esac
+    if [ "${#LAST_TS}" -gt 10 ] || [ "$LAST_TS" -gt "$NOW" ]; then LAST_TS=0; fi
+    if [ "${#COUNT}" -gt 2 ] || [ "$COUNT" -gt 5 ]; then COUNT=5; fi
     AGE=$((NOW - LAST_TS))
     if [ "$AGE" -le "$RESTART_WINDOW_SECONDS" ]; then
         COUNT=$((COUNT + 1))
@@ -246,14 +258,9 @@ log_runtime_display() {
 start_watchdog() {
     if [ -f "$WATCHDOG_SCRIPT" ]; then
         chmod 755 "$WATCHDOG_SCRIPT" 2>/dev/null
-        if [ -d "$WATCHDOG_LOCK_DIR" ]; then
-            return
-        fi
-        if ! ps -A 2>/dev/null | grep -v grep | grep -q "hsvj_watchdog.sh"; then
-            rm -f "$PID_FILE" 2>/dev/null
-            setsid sh "$WATCHDOG_SCRIPT" restart-script >> "$RESTART_LOG_FILE" 2>&1 < /dev/null &
-            log "watchdog submitted"
-        fi
+        # The daemon owns singleton arbitration; never delete a live owner's PID.
+        setsid sh "$WATCHDOG_SCRIPT" restart-script >> "$RESTART_LOG_FILE" 2>&1 < /dev/null &
+        log "watchdog submitted"
     fi
 }
 
@@ -265,23 +272,19 @@ start_app() {
         return 1
     fi
     log "start backend=$BACKEND"
-    if ! sh "$TAKEOVER_SCRIPT" "$BACKEND" >> "$RESTART_LOG_FILE" 2>&1; then
+    if ! HSVJ_RESTART_SOURCE="$SOURCE" sh "$TAKEOVER_SCRIPT" "$BACKEND" >> "$RESTART_LOG_FILE" 2>&1; then
         log "backend takeover failed backend=$BACKEND"
         return 1
     fi
     wait_for_backend_ready
 }
 
-restart_app_fast() {
-    stop_app
-    start_app
-}
 
 schedule_start_app() {
     setsid sh -c "
         sleep 3
         BACKEND=\"\$(getprop $BACKEND_PROP 2>/dev/null)\"
-        case \"\$BACKEND\" in surface|drm-kms) ;; *) BACKEND=drm-kms ;; esac
+        case \"\$BACKEND\" in surface|drm-kms) ;; *) BACKEND=surface ;; esac
         echo \"\$(date '+%F %T') [$SOURCE] delayed restore backend=\$BACKEND\" >> \"$RESTART_LOG_FILE\"
         if [ -x \"$TAKEOVER_SCRIPT\" ]; then
             sh \"$TAKEOVER_SCRIPT\" \"\$BACKEND\" >> \"$RESTART_LOG_FILE\" 2>&1
@@ -293,22 +296,6 @@ schedule_start_app() {
     log "delayed backend restore submitted"
 }
 
-stop_app() {
-    log "force-stop app"
-    am force-stop "$PACKAGE_NAME" >> "$RESTART_LOG_FILE" 2>&1
-    PIDS="$(app_pids)"
-    if [ -n "$PIDS" ]; then
-        log "kill stale pids: $PIDS"
-        kill $PIDS 2>/dev/null
-        sleep 1
-    fi
-    PIDS="$(app_pids)"
-    if [ -n "$PIDS" ]; then
-        log "force kill stale pids: $PIDS"
-        kill -9 $PIDS 2>/dev/null
-        sleep 1
-    fi
-}
 
 log "restart begin"
 mark_planned_restart
@@ -322,13 +309,22 @@ esac
 apply_restart_backoff
 refresh_planned_restart
 case "$SOURCE" in
+    watchdog:process_not_running)
+        if is_app_running; then
+            log "watchdog process_not_running recheck passed; app is running pids=$(app_pids)"
+            clear_planned_restart
+            exit 0
+        fi
+        ;;
+esac
+case "$SOURCE" in
     watchdog:*|native:*)
         ;;
     *)
         case "$SOURCE" in
             manual:direct)
                 log "manual direct restart bypasses package update grace"
-                if restart_app_fast; then
+                if start_app; then
                     log "restart success"
                 else
                     log "restart failed before backend became ready"
@@ -344,7 +340,6 @@ case "$SOURCE" in
                 fi
                 ;;
         esac
-        stop_app
         if start_app; then
             log "restart success"
         else
@@ -354,7 +349,6 @@ case "$SOURCE" in
         exit 0
         ;;
 esac
-stop_app
 cleanup_memory
 if start_app; then
     log "restart success"

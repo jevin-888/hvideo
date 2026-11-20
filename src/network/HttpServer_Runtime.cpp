@@ -41,6 +41,10 @@ Json::Value layerRuntimeToJson(hsvj::Layer *layer) {
   data["scale"] = layer->getScale();
   data["alpha"] = layer->getAlpha();
   data["priority"] = layer->getPriority();
+  data["cropLeft"] = layer->getCropLeft();
+  data["cropTop"] = layer->getCropTop();
+  data["cropRight"] = layer->getCropRight();
+  data["cropBottom"] = layer->getCropBottom();
   if (auto *videoLayer = dynamic_cast<hsvj::LayerVideo *>(layer)) {
     data["volume"] = videoLayer->getVolume();
     data["isCaptureMode"] = videoLayer->isCaptureMode();
@@ -197,6 +201,21 @@ void HttpServer::registerRuntimeRoutes() {
     }
     if (body.isMember("fitMode") && body["fitMode"].isInt()) {
       layer->setFitMode(std::clamp(body["fitMode"].asInt(), 0, 1));
+    }
+    if (body.isMember("cropLeft") || body.isMember("crop_left") ||
+        body.isMember("cropTop") || body.isMember("crop_top") ||
+        body.isMember("cropRight") || body.isMember("crop_right") ||
+        body.isMember("cropBottom") || body.isMember("crop_bottom")) {
+      const auto crop = [&body](const char *camel, const char *snake,
+                                float fallback) {
+        if (body.isMember(camel) && body[camel].isNumeric()) return body[camel].asFloat();
+        if (body.isMember(snake) && body[snake].isNumeric()) return body[snake].asFloat();
+        return fallback;
+      };
+      layer->setContentCrop(crop("cropLeft", "crop_left", layer->getCropLeft()),
+                            crop("cropTop", "crop_top", layer->getCropTop()),
+                            crop("cropRight", "crop_right", layer->getCropRight()),
+                            crop("cropBottom", "crop_bottom", layer->getCropBottom()));
     }
     if (body.isMember("mirrorReadyHintVisible") &&
         body["mirrorReadyHintVisible"].isBool()) {

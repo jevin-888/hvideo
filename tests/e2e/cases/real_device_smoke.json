@@ -1,0 +1,204 @@
+{
+  "id": "real-device-smoke",
+  "name": "真实播放器基础状态和只读能力",
+  "tags": ["real-device", "read-only", "hw81", "hw82"],
+  "description": "连接真实播放器后验证认证、心跳、系统、视频、图层、配置、资源和只读模块能力。动作失败会保留接口响应和设备证据。",
+  "steps": [
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/auth/validate",
+      "expect_status": 200,
+      "save_as": "auth_validate"
+    },
+    {
+      "type": "assert",
+      "from": "vars",
+      "path": "auth_validate.body.ok",
+      "equals": true
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/heartbeat",
+      "expect_status": 200,
+      "save_as": "heartbeat"
+    },
+    {
+      "type": "assert",
+      "path": "body.ok",
+      "equals": true
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/system/status",
+      "expect_status": 200,
+      "save_as": "system_status"
+    },
+    {
+      "type": "assert",
+      "path": "body.data.app_version",
+      "matches": "^\\d+\\.\\d+\\.\\d+"
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/video/status",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/layers",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/layers/authorized",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/config.json",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/system/device-info",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/system/resources",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/playlists",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "GET",
+      "path": "/api/v1/peripherals/command-lists",
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/layers/actions/list",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/playback/actions/getStatus",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/playback/actions/getSystemVolume",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/playback/actions/getPlaybackLock",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/peripherals/actions/get_config",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/peripherals/actions/list_serial_ports",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/peripherals/actions/get_templates",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/regions/actions/get_region_config",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/regions/actions/get_flexible_mapping",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/lyrics/actions/getStatus",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/lyrics/actions/get_margin",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/lyrics/actions/get_bind_layer",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/lyrics/actions/list_styles",
+      "body": {},
+      "expect_status": 200
+    },
+    {
+      "type": "http",
+      "method": "POST",
+      "path": "/api/v1/stage-control/actions/get_config",
+      "body": {},
+      "expect_status_any": [200, 403],
+      "allow_blocked": true
+    },
+    {
+      "type": "adb_capture",
+      "command": ["exec-out", "screencap", "-p"],
+      "save_file": "device/smoke-screen.png",
+      "expect_returncode": 0
+    },
+    {
+      "type": "adb",
+      "command": ["shell", "pidof", "com.hsvj.engine"],
+      "save_stdout": "device/player-pid.txt",
+      "expect_returncode": 0
+    }
+  ]
+}

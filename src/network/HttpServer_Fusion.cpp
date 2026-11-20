@@ -14,6 +14,15 @@ void HttpServer::registerFusionRoutes() {
     executeCommandAndRespond(buildCommandJson(0, 0x0C, param), response);
   });
 
+  post("/api/v1/fusion/checkpoint", [this](const HttpRequest &request,
+                                         HttpResponse &response) {
+    (void)request;
+    if (!checkCommandRouter(response)) return;
+    Json::Value param(Json::objectValue);
+    param["action"] = "checkpoint_fusion_state";
+    executeCommandAndRespond(buildCommandJson(0, 0x0C, param), response);
+  });
+
   post("/api/v1/fusion/reset", [this](const HttpRequest &request,
                                     HttpResponse &response) {
     (void)request;

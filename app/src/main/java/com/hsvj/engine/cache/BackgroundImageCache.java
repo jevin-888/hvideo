@@ -19,6 +19,7 @@ import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * 背景图片索引缓存
@@ -111,7 +112,7 @@ public class BackgroundImageCache {
                 }
             }
             
-            Log.i(TAG, String.format("成功加载背景图片索引缓存，共 %d 个文件", images.size()));
+            Log.i(TAG, String.format(Locale.ROOT, "成功加载背景图片索引缓存，共 %d 个文件", images.size()));
             return images;
             
         } catch (Exception e) {
@@ -156,7 +157,7 @@ public class BackgroundImageCache {
             fos.write(jsonString.getBytes(StandardCharsets.UTF_8));
             fos.close();
             
-            Log.i(TAG, String.format("背景图片索引缓存已保存，共 %d 个文件", images.size()));
+            Log.i(TAG, String.format(Locale.ROOT, "背景图片索引缓存已保存，共 %d 个文件", images.size()));
             
         } catch (Exception e) {
             Log.e(TAG, "保存背景图片索引缓存失败", e);
@@ -197,7 +198,7 @@ public class BackgroundImageCache {
                 }
             }
             
-            Log.i(TAG, String.format("扫描背景图片目录完成，找到 %d 个文件", images.size()));
+            Log.i(TAG, String.format(Locale.ROOT, "扫描背景图片目录完成，找到 %d 个文件", images.size()));
             
         } catch (Exception e) {
             Log.e(TAG, "扫描背景图片目录失败", e);
@@ -245,7 +246,7 @@ public class BackgroundImageCache {
     private boolean isImageFile(String filename) {
         if (filename == null) return false;
         
-        String lowerName = filename.toLowerCase();
+        String lowerName = filename.toLowerCase(Locale.ROOT);
         return lowerName.endsWith(".jpg") || 
                lowerName.endsWith(".jpeg") || 
                lowerName.endsWith(".png") || 
@@ -266,7 +267,7 @@ public class BackgroundImageCache {
             List<ImageInfo> images = loadCachedIndex();
             int imageCount = images != null ? images.size() : 0;
             
-            return String.format("背景图片索引缓存: %d 个文件, 缓存大小 %d 字节", 
+            return String.format(Locale.ROOT, "背景图片索引缓存: %d 个文件, 缓存大小 %d 字节",
                 imageCount, cacheSize);
                 
         } catch (Exception e) {

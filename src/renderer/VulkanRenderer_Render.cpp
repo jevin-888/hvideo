@@ -43,7 +43,48 @@ bool transformCanLeaveLayerBounds(float rotation, float scale) {
   return angle > 0.01f || scale > 1.0001f;
 }
 
+bool canUseFastYcbcrPipeline(const PushConstants &pc) {
+  const auto isNeutral = [](float value, float expected) {
+    constexpr float kNeutralEpsilon = 1.0e-6f;
+    return std::fabs(value - expected) <= kNeutralEpsilon;
+  };
+
+  return isNeutral(pc.color[0], 1.0f) &&
+         isNeutral(pc.color[1], 1.0f) &&
+         isNeutral(pc.color[2], 1.0f) &&
+         isNeutral(pc.color[3], 1.0f) &&
+         isNeutral(pc.shapeInfo[0], 0.0f) &&
+         isNeutral(pc.shapeInfo[2], 0.0f) &&
+         isNeutral(pc.extEffect[0], 0.0f) &&
+         isNeutral(pc.extEffect[1], 0.0f) &&
+         isNeutral(pc.extEffect[3], 0.0f);
+}
+
+bool canUseFastRgbaPipeline(const PushConstants &pc) {
+  // The simple shader preserves crop, rotation, flips, tint and alpha. Shape,
+  // luma key and effects still require the full shader. Use exact comparisons:
+  // packed effect IDs can be tiny nonzero floats and must not be approximated.
+  return pc.shapeInfo[0] == 0.0f && pc.shapeInfo[2] == 0.0f &&
+         pc.extEffect[0] == 0.0f;
+}
+
 } // 命名空间
+
+VulkanRenderer::ScopedSliceCrop::ScopedSliceCrop(
+    VulkanRenderer &renderer, float left, float top, float right, float bottom)
+    : renderer_(renderer), previous_(renderer.sliceCrop_) {
+  const auto clampCrop = [](float value, float maximum) {
+    return std::isfinite(value) ? std::clamp(value, 0.0f, maximum) : 0.0f;
+  };
+  left = clampCrop(left, 1.0f);
+  top = clampCrop(top, 1.0f);
+  renderer_.sliceCrop_ = {left, top, clampCrop(right, 1.0f - left),
+                         clampCrop(bottom, 1.0f - top)};
+}
+
+VulkanRenderer::ScopedSliceCrop::~ScopedSliceCrop() {
+  renderer_.sliceCrop_ = previous_;
+}
 
 bool VulkanRenderer::buildLayerPushConstants(
     const Texture &texture, int x, int y, int width, int height,
@@ -135,7 +176,7 @@ bool VulkanRenderer::buildLayerPushConstants(
     pc.cropInfo[3] = static_cast<float>(texture.sampleUvOffsetRows());
   }
 
-  if (mode == LayerPushConstantMode::ColorModulated && !texture.isNV16 &&
+  if (mode == LayerPushConstantMode::ColorModulated &&
       texture.width > static_cast<uint32_t>(texW) && texW > 0.0f) {
     pc.cropInfo[0] = texW;
     pc.cropInfo[2] = static_cast<float>(texture.width);
@@ -196,6 +237,15 @@ bool VulkanRenderer::buildLayerPushConstants(
   float sampleY = sampleSpaceY;
   float sampleW = sampleSpaceW;
   float sampleH = sampleSpaceH;
+  const float sliceCropW = 1.0f - sliceCrop_[0] - sliceCrop_[2];
+  const float sliceCropH = 1.0f - sliceCrop_[1] - sliceCrop_[3];
+  // 裁空时不绘制，不能退回完整画面。旋转采集按可见方向裁剪。
+  if (sliceCropW <= 0.0f || sliceCropH <= 0.0f) {
+    return false;
+  }
+  applyNormalizedContentCrop(true, sliceCrop_[0], sliceCrop_[1],
+                             sliceCropW, sliceCropH,
+                             sampleX, sampleY, sampleW, sampleH);
   const int effectiveFitCropMode =
       (contentCropApplied && !texture.forceContentCropForStretch) ? 0 : fitMode;
   applyFitModeCrop(effectiveFitCropMode, width, height, sampleX, sampleY,
@@ -292,10 +342,8 @@ void VulkanRenderer::renderLayer(uint32_t textureId, int x, int y, int width,
 
   Texture &texture = it->second;
 
-  // 记录当前帧的 fence，DMA-BUF 纹理后续重绑/销毁只需等这条 fence。
-  if ((texture.isCaptureTexture() || texture.isDrmPrime) &&
-      currentFrame_ < inFlightFences_.size()) {
-    texture.lastUsageFence = inFlightFences_[currentFrame_];
+  if (texture.isCaptureTexture() || texture.isDrmPrime) {
+    recordTextureUsage(textureId);
   }
   VkCommandBuffer cmdBuffer = commandBuffers_[currentFrame_];
 
@@ -416,6 +464,9 @@ void VulkanRenderer::renderLayerWithColor(uint32_t textureId, int x, int y,
   }
 
   Texture &texture = it->second;
+  if (texture.isCaptureTexture() || texture.isDrmPrime) {
+    recordTextureUsage(textureId);
+  }
   VkCommandBuffer cmdBuffer = commandBuffers_[currentFrame_];
 
   if (!renderPassStarted_) {
@@ -1425,7 +1476,6 @@ void VulkanRenderer::selectPipelineForTexture(const Texture &texture,
                                               VkPipelineLayout &layout,
                                               const char *&pipelineName,
                                               int drawW, int drawH) {
-  (void)pc;
   (void)drawW;
   (void)drawH;
   // 1. 示例/字段：视频图层：DRM PRIME（RKMPP 零拷贝）
@@ -1433,24 +1483,39 @@ void VulkanRenderer::selectPipelineForTexture(const Texture &texture,
   // 但 descriptor set / sampler conversion / pipeline layout 完全不同。
   // 若误走 V4L2 管线，会在 vkQueueSubmit 时触发 GPU device lost。
   if (texture.isDrmPrime && drmPrimePipeline_ != VK_NULL_HANDLE) {
-    pipe = drmPrimePipeline_;
-    layout = drmPrimePipelineLayout_;
-    pipelineName = "drm_prime";
-    return;
-  }
-
-  if (texture.isNV16) {
-    pipe = nv16Pipeline_;
-    layout = nv16PipelineLayout_;
-    pipelineName = "nv16";
+    if (drmPrimeFastPipeline_ != VK_NULL_HANDLE &&
+        canUseFastYcbcrPipeline(pc)) {
+      pipe = drmPrimeFastPipeline_;
+      layout = drmPrimePipelineLayout_;
+      pipelineName = "drm_prime_fast";
+      if (!drmPrimeFastPipelineLogged_) {
+        LOG_INFO("[Vulkan] selected DRM PRIME fast YCbCr pipeline");
+        drmPrimeFastPipelineLogged_ = true;
+      }
+    } else {
+      pipe = drmPrimePipeline_;
+      layout = drmPrimePipelineLayout_;
+      pipelineName = "drm_prime";
+    }
     return;
   }
 
   // 2. 说明：V4L2 采集纹理
   if (texture.isV4L2Capture && v4l2Pipeline_ != VK_NULL_HANDLE) {
-    pipe = v4l2Pipeline_;
-    layout = v4l2PipelineLayout_;
-    pipelineName = "v4l2";
+    if (v4l2FastPipeline_ != VK_NULL_HANDLE &&
+        canUseFastYcbcrPipeline(pc)) {
+      pipe = v4l2FastPipeline_;
+      layout = v4l2PipelineLayout_;
+      pipelineName = "v4l2_fast";
+      if (!v4l2FastPipelineLogged_) {
+        LOG_INFO("[Vulkan] selected V4L2 fast YCbCr pipeline");
+        v4l2FastPipelineLogged_ = true;
+      }
+    } else {
+      pipe = v4l2Pipeline_;
+      layout = v4l2PipelineLayout_;
+      pipelineName = "v4l2";
+    }
     return;
   }
 
@@ -1515,6 +1580,14 @@ void VulkanRenderer::selectPipelineForTexture(const Texture &texture,
   pipe = graphicsPipeline_;
   layout = pipelineLayout_;
   pipelineName = "default";
+  if (rgbaFastPipeline_ != VK_NULL_HANDLE && canUseFastRgbaPipeline(pc)) {
+    pipe = rgbaFastPipeline_;
+    pipelineName = "rgba_fast";
+    if (!rgbaFastPipelineLogged_) {
+      LOG_INFO("[Vulkan] selected RGBA fast pipeline (alpha blending retained)");
+      rgbaFastPipelineLogged_ = true;
+    }
+  }
 }
 
 void VulkanRenderer::setLayerClipRect(int x, int y, int w, int h) {

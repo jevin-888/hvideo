@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
+#include <sys/stat.h>
 #include <vector>
 
 namespace hsvj::fusion {
@@ -299,13 +301,14 @@ BlendSideState blendSideFromFileGap(const GapInfoT &info) {
   BlendSideState side;
   side.enabled = info.blMerge;
   side.width = std::max(0.0f, std::min(1.0f, info.fRange));
-  side.gamma = std::max(0.001f, info.co_r);
-  side.slope = std::max(0.001f, info.co_p);
+  side.gamma = info.co_r;
+  side.slope = info.co_p;
   side.stripStart = std::max(0, std::min(255, static_cast<int>(info.stripStart)));
   side.stripEnd = std::max(0, std::min(255, static_cast<int>(info.stripEnd)));
   side.anchor = std::max(0.0f, std::min(1.0f, info.co_a));
   side.bright = {{info.bright[0], info.bright[1], info.bright[2]}};
   side.solid = info.blSolid;
+  normalizeBlendSide(side);
   return side;
 }
 
@@ -314,22 +317,24 @@ BlendSideState blendSideFromLegacy(const LegacyMergeGapInfo &info) {
 }
 
 ThirdPartyMergeGapInfo thirdPartyFromBlendSide(const BlendSideState &side) {
+  BlendSideState normalized = side;
+  normalizeBlendSide(normalized);
   ThirdPartyMergeGapInfo info;
   std::memset(&info, 0, sizeof(info));
-  info.blMerge = side.enabled;
-  info.blSolid = side.solid;
-  info.fRange = std::max(0.0f, std::min(1.0f, side.width));
-  info.co_r = std::max(0.001f, side.gamma);
+  info.blMerge = normalized.enabled;
+  info.blSolid = normalized.solid;
+  info.fRange = normalized.width;
+  info.co_r = normalized.gamma;
   info.degree = static_cast<int>((info.co_r - 1.8f) * 10.0f);
   info.stripStart =
-      static_cast<float>(std::max(0, std::min(255, side.stripStart)));
+      static_cast<float>(normalized.stripStart);
   info.stripEnd =
-      static_cast<float>(std::max(0, std::min(255, side.stripEnd)));
-  info.co_a = std::max(0.0f, std::min(1.0f, side.anchor));
-  info.co_p = std::max(0.001f, side.slope);
+      static_cast<float>(normalized.stripEnd);
+  info.co_a = normalized.anchor;
+  info.co_p = normalized.slope;
   for (int i = 0; i < 3; ++i) {
     info.bright[i] = static_cast<unsigned char>(
-        std::max(0, std::min(255, side.bright[static_cast<size_t>(i)])));
+        normalized.bright[static_cast<size_t>(i)]);
   }
   return info;
 }
@@ -608,11 +613,7 @@ bool saveThirdPartyMergeFile(const std::string &path,
                              const FusionProjectState &state,
                              int regionCount,
                              std::string *errorMessage) {
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
-  if (!file.is_open()) {
-    if (errorMessage) *errorMessage = "Fusion file create failed: " + path;
-    return false;
-  }
+  std::ostringstream file(std::ios::out | std::ios::binary);
 
   const int screenCount = std::max(1, regionCount);
   GeometryRegionState firstGeometry;
@@ -694,8 +695,13 @@ bool saveThirdPartyMergeFile(const std::string &path,
     }
   }
 
-  LOG_INFO("[FusionFileStore] saved huoshanVJ raw merge.dat: %s screens=%d "
-           "longSize=%zu",
+  const std::string content = file.str();
+  if (!FileUtils::writeTextFile(path, content)) {
+    if (errorMessage) *errorMessage = "Fusion file commit failed: " + path;
+    return false;
+  }
+  LOG_INFO("[FusionFileStore] saved huoshanVJ raw merge.dat atomically: %s "
+           "screens=%d longSize=%zu",
            path.c_str(), screenCount, sizeof(long));
   return true;
 }
@@ -784,11 +790,7 @@ bool saveZheZhaoFile(const std::string &path,
   }
 
   MaskState mask = normalizedMaskForFile(source);
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
-  if (!file.is_open()) {
-    if (errorMessage) *errorMessage = "ZheZhao.dat create failed: " + path;
-    return false;
-  }
+  std::ostringstream file(std::ios::out | std::ios::binary);
 
   const int pointCount = mask.rows * mask.cols;
   if (!writeBeInt32(file, canvasWidth) ||
@@ -812,8 +814,13 @@ bool saveZheZhaoFile(const std::string &path,
     }
   }
 
-  LOG_INFO("[FusionFileStore] saved huoshanVJ ZheZhao.dat: %s canvas=%dx%d "
-           "grid=%dx%d",
+  const std::string content = file.str();
+  if (!FileUtils::writeTextFile(path, content)) {
+    if (errorMessage) *errorMessage = "ZheZhao.dat commit failed: " + path;
+    return false;
+  }
+  LOG_INFO("[FusionFileStore] saved huoshanVJ ZheZhao.dat atomically: %s "
+           "canvas=%dx%d grid=%dx%d",
            path.c_str(), canvasWidth, canvasHeight, mask.rows, mask.cols);
   return true;
 }
@@ -1068,6 +1075,35 @@ void overlayFusionStateSidecar(FusionProjectState *state,
   state->managerMode = false;
 }
 
+int64_t fileModifiedTimeNs(const std::string &path) {
+  struct stat info {};
+  if (stat(path.c_str(), &info) != 0) return -1;
+#if defined(__APPLE__)
+  return static_cast<int64_t>(info.st_mtimespec.tv_sec) * 1000000000LL +
+         static_cast<int64_t>(info.st_mtimespec.tv_nsec);
+#elif defined(_WIN32)
+  return static_cast<int64_t>(info.st_mtime) * 1000000000LL;
+#else
+  return static_cast<int64_t>(info.st_mtim.tv_sec) * 1000000000LL +
+         static_cast<int64_t>(info.st_mtim.tv_nsec);
+#endif
+}
+
+bool isSidecarLatest(const FusionFilePaths &paths) {
+  const int64_t sidecarTime = fileModifiedTimeNs(paths.statePath);
+  if (sidecarTime < 0) return false;
+  const std::string compatibilityFiles[] = {
+      paths.binaryPath,
+      paths.maskPath,
+      paths.correctionPath,
+  };
+  for (const auto &path : compatibilityFiles) {
+    const int64_t fileTime = fileModifiedTimeNs(path);
+    if (fileTime > sidecarTime) return false;
+  }
+  return true;
+}
+
 bool loadFusionStateSidecarFile(const std::string &path,
                                 FusionProjectState *state,
                                 bool fullRestore,
@@ -1177,7 +1213,8 @@ bool loadFusionFiles(const std::string &rootPath, int expectedRegionCount,
 
   if (FileUtils::exists(paths.statePath)) {
     std::string sidecarError;
-    if (loadFusionStateSidecarFile(paths.statePath, state, !loadedAny,
+    const bool fullRestore = !loadedAny || isSidecarLatest(paths);
+    if (loadFusionStateSidecarFile(paths.statePath, state, fullRestore,
                                    &sidecarError)) {
       loadedAny = true;
     } else if (!sidecarError.empty()) {
@@ -1185,6 +1222,8 @@ bool loadFusionFiles(const std::string &rootPath, int expectedRegionCount,
       if (!loadedAny && errorMessage) *errorMessage = sidecarError;
     }
   }
+  // Normalize legacy or hand-edited CAVE walls before the renderer consumes them.
+  ensureState(*state, expectedRegionCount);
   return loadedAny;
 }
 
@@ -1249,6 +1288,36 @@ bool saveFusionFiles(const std::string &rootPath, const FusionProjectState &stat
 
   if (errorMessage) {
     *errorMessage = lastError.empty() ? "Fusion file write failed" : lastError;
+  }
+  return false;
+}
+
+bool saveFusionCheckpoint(const std::string &rootPath,
+                          const FusionProjectState &state, int regionCount,
+                          std::string *errorMessage,
+                          std::string *savedPath) {
+  (void)rootPath;
+  FusionProjectState normalized = state;
+  ensureState(normalized, regionCount);
+
+  std::string lastError;
+  for (const auto &candidateRoot : fusionRootCandidates()) {
+    const FusionFilePaths paths = buildFusionFilePaths(candidateRoot);
+    if (!FileUtils::createDirectory(paths.directory)) {
+      lastError = "Fusion checkpoint directory create failed: " + paths.directory;
+      LOG_WARN("[FusionFileStore] %s", lastError.c_str());
+      continue;
+    }
+    if (!saveFusionStateSidecarFile(paths.statePath, normalized, &lastError)) {
+      LOG_WARN("[FusionFileStore] %s", lastError.c_str());
+      continue;
+    }
+    if (savedPath) *savedPath = paths.statePath;
+    return true;
+  }
+
+  if (errorMessage) {
+    *errorMessage = lastError.empty() ? "Fusion checkpoint write failed" : lastError;
   }
   return false;
 }

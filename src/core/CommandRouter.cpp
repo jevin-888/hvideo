@@ -15,8 +15,9 @@
 
 #include "core/CommandRouter.h"
 #include "core/Engine.h"
+#include "core/LicenseManager.h"
 #include "core/Mubu.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/PeripheralManager.h"
 #include "core/SceneManager.h"
 #include "core/SystemConfig.h"
@@ -88,6 +89,9 @@ CommandRouter::CommandRouter() {
   });
   registerHandler(0x51, [this](const std::string &json) {
     return handlePeripheral(0x51, json);
+  });
+  registerHandler(0x52, [this](const std::string &json) {
+    return handleStageControl(json);
   });
 }
 
@@ -192,7 +196,7 @@ void CommandRouter::systemConfigSaveWorkerLoop() {
 bool CommandRouter::isPlaybackLocked(int layerId) const {
   std::lock_guard<std::mutex> lock(playbackLockMutex_);
   auto it = playbackLocks_.find(layerId);
-  return it != playbackLocks_.end() && it->second;
+  return globalPlaybackLocked_ || (it != playbackLocks_.end() && it->second);
 }
 
 void CommandRouter::setPlaybackLocked(int layerId, bool locked) {
@@ -202,6 +206,29 @@ void CommandRouter::setPlaybackLocked(int layerId, bool locked) {
   } else {
     playbackLocks_.erase(layerId);
   }
+}
+
+bool CommandRouter::isGlobalPlaybackLocked() const {
+  std::lock_guard<std::mutex> lock(playbackLockMutex_);
+  return globalPlaybackLocked_;
+}
+
+void CommandRouter::setGlobalPlaybackLocked(bool locked) {
+  std::lock_guard<std::mutex> lock(playbackLockMutex_);
+  globalPlaybackLocked_ = locked;
+}
+
+Json::Value CommandRouter::playbackLockState(int layerId) const {
+  std::lock_guard<std::mutex> lock(playbackLockMutex_);
+  const auto it = playbackLocks_.find(layerId);
+  const bool layerLocked = it != playbackLocks_.end() && it->second;
+  Json::Value state;
+  state["layerId"] = layerId;
+  state["globalLocked"] = globalPlaybackLocked_;
+  state["layerLocked"] = layerLocked;
+  state["locked"] = globalPlaybackLocked_ || layerLocked;
+  state["state"] = (globalPlaybackLocked_ || layerLocked) ? "locked" : "unlocked";
+  return state;
 }
 
 bool CommandRouter::rejectIfPlaybackLocked(int layerId, const std::string& action,
@@ -348,6 +375,22 @@ CommandResponse CommandRouter::processCommand(const CommandRequest &request) {
     return response;
   }
 
+  const char *requiredModule = request.code == 0x52 ? "stage" : nullptr;
+  if (request.code == 0x0A) {
+    Json::Value param;
+    if (JsonUtils::parseJson(request.paramJson, param)) {
+      const std::string action = param.get("action", "").asString();
+      if (action != "save_current" && action != "load_default") requiredModule = "scene";
+    }
+  }
+  if (requiredModule && (!engine_ || !engine_->getLicenseManager() ||
+      !engine_->getLicenseManager()->isModuleEnabled(requiredModule))) {
+    response.ok = false;
+    response.error = 0x0403;
+    response.message = std::string(requiredModule) + " module not licensed";
+    return response;
+  }
+
   if (commandRequiresSystemConfig(request.code) && !systemConfig_) {
     response.ok = false;
     response.error = 0x0010;
@@ -371,7 +414,13 @@ CommandResponse CommandRouter::processCommand(const CommandRequest &request) {
   }
 
   auto dispatchHandler = [&]() {
-    if (isHighFreqCmd) {
+    // File sync owns its operation lock and must never block playback/control
+    // behind network IO for minutes. Other sync actions retain normal ordering.
+    Json::Value syncParam;
+    const bool isFileSync = request.code == 0x06 &&
+        JsonUtils::parseJson(request.paramJson, syncParam) &&
+        syncParam["action"].isString() && syncParam["action"].asString() == "sync_device";
+    if (isHighFreqCmd || isFileSync) {
       return it->second(request.paramJson);
     }
     const auto waitStart = std::chrono::steady_clock::now();
@@ -453,6 +502,24 @@ CommandResponse CommandRouter::processCommand(const CommandRequest &request) {
     LOG_INFO("[FusionICloseTrace] trace=%s stage=command.completed code=0x%02X total_ms=%lld ok=%d error=0x%04X",
              traceId.c_str(), request.code, static_cast<long long>(totalMs),
              response.ok ? 1 : 0, response.error);
+  }
+
+  // 主设备只复制成功的规范化命令；从 4322 组播执行的命令明确禁止回环。
+  if (response.ok && !request.fromSyncGroup) {
+    CommandObserver observer;
+    {
+      std::lock_guard<std::mutex> lock(commandObserverMutex_);
+      observer = commandObserver_;
+    }
+    if (observer) {
+      try {
+        observer(request, response);
+      } catch (const std::exception &e) {
+        LOG_WARN("命令同步观察器异常，忽略同步发布: %s", e.what());
+      } catch (...) {
+        LOG_WARN("命令同步观察器发生未知异常，忽略同步发布");
+      }
+    }
   }
 
   return response;

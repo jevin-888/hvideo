@@ -3,12 +3,17 @@
  * @brief 媒体工具类实现
  */
 
+#ifdef __ANDROID__
+#include "utils/EncryptedMedia.h"
+#endif
 #include "MediaUtils.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "utils/Logger.h"
 #include "utils/JsonUtils.h"
 #include "utils/FileUtils.h"
+#include "utils/FfmpegStreamInfo.h"
 #include <fstream>
+#include <cctype>
 #include <algorithm>
 #include <cstring>
 #include <cmath>
@@ -49,7 +54,7 @@ bool MediaUtils::probeVideoInfo(const std::string &videoPath,
     av_dict_set(&opts, "analyzeduration", "1000000", 0);
     av_dict_set(&opts, "probesize", "1048576", 0);
 
-    int ret = avformat_open_input(&fmt, videoPath.c_str(), nullptr, &opts);
+    int ret = encrypted_media::openInput(&fmt, videoPath.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     if (ret < 0) {
         if (outError) {
@@ -60,15 +65,17 @@ bool MediaUtils::probeVideoInfo(const std::string &videoPath,
         return false;
     }
 
-    ret = avformat_find_stream_info(fmt, nullptr);
-    if (ret < 0) {
-        if (outError) {
-            char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
-            av_strerror(ret, errbuf, sizeof(errbuf));
-            *outError = errbuf;
+    if (!ffmpeg_stream_info::hasUsableContainerMetadata(fmt)) {
+        ret = avformat_find_stream_info(fmt, nullptr);
+        if (ret < 0) {
+            if (outError) {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                *outError = errbuf;
+            }
+            avformat_close_input(&fmt);
+            return false;
         }
-        avformat_close_input(&fmt);
-        return false;
     }
 
     outInfo.valid = true;
@@ -192,7 +199,7 @@ bool MediaUtils::isBlackFrame(AVFrame *frame, int threshold, int sampleRatio) {
     return count == 0 || (double)total / count < threshold;
 }
 
-std::string MediaUtils::getThumbnailCacheDir(const std::string &videoPath) {
+std::string MediaUtils::getThumbnailCacheDir() {
     return hsvj::ROOT_PATH + ".cache/thumbnails/";
 }
 
@@ -220,7 +227,7 @@ void MediaUtils::generateThumbnailAsync(const std::string &videoPath,
     cleanupCompletedThumbnailTasks();
     thumbnailTasks_.push_back(std::async(std::launch::async, [videoPath, broadcastCallback]() {
         AVFormatContext *f = nullptr;
-        if (avformat_open_input(&f, videoPath.c_str(), nullptr, nullptr) < 0) return;
+        if (encrypted_media::openInput(&f, videoPath.c_str(), nullptr, nullptr) < 0) return;
         avformat_find_stream_info(f, nullptr);
         int vIdx = -1;
         for (unsigned i=0; i<f->nb_streams; i++) if (f->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) { vIdx=i; break; }
@@ -277,7 +284,7 @@ void MediaUtils::generateThumbnailAsync(const std::string &videoPath,
                         // 关键修复5：跳过前几帧（可能是seek后的不完整帧）
                         if (validFrames > 2 && !isBlackFrame(frame)) {
                             size_t h = std::hash<std::string>{}(videoPath);
-                            generateThumbnailFromFrame(frame, getThumbnailCacheDir(videoPath) + std::to_string(h) + ".jpg", videoPath, broadcastCallback);
+                            generateThumbnailFromFrame(frame, getThumbnailCacheDir() + std::to_string(h) + ".jpg", videoPath, broadcastCallback);
                             av_packet_unref(pkt);
                             goto cleanup;
                         }
@@ -296,7 +303,7 @@ void MediaUtils::generateThumbnailAsync(const std::string &videoPath,
                 if (pkt->stream_index == vIdx && avcodec_send_packet(ctx, pkt) >= 0) {
                     if (avcodec_receive_frame(ctx, frame) == 0) {
                         size_t h = std::hash<std::string>{}(videoPath);
-                        generateThumbnailFromFrame(frame, getThumbnailCacheDir(videoPath) + std::to_string(h) + ".jpg", videoPath, broadcastCallback);
+                        generateThumbnailFromFrame(frame, getThumbnailCacheDir() + std::to_string(h) + ".jpg", videoPath, broadcastCallback);
                         av_packet_unref(pkt);
                         break;
                     }
@@ -317,7 +324,7 @@ cleanup:
 bool MediaUtils::checkVideoFormatSupport(const std::string &path, std::string &outFmt, std::string &outErr) {
     AVFormatContext *f = nullptr;
     bool bad = false;
-    if (avformat_open_input(&f, path.c_str(), nullptr, nullptr) < 0) return true;
+    if (encrypted_media::openInput(&f, path.c_str(), nullptr, nullptr) < 0) return true;
     if (avformat_find_stream_info(f, nullptr) >= 0) {
         for (unsigned i=0; i<f->nb_streams; i++) {
             AVCodecParameters *p = f->streams[i]->codecpar;
@@ -359,7 +366,7 @@ bool MediaUtils::checkVideoFormatSupport(const std::string &path, std::string &o
                 tagBuf[3] = (char)((tag >> 24) & 0xFF);
                 tagBuf[4] = '\0';
                 
-                std::string tagStr = tagBuf; std::transform(tagStr.begin(), tagStr.end(), tagStr.begin(), ::tolower);
+                std::string tagStr = tagBuf; std::transform(tagStr.begin(), tagStr.end(), tagStr.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                 outFmt += " [Tag: " + tagStr + "]";
 
                 if (tagStr.find("dxv") != std::string::npos || tagStr.find("hap") != std::string::npos) {

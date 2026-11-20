@@ -11,8 +11,9 @@
 #include "database/PlaylistDatabase.h"
 #include "utils/Logger.h"
 #include "utils/FileUtils.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 
 namespace hsvj {
@@ -118,10 +119,10 @@ bool PlaylistManager::initialize(const std::string &dbPath) {
     std::vector<std::string> videoFiles = FileUtils::listFiles(DEFAULT_VIDEO_DIR, "*");
     for (const auto& filePath : videoFiles) {
       std::string ext = FileUtils::getExtension(filePath);
-      std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+      std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
       
       // 检查 if supported 视频 格式
-    if (ext == "mp4" || ext == "mkv" || ext == "avi" || ext == "mov" || ext == "wmv" || ext == "flv" || ext == "ts") {
+    if (ext == "hvideo" || ext == "mp4" || ext == "mkv" || ext == "avi" || ext == "mov" || ext == "wmv" || ext == "flv" || ext == "ts") {
         PlaylistItem item;
         item.uri = filePath;
         item.title = FileUtils::getFilename(filePath);

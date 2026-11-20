@@ -95,6 +95,11 @@ bool DecoderResourceGate::tryBeginOpen(int layerId,
   return true;
 }
 
+bool DecoderResourceGate::requiresAdmissionProbe(int layerId) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return hasOtherFourKLocked(layerId);
+}
+
 void DecoderResourceGate::onDecoderOpenFinished(
     int layerId, const DecoderAdmissionInfo &info, bool success) {
   DecoderResourceStats stats;

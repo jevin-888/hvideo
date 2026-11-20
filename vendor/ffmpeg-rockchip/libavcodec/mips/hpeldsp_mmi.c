@@ -52,7 +52,7 @@ void ff_put_pixels4_8_mmi(uint8_t *block, const uint8_t *pixels,
           RESTRICT_ASM_LOW32
           [block]"+&r"(block),              [pixels]"+&r"(pixels),
           [h]"+&r"(h)
-        : [line_size]"r"((mips_reg)? line_size)
+        : [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }
@@ -91,7 +91,7 @@ void ff_put_pixels8_8_mmi(uint8_t *block, const uint8_t *pixels,
           RESTRICT_ASM_ALL64
           [block]"+&r"(block),              [pixels]"+&r"(pixels),
           [h]"+&r"(h)
-        : [line_size]"r"((mips_reg)? line_size)
+        : [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }
@@ -140,7 +140,7 @@ void ff_put_pixels16_8_mmi(uint8_t *block, const uint8_t *pixels,
           RESTRICT_ASM_ALL64
           [block]"+&r"(block),              [pixels]"+&r"(pixels),
           [h]"+&r"(h)
-        : [line_size]"r"((mips_reg)? line_size)
+        : [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }
@@ -177,7 +177,7 @@ void ff_avg_pixels4_8_mmi(uint8_t *block, const uint8_t *pixels,
           [addr0]"=&r"(addr[0]),            [addr1]"=&r"(addr[1]),
           [block]"+&r"(block),              [pixels]"+&r"(pixels),
           [h]"+&r"(h)
-        : [line_size]"r"((mips_reg)? line_size)
+        : [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }
@@ -229,7 +229,7 @@ void ff_avg_pixels8_8_mmi(uint8_t *block, const uint8_t *pixels,
           [addr2]"=&r"(addr[2]),
           [block]"+&r"(block),              [pixels]"+&r"(pixels),
           [h]"+&r"(h)
-        : [line_size]"r"((mips_reg)? line_size)
+        : [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }
@@ -295,7 +295,7 @@ void ff_avg_pixels16_8_mmi(uint8_t *block, const uint8_t *pixels,
           [addr0]"=&r"(addr[0]),
           [block]"+&r"(block),              [pixels]"+&r"(pixels),
           [h]"+&r"(h)
-        : [line_size]"r"((mips_reg)? line_size)
+        : [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }
@@ -339,7 +339,7 @@ inline void ff_put_pixels4_l2_8_mmi(uint8_t *dst, const uint8_t *src1,
           [src2]"+&r"(src2),                [h]"+&r"(h)
         : [dst_stride]"r"((mips_reg)dst_stride),
           [src_stride1]"r"((mips_reg)src_stride1),
-          [src_stride2]"r"((mips_reg)? src_stride2)
+          [src_stride2]"r"((mips_reg)src_stride2)
         : "memory"
     );
 }
@@ -400,7 +400,7 @@ inline void ff_put_pixels8_l2_8_mmi(uint8_t *dst, const uint8_t *src1,
           [src2]"+&r"(src2),                [h]"+&r"(h)
         : [dst_stride]"r"((mips_reg)dst_stride),
           [src_stride1]"r"((mips_reg)src_stride1),
-          [src_stride2]"r"((mips_reg)? src_stride2)
+          [src_stride2]"r"((mips_reg)src_stride2)
         : "memory"
     );
 }
@@ -479,7 +479,7 @@ inline void ff_put_pixels16_l2_8_mmi(uint8_t *dst, const uint8_t *src1,
           [src2]"+&r"(src2),                [h]"+&r"(h)
         : [dst_stride]"r"((mips_reg)dst_stride),
           [src_stride1]"r"((mips_reg)src_stride1),
-          [src_stride2]"r"((mips_reg)? src_stride2)
+          [src_stride2]"r"((mips_reg)src_stride2)
         : "memory"
     );
 }
@@ -525,7 +525,7 @@ inline void ff_avg_pixels4_l2_8_mmi(uint8_t *dst, const uint8_t *src1,
           [src2]"+&r"(src2),                [h]"+&r"(h)
         : [dst_stride]"r"((mips_reg)dst_stride),
           [src_stride1]"r"((mips_reg)src_stride1),
-          [src_stride2]"r"((mips_reg)? src_stride2)
+          [src_stride2]"r"((mips_reg)src_stride2)
         : "memory"
     );
 }
@@ -597,7 +597,7 @@ inline void ff_avg_pixels8_l2_8_mmi(uint8_t *dst, const uint8_t *src1,
           [src2]"+&r"(src2),                [h]"+&r"(h)
         : [dst_stride]"r"((mips_reg)dst_stride),
           [src_stride1]"r"((mips_reg)src_stride1),
-          [src_stride2]"r"((mips_reg)? src_stride2)
+          [src_stride2]"r"((mips_reg)src_stride2)
         : "memory"
     );
 }
@@ -724,7 +724,7 @@ inline void ff_put_no_rnd_pixels8_l2_8_mmi(uint8_t *dst, const uint8_t *src1,
           [src2]"+&r"(src2),                [h]"+&r"(h)
         : [dst_stride]"r"((mips_reg)dst_stride),
           [src_stride1]"r"((mips_reg)src_stride1),
-          [src_stride2]"r"((mips_reg)? src_stride2)
+          [src_stride2]"r"((mips_reg)src_stride2)
         : "memory"
     );
 }
@@ -924,7 +924,7 @@ void ff_put_pixels8_xy2_8_mmi(uint8_t *block, const uint8_t *pixels,
           RESTRICT_ASM_ADDRT
           [addr0]"=&r"(addr[0]),            [addr1]"=&r"(addr[1]),
           [h]"+&r"(h),                      [pixels]"+&r"(pixels)
-        : [block]"r"(block),                [line_size]"r"((mips_reg)? line_size)
+        : [block]"r"(block),                [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 #else

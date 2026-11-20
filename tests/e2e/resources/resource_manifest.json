@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "name": "hplayer-real-device-test-resources",
+  "project_paths": {
+    "player": "D:/HVIDEO/Hplayer",
+    "server": "D:/HVIDEO/Hvideo_server",
+    "pad": "D:/HVIDEO/Fultter_pad",
+    "pad_vod": "D:/HVIDEO/Fultter_pad_vod",
+    "distributed": "D:/HVIDEO/Distributed Matrix System"
+  },
+  "services": {
+    "player_http_port": 8080,
+    "player_mobile_port": 8081,
+    "player_websocket_port": 9898,
+    "server_http_port": 9898
+  },
+  "player": {
+    "package": "com.hsvj.engine",
+    "required_endpoints": [
+      "/api/v1/heartbeat",
+      "/api/v1/system/status",
+      "/api/v1/video/status",
+      "/api/v1/layers",
+      "/api/v1/system/resources"
+    ],
+    "read_only_endpoints": [
+      "/api/v1/config.json",
+      "/api/v1/system/device-info",
+      "/api/v1/playlists",
+      "/api/v1/peripherals/command-lists"
+    ]
+  },
+  "server": {
+    "required_endpoints": [
+      "/api/v1/terminals/pad-list",
+      "/api/v1/songdb/songs?page=1&pageSize=5",
+      "/api/v1/songdb/singers?page=1&pageSize=1",
+      "/api/v1/service-types",
+      "/api/v1/system/dicts"
+    ],
+    "room_binding": {
+      "required_for": ["pad-song-search-and-queue", "pad-service-call"],
+      "terminal_match": "player_ip",
+      "required_field": "roomId"
+    },
+    "song_fixture": {
+      "minimum_count": 1,
+      "required_fields": ["songId", "songNo", "songName", "videoFileType"],
+      "selection": "first_available_server_song"
+    }
+  },
+  "pad": {
+    "flow_contract": "pad_flow_contract.json",
+    "packages": ["com.hvideo.padcontrol", "com.hvideo.pad"],
+    "apk_paths": {
+      "control": "D:/HVIDEO/Fultter_pad/build/app/outputs/flutter-apk/app-release.apk",
+      "vod": "D:/HVIDEO/Fultter_pad_vod/build/app/outputs/flutter-apk/app-release.apk"
+    },
+    "required_flow": [
+      "launch",
+      "configure_server",
+      "discover_terminal",
+      "search_song",
+      "select_song",
+      "playback_control",
+      "volume_and_mute",
+      "service_call"
+    ]
+  },
+  "media": {
+    "source": "server_song_fixture",
+    "local_upload_required": false,
+    "unsupported_codec_policy": "blocked_with_evidence",
+    "note": "媒体使用服务器当前可用歌曲，不能把服务器绝对路径当作播放器本地路径。"
+  },
+  "hardware": {
+    "serial": {"required": false, "method": "POST", "probe": "/api/v1/peripherals/actions/list_serial_ports"},
+    "dmx": {"required": false, "method": "POST", "probe": "/api/v1/peripherals/actions/get_config"},
+    "projector": {"required": false, "method": "POST", "probe": "/api/v1/stage-control/actions/get_config"},
+    "audio_output": {"required": true, "method": "POST", "probe": "/api/v1/playback/actions/getSystemVolume"},
+    "hdmi_capture": {"required": false, "method": "GET", "probe": "/api/v1/video/status"}
+  },
+  "evidence": {
+    "root": "tests/e2e/.artifacts",
+    "required_files": ["report.json", "resource_inventory.json"],
+    "capture": ["adb_screenshot", "player_status", "server_terminals", "selected_song"]
+  }
+}

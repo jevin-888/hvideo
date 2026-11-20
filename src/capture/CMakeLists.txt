@@ -4,7 +4,7 @@ set(CAPTURE_SOURCES
     V4L2Capture.cpp        # HDMI/MIPI 专用（多平面 + dmabuf）
     UsbCapture.cpp         # USB 专用（单平面 + MJPEG mmap）
     V4L2SubdevQuery.cpp
-    VpssConverter.cpp
+    Rk628Edid.cpp
 )
 
 add_library(hsvj_capture STATIC ${CAPTURE_SOURCES})
@@ -23,4 +23,8 @@ target_link_libraries(hsvj_capture PRIVATE
     log
 )
 
-
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_capture PRIVATE
+    hsvj_utils
+    hsvj_jsoncpp
+)

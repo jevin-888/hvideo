@@ -1345,7 +1345,7 @@ static int qsv_frames_derive_from(AVHWFramesContext *dst_ctx,
             for (i = 0; i < src_hwctx->nb_surfaces; i++) {
                 mfxHDLPair *pair = (mfxHDLPair*)src_hwctx->surfaces[i].Data.MemId;
                 dst_hwctx->texture_infos[i].texture = (ID3D11Texture2D*)pair->first;
-                dst_hwctx->texture_infos[i].index = pair->second == (mfxMemId)MFX_INFINITE ? (intptr_t)? 0 : (intptr_t)pair->second;
+                dst_hwctx->texture_infos[i].index = pair->second == (mfxMemId)MFX_INFINITE ? (intptr_t)0 : (intptr_t)pair->second;
             }
             ID3D11Texture2D_GetDesc(dst_hwctx->texture_infos[0].texture, &texDesc);
             dst_hwctx->BindFlags = texDesc.BindFlags;
@@ -1439,7 +1439,7 @@ static int qsv_map_from(AVHWFramesContext *ctx,
        if (child_frames_ctx->device_ctx->type == AV_HWDEVICE_TYPE_D3D11VA) {
             mfxHDLPair *pair = (mfxHDLPair*)surf->Data.MemId;
             dst->data[0] = pair->first;
-            dst->data[1] = pair->second == (mfxMemId)MFX_INFINITE ? (uint8_t *)? 0 : pair->second;
+            dst->data[1] = pair->second == (mfxMemId)MFX_INFINITE ? (uint8_t *)0 : pair->second;
         } else {
             dst->data[3] = child_data;
         }
@@ -1469,7 +1469,7 @@ static int qsv_map_from(AVHWFramesContext *ctx,
     if (child_frames_ctx->device_ctx->type == AV_HWDEVICE_TYPE_D3D11VA) {
         mfxHDLPair *pair = (mfxHDLPair*)surf->Data.MemId;
         dummy->data[0] = pair->first;
-        dummy->data[1] = pair->second == (mfxMemId)MFX_INFINITE ? (uint8_t *)? 0 : pair->second;
+        dummy->data[1] = pair->second == (mfxMemId)MFX_INFINITE ? (uint8_t *)0 : pair->second;
     } else {
         dummy->data[3] = child_data;
     }

@@ -1,0 +1,29 @@
+diff --git a/vendor/chuangwei-minimal-perf/build_h66_por_update.sh b/vendor/chuangwei-minimal-perf/build_h66_por_update.sh
+--- a/vendor/chuangwei-minimal-perf/build_h66_por_update.sh
++++ b/vendor/chuangwei-minimal-perf/build_h66_por_update.sh
+@@ -52,1 +52,2 @@
+-RECOVERY_IMG="$STARTUP_DIR/recovery.img"
++REFERENCE_RECOVERY_IMG="$STARTUP_DIR/recovery.img"
++RECOVERY_IMG="$PRODUCT_OUT/recovery.img"
+@@ -737,1 +738,1 @@
+-    require_sha256 "$EXPECTED_RECOVERY_SHA256" "$RECOVERY_IMG"
++    require_sha256 "$EXPECTED_RECOVERY_SHA256" "$REFERENCE_RECOVERY_IMG"
+@@ -2411,1 +2412,7 @@
+ cd "$ROOT_DIR"
++export HSVJ_ROM_VERSION="${H66_RELEASE_VERSION#v}"
++[[ "$HSVJ_ROM_VERSION" =~ ^[1-9][0-9]+$ ]] || fail "invalid internal ROM version"
++mkdir -p vendor/chuangwei-minimal-perf/hsvj-rom-update
++cp "$ENGINE_PROJECT_ROOT/system-integration/hsvj-rom-update/"{Android.bp,rom_update.cpp,trusted_key.h} vendor/chuangwei-minimal-perf/hsvj-rom-update/
++export HSVJ_ROM_VERSION
++
+@@ -2438,1 +2445,1 @@
+-m bootimage systemimage productimage systemextimage vendorimage superimage userdataimage -j"$JOBS"
++m bootimage recoveryimage systemimage productimage systemextimage vendorimage superimage userdataimage -j"$JOBS"
+diff --git a/vendor/chuangwei-minimal-perf/chuangwei_minimal_perf.mk b/vendor/chuangwei-minimal-perf/chuangwei_minimal_perf.mk
+--- a/vendor/chuangwei-minimal-perf/chuangwei_minimal_perf.mk
++++ b/vendor/chuangwei-minimal-perf/chuangwei_minimal_perf.mk
+@@ -1,0 +1,4 @@
++# Internal ROM protocol is supported only by the matching protected Recovery.
++PRODUCT_PACKAGES += hsvj-rom-update
++PRODUCT_SYSTEM_DEFAULT_PROPERTIES += ro.hsvj.rom_update.protocol=1 ro.hsvj.rom.version=$(HSVJ_ROM_VERSION)
++

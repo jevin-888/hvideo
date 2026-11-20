@@ -39,7 +39,7 @@ public:
      * @param filename ASS 文件路径
      * @return 是否成功
      */
-    bool loadSubtitleFile(const std::string& filename);
+    bool loadSubtitleFile(const std::string& filename, const std::string& assData = "");
 
     /**
      * @brief 清空当前轨道内容并保留已初始化的 渲染器/library
@@ -50,8 +50,8 @@ public:
     /**
      * @brief 渲染指定时间的字幕
      * @param 时间Ms 时间（毫秒）
-     * @param detectChange 输出参数，指示内容是否变化（1=变化，0=未变化），可为 nullptr
-     * @return ASS_Image 链表，包含渲染的字幕图像
+     * @param detectChange 输出变化类型（0=未变，1=位置变化，2=内容变化），可为 nullptr
+     * @return 借用的 ASS_Image 链表，由渲染器持有；下次渲染前有效，调用方不得释放
      */
     ASS_Image* renderFrame(int64_t timeMs, int* detectChange = nullptr);
 
@@ -82,7 +82,7 @@ public:
 
     /**
      * @brief 设置共享 libass 实例（必须在 initialize 前调用）
-     * @param holder 由 Engine 创建并注入的 SharedLibassHolder
+     * @param holder 由 Mubu 创建图层时注入的 SharedLibassHolder
      */
     void setSharedLibassHolder(class SharedLibassHolder *holder);
 
@@ -123,5 +123,3 @@ private:
 } // 命名空间 hsvj
 
 #endif // 结束 ASS_RENDERER_H
-
-

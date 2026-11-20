@@ -59,7 +59,7 @@
 
 /**
  * Extract version components from the full ::AV_VERSION_INT int as returned
- * by functions like ::avformat_version() ? and ::avcodec_version()
+ * by functions like ::avformat_version() and ::avcodec_version()
  */
 #define AV_VERSION_MAJOR(a) ((a) >> 16)
 #define AV_VERSION_MINOR(a) (((a) & 0x00FF00) >> 8)

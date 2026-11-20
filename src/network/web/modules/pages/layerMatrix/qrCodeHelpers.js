@@ -1,8 +1,14 @@
+/* global QRCode */
 // 二维码辅助模块
-import { apiPut, sendLayerCommand } from '../../core/api.js';
-import { addToCommandLog } from '../../core/commandLog.js';
+import { apiGet, apiPut, sendLayerCommand } from '../../core/api.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { rgbaStringToCssColor, cssColorToRgbaString } from './utils.js';
 import { showError } from '../../components/toast.js';
+import { buildQrAddressOptions, normalizeQrAddressValue } from '../../../shared/qrAddressOptions.js?v=1';
+import { renderQrAddressOptions, setupQrAddressPicker } from '../../../shared/qrAddressPicker.js?v=1';
+
+const DEFAULT_QR_BG_COLOR_RGBA = '0 0.2 1 1';
+const DEFAULT_QR_BG_COLOR_CSS = '#0033FF';
 
 /**
  * 通用 RGBA 颜色三联输入控件（picker / hex / hidden rgba）+ 色块预览。
@@ -125,7 +131,7 @@ export async function drawQRCodeCard(canvas, width, content, qrText, fgColor, bg
     };
 
     const toCssRgba = (str) => {
-        if (!str) return 'rgba(139, 164, 217, 1)';
+        if (!str) return DEFAULT_QR_BG_COLOR_CSS;
         if (str.startsWith('#')) return str;
         const p = str.trim().split(/\s+/).map(parseFloat);
         if (p.length < 3) return str;
@@ -144,20 +150,22 @@ export async function drawQRCodeCard(canvas, width, content, qrText, fgColor, bg
     drawRoundedRect(padding, padding, qrBoxSize, qrBoxSize, boxR);
     ctx.fill();
 
-    const qrInternalPadding = Math.round(qrBoxSize * 0.05);
-    const qrDrawSize = qrBoxSize - (qrInternalPadding * 2);
-
+    const qrInset = 10;
     const qrTemp = document.createElement('canvas');
     await new Promise((resolve, reject) => {
         QRCode.toCanvas(qrTemp, content || '微信扫码关注', {
-            width: qrDrawSize,
-            margin: 1,
+            width: qrBoxSize - qrInset * 2,
+            margin: 0,
             color: { dark: toHex(fgColor), light: '#ffffff' },
             errorCorrectionLevel: ['L', 'M', 'Q', 'H'][errorCorrection] || 'M'
         }, (err) => err ? reject(err) : resolve());
     });
 
-    ctx.drawImage(qrTemp, padding + qrInternalPadding, padding + qrInternalPadding);
+    // Match the player's 10-pixel white inset; the QR library adds no extra margin.
+    ctx.save();
+    ctx.clip(); // Preserve the rounded white box drawn above.
+    ctx.drawImage(qrTemp, padding + qrInset, padding + qrInset);
+    ctx.restore();
 
     if (normalizedQrText) {
         ctx.fillStyle = '#ffffff';
@@ -216,7 +224,7 @@ export async function updateQRCodePreview(drawQRCodeCard) {
     const errorLevel = qrErrorCorrection ? parseInt(qrErrorCorrection.value) : 1;
 
     let fgColor = qrFgColorPicker ? qrFgColorPicker.value : (qrFgColorInput ? qrFgColorInput.value : '#000000');
-    let bgColor = qrBgColorPicker ? qrBgColorPicker.value : (qrBgColorInput ? qrBgColorInput.value : '#8ba4d9');
+    let bgColor = qrBgColorPicker ? qrBgColorPicker.value : (qrBgColorInput ? qrBgColorInput.value : DEFAULT_QR_BG_COLOR_CSS);
 
     if (typeof QRCode === 'undefined') {
         qrPreview.innerHTML = '<div class="qr-placeholder">加载中...</div>';
@@ -271,7 +279,7 @@ export async function generateQRCode(layerId, applyLayerProperties, drawCanvas =
     addToCommandLog('开始生成', 'info', `点击了生成按钮, 图层ID: ${layerId}`);
 
     const generateQRBtn = document.getElementById('generate-qrcode-btn');
-    const originalBtnText = generateQRBtn ? generateQRBtn.textContent : '生成二维码';
+    const originalBtnText = generateQRBtn ? (globalThis.PlayerI18n?.sourceText(generateQRBtn) ?? generateQRBtn.textContent) : '生成二维码';
 
     if (typeof QRCode === 'undefined') {
         const errorMsg = '二维码生成失败: QRCode库未加载。请检查网络连接或刷新页面。';
@@ -319,7 +327,7 @@ export async function generateQRCode(layerId, applyLayerProperties, drawCanvas =
         const size = parseInt(qrSizeInput.value) || 256;
         const errorCorrection = qrErrorCorrectionInput ? parseInt(qrErrorCorrectionInput.value) || 1 : 1;
         const fgColor = qrFgColorInput ? qrFgColorInput.value.trim() || '0.0 0.0 0.0 1.0' : '0.0 0.0 0.0 1.0';
-        const bgColor = qrBgColorInput ? qrBgColorInput.value.trim() || '1.0 1.0 1.0 1.0' : '1.0 1.0 1.0 1.0';
+        const bgColor = qrBgColorInput ? qrBgColorInput.value.trim() || DEFAULT_QR_BG_COLOR_RGBA : DEFAULT_QR_BG_COLOR_RGBA;
 
         if (!content) {
             addToCommandLog('生成二维码', 'error', '请输入二维码内容');
@@ -357,7 +365,7 @@ export async function generateQRCode(layerId, applyLayerProperties, drawCanvas =
         }
 
         const finalCanvas = document.createElement('canvas');
-        const calculatedHeight = await drawQRCodeCard(finalCanvas, size, content, qrText, fgColor, bgColor, errorCorrection);
+        await drawQRCodeCard(finalCanvas, size, content, qrText, fgColor, bgColor, errorCorrection);
         const base64Data = finalCanvas.toDataURL('image/png');
         payload.image_data = base64Data;
 
@@ -366,16 +374,6 @@ export async function generateQRCode(layerId, applyLayerProperties, drawCanvas =
         if (apiResult == null) {
             const errorMsg = '二维码生成失败';
             addToCommandLog('生成二维码', 'error', errorMsg);
-            if (generateQRBtn) {
-                generateQRBtn.disabled = false;
-                generateQRBtn.textContent = originalBtnText;
-            }
-            return;
-        }
-
-        if (apiResult === null || apiResult === undefined) {
-            // API调用失败或返回null
-            addToCommandLog('生成二维码', 'error', '二维码生成失败：服务器未返回有效响应');
             if (generateQRBtn) {
                 generateQRBtn.disabled = false;
                 generateQRBtn.textContent = originalBtnText;
@@ -395,7 +393,7 @@ export async function generateQRCode(layerId, applyLayerProperties, drawCanvas =
                 if (widthInputUI && result.width !== undefined) widthInputUI.value = result.width;
                 if (heightInputUI && result.height !== undefined) heightInputUI.value = result.height;
                 const visibilityBtn = document.querySelector('.toggle-visibility');
-                if (visibilityBtn && visibilityBtn.textContent === '显示') visibilityBtn.click();
+                if (visibilityBtn && (globalThis.PlayerI18n?.sourceText(visibilityBtn) ?? visibilityBtn.textContent) === '显示') visibilityBtn.click();
             }
 
             const qrPreview = document.getElementById('qr-preview');
@@ -413,7 +411,7 @@ export async function generateQRCode(layerId, applyLayerProperties, drawCanvas =
                 const errorLevel = qrErrorCorrection ? parseInt(qrErrorCorrection.value) : 1;
 
                 let fgColor = qrFgColorPicker ? qrFgColorPicker.value : (qrFgColorInput ? qrFgColorInput.value : '#000000');
-                let bgColor = qrBgColorPicker ? qrBgColorPicker.value : (qrBgColorInput ? qrBgColorInput.value : '#8ba4d9');
+                let bgColor = qrBgColorPicker ? qrBgColorPicker.value : (qrBgColorInput ? qrBgColorInput.value : DEFAULT_QR_BG_COLOR_CSS);
 
                 if (typeof QRCode !== 'undefined') {
                     let canvas = qrPreview.querySelector('canvas.preview-canvas');
@@ -499,6 +497,26 @@ export function cleanupQRCodeListeners() {
     qrCodeListenersCleanup = [];
 }
 
+async function populateQrAddressOptions(select) {
+    if (!select || select.tagName !== 'INPUT') return;
+    const renderedValue = select.value;
+    const current = normalizeQrAddressValue(select.dataset.initialValue);
+    const [networkInfo, systemConfig] = await Promise.all([
+        apiGet('/system/network/info', { silent: true }),
+        apiGet('/system/config', { silent: true })
+    ]);
+    const ip = networkInfo?.primary_ip || window.location.hostname || '127.0.0.1';
+    const addresses = buildQrAddressOptions(
+        ip,
+        Number(systemConfig?.vodMode ?? (systemConfig?.enableVod ? 2 : 0)) === 2,
+        systemConfig?.onlineVodHost
+    );
+    renderQrAddressOptions(select, addresses);
+    if (select.value === renderedValue) {
+        select.value = current || addresses[0];
+    }
+}
+
 /**
  * 设置二维码Dashboard事件监听器
  */
@@ -513,29 +531,41 @@ export function setupQRCodeDashboardListeners(
 
     const qrContentInput = document.getElementById('qr-content');
     const generateQRBtn = document.getElementById('generate-qrcode-btn');
-    const loadQrLogoBtn = document.getElementById('load-qr-logo-btn');
+    const qrAddressReady = populateQrAddressOptions(qrContentInput).catch(() => {});
+    setupQrAddressPicker(qrContentInput, qrAddressReady, cleanup => qrCodeListenersCleanup.push(cleanup));
+    qrAddressReady.then(() => updateQRCodePreview(drawQRCodeCard)).catch(() => {});
+
+    const fusionDebugEnabled = document.getElementById('fusion-debug-enabled');
+    if (fusionDebugEnabled) {
+        apiGet('/system/config', { silent: true }).then(systemConfig => {
+            fusionDebugEnabled.checked = systemConfig?.fusionDebugEnabled !== false;
+        }).catch(() => {});
+        const fusionDebugHandler = async () => {
+            await apiPut('/system/config', {
+                fusionDebugEnabled: fusionDebugEnabled.checked
+            }, { silent: true });
+        };
+        fusionDebugEnabled.addEventListener('change', fusionDebugHandler);
+        qrCodeListenersCleanup.push(() => fusionDebugEnabled.removeEventListener('change', fusionDebugHandler));
+    }
 
     if (generateQRBtn) {
-        const generateHandler = () => generateQRCode(layerId, { idPrefix, sliceKey, applySliceProperties });
+        const generateHandler = async () => {
+            await qrAddressReady;
+            generateQRCode(layerId, { idPrefix, sliceKey, applySliceProperties });
+        };
         generateQRBtn.onclick = generateHandler;
         qrCodeListenersCleanup.push(() => {
             generateQRBtn.onclick = null;
         });
     }
 
-    if (loadQrLogoBtn) {
-        const loadLogoHandler = () => {
-            addToCommandLog('加载Logo', 'info', 'Logo加载功能');
-        };
-        loadQrLogoBtn.addEventListener('click', loadLogoHandler);
-        qrCodeListenersCleanup.push(() => {
-            loadQrLogoBtn.removeEventListener('click', loadLogoHandler);
-        });
-    }
-
     if (qrContentInput) {
-        const keypressHandler = e => {
-            if (e.key === 'Enter') generateQRCode(layerId, { idPrefix, sliceKey, applySliceProperties });
+        const keypressHandler = async e => {
+            if (e.key === 'Enter') {
+                await qrAddressReady;
+                generateQRCode(layerId, { idPrefix, sliceKey, applySliceProperties });
+            }
         };
         qrContentInput.addEventListener('keypress', keypressHandler);
         qrCodeListenersCleanup.push(() => {
@@ -549,8 +579,10 @@ export function setupQRCodeDashboardListeners(
             qrTimer = setTimeout(applyFn, 500);
         };
         qrContentInput.addEventListener('input', inputHandler);
+        qrContentInput.addEventListener('change', inputHandler);
         qrCodeListenersCleanup.push(() => {
             qrContentInput.removeEventListener('input', inputHandler);
+            qrContentInput.removeEventListener('change', inputHandler);
             if (qrTimer) {
                 clearTimeout(qrTimer);
                 qrTimer = null;
@@ -559,15 +591,11 @@ export function setupQRCodeDashboardListeners(
     }
 
     const qrTextInput = document.getElementById('qr-text');
-    const qrPreviewLabel = document.querySelector('.qr-preview-label');
-    const qrLogoSizeInput = document.getElementById('qr-logo-size');
     const qrSizeInput = document.getElementById('qr-size');
 
-    if (qrTextInput && qrPreviewLabel) {
-        qrPreviewLabel.textContent = qrTextInput.value || '微信扫码关注';
+    if (qrTextInput) {
         let qrTextTimer = null;
         const textInputHandler = () => {
-            qrPreviewLabel.textContent = qrTextInput.value || '微信扫码关注';
             updateQRCodePreview(drawQRCodeCard);
             clearTimeout(qrTextTimer);
             qrTextTimer = setTimeout(applyFn, 500);
@@ -578,24 +606,6 @@ export function setupQRCodeDashboardListeners(
             if (qrTextTimer) {
                 clearTimeout(qrTextTimer);
                 qrTextTimer = null;
-            }
-        });
-    }
-
-    if (qrLogoSizeInput) {
-        let timer = null;
-        const triggerApply = () => {
-            clearTimeout(timer);
-            timer = setTimeout(applyFn, 300);
-        };
-        qrLogoSizeInput.addEventListener('change', triggerApply);
-        qrLogoSizeInput.addEventListener('input', triggerApply);
-        qrCodeListenersCleanup.push(() => {
-            qrLogoSizeInput.removeEventListener('change', triggerApply);
-            qrLogoSizeInput.removeEventListener('input', triggerApply);
-            if (timer) {
-                clearTimeout(timer);
-                timer = null;
             }
         });
     }
@@ -660,7 +670,7 @@ export function setupQRCodeColorInputs(layerId, updateQRCodePreview, drawQRCodeC
         hiddenId: 'qr-bg-color',
         altHiddenId: 'qr-bg-color-rgba',
         swatchId: 'qr-bg-color-swatch',
-        defaultRgba: '0 0.2 1 1', // 默认 #0051FF
+        defaultRgba: DEFAULT_QR_BG_COLOR_RGBA, // 默认 #0051FF
         onChange: onPreviewChange,
         cleanupArray: qrCodeListenersCleanup
     });

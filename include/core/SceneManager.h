@@ -16,7 +16,7 @@
 #include <string>
 #include <memory>
 #include <vector>
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 
 namespace hsvj {
 

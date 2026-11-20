@@ -1,11 +1,14 @@
 // 系统设置页面模块
 import { apiGet, apiPost, apiDelete, getLastApiError, apiAction } from '../core/api.js';
 import { applyAppTitleFromLicense } from '../core/appTitle.js';
-import { addToCommandLog } from '../core/commandLog.js';
+import { MODULE_LABELS, applyModuleLicense, isModuleLicensed } from '../core/moduleLicense.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { roundNumbersInObject } from '../utils/configUtils.js';
-import { parseApiResponse } from '../utils/apiResponseParser.js';
+import { parseApiResponse } from '/shared/apiResponseParser.js';
 import { showSuccess, showError, showConfirm, showPrompt } from '../components/toast.js';
-import { initializeFlexibleMapping, loadFlexibleMapping, setLicensedInputChannelCount } from './flexibleMapping.js?v=2.64';
+import { initializeFlexibleMapping, loadFlexibleMapping, setLicensedInputChannelCount } from './flexibleMapping.js?v=2.65';
+import { initializeDisplayOutput, loadDisplayOutput } from './displayOutput.js?v=2';
+import { initializeDisplayResolution, loadDisplayResolution } from './displayResolution.js?v=1';
 
 // 局域网配置同步：唯一 base_path 值为 current，后端始终写入当前 ROOT_PATH。
 const SYNC_CONFIG_DIRS = [
@@ -13,20 +16,13 @@ const SYNC_CONFIG_DIRS = [
     'config', 'data', 'logs', 'models', 'shaders', 'singers', 'ttf', 'video', 'web'
 ];
 const SYNC_BASE_PATH = 'current';
+const SYNC_REQUEST_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 const SYNC_BASE_LABEL = '当前数据根目录';
 const RENDER_QUALITY_SURFACE_SIZE = {
     smooth: '1920x1080',
     normal: '2560x1440',
     high: '2880x1620',
     ultra: '3840x2160'
-};
-
-// 模块名称映射
-const MODULE_LABELS = {
-    'TV': 'TV',
-    '投屏': '投屏',
-    '霸屏': '霸屏',
-    'effects': '特效'
 };
 
 const USAGE_MODE_LABELS = {
@@ -45,6 +41,10 @@ let logSearchIndex = -1;
 export function initializeSettings() {
     // 初始化标签切换功能
     initializeSettingsTabs();
+    initializeCommonConfigSwitcher();
+    initializeDisplayOutput();
+    initializeDisplayResolution();
+    initializeLyricPreview();
     // 初始化矩阵配置
     initializeFlexibleMapping();
     // 初始化局域网配置同步模块
@@ -56,6 +56,76 @@ export function initializeSettings() {
     initializeDeviceInfoSecretEdit();
     // 隐藏功能：供应商名称连续点击 10 次切换开机动画
     initializeBootAnimationSecretSwitch();
+}
+
+function initializeLyricPreview() {
+    const panel = document.getElementById('common-config-panel-lyric');
+    if (!panel) return;
+    panel.addEventListener('change', updateLyricPreview);
+    updateLyricPreview();
+}
+
+function updateLyricPreview() {
+    const stage = document.getElementById('lyric-preview-stage');
+    if (!stage) return;
+    const pinyin = document.getElementById('common-lyric-display-mode')?.value === 'pinyin';
+    const headerVisible = document.getElementById('common-lyric-header-visible')?.checked === true;
+    const backgroundVisible = document.getElementById('common-lyric-background-visible')?.checked === true;
+    const modeLabel = pinyin ? '纯拼音 · 带声调' : '原文歌词';
+    document.getElementById('lyric-preview-mode').textContent = modeLabel;
+    document.getElementById('lyric-preview-header').hidden = !headerVisible;
+    document.getElementById('lyric-preview-sung').textContent = pinyin ? 'ràng měi yí jù gē' : '让每一句歌';
+    document.getElementById('lyric-preview-pending').textContent = pinyin ? 'dōu qīng xī dòng rén' : '都清晰动人';
+    document.getElementById('lyric-preview-next').textContent = pinyin ? 'bǎ měi hǎo liú zài zhè yí kè' : '把美好留在这一刻';
+    stage.classList.toggle('has-background', backgroundVisible);
+    stage.classList.toggle('is-pinyin', pinyin);
+    stage.setAttribute('aria-label', `${modeLabel}排版示意，歌曲信息${headerVisible ? '显示' : '隐藏'}，歌词背景${backgroundVisible ? '开启' : '关闭'}`);
+}
+
+function initializeCommonConfigSwitcher() {
+    const tabs = Array.from(document.querySelectorAll('[data-common-config-target]'));
+    const panels = Array.from(document.querySelectorAll('[data-common-config-panel]'));
+    if (tabs.length === 0 || panels.length === 0) return;
+
+    const activate = (target, focusTab = false) => {
+        const availableTabs = tabs.filter(tab => !tab.hidden && !tab.disabled);
+        const selectedTab = availableTabs.find(tab => tab.dataset.commonConfigTarget === target) || availableTabs[0];
+        if (!selectedTab) return;
+        const selectedTarget = selectedTab.dataset.commonConfigTarget;
+
+        tabs.forEach(tab => {
+            const active = tab === selectedTab;
+            tab.classList.toggle('active', active);
+            tab.setAttribute('aria-selected', String(active));
+            tab.tabIndex = active ? 0 : -1;
+        });
+        panels.forEach(panel => {
+            const active = panel.dataset.commonConfigPanel === selectedTarget;
+            panel.classList.toggle('active', active);
+            panel.hidden = !active;
+        });
+
+        if (focusTab) selectedTab.focus();
+    };
+
+    tabs.forEach(tab => {
+        tab.addEventListener('click', () => activate(tab.dataset.commonConfigTarget));
+        tab.addEventListener('keydown', event => {
+            const availableTabs = tabs.filter(item => !item.hidden && !item.disabled);
+            const currentIndex = availableTabs.indexOf(tab);
+            let nextIndex = currentIndex;
+            if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % availableTabs.length;
+            else if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + availableTabs.length) % availableTabs.length;
+            else if (event.key === 'Home') nextIndex = 0;
+            else if (event.key === 'End') nextIndex = availableTabs.length - 1;
+            else return;
+
+            event.preventDefault();
+            activate(availableTabs[nextIndex]?.dataset.commonConfigTarget, true);
+        });
+    });
+
+    activate(tabs.find(tab => tab.classList.contains('active'))?.dataset.commonConfigTarget);
 }
 
 // 初始化设置页面标签切换
@@ -271,7 +341,9 @@ async function loadLogDetail() {
     detail.textContent = '日志加载中...';
     try {
         const url = `/api/v1/logs/file?date=${encodeURIComponent(selectedLogDate)}&name=${encodeURIComponent(selectedLogFile)}`;
-        const response = await fetch(url);
+        const token = localStorage.getItem('hvideo_auth_token');
+        const response = await fetch(url, token
+            ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
         currentLogText = response.ok ? await response.text() : '日志读取失败';
         detail.textContent = currentLogText;
         resetLogSearch(false);
@@ -414,7 +486,23 @@ function initializeLicenseButtons() {
             }
         });
     }
+    const syncRoleSelect = document.getElementById('common-sync-role');
+    if (syncRoleSelect) {
+        syncRoleSelect.addEventListener('change', updateSyncLeaderVisibility);
+    }
+    updateSyncLeaderVisibility();
 
+}
+
+function updateSyncLeaderVisibility() {
+    const role = document.getElementById('common-sync-role')?.value || 'follower';
+    const input = document.getElementById('common-sync-leader-ip');
+    if (!input) return;
+    const item = input.closest('.setting-item');
+    if (item) item.style.opacity = role === 'leader' ? '0.65' : '1';
+    input.placeholder = role === 'leader'
+        ? '主设备可留空；从设备填写主设备 IP'
+        : '填写主设备 IP，例如 192.168.2.103';
 }
 
 /**
@@ -433,6 +521,22 @@ async function updateConfig(updater, logTag = '系统设置') {
         const result = await apiPost('/config.json', roundNumbersInObject(updatedConfig), 15000);
 
         if (result != null) {
+            // VOD 增益和歌词选项需要跨应用重启保持；保存后立即从引擎权威配置回读，
+            // 防止旧缓存或并发配置写入造成页面显示成功但实际未落盘。
+            const persistedKeys = ['startupIpHintEnabled', 'playbackOperationHintEnabled', 'vodVolumeGainDb', 'lyricDisplayMode', 'lyricFont', 'lyricHeaderVisible', 'lyricBackgroundVisible',
+                'lyricTitleFontSize', 'lyricTitleOutlineWidth', 'lyricTextFontSize',
+                'lyricTextOutlineWidth', 'lyricTextSpacing', 'lyricProducerText'];
+            const needsReadback = persistedKeys.some(key => Object.prototype.hasOwnProperty.call(updatedConfig, key));
+            if (needsReadback) {
+                const persisted = await apiGet('/config.json');
+                const expectedPersisted = roundNumbersInObject(updatedConfig);
+                const mismatch = persistedKeys.some(key =>
+                    Object.prototype.hasOwnProperty.call(updatedConfig, key) &&
+                    persisted?.[key] !== expectedPersisted[key]);
+                if (mismatch) {
+                    throw new Error('公共配置回读不一致，未确认持久化，请重试');
+                }
+            }
             addToCommandLog(logTag, 'success', '配置已同步并持久化');
             showSuccess(`${logTag}成功`);
             return true;
@@ -449,17 +553,21 @@ async function updateConfig(updater, logTag = '系统设置') {
 
 async function saveCommonConfig() {
     const ok = await updateConfig(config => {
+        const originalConfig = { ...config };
         const audioSelect = document.getElementById('common-audio-output-layer-id');
         const vodModeSelect = document.getElementById('common-vod-mode');
         const renderFrameRateMode = document.getElementById('common-render-frame-rate-mode');
         const renderQuality = document.getElementById('common-render-quality');
+        const playbackOperationHintEnabled = document.getElementById('common-playback-operation-hint-enabled');
+        const startupIpHintEnabled = document.getElementById('common-startup-ip-hint-enabled');
         const localSongFileScanEnabled = document.getElementById('common-local-song-file-scan-enabled');
         const appUpdateEnabled = document.getElementById('common-app-update-enabled');
         const networkIpMode = document.getElementById('common-network-ip-mode');
         const networkStaticIp = document.getElementById('common-network-static-ip');
         const networkGateway = document.getElementById('common-network-gateway');
         const networkDns = document.getElementById('common-network-dns');
-        const debugHotspotEnabled = document.getElementById('common-debug-hotspot-enabled');
+        const startupWirelessMode = document.getElementById('common-startup-wireless-mode');
+        const usbOtgMode = document.getElementById('common-usb-otg-mode');
         const vodHost = document.getElementById('common-online-vod-host');
         const vodRoom = document.getElementById('common-online-vod-room-id');
         const powerScheduleEnabled = document.getElementById('common-power-schedule-enabled');
@@ -469,6 +577,23 @@ async function saveCommonConfig() {
         const powerOffScheduleEnabled = document.getElementById('common-power-off-schedule-enabled');
         const powerOffDate = document.getElementById('common-power-off-date');
         const powerOffTime = document.getElementById('common-power-off-time');
+        const lyricFont = document.getElementById('common-lyric-font');
+        const lyricHeaderVisible = document.getElementById('common-lyric-header-visible');
+        const lyricBackgroundVisible = document.getElementById('common-lyric-background-visible');
+        const lyricDisplayMode = document.getElementById('common-lyric-display-mode');
+        const lyricTitleFontSize = document.getElementById('common-lyric-title-font-size');
+        const lyricTitleOutlineWidth = document.getElementById('common-lyric-title-outline-width');
+        const lyricTextFontSize = document.getElementById('common-lyric-text-font-size');
+        const lyricTextOutlineWidth = document.getElementById('common-lyric-text-outline-width');
+        const lyricTextSpacing = document.getElementById('common-lyric-text-spacing');
+        const lyricProducerText = document.getElementById('common-lyric-producer-text');
+        const syncEnabled = document.getElementById('common-sync-enabled');
+        const syncRole = document.getElementById('common-sync-role');
+        const syncGroupId = document.getElementById('common-sync-group-id');
+        const syncLeaderIp = document.getElementById('common-sync-leader-ip');
+        const syncMulticastAddr = document.getElementById('common-sync-multicast-addr');
+        const syncInterface = document.getElementById('common-sync-interface');
+        const syncTtl = document.getElementById('common-sync-ttl');
 
         if (audioSelect) {
             const audioLayerId = parseInt(audioSelect.value);
@@ -485,15 +610,30 @@ async function saveCommonConfig() {
         if (renderQuality) {
             config.renderQuality = normalizeRenderQuality(renderQuality.value);
         }
+        if (playbackOperationHintEnabled) config.playbackOperationHintEnabled = playbackOperationHintEnabled.checked;
+        if (startupIpHintEnabled) config.startupIpHintEnabled = startupIpHintEnabled.checked;
         if (localSongFileScanEnabled) config.localSongFileScanEnabled = localSongFileScanEnabled.checked;
         if (appUpdateEnabled) config.appUpdateEnabled = appUpdateEnabled.checked;
         if (networkIpMode) config.networkIpMode = networkIpMode.value === 'static' ? 'static' : 'dynamic';
         if (networkStaticIp) config.networkStaticIp = networkStaticIp.value.trim();
         if (networkGateway) config.networkGateway = networkGateway.value.trim();
         if (networkDns) config.networkDns = networkDns.value.trim();
-        if (debugHotspotEnabled) config.debugHotspotEnabled = debugHotspotEnabled.checked;
+        if (startupWirelessMode) config.startupWirelessMode = startupWirelessMode.value === 'wifi' ? 'wifi' : 'hotspot';
+        if (usbOtgMode) {
+            config.usbOtgMode = ['otg', 'peripheral', 'host'].includes(usbOtgMode.value)
+                ? usbOtgMode.value
+                : 'host';
+        }
         if (vodHost) config.onlineVodHost = vodHost.value.trim();
         if (vodRoom) config.onlineVodRoomId = vodRoom.value.trim();
+        const vodGain = document.getElementById('common-vod-volume-gain-db');
+        if (vodGain) {
+            const gainDb = Number(vodGain.value);
+            if (!Number.isInteger(gainDb) || gainDb < 0 || gainDb > 10) {
+                throw new Error('VOD 音量增益请选择 0 至 +10 dB');
+            }
+            config.vodVolumeGainDb = gainDb;
+        }
         if (powerScheduleEnabled) config.powerScheduleEnabled = powerScheduleEnabled.checked;
         if (powerOnScheduleEnabled) config.powerOnScheduleEnabled = powerOnScheduleEnabled.checked;
         if (powerOnDate) config.powerOnDate = powerOnDate.value;
@@ -501,11 +641,53 @@ async function saveCommonConfig() {
         if (powerOffScheduleEnabled) config.powerOffScheduleEnabled = powerOffScheduleEnabled.checked;
         if (powerOffDate) config.powerOffDate = powerOffDate.value;
         if (powerOffTime) config.powerOffTime = powerOffTime.value;
+        if (lyricFont) config.lyricFont = normalizeLyricFontValue(lyricFont.value);
+        if (lyricHeaderVisible) config.lyricHeaderVisible = lyricHeaderVisible.checked;
+        if (lyricBackgroundVisible) config.lyricBackgroundVisible = lyricBackgroundVisible.checked;
+        if (lyricDisplayMode) config.lyricDisplayMode = lyricDisplayMode.value === 'pinyin' ? 'pinyin' : 'original';
+        const readLyricNumber = (element, fallback) => {
+            if (!element) return fallback;
+            const value = Number(element.value);
+            return Number.isFinite(value) ? value : fallback;
+        };
+        config.lyricTitleFontSize = readLyricNumber(lyricTitleFontSize, 150);
+        config.lyricTitleOutlineWidth = readLyricNumber(lyricTitleOutlineWidth, 8);
+        config.lyricTextFontSize = readLyricNumber(lyricTextFontSize, 140);
+        config.lyricTextOutlineWidth = readLyricNumber(lyricTextOutlineWidth, 10);
+        config.lyricTextSpacing = readLyricNumber(lyricTextSpacing, -10);
+        if (lyricProducerText) config.lyricProducerText = lyricProducerText.value.slice(0, 256);
+        if (!isModuleLicensed('vod')) {
+            for (const key of ['audioOutputLayerId', 'vodMode', 'enableVod', 'onlineVodHost', 'onlineVodRoomId', 'vodVolumeGainDb',
+                'lyricFont', 'lyricHeaderVisible', 'lyricBackgroundVisible', 'lyricDisplayMode',
+                'lyricTitleFontSize', 'lyricTitleOutlineWidth', 'lyricTextFontSize',
+                'lyricTextOutlineWidth', 'lyricTextSpacing', 'lyricProducerText']) {
+                if (Object.prototype.hasOwnProperty.call(originalConfig, key)) config[key] = originalConfig[key];
+                else delete config[key];
+            }
+        }
+        if (syncEnabled || syncRole || syncGroupId || syncLeaderIp || syncMulticastAddr || syncInterface || syncTtl) {
+            const previousSync = config.syncGroup && typeof config.syncGroup === 'object'
+                ? config.syncGroup
+                : {};
+            const ttlValue = syncTtl ? Number.parseInt(syncTtl.value, 10) : Number(previousSync.ttl);
+            config.syncGroup = {
+                ...previousSync,
+                enabled: syncEnabled ? syncEnabled.checked : !!previousSync.enabled,
+                role: syncRole?.value === 'leader' ? 'leader' : 'follower',
+                groupId: (syncGroupId?.value || previousSync.groupId || 'default').trim() || 'default',
+                leaderIp: (syncLeaderIp?.value || previousSync.leaderIp || '').trim(),
+                leaderDeviceId: syncLeaderIp?.value?.trim() ? '' : (previousSync.leaderDeviceId || ''),
+                multicastAddr: (syncMulticastAddr?.value || previousSync.multicastAddr || '239.255.42.10').trim(),
+                interface: (syncInterface?.value || previousSync.interface || '').trim(),
+                port: 4322,
+                ttl: Number.isInteger(ttlValue) ? Math.max(0, Math.min(255, ttlValue)) : 1
+            };
+        }
 
         return config;
     }, '公共配置');
     if (ok) {
-        addToCommandLog('公共配置', 'info', '渲染质量和调试热点开关将在重启应用后生效');
+        addToCommandLog('公共配置', 'info', '渲染质量将在重启应用后生效；启动无线模式将在重启设备后生效');
     }
 }
 
@@ -514,7 +696,9 @@ export async function updateSettings() {
     await Promise.allSettled([
         loadDeviceInfo(),
         loadLicenseStatus(),
-        loadConfigForSettings()
+        loadConfigForSettings(),
+        loadDisplayOutput(),
+        loadDisplayResolution()
     ]);
     loadFlexibleMapping();
 }
@@ -539,13 +723,16 @@ async function loadConfigForSettings() {
         const vodModeEl = document.getElementById('common-vod-mode');
         const renderFrameRateModeEl = document.getElementById('common-render-frame-rate-mode');
         const renderQualityEl = document.getElementById('common-render-quality');
+        const playbackOperationHintEnabledEl = document.getElementById('common-playback-operation-hint-enabled');
+        const startupIpHintEnabledEl = document.getElementById('common-startup-ip-hint-enabled');
         const localSongFileScanEl = document.getElementById('common-local-song-file-scan-enabled');
         const appUpdateEnabledEl = document.getElementById('common-app-update-enabled');
         const networkIpModeEl = document.getElementById('common-network-ip-mode');
         const networkStaticIpEl = document.getElementById('common-network-static-ip');
         const networkGatewayEl = document.getElementById('common-network-gateway');
         const networkDnsEl = document.getElementById('common-network-dns');
-        const debugHotspotEnabledEl = document.getElementById('common-debug-hotspot-enabled');
+        const startupWirelessModeEl = document.getElementById('common-startup-wireless-mode');
+        const usbOtgModeEl = document.getElementById('common-usb-otg-mode');
         const vodHostEl = document.getElementById('common-online-vod-host');
         const vodRoomEl = document.getElementById('common-online-vod-room-id');
         const powerScheduleEnabledEl = document.getElementById('common-power-schedule-enabled');
@@ -555,6 +742,31 @@ async function loadConfigForSettings() {
         const powerOffScheduleEnabledEl = document.getElementById('common-power-off-schedule-enabled');
         const powerOffDateEl = document.getElementById('common-power-off-date');
         const powerOffTimeEl = document.getElementById('common-power-off-time');
+        const syncEnabledEl = document.getElementById('common-sync-enabled');
+        const syncRoleEl = document.getElementById('common-sync-role');
+        const syncGroupIdEl = document.getElementById('common-sync-group-id');
+        const syncLeaderIpEl = document.getElementById('common-sync-leader-ip');
+        const syncMulticastAddrEl = document.getElementById('common-sync-multicast-addr');
+        const syncInterfaceEl = document.getElementById('common-sync-interface');
+        const syncPortEl = document.getElementById('common-sync-port');
+        const syncTtlEl = document.getElementById('common-sync-ttl');
+
+        const syncGroup = data && data.syncGroup && typeof data.syncGroup === 'object'
+            ? data.syncGroup
+            : {};
+        if (syncEnabledEl) syncEnabledEl.checked = syncGroup.enabled === true;
+        if (syncRoleEl) syncRoleEl.value = syncGroup.role === 'leader' ? 'leader' : 'follower';
+        if (syncGroupIdEl) syncGroupIdEl.value = syncGroup.groupId || 'default';
+        if (syncLeaderIpEl) {
+            const legacyId = syncGroup.leaderDeviceId || '';
+            const legacyLooksLikeIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(legacyId);
+            syncLeaderIpEl.value = syncGroup.leaderIp || (legacyLooksLikeIp ? legacyId : '');
+        }
+        if (syncMulticastAddrEl) syncMulticastAddrEl.value = syncGroup.multicastAddr || '239.255.42.10';
+        if (syncInterfaceEl) syncInterfaceEl.value = syncGroup.interface || '';
+        if (syncPortEl) syncPortEl.value = 4322;
+        if (syncTtlEl) syncTtlEl.value = Number.isInteger(syncGroup.ttl) ? syncGroup.ttl : 1;
+        updateSyncLeaderVisibility();
 
         let vodMode = 0;
         if (data && data.vodMode !== undefined) {
@@ -570,6 +782,8 @@ async function loadConfigForSettings() {
         if (renderQualityEl) {
             renderQualityEl.value = normalizeRenderQuality(data && data.renderQuality);
         }
+        if (playbackOperationHintEnabledEl) playbackOperationHintEnabledEl.checked = data?.playbackOperationHintEnabled !== false;
+        if (startupIpHintEnabledEl) startupIpHintEnabledEl.checked = data?.startupIpHintEnabled !== false;
         if (localSongFileScanEl) localSongFileScanEl.checked = !!(data && data.localSongFileScanEnabled === true);
         if (appUpdateEnabledEl) appUpdateEnabledEl.checked = !(data && data.appUpdateEnabled === false);
         const networkIpMode = data && data.networkIpMode === 'static' ? 'static' : 'dynamic';
@@ -577,9 +791,16 @@ async function loadConfigForSettings() {
         if (networkStaticIpEl) networkStaticIpEl.value = (data && data.networkStaticIp) || '';
         if (networkGatewayEl) networkGatewayEl.value = (data && data.networkGateway) || '';
         if (networkDnsEl) networkDnsEl.value = (data && data.networkDns) || '';
-        if (debugHotspotEnabledEl) debugHotspotEnabledEl.checked = !!(data && data.debugHotspotEnabled === true);
+        if (startupWirelessModeEl) startupWirelessModeEl.value = data?.startupWirelessMode === 'wifi' ? 'wifi' : 'hotspot';
+        if (usbOtgModeEl) {
+            usbOtgModeEl.value = data && ['otg', 'peripheral', 'host'].includes(data.usbOtgMode)
+                ? data.usbOtgMode
+                : 'host';
+        }
         if (vodHostEl) vodHostEl.value = (data && data.onlineVodHost) || '';
         if (vodRoomEl) vodRoomEl.value = (data && data.onlineVodRoomId) || 'current';
+        const vodGainEl = document.getElementById('common-vod-volume-gain-db');
+        if (vodGainEl) vodGainEl.value = String(data?.vodVolumeGainDb ?? 0);
         if (powerScheduleEnabledEl) powerScheduleEnabledEl.checked = !!(data && data.powerScheduleEnabled === true);
         if (powerOnScheduleEnabledEl) powerOnScheduleEnabledEl.checked = !!(data && data.powerOnScheduleEnabled === true);
         if (powerOnDateEl) powerOnDateEl.value = (data && data.powerOnDate) || '';
@@ -587,6 +808,27 @@ async function loadConfigForSettings() {
         if (powerOffScheduleEnabledEl) powerOffScheduleEnabledEl.checked = !!(data && data.powerOffScheduleEnabled === true);
         if (powerOffDateEl) powerOffDateEl.value = (data && data.powerOffDate) || '';
         if (powerOffTimeEl) powerOffTimeEl.value = (data && data.powerOffTime) || '';
+        await loadLyricFontOptions(data && typeof data.lyricFont === 'string' ? data.lyricFont : '');
+        const lyricHeaderVisibleEl = document.getElementById('common-lyric-header-visible');
+        if (lyricHeaderVisibleEl) lyricHeaderVisibleEl.checked = data?.lyricHeaderVisible === true;
+        const lyricBackgroundVisibleEl = document.getElementById('common-lyric-background-visible');
+        if (lyricBackgroundVisibleEl) lyricBackgroundVisibleEl.checked = data?.lyricBackgroundVisible !== false;
+        const lyricDisplayModeEl = document.getElementById('common-lyric-display-mode');
+        if (lyricDisplayModeEl) lyricDisplayModeEl.value = data?.lyricDisplayMode === 'pinyin' ? 'pinyin' : 'original';
+        const lyricTitleFontSizeEl = document.getElementById('common-lyric-title-font-size');
+        const lyricTitleOutlineWidthEl = document.getElementById('common-lyric-title-outline-width');
+        const lyricTextFontSizeEl = document.getElementById('common-lyric-text-font-size');
+        const lyricTextOutlineWidthEl = document.getElementById('common-lyric-text-outline-width');
+        const lyricTextSpacingEl = document.getElementById('common-lyric-text-spacing');
+        const lyricProducerTextEl = document.getElementById('common-lyric-producer-text');
+        if (lyricTitleFontSizeEl) lyricTitleFontSizeEl.value = data?.lyricTitleFontSize ?? 150;
+        if (lyricTitleOutlineWidthEl) lyricTitleOutlineWidthEl.value = data?.lyricTitleOutlineWidth ?? 8;
+        if (lyricTextFontSizeEl) lyricTextFontSizeEl.value = data?.lyricTextFontSize ?? 140;
+        if (lyricTextOutlineWidthEl) lyricTextOutlineWidthEl.value = data?.lyricTextOutlineWidth ?? 10;
+        if (lyricTextSpacingEl) lyricTextSpacingEl.value = data?.lyricTextSpacing ?? -10;
+        if (lyricProducerTextEl) lyricProducerTextEl.value = typeof data?.lyricProducerText === 'string'
+            ? data.lyricProducerText : '';
+        updateLyricPreview();
 
         updateVodGroupsVisibility(vodMode);
         updateNetworkIpModeVisibility(networkIpMode);
@@ -596,6 +838,88 @@ async function loadConfigForSettings() {
     } catch (_) {
         const input = document.getElementById('license-server-url');
         if (input) input.value = '';
+    }
+}
+
+function normalizeLyricFontValue(value) {
+    if (typeof value !== 'string' || !value) return '';
+    let normalized = value.replace(/\\/g, '/');
+    if (normalized.startsWith('ttf/')) normalized = normalized.substring(4);
+    if (!normalized || normalized.startsWith('/') || normalized.includes(':')) return '';
+    const segments = normalized.split('/');
+    if (segments.some(segment => !segment || segment === '.' || segment === '..')) return '';
+    return /\.(ttf|otf|ttc)$/i.test(normalized) ? normalized : '';
+}
+
+function relativeFontPath(material) {
+    const rawPath = typeof material?.path === 'string' ? material.path.replace(/\\/g, '/') : '';
+    const markerIndex = rawPath.toLowerCase().lastIndexOf('/ttf/');
+    const fromPath = markerIndex >= 0 ? rawPath.substring(markerIndex + 5) : '';
+    return normalizeLyricFontValue(fromPath || material?.name || '');
+}
+
+async function loadLyricFontOptions(configuredValue) {
+    const select = document.getElementById('common-lyric-font');
+    if (!select) return;
+
+    const configuredFont = normalizeLyricFontValue(configuredValue);
+    select.setAttribute('aria-busy', 'true');
+    select.replaceChildren();
+
+    const automaticOption = document.createElement('option');
+    automaticOption.value = '';
+    automaticOption.textContent = '\u81ea\u52a8\u9009\u62e9';
+    select.appendChild(automaticOption);
+
+    try {
+        const materials = await apiGet('/materials?type=font');
+        if (!Array.isArray(materials)) {
+            throw new Error(getLastApiError()?.message || '\u5b57\u4f53\u7d20\u6750\u63a5\u53e3\u672a\u8fd4\u56de\u5217\u8868');
+        }
+
+        const fontsByPath = new Map();
+        materials.forEach(material => {
+            const value = relativeFontPath(material);
+            if (!value) return;
+            const key = value.toLocaleLowerCase();
+            if (!fontsByPath.has(key)) {
+                fontsByPath.set(key, { value, name: material.name || value });
+            }
+        });
+        const fonts = Array.from(fontsByPath.values()).sort((left, right) =>
+            left.name.localeCompare(right.name, 'zh-CN', { numeric: true, sensitivity: 'base' }));
+
+        fonts.forEach(font => {
+            const option = document.createElement('option');
+            option.value = font.value;
+            option.setAttribute('translate', 'no');
+            option.textContent = font.name;
+            option.title = font.value;
+            select.appendChild(option);
+        });
+
+        if (configuredFont && !fonts.some(font =>
+            font.value.toLocaleLowerCase() === configuredFont.toLocaleLowerCase())) {
+            const missingOption = document.createElement('option');
+            missingOption.value = configuredFont;
+            missingOption.textContent = `${configuredFont}\uff08\u6587\u4ef6\u4e0d\u5b58\u5728\uff09`;
+            missingOption.title = configuredFont;
+            select.appendChild(missingOption);
+        }
+        select.value = configuredFont;
+        select.title = '\u9009\u62e9 /huoshan/ttf \u76ee\u5f55\u4e2d\u7684\u5b57\u4f53\uff1b\u4fdd\u5b58\u540e\u91cd\u542f\u5e94\u7528\u751f\u6548';
+    } catch (error) {
+        if (configuredFont) {
+            const currentOption = document.createElement('option');
+            currentOption.value = configuredFont;
+            currentOption.textContent = configuredFont;
+            select.appendChild(currentOption);
+            select.value = configuredFont;
+        }
+        select.title = '\u5b57\u4f53\u5217\u8868\u52a0\u8f7d\u5931\u8d25\uff0c\u5df2\u4fdd\u7559\u5f53\u524d\u914d\u7f6e';
+        addToCommandLog('\u6b4c\u8bcd\u5b57\u4f53', 'warn', error.message || '\u5b57\u4f53\u5217\u8868\u52a0\u8f7d\u5931\u8d25');
+    } finally {
+        select.removeAttribute('aria-busy');
     }
 }
 
@@ -724,12 +1048,16 @@ function initializeDeviceInfoSecretEdit() {
                 const currentValue = element.textContent || '';
                 const newValue = await showPrompt(`请输入新的${label}`, `修改${label}`, currentValue, 'text', { dismissOnBackdrop: false });
                 if (newValue !== null && newValue.trim() !== '') {
-                    const result = await apiPost('/system/device-alias', { name: newValue.trim() });
+                    const normalizedName = newValue.trim();
+                    const result = await apiPost('/system/device-alias', {
+                        device_hsname: normalizedName
+                    });
                     if (result) {
-                        element.textContent = newValue.trim();
-                        addToCommandLog(`修改${label}`, 'success', `${label}已修改为: ${newValue.trim()}`);
+                        element.textContent = normalizedName;
+                        addToCommandLog(`修改${label}`, 'success', `${label}已修改为: ${normalizedName}`);
                     } else {
-                        addToCommandLog(`修改${label}`, 'error', `${label}修改失败`);
+                        const reason = getLastApiError()?.message || `${label}修改失败`;
+                        addToCommandLog(`修改${label}`, 'error', reason);
                     }
                 }
             }
@@ -885,6 +1213,10 @@ async function importLicenseFile(event) {
 
         const response = await fetch('/api/v1/system/license/import', {
             method: 'POST',
+            headers: (() => {
+                const token = localStorage.getItem('hvideo_auth_token');
+                return token ? { Authorization: `Bearer ${token}` } : {};
+            })(),
             body: formData
         });
 
@@ -919,6 +1251,7 @@ async function loadLicenseStatus() {
     try {
         const browserTime = Math.floor(Date.now() / 1000);
         const data = await apiGet(`/system/license?browser_time=${browserTime}`);
+        applyModuleLicense(data);
         if (data) {
             applyAppTitleFromLicense(data);
             updateStatusBadge(data.status, data.days_remaining);
@@ -937,12 +1270,16 @@ async function loadLicenseStatus() {
             updateModulesGrid(data.modules || []);
             updateLayersGrid(data.enabled_layers || []);
             addToCommandLog('加载授权状态', 'success', '授权状态加载成功');
+            return data;
         }
+        return null;
     } catch (error) {
+        applyModuleLicense(null);
         setTextContent('license-usage-mode', '--');
         setTextContent('license-input-channel-count', '--');
         setLicensedInputChannelCount(0);
         updateStatusBadge('unlicensed');
+        return null;
     }
 }
 
@@ -978,7 +1315,7 @@ function updateModulesGrid(enabledModules) {
     if (!grid) return;
 
     grid.innerHTML = '';
-    const allModules = ['TV', '投屏', '霸屏', 'effects'];
+    const allModules = Object.keys(MODULE_LABELS);
 
     allModules.forEach(mod => {
         const tag = document.createElement('div');
@@ -1011,14 +1348,14 @@ function updateLayersGrid(enabledLayers) {
 
 // ==================== 局域网配置同步 ====================
 
-/** 当前扫描到的同型号设备列表（ip -> { ip, name? }） */
-let lanSyncDevices = [];
-
 /** 同步方向模式：'to-device' 推送到选中设备（左侧列表可勾选）| 'to-local' 拉取到本机（右侧列表可勾选） */
 let lanSyncMode = 'to-device';
 
-/** 同步过程中箭头方向：'' 不显示 | 'to-device' 本机→设备 → | 'to-local' 设备→本机 ← */
+/** 同步过程中箭头方向：'' 不显示 | 'to-device' 本机→设备 ← | 'to-local' 设备→本机 → */
 let lanSyncArrowDirection = '';
+
+/** Prevent duplicate scan or sync submissions. */
+let lanSyncBusy = false;
 
 /** 渲染扫描设备卡片：设备列表或占位 */
 function renderLanSyncDeviceList(devices) {
@@ -1036,7 +1373,7 @@ function renderLanSyncDeviceList(devices) {
     }
 
     devices.forEach((dev, i) => {
-        const ip = dev.ip || dev.id;
+        const ip = typeof dev.ip === 'string' ? dev.ip : '';
         const name = dev.name || dev.ip || dev.id || `设备${i + 1}`;
         const label = document.createElement('label');
         label.className = 'lan-sync-device-item';
@@ -1046,13 +1383,45 @@ function renderLanSyncDeviceList(devices) {
         cb.type = 'checkbox';
         cb.value = ip;
         cb.setAttribute('data-lan-ip', ip);
+        cb.setAttribute('data-lan-serial', typeof dev.serial === 'string' ? dev.serial : '');
+        const compatible = Number(dev.config_sync?.protocol) === 2;
+        const pending = dev.config_sync?.state === 'pending_restart';
+        cb.setAttribute('data-lan-ready', ip && dev.serial && compatible && !pending ? 'true' : 'false');
+        cb.disabled = cb.getAttribute('data-lan-ready') !== 'true';
         label.appendChild(cb);
-        label.appendChild(document.createTextNode(name));
+        const info = document.createElement('span');
+        info.className = 'lan-sync-device-info';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'lan-sync-device-name';
+        nameEl.textContent = name;
+        info.appendChild(nameEl);
+        const ipEl = document.createElement('span');
+        ipEl.className = 'lan-sync-device-detail';
+        ipEl.textContent = `IP：${ip || '未提供'}`;
+        info.appendChild(ipEl);
+        const serialEl = document.createElement('span');
+        serialEl.className = 'lan-sync-device-detail';
+        serialEl.textContent = `序列号：${dev.serial || '未提供'}`;
+        info.appendChild(serialEl);
+        if (pending || !compatible || !dev.serial || !ip) {
+            const hint = document.createElement('span');
+            hint.className = 'lan-sync-device-detail';
+            hint.textContent = pending ? '已校验，需重启系统应用' : (!compatible ? '请升级此设备播放器后同步' : '身份信息不完整，请重新扫描');
+            info.appendChild(hint);
+        }
+        label.appendChild(info);
         container.appendChild(label);
     });
 
     container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-        cb.addEventListener('change', updateLanSyncDeviceFolderTitle);
+        cb.addEventListener('change', () => {
+            if (lanSyncMode === 'to-local' && cb.checked) {
+                container.querySelectorAll('input[type="checkbox"]').forEach(other => {
+                    if (other !== cb) other.checked = false;
+                });
+            }
+            updateLanSyncDeviceFolderTitle();
+        });
     });
     updateLanSyncDeviceFolderTitle();
 }
@@ -1104,17 +1473,51 @@ function applyLanSyncMode() {
     const devicePanel = document.querySelector('.lan-sync-folder-panel.lan-sync-folder-device');
     const localPanel = document.querySelector('.lan-sync-folder-panel.lan-sync-folder-local');
 
-    if (pullBtn) pullBtn.classList.toggle('active', lanSyncMode === 'to-local');
-    if (pushBtn) pushBtn.classList.toggle('active', lanSyncMode === 'to-device');
+    if (pullBtn) {
+        pullBtn.classList.toggle('active', lanSyncMode === 'to-local');
+        pullBtn.classList.toggle('primary', lanSyncMode === 'to-local');
+        pullBtn.setAttribute('aria-pressed', String(lanSyncMode === 'to-local'));
+        pullBtn.disabled = lanSyncBusy;
+    }
+    if (pushBtn) {
+        pushBtn.classList.toggle('active', lanSyncMode === 'to-device');
+        pushBtn.classList.toggle('primary', lanSyncMode === 'to-device');
+        pushBtn.setAttribute('aria-pressed', String(lanSyncMode === 'to-device'));
+        pushBtn.disabled = lanSyncBusy;
+    }
 
     if (devicePanel) {
         devicePanel.classList.toggle('lan-sync-folder-panel-selectable', lanSyncMode === 'to-device');
         devicePanel.classList.toggle('lan-sync-folder-panel-disabled', lanSyncMode === 'to-local');
+        devicePanel.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.disabled = lanSyncBusy || lanSyncMode !== 'to-device';
+        });
     }
     if (localPanel) {
         localPanel.classList.toggle('lan-sync-folder-panel-selectable', lanSyncMode === 'to-local');
         localPanel.classList.toggle('lan-sync-folder-panel-disabled', lanSyncMode === 'to-device');
+        localPanel.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.disabled = lanSyncBusy || lanSyncMode !== 'to-local';
+        });
     }
+}
+
+function setLanSyncBusy(busy, operation = '') {
+    lanSyncBusy = busy;
+    const scanBtn = document.getElementById('lan-sync-scan-btn');
+    const execBtn = document.getElementById('lan-sync-exec-btn');
+    if (scanBtn) {
+        scanBtn.disabled = busy;
+        scanBtn.textContent = busy && operation === 'scan' ? '扫描中…' : '扫描';
+    }
+    if (execBtn) {
+        execBtn.disabled = busy;
+        execBtn.textContent = busy && operation === 'sync' ? '同步中…' : '同步';
+    }
+    document.querySelectorAll('#lan-sync-device-list input[type="checkbox"]').forEach(cb => {
+        cb.disabled = busy || cb.getAttribute('data-lan-ready') !== 'true';
+    });
+    applyLanSyncMode();
 }
 
 /** 根据当前勾选的设备更新「设备文件夹」标题（选中哪个显示哪个，如 001 设备） */
@@ -1130,7 +1533,8 @@ function updateLanSyncDeviceFolderTitle() {
     if (checked.length === 1) {
         const label = checked[0].closest('.lan-sync-device-item');
         const name = label ? (label.getAttribute('data-lan-name') || label.textContent.trim() || '设备') : '设备';
-        titleEl.textContent = name;
+        const ip = checked[0].value;
+        titleEl.textContent = ip && ip !== name ? `${name}（${ip}）` : name;
         return;
     }
     titleEl.textContent = `已选 ${checked.length} 台设备`;
@@ -1148,13 +1552,18 @@ function initializeLanSync() {
     const pullModeBtn = document.getElementById('lan-sync-mode-pull-btn');
     if (pullModeBtn) {
         pullModeBtn.addEventListener('click', () => {
+            if (lanSyncBusy) return;
             lanSyncMode = 'to-local';
+            const selected = document.querySelectorAll('#lan-sync-device-list input[type="checkbox"]:checked');
+            selected.forEach((checkbox, index) => { checkbox.checked = index === 0; });
+            updateLanSyncDeviceFolderTitle();
             applyLanSyncMode();
         });
     }
     const pushModeBtn = document.getElementById('lan-sync-mode-push-btn');
     if (pushModeBtn) {
         pushModeBtn.addEventListener('click', () => {
+            if (lanSyncBusy) return;
             lanSyncMode = 'to-device';
             applyLanSyncMode();
         });
@@ -1169,24 +1578,32 @@ function initializeLanSync() {
 }
 
 async function scanLanDevices() {
-    addToCommandLog('扫描设备', 'info', '正在扫描局域网同型号设备…');
+    if (lanSyncBusy) return;
+    setLanSyncBusy(true, 'scan');
+    addToCommandLog('配置同步', 'info', '正在扫描局域网设备…');
     try {
-        const data = await apiGet('/system/lan-devices').catch(() => null);
-        const devices = (data && Array.isArray(data.devices)) ? data.devices : (Array.isArray(data) ? data : []);
-
-        if (devices.length > 0) {
-            lanSyncDevices = devices;
-            renderLanSyncDeviceList(devices);
-            addToCommandLog('扫描设备', 'success', `发现 ${devices.length} 台设备`);
-        } else {
-            lanSyncDevices = [];
+        const data = await apiGet('/system/lan-devices', { timeoutMs: 15000, retries: 0 });
+        if (data == null) {
+            const message = getLanSyncErrorMessage('扫描设备失败');
             renderLanSyncDeviceList([]);
-            addToCommandLog('扫描设备', 'info', '未发现同型号设备');
+            showError(message, 3000);
+            addToCommandLog('配置同步', 'error', message);
+            return;
         }
-    } catch (e) {
-        addToCommandLog('扫描设备', 'error', (e && e.message) || '扫描失败');
-        lanSyncDevices = [];
-        renderLanSyncDeviceList([]);
+
+        const devices = Array.isArray(data.devices) ? data.devices : (Array.isArray(data) ? data : []);
+        renderLanSyncDeviceList(devices);
+        if (devices.length > 0) {
+            addToCommandLog('配置同步', 'success', `发现 ${devices.length} 台设备`);
+        } else {
+            addToCommandLog('配置同步', 'info', '未发现可同步设备');
+        }
+    } catch (error) {
+        const message = error?.message || '扫描失败，请检查网络后重试';
+        showError(message, 5000);
+        addToCommandLog('配置同步', 'error', message);
+    } finally {
+        setLanSyncBusy(false);
     }
 }
 
@@ -1203,97 +1620,120 @@ function getSelectedLanDevices() {
     return Array.from(list).map(el => el.value);
 }
 
+function getSelectedLanDeviceSerials() {
+    const serials = {};
+    document.querySelectorAll('.lan-sync-device-item input[type="checkbox"]:checked').forEach(cb => {
+        serials[cb.value] = cb.getAttribute('data-lan-serial') || '';
+    });
+    return serials;
+}
+
 /** 根据当前同步方向更新箭头显示（默认不显示，同步中显示 → 或 ←） */
 function updateLanSyncArrowCells() {
-    const symbol = lanSyncArrowDirection === 'to-device' ? '→' : (lanSyncArrowDirection === 'to-local' ? '←' : '');
+    const symbol = lanSyncArrowDirection === 'to-device' ? '←' : (lanSyncArrowDirection === 'to-local' ? '→' : '');
     document.querySelectorAll('.lan-sync-arrow-cell').forEach(el => { el.textContent = symbol; });
 }
 
+function buildLanSyncSuccessMessage(result, pullMode = false) {
+    const files = Number(result?.files_count || 0);
+    const devices = Number(result?.synced_count || (pullMode ? 1 : 0));
+    const direction = pullMode ? '本机已完整接收并校验' : `${devices} 台设备已完整接收并校验`;
+    return `${direction}，共 ${files} 个文件；请重启${pullMode ? '本机' : '接收设备'}系统后应用`;
+}
+
+function getLanSyncErrorMessage(fallback) {
+    const message = getLastApiError()?.message;
+    // Older devices may return question-mark placeholders instead of readable text.
+    return typeof message === 'string' && message && !/\?{2,}|\uFFFD/.test(message) ? message : fallback;
+}
+
 async function startLanSync() {
+    if (lanSyncBusy) return;
     const dirs = getSelectedLanDirs();
     const devices = getSelectedLanDevices();
     if (dirs.length === 0) {
-        showError('请至少勾选一个要同步的配置子目录', 2500);
+        showError('请至少选择一个需要同步的文件夹', 2500);
         return;
     }
-    if (lanSyncDevices.length > 0 && devices.length === 0) {
-        showError('请先扫描设备并勾选要同步的目标设备', 2500);
+    if (devices.length === 0) {
+        showError('请选择需要同步的目标设备', 2500);
         return;
     }
 
+    setLanSyncBusy(true, 'sync');
     lanSyncArrowDirection = 'to-device';
     updateLanSyncArrowCells();
-    addToCommandLog('配置同步', 'info', `正在同步到选中设备: ${SYNC_BASE_LABEL} [${dirs.join(', ')}]`);
+    addToCommandLog('配置同步', 'info', `正在推送配置到选中设备：${SYNC_BASE_LABEL} [${dirs.join(', ')}]`);
     try {
         const result = await apiAction('sync', 'sync_device', { sync_data: {
-                    timestamp: Math.floor(Date.now() / 1000),
-                    sync_mode: 0,
                     base_path: SYNC_BASE_PATH,
                     dirs: dirs,
-                    target_ips: devices
-                } });
-        const completed = result != null;
-        if (completed) {
-            const msg = '同步请求已完成';
-            showSuccess(msg, 3000);
-            addToCommandLog('配置同步', 'success', msg);
+                    target_ips: devices,
+                    target_serials: getSelectedLanDeviceSerials()
+                } }, { timeoutMs: SYNC_REQUEST_TIMEOUT_MS, retries: 0 });
+        if (result != null) {
+            const message = buildLanSyncSuccessMessage(result, false);
+            showSuccess(message, 5000);
+            addToCommandLog('配置同步', 'success', message);
         } else {
-            const errMsg = result?.message || '同步失败';
-            showError(errMsg, 3000);
-            addToCommandLog('配置同步', 'error', errMsg);
+            const message = getLanSyncErrorMessage('同步到选中设备失败，请重试');
+            showError(message, 5000);
+            addToCommandLog('配置同步', 'error', message);
         }
-    } catch (e) {
-        const errMsg = (e && e.message) ? e.message : '请求失败';
-        showError(errMsg, 3000);
-        addToCommandLog('配置同步', 'error', errMsg);
+    } catch (error) {
+        const message = error?.message || '同步请求中断，请检查接收设备是否已等待重启';
+        showError(message, 5000);
+        addToCommandLog('配置同步', 'error', message);
     } finally {
         lanSyncArrowDirection = '';
         updateLanSyncArrowCells();
+        setLanSyncBusy(false);
     }
 }
 
-/** 从选中设备同步到本机：勾选一个设备作为来源，将对方目录拉取到本机 */
+/** 从一台选中的设备拉取配置到本机。 */
 async function startLanSyncPull() {
+    if (lanSyncBusy) return;
     const dirs = getSelectedLanDirs();
     const devices = getSelectedLanDevices();
     if (dirs.length === 0) {
-        showError('请至少勾选一个要同步的配置子目录', 2500);
+        showError('请至少选择一个需要同步的文件夹', 2500);
         return;
     }
     if (devices.length !== 1) {
-        showError('请勾选一个设备作为来源（从该设备同步到本机）', 2500);
+        showError('请选择一台设备作为同步来源', 2500);
         return;
     }
     const sourceIp = devices[0];
 
+    setLanSyncBusy(true, 'sync');
     lanSyncArrowDirection = 'to-local';
     updateLanSyncArrowCells();
-    addToCommandLog('配置同步', 'info', `正在从 ${sourceIp} 同步到本机: ${SYNC_BASE_LABEL} [${dirs.join(', ')}]`);
+    addToCommandLog('配置同步', 'info', `正在从 ${sourceIp} 拉取配置到本机：${SYNC_BASE_LABEL} [${dirs.join(', ')}]`);
     try {
         const result = await apiAction('sync', 'sync_device', { sync_data: {
-                    timestamp: Math.floor(Date.now() / 1000),
-                    sync_mode: 0,
                     base_path: SYNC_BASE_PATH,
                     dirs: dirs,
-                    source_ip: sourceIp
-                } });
-        const completed = result != null;
-        if (completed) {
-            const msg = '已从设备同步到本机';
-            showSuccess(msg, 3000);
-            addToCommandLog('配置同步', 'success', msg);
+                    source_ip: sourceIp,
+                    source_serial: getSelectedLanDeviceSerials()[sourceIp]
+                } }, { timeoutMs: SYNC_REQUEST_TIMEOUT_MS, retries: 0 });
+        if (result != null) {
+            const message = buildLanSyncSuccessMessage(result, true);
+            showSuccess(message, 5000);
+            addToCommandLog('配置同步', 'success', message);
         } else {
-            const errMsg = result?.message || '拉取同步失败';
-            showError(errMsg, 3000);
-            addToCommandLog('配置同步', 'error', errMsg);
+            const message = getLanSyncErrorMessage('同步到本机失败，请重试');
+            showError(message, 5000);
+            addToCommandLog('配置同步', 'error', message);
         }
-    } catch (e) {
-        const errMsg = (e && e.message) ? e.message : '请求失败';
-        showError(errMsg, 3000);
-        addToCommandLog('配置同步', 'error', errMsg);
+    } catch (error) {
+        const message = error?.message || '同步请求中断，请检查接收设备是否已等待重启';
+        showError(message, 5000);
+        addToCommandLog('配置同步', 'error', message);
     } finally {
         lanSyncArrowDirection = '';
         updateLanSyncArrowCells();
+        setLanSyncBusy(false);
     }
 }
 

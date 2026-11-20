@@ -17,34 +17,7 @@ echo "[HSVJ-SAFE] Safe optimizer started."
 # SELinux 规则配置
 # ==============================================
 configure_selinux_rules() {
-    echo "[HSVJ-SAFE] Configuring SELinux rules for MPP access..."
-
-    if command -v supolicy >/dev/null 2>&1; then
-        echo "[HSVJ-SAFE] Using supolicy to inject SELinux rules..."
-        supolicy --live \
-            "allow system_app shell_data_file dir { search read open getattr write add_name remove_name }" \
-            "allow system_app shell_data_file file { read write open getattr create unlink append }" \
-            "allow system_app video_device chr_file ioctl" \
-            "allow system_app video_device chr_file { read write open getattr }" \
-            "allow system_app mpp_device chr_file ioctl" \
-            "allow system_app mpp_device chr_file { read write open getattr }" \
-            "allow system_app gpu_device chr_file ioctl" \
-            "allow system_app gpu_device chr_file { read write open getattr }" \
-            2>/dev/null
-    fi
-
-    if [ "$(getenforce)" = "Enforcing" ]; then
-        echo "[HSVJ-SAFE] Setting SELinux to Permissive mode"
-        setenforce 0
-    fi
-
-    for dev in /dev/mpp_service /dev/mpp-service /dev/rkvdec /dev/rkvenc /dev/vepu /dev/vpu_service /dev/dri/renderD128; do
-        if [ -e "$dev" ]; then
-            chmod 666 "$dev" 2>/dev/null
-            chown system:system "$dev" 2>/dev/null
-            chcon u:object_r:video_device:s0 "$dev" 2>/dev/null
-        fi
-    done
+    echo "[HSVJ-SAFE] SELinux and device access are managed by the H66_POR ROM policy."
 }
 
 # ==============================================
@@ -84,7 +57,7 @@ lock_cpu_performance() {
         [ -d "$policy" ] || continue
         set_node_value "$policy/scaling_governor" performance
         MAX_FREQ="$(cat "$policy/cpuinfo_max_freq" 2>/dev/null)"
-        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$policy/scaling_available_frequencies" 2>/dev/null | awk '{print $NF}')"
+        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(tr ' ' '\n' < "$policy/scaling_available_frequencies" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $1 > max { max=$1 } END { if (max) print max }')"
         if [ -n "$MAX_FREQ" ]; then
             set_node_value "$policy/scaling_max_freq" "$MAX_FREQ"
             set_node_value "$policy/scaling_min_freq" "$MAX_FREQ"
@@ -106,8 +79,10 @@ lock_devfreq_performance() {
         esac
 
         set_node_value "$dev/governor" performance
-        MAX_FREQ="$(cat "$dev/max_freq" 2>/dev/null)"
-        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$dev/available_frequencies" 2>/dev/null | awk '{print $NF}')"
+        # available_frequencies is the hardware table. max_freq may already be
+        # temporarily reduced by thermal cooling when this script starts.
+        MAX_FREQ="$(tr ' ' '\n' < "$dev/available_frequencies" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $1 > max { max=$1 } END { if (max) print max }')"
+        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$dev/max_freq" 2>/dev/null)"
         if [ -n "$MAX_FREQ" ]; then
             set_node_value "$dev/max_freq" "$MAX_FREQ"
             set_node_value "$dev/min_freq" "$MAX_FREQ"

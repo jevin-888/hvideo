@@ -1,22 +1,21 @@
 #include "vod/LocalSongFileScanner.h"
 #include "utils/Logger.h"
+#include "utils/ProcessRunner.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cctype>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sqlite3.h>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace hsvj {
 
 namespace {
-constexpr size_t kUpdateBatchSize = 500;
-
 int64_t nowEpochMs() {
     return static_cast<int64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -43,8 +42,8 @@ int64_t safeModifiedTime(const std::filesystem::directory_entry& entry) {
         std::chrono::duration_cast<std::chrono::milliseconds>(sctp.time_since_epoch()).count());
 }
 
-void bindText(sqlite3_stmt* stmt, int index, const std::string& value) {
-    sqlite3_bind_text(stmt, index, value.c_str(), -1, SQLITE_TRANSIENT);
+bool bindText(sqlite3_stmt* stmt, int index, const std::string& value) {
+    return sqlite3_bind_text(stmt, index, value.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
 }
 
 std::string shellQuote(const std::string& value) {
@@ -58,13 +57,6 @@ std::string shellQuote(const std::string& value) {
     }
     quoted.push_back('\'');
     return quoted;
-}
-
-std::string trimLineEnd(std::string value) {
-    while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) {
-        value.pop_back();
-    }
-    return value;
 }
 
 bool isPathMounted(const std::string& path) {
@@ -103,7 +95,7 @@ std::vector<std::string> detectUsbPartitions() {
     return partitions;
 }
 
-std::vector<std::string> mountUsbPartitionsForScan() {
+std::vector<std::string> mountUsbPartitionsForScan(const std::atomic<bool>& stopRequested) {
     std::vector<std::string> roots;
     const auto partitions = detectUsbPartitions();
     if (partitions.empty()) {
@@ -112,6 +104,7 @@ std::vector<std::string> mountUsbPartitionsForScan() {
     }
 
     for (const auto& partition : partitions) {
+        if (stopRequested.load()) break;
         const std::string blockPath = "/dev/block/" + partition;
         const std::string mountPath = "/mnt/usb_storage/" + partition;
         std::error_code ec;
@@ -121,8 +114,9 @@ std::vector<std::string> mountUsbPartitionsForScan() {
             continue;
         }
 
-        const std::string command = "su 0 sh -c \"mkdir -p " + shellQuote(mountPath) + " && mount -t auto " + shellQuote(blockPath) + " " + shellQuote(mountPath) + "\"";
-        const int rc = std::system(command.c_str());
+        const std::string command = "su 0 sh -c " + shellQuote("mkdir -p " + shellQuote(mountPath) + " && mount -t auto " + shellQuote(blockPath) + " " + shellQuote(mountPath));
+        const auto result = runShellCommand(command, std::chrono::seconds(10), &stopRequested);
+        const int rc = result.succeeded() ? 0 : -1;
         if (rc == 0 && isPathMounted(mountPath)) {
             roots.push_back(mountPath);
             LOG_WARN("[VOD] [本地歌曲对照] USB分区挂载成功：%s -> %s", blockPath.c_str(), mountPath.c_str());
@@ -139,6 +133,7 @@ LocalSongFileScanner::~LocalSongFileScanner() {
 }
 
 void LocalSongFileScanner::startAsync(const std::string& songDbPath, const std::vector<std::string>& mediaRoots) {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
     if (running_.load()) {
         LOG_WARN("[VOD] [本地歌曲对照] 已在运行，跳过重复启动");
         return;
@@ -149,15 +144,28 @@ void LocalSongFileScanner::startAsync(const std::string& songDbPath, const std::
         return;
     }
 
+    if (worker_.joinable()) worker_.join();
     stopRequested_.store(false);
     running_.store(true);
-    worker_ = std::thread([this, songDbPath, mediaRoots]() {
-        scan(songDbPath, mediaRoots);
+    try {
+        worker_ = std::thread([this, songDbPath, mediaRoots]() {
+            try {
+                scan(songDbPath, mediaRoots);
+            } catch (const std::exception& error) {
+                LOG_ERROR("LocalSongFileScanner aborted: %s", error.what());
+            } catch (...) {
+                LOG_ERROR("LocalSongFileScanner aborted with unknown exception");
+            }
+            running_.store(false);
+        });
+    } catch (...) {
         running_.store(false);
-    });
+        throw;
+    }
 }
 
 void LocalSongFileScanner::stop() {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
     stopRequested_.store(true);
     if (worker_.joinable()) {
         worker_.join();
@@ -173,7 +181,7 @@ void LocalSongFileScanner::scan(const std::string& songDbPath, std::vector<std::
         return;
     }
 
-    const auto mountedUsbRoots = mountUsbPartitionsForScan();
+    const auto mountedUsbRoots = mountUsbPartitionsForScan(stopRequested_);
     mediaRoots.insert(mediaRoots.end(), mountedUsbRoots.begin(), mountedUsbRoots.end());
 
     std::sort(mediaRoots.begin(), mediaRoots.end());
@@ -184,8 +192,20 @@ void LocalSongFileScanner::scan(const std::string& songDbPath, std::vector<std::
     std::vector<MatchedFile> matchedFiles;
     int64_t scannedFiles = 0;
     int64_t unknownFiles = 0;
+    bool scanIncomplete = false;
+    std::vector<std::string> scannedRoots;
     for (const auto& root : mediaRoots) {
         if (stopRequested_.load()) break;
+        std::error_code rootError;
+        if (root.empty()) continue;
+        const bool exists = std::filesystem::exists(root, rootError);
+        if (!exists && !rootError) continue;
+        if (rootError || !std::filesystem::is_directory(root, rootError)) {
+            LOG_WARN("LocalSongFileScanner cannot inspect root: %s", root.c_str());
+            scanIncomplete = true;
+            continue;
+        }
+        scannedRoots.push_back(root);
         if (shouldUseSuFind(root)) {
             scanRootWithSuFind(root, songLookup, matchedFiles, scannedFiles, unknownFiles);
         } else {
@@ -193,8 +213,15 @@ void LocalSongFileScanner::scan(const std::string& songDbPath, std::vector<std::
         }
     }
 
-    if (!stopRequested_.load()) {
-        updateDatabase(songDbPath, matchedFiles);
+    for (const auto& root : scannedRoots) {
+        std::error_code error;
+        if (!std::filesystem::is_directory(root, error)) scanIncomplete = true;
+    }
+    if (scannedRoots.empty()) scanIncomplete = true;
+    if (!stopRequested_.load() && !scanIncomplete) {
+        if (!updateDatabase(songDbPath, matchedFiles)) return;
+    } else if (scanIncomplete) {
+        LOG_WARN("[VOD] [本地歌曲对照] 扫描不完整，跳过数据库更新以保留上一份索引");
     }
 
     const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -217,16 +244,19 @@ bool LocalSongFileScanner::loadSongLookup(const std::string& songDbPath, SongNoL
         return false;
     }
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int stepResult = SQLITE_OK;
+    while ((stepResult = sqlite3_step(stmt)) == SQLITE_ROW) {
         const char* songNo = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
         if (songNo && songNo[0] != '\0') {
             out.emplace(songNo, songNo);
         }
     }
 
+    const bool readOk = stepResult == SQLITE_DONE;
+
     sqlite3_finalize(stmt);
     sqlite3_close(db);
-    return !out.empty();
+    return readOk && !out.empty();
 }
 
 void LocalSongFileScanner::scanRoot(const std::string& root,
@@ -242,18 +272,24 @@ void LocalSongFileScanner::scanRoot(const std::string& root,
     LOG_INFO("[VOD] LocalSongFileScanner scanning root: %s", root.c_str());
     std::filesystem::recursive_directory_iterator it(
         root,
-        std::filesystem::directory_options::skip_permission_denied,
+        std::filesystem::directory_options::none,
         ec);
     std::filesystem::recursive_directory_iterator end;
+    if (ec) throw std::runtime_error("Cannot open scan root: " + root);
 
     while (!stopRequested_.load() && it != end) {
         const auto entry = *it;
         it.increment(ec);
         if (ec) {
-            ec.clear();
-            continue;
+            throw std::runtime_error("filesystem traversal failed for " + root +
+                                     ": " + ec.message());
         }
-        if (!entry.is_regular_file(ec)) {
+        const bool regular = entry.is_regular_file(ec);
+        if (ec) {
+            throw std::runtime_error("filesystem entry inspection failed for " +
+                                     entry.path().string() + ": " + ec.message());
+        }
+        if (!regular) {
             continue;
         }
 
@@ -290,29 +326,28 @@ void LocalSongFileScanner::scanRootWithSuFind(const std::string& root,
                                               int64_t& scannedFiles,
                                               int64_t& unknownFiles) {
     std::error_code ec;
-    if (root.empty() || !std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
-        return;
+    if (root.empty() || !std::filesystem::is_directory(root, ec)) {
+        throw std::runtime_error("Scan root disappeared: " + root);
     }
 
     LOG_INFO("[VOD] LocalSongFileScanner scanning root with su find: %s", root.c_str());
     const std::string quotedRoot = shellQuote(root);
-    const std::string command =
-        "su 0 sh -c \"find " + quotedRoot +
-        " -path '*/\\$RECYCLE.BIN/*' -prune -o "
+    const std::string command = "su 0 sh -c " + shellQuote(
+        "find " + quotedRoot +
+        " -path '*/$RECYCLE.BIN/*' -prune -o "
         "-path '*/System Volume Information/*' -prune -o "
-        "-type f \\( -iname '*.mp4' -o -iname '*.mpg' -o -iname '*.mpeg' -o -iname '*.ts' "
+        "-type f \\( -iname '*.hvideo' -o -iname '*.mp4' -o -iname '*.mpg' -o -iname '*.mpeg' -o -iname '*.ts' "
         "-o -iname '*.vob' -o -iname '*.mkv' -o -iname '*.avi' -o -iname '*.mov' "
-        "-o -iname '*.dat' -o -iname '*.wmv' -o -iname '*.flv' \\) -print 2>/dev/null\"";
+        "-o -iname '*.dat' -o -iname '*.wmv' -o -iname '*.flv' \\) -print0 2>/dev/null");
 
-    FILE* pipe = popen(command.c_str(), "r");
-    if (!pipe) {
-        LOG_WARN("[VOD] LocalSongFileScanner: su find failed to start: %s", root.c_str());
-        return;
+    const auto result = runShellCommand(command, std::chrono::minutes(5),
+                                        &stopRequested_, 8 * 1024 * 1024);
+    if (!result.succeeded()) {
+        throw std::runtime_error("su find failed or was interrupted; retaining previous song index");
     }
-
-    char buffer[4096];
-    while (!stopRequested_.load() && fgets(buffer, sizeof(buffer), pipe)) {
-        const std::string path = trimLineEnd(buffer);
+    std::istringstream output(result.output);
+    std::string path;
+    while (!stopRequested_.load() && std::getline(output, path, '\0')) {
         if (path.empty() || !isMediaFile(path)) {
             continue;
         }
@@ -334,16 +369,11 @@ void LocalSongFileScanner::scanRootWithSuFind(const std::string& root,
         matchedFiles.push_back(std::move(matched));
     }
 
-    const int status = pclose(pipe);
-    if (status != 0) {
-        LOG_WARN("[VOD] LocalSongFileScanner: su find exited with status=%d root=%s", status, root.c_str());
-    }
 }
 
 bool LocalSongFileScanner::updateDatabase(const std::string& songDbPath, const std::vector<MatchedFile>& matchedFiles) {
     if (matchedFiles.empty()) {
-        LOG_WARN("[VOD] [本地歌曲对照] 写入跳过：没有匹配到任何文件");
-        LOG_INFO("[VOD] LocalSongFileScanner: no matched files to update");
+        LOG_INFO("LocalSongFileScanner publishing an empty complete scan");
     }
 
     std::unordered_map<std::string, MatchedFile> uniqueMatches;
@@ -363,10 +393,20 @@ bool LocalSongFileScanner::updateDatabase(const std::string& songDbPath, const s
         return false;
     }
 
-    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_busy_timeout(db, 5000);
-    sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db, R"(
+    const auto execSql = [&](const char* sql) {
+        char* errorMessage = nullptr;
+        const int rc = sqlite3_exec(db, sql, nullptr, nullptr, &errorMessage);
+        if (rc != SQLITE_OK) {
+            LOG_WARN("[VOD] [本地歌曲对照] SQL执行失败 rc=%d error=%s",
+                     rc, errorMessage ? errorMessage : sqlite3_errmsg(db));
+        }
+        if (errorMessage) sqlite3_free(errorMessage);
+        return rc == SQLITE_OK;
+    };
+    if (!execSql("PRAGMA journal_mode=WAL;") ||
+        !execSql("PRAGMA synchronous=NORMAL;") ||
+        !execSql(R"(
         CREATE TABLE IF NOT EXISTS local_available_songs (
             songNo TEXT PRIMARY KEY,
             absolutePath TEXT NOT NULL,
@@ -375,8 +415,11 @@ bool LocalSongFileScanner::updateDatabase(const std::string& songDbPath, const s
             modifiedTime INTEGER DEFAULT 0,
             updatedAt INTEGER DEFAULT 0
         );
-    )", nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_local_available_songs_path ON local_available_songs(absolutePath);", nullptr, nullptr, nullptr);
+    )") ||
+        !execSql("CREATE INDEX IF NOT EXISTS idx_local_available_songs_path ON local_available_songs(absolutePath);")) {
+        sqlite3_close(db);
+        return false;
+    }
 
     const char* updateSongsSql = R"(
         UPDATE songs
@@ -417,55 +460,58 @@ bool LocalSongFileScanner::updateDatabase(const std::string& songDbPath, const s
     }
 
     size_t updated = 0;
-    sqlite3_exec(db, "BEGIN;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "DELETE FROM local_available_songs;", nullptr, nullptr, nullptr);
+    bool ok = sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) == SQLITE_OK;
+    if (ok) ok = sqlite3_exec(db, "DELETE FROM local_available_songs;", nullptr, nullptr, nullptr) == SQLITE_OK;
     LOG_WARN("[VOD] [本地歌曲对照] 开始写入：唯一匹配=%zu，已清空旧对照缓存", uniqueMatches.size());
     for (const auto& pair : uniqueMatches) {
+        if (stopRequested_.load()) ok = false;
+        if (!ok) break;
         const auto& matched = pair.second;
         const int64_t checkedTime = nowEpochMs();
 
         sqlite3_reset(updateSongs);
         sqlite3_clear_bindings(updateSongs);
-        bindText(updateSongs, 1, matched.absolutePath);
-        bindText(updateSongs, 2, matched.fileName);
-        sqlite3_bind_int64(updateSongs, 3, matched.fileSize);
-        sqlite3_bind_int64(updateSongs, 4, checkedTime);
-        bindText(updateSongs, 5, matched.songNo);
-        sqlite3_step(updateSongs);
+        if (!bindText(updateSongs, 1, matched.absolutePath) ||
+            !bindText(updateSongs, 2, matched.fileName) ||
+            sqlite3_bind_int64(updateSongs, 3, matched.fileSize) != SQLITE_OK ||
+            sqlite3_bind_int64(updateSongs, 4, checkedTime) != SQLITE_OK ||
+            !bindText(updateSongs, 5, matched.songNo) ||
+            sqlite3_step(updateSongs) != SQLITE_DONE) { ok = false; break; }
         sqlite3_reset(updateSongs);
         sqlite3_clear_bindings(updateSongs);
 
-        bindText(updateSearch, 1, matched.songNo);
-        sqlite3_step(updateSearch);
+        if (!bindText(updateSearch, 1, matched.songNo) ||
+            sqlite3_step(updateSearch) != SQLITE_DONE) { ok = false; break; }
         sqlite3_reset(updateSearch);
         sqlite3_clear_bindings(updateSearch);
 
-        bindText(updateFiles, 1, matched.fileName);
-        bindText(updateFiles, 2, matched.absolutePath);
-        sqlite3_bind_int64(updateFiles, 3, matched.fileSize);
-        sqlite3_bind_int64(updateFiles, 4, checkedTime);
-        bindText(updateFiles, 5, matched.songNo);
-        sqlite3_step(updateFiles);
+        if (!bindText(updateFiles, 1, matched.fileName) ||
+            !bindText(updateFiles, 2, matched.absolutePath) ||
+            sqlite3_bind_int64(updateFiles, 3, matched.fileSize) != SQLITE_OK ||
+            sqlite3_bind_int64(updateFiles, 4, checkedTime) != SQLITE_OK ||
+            !bindText(updateFiles, 5, matched.songNo) ||
+            sqlite3_step(updateFiles) != SQLITE_DONE) { ok = false; break; }
         sqlite3_reset(updateFiles);
         sqlite3_clear_bindings(updateFiles);
 
-        bindText(upsertAvailable, 1, matched.songNo);
-        bindText(upsertAvailable, 2, matched.absolutePath);
-        bindText(upsertAvailable, 3, matched.fileName);
-        sqlite3_bind_int64(upsertAvailable, 4, matched.fileSize);
-        sqlite3_bind_int64(upsertAvailable, 5, matched.modifiedTime);
-        sqlite3_bind_int64(upsertAvailable, 6, checkedTime);
-        sqlite3_step(upsertAvailable);
+        if (!bindText(upsertAvailable, 1, matched.songNo) ||
+            !bindText(upsertAvailable, 2, matched.absolutePath) ||
+            !bindText(upsertAvailable, 3, matched.fileName) ||
+            sqlite3_bind_int64(upsertAvailable, 4, matched.fileSize) != SQLITE_OK ||
+            sqlite3_bind_int64(upsertAvailable, 5, matched.modifiedTime) != SQLITE_OK ||
+            sqlite3_bind_int64(upsertAvailable, 6, checkedTime) != SQLITE_OK ||
+            sqlite3_step(upsertAvailable) != SQLITE_DONE) { ok = false; break; }
         sqlite3_reset(upsertAvailable);
         sqlite3_clear_bindings(upsertAvailable);
 
         updated++;
-        if (updated % kUpdateBatchSize == 0) {
-            sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
-            sqlite3_exec(db, "BEGIN;", nullptr, nullptr, nullptr);
-        }
     }
-    sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
+    if (stopRequested_.load()) ok = false;
+    if (ok) ok = sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr) == SQLITE_OK;
+    if (!ok) {
+        LOG_ERROR("LocalSongFileScanner rolling back index update: %s", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+    }
 
     sqlite3_finalize(updateSongs);
     sqlite3_finalize(updateSearch);
@@ -473,9 +519,11 @@ bool LocalSongFileScanner::updateDatabase(const std::string& songDbPath, const s
     sqlite3_finalize(upsertAvailable);
     sqlite3_close(db);
 
-    LOG_INFO("[VOD] LocalSongFileScanner updated song paths: matched=%zu unique=%zu updated=%zu available=%d",
+    if (!ok) return false;
+
+    LOG_INFO("[VOD] LocalSongFileScanner updated song paths: matched=%zu unique=%zu updated=%zu available=%zu",
              matchedFiles.size(), uniqueMatches.size(), updated, uniqueMatches.size());
-    LOG_WARN("[VOD] [本地歌曲对照] 写入完成：匹配文件=%zu 唯一歌曲=%zu 成功更新=%zu 当前可用=%d",
+    LOG_WARN("[VOD] [本地歌曲对照] 写入完成：匹配文件=%zu 唯一歌曲=%zu 成功更新=%zu 当前可用=%zu",
              matchedFiles.size(), uniqueMatches.size(), updated, uniqueMatches.size());
     return true;
 }
@@ -507,7 +555,7 @@ bool LocalSongFileScanner::isMediaFile(const std::string& path) const {
     if (dot == std::string::npos) return false;
     std::string ext = path.substr(dot);
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return ext == ".mp4" || ext == ".mpg" || ext == ".mpeg" || ext == ".ts" ||
+    return ext == ".hvideo" || ext == ".mp4" || ext == ".mpg" || ext == ".mpeg" || ext == ".ts" ||
            ext == ".vob" || ext == ".mkv" || ext == ".avi" || ext == ".mov" ||
            ext == ".dat" || ext == ".wmv" || ext == ".flv";
 }
@@ -523,4 +571,3 @@ bool LocalSongFileScanner::shouldUseSuFind(const std::string& root) const {
 }
 
 } // 命名空间 hsvj
-

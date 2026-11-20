@@ -9,7 +9,7 @@
  * - 图层选择和控制
  */
 import { apiPost, apiGet, apiPut, apiAction } from '../core/api.js';
-import { addToCommandLog } from '../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { updateButtonGroupState, getButtonGroupValue } from '../components/buttonGroups.js';
 import { subscribeSSEEvent } from '../core/connectionManager.js';
 import { debounce } from '../utils/domHelpers.js';
@@ -658,10 +658,11 @@ async function loadLayerVolume(layerId) {
     }
 }
 
-function updatePlaybackLockButton(locked) {
+function updatePlaybackLockButton(locked, globalLocked = false) {
     const btn = document.getElementById('playback-lock-btn');
     if (!btn) return;
     btn.dataset.locked = locked ? 'true' : 'false';
+    btn.title = globalLocked ? '全局锁定生效中；此按钮仅设置当前图层锁' : '设置当前图层播放锁';
     btn.classList.toggle('active', locked);
     btn.classList.toggle('locked', locked);
     const text = btn.querySelector('.text');
@@ -678,7 +679,7 @@ async function refreshPlaybackLockState(layerId = null) {
     const result = await postVideoCommand('getPlaybackLock', {
         layerId: parseInt(targetLayerId)
     });
-    updatePlaybackLockButton(!!result?.locked);
+    updatePlaybackLockButton(!!(result?.layerLocked ?? result?.locked), !!result?.globalLocked);
 }
 
 async function togglePlaybackLock() {
@@ -697,8 +698,8 @@ async function togglePlaybackLock() {
     });
 
     if (result) {
-        const nextLocked = !!result.locked;
-        updatePlaybackLockButton(nextLocked);
+        const nextLocked = !!(result.layerLocked ?? result.locked);
+        updatePlaybackLockButton(nextLocked, !!result.globalLocked);
         addToCommandLog(actionName, 'success', `图层${layerId}${nextLocked ? '已锁定' : '已解锁'}`);
     } else {
         addToCommandLog(actionName, 'error', `${actionName}失败`);
@@ -745,7 +746,7 @@ async function testDspAudioRoute(event) {
 
     const dspType = parseInt(btn.dataset.dspType, 10);
     const isHdmin = parseInt(btn.dataset.isHdmin || '0', 10);
-    const label = btn.textContent.trim();
+    const label = (globalThis.PlayerI18n?.sourceText(btn) ?? btn.textContent).trim();
 
     await handleApiOperation(
         apiPost('/video/dsp/audio-route', {
@@ -1059,29 +1060,6 @@ async function resumeVideo() {
     );
 }
 
-/**
- * 停止视频
- * 停止当前选择的图层视频
- */
-async function stopVideo() {
-    const playlistId = getCurrentPlaylistId();
-    const layerId = await getCurrentLayerId();
-
-    if (!layerId) {
-        addToCommandLog('停止视频', 'error', '请选择列表或图层');
-        return;
-    }
-
-    await handleApiOperation(
-        postVideoCommand('stop', {
-            layerId: parseInt(layerId),
-            playlistId: playlistId || undefined
-        }),
-        '停止视频',
-        `成功停止${playlistId ? '列表' : '图层' + layerId}视频`,
-        `停止${playlistId ? '列表' : '图层' + layerId}视频失败`
-    );
-}
 
 /**
  * 重播视频
@@ -1262,13 +1240,6 @@ async function toggleMute() {
     }
 }
 
-/**
- * 跳转到指定位置
- * @param {number} position - 目标位置（秒）
- */
-async function seekVideo(position) {
-    await seekTestVideo(position);
-}
 
 /**
  * 切换音轨

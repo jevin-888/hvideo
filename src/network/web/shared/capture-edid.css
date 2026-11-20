@@ -1,0 +1,110 @@
+/* Capture fields use the shared layer-property grid; only EDID spans a row. */
+#layer-properties-form .property-content.tab-common .capture-resolution-card { display: none !important; }
+#layer-properties-form .capture-custom-only[hidden] { display: none !important; }
+
+#layer-properties-form .capture-resolution-card {
+    min-width: 0;
+    padding: 16px;
+    border: 1px solid rgba(255,255,255,.14);
+    border-radius: 6px;
+    background: rgba(255,255,255,.035);
+}
+
+#layer-properties-form .capture-resolution-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+}
+#layer-properties-form .capture-resolution-row > #capture-edid-mode {
+    flex: 0 0 120px;
+    width: 120px !important;
+    height: 32px;
+    margin: 0;
+}
+#layer-properties-form .capture-resolution-row > label {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: #b5b4c8;
+    font-size: 12px;
+    white-space: nowrap;
+}
+#layer-properties-form .capture-resolution-row .capture-lock-label { flex: 0 0 auto; color: #eeeef6; }
+#layer-properties-form .capture-resolution-row .capture-lock-label input { margin: 0; }
+#layer-properties-form .capture-resolution-row > .capture-dimensions { flex: 1 1 190px; }
+#layer-properties-form .capture-resolution-row > .capture-refresh-input { flex: 0 0 108px; }
+#layer-properties-form .capture-resolution-row .form-control { height: 32px; margin: 0; min-width: 0; }
+#layer-properties-form .capture-resolution-row #capture-edid-apply,
+#layer-properties-form .capture-resolution-row #capture-edid-refresh-status { flex: 0 0 auto; width: auto !important; min-width: 52px !important; height: 32px !important; }
+#layer-properties-form .capture-resolution-row + .capture-edid-state { margin-top: 8px; }
+
+#layer-properties-form .capture-dimensions,
+#layer-properties-form .capture-refresh-input {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+#layer-properties-form .capture-dimensions input,
+#layer-properties-form .capture-refresh-input input {
+    box-sizing: border-box;
+    min-width: 0;
+    height: 32px;
+    margin: 0;
+    border: 1px solid rgba(255,255,255,.18) !important;
+    border-radius: 4px !important;
+    background: #272735 !important;
+    color: #f2f1ff;
+}
+
+#layer-properties-form .capture-dimensions input::placeholder,
+#layer-properties-form .capture-refresh-input input::placeholder { color: #8f8da4; }
+
+#layer-properties-form .capture-dimensions input,
+#layer-properties-form .capture-refresh-input input { flex: 1 1 0; width: 0; }
+#layer-properties-form .capture-dimensions > span,
+#layer-properties-form .capture-refresh-input > span { flex: 0 0 auto; color: #9999b1; font-size: 12px; }
+
+#layer-properties-form .capture-lock-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: #eeeef6;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+#layer-properties-form .capture-lock-label input { accent-color: #71b6a1; }
+
+#layer-properties-form .capture-edid-state {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    margin-top: 8px;
+    padding: 9px 10px;
+    border-radius: 4px;
+    background: rgba(255,255,255,.055);
+    color: #c7c5db;
+    font-size: 12px;
+}
+
+#layer-properties-form .capture-edid-state > span:nth-child(2) { flex: 1; min-width: 0; }
+#layer-properties-form .capture-state-dot { flex: 0 0 7px; height: 7px; border-radius: 50%; background: #e6ba6b; }
+#layer-properties-form #capture-edid-refresh-status {
+    width: auto !important;
+    min-width: 56px !important;
+    padding: 3px 8px !important;
+}
+
+@media (max-width: 650px) {
+    #layer-properties-form .capture-resolution-card { padding: 13px; }
+    #layer-properties-form .capture-resolution-row > #capture-edid-mode { flex: 1 1 100%; width: 100% !important; }
+    #layer-properties-form .capture-resolution-row > .capture-dimensions { flex: 1 1 100%; }
+    #layer-properties-form .capture-resolution-row > .capture-refresh-input { flex: 1 1 100%; }
+    #layer-properties-form .capture-resolution-row .capture-lock-label { flex: 1 1 auto; }
+}
+

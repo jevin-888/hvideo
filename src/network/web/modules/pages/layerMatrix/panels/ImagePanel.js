@@ -1,3 +1,4 @@
+import { createNumInput } from './CommonControls.js';
 // 图像图层（33 / 60 / 70）参数 HTML
 // 注意：layerId === 60 的形状/黑色透明在漫游配置区域展示，layerId === 71 是二维码（不走此 panel）
 import { shapeBlockHtml } from './SharedBlocks.js';
@@ -40,33 +41,9 @@ export function generateImageHtml(layer, layerId) {
                     <option value="1" ${layer.filter_mode === 1 ? 'selected' : ''}>最近邻过滤</option>
                 </select>
             </div>
-            <div class="setting-item" style="grid-column: span 1;">
-                <label for="image-fade-in-time">淡入时间(秒):</label>
-                <div class="number-input-wrapper horizontal layer-param-input">
-                    <button type="button" class="number-btn minus" data-target="image-fade-in-time">-</button>
-                    <input type="number" id="image-fade-in-time" min="0.0" step="0.1" value="${fadeIn}" data-default="${fadeIn}" class="form-control number-input">
-                    <button type="button" class="number-btn plus" data-target="image-fade-in-time">+</button>
-                    <button type="button" class="number-btn number-reset" data-target="image-fade-in-time" title="恢复默认">↻</button>
-                </div>
-            </div>
-            <div class="setting-item" style="grid-column: span 1;">
-                <label for="image-fade-out-time">淡出时间(秒):</label>
-                <div class="number-input-wrapper horizontal layer-param-input">
-                    <button type="button" class="number-btn minus" data-target="image-fade-out-time">-</button>
-                    <input type="number" id="image-fade-out-time" min="0.0" step="0.1" value="${fadeOut}" data-default="${fadeOut}" class="form-control number-input">
-                    <button type="button" class="number-btn plus" data-target="image-fade-out-time">+</button>
-                    <button type="button" class="number-btn number-reset" data-target="image-fade-out-time" title="恢复默认">↻</button>
-                </div>
-            </div>
-            <div class="setting-item" style="grid-column: span 1;">
-                <label for="image-display-duration">显示时长(秒):</label>
-                <div class="number-input-wrapper horizontal layer-param-input">
-                    <button type="button" class="number-btn minus" data-target="image-display-duration">-</button>
-                    <input type="number" id="image-display-duration" min="0.0" step="0.1" value="${dispDur}" data-default="${dispDur}" class="form-control number-input">
-                    <button type="button" class="number-btn plus" data-target="image-display-duration">+</button>
-                    <button type="button" class="number-btn number-reset" data-target="image-display-duration" title="恢复默认">↻</button>
-                </div>
-            </div>
+            ${createNumInput('image-fade-in-time', '淡入时间(秒)', fadeIn, '0.0', null, '0.1', 1)}
+            ${createNumInput('image-fade-out-time', '淡出时间(秒)', fadeOut, '0.0', null, '0.1', 1)}
+            ${createNumInput('image-display-duration', '显示时长(秒)', dispDur, '0.0', null, '0.1', 1)}
             <div class="setting-item" style="grid-column: span 1;">
                 <label for="image-animated">显示模式:</label>
                 <select id="image-animated" class="form-control">

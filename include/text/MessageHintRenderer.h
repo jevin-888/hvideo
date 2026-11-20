@@ -130,8 +130,9 @@ public:
      * @param 高度 渲染高度
      * @param alpha 透明度
      * @param displayAlign 显示对齐（0=左, 1=中, 2=右），由调用方传入，保证按配置绘制
+     * @param isSlice 切片仅绘制播放列表；操作提示由主图按逻辑画布居中绘制一次
      */
-    void render(VulkanRenderer* renderer, int x, int y, int width, int height, float alpha, int displayAlign = -1);
+    void render(VulkanRenderer* renderer, int x, int y, int width, int height, float alpha, int displayAlign = -1, bool isSlice = false);
 
     /**
      * @brief 在 render pass 外更新纹理
@@ -180,12 +181,19 @@ public:
      */
     void showOperationHint(HintType type, const std::string& customText  = "");
 
+    // Only playback controls are optional; playlist and system hints remain independent.
+    void setPlaybackOperationHintEnabled(bool enabled);
+
     /**
-     * @brief 显示受保护的永久操作提示，普通提示不会覆盖它
+     * @brief 显示启动提示；仅可中断的就绪提示允许普通操作覆盖
      * @param type 提示类型
      * @param customText 自定义文本（可选）
      */
-    void showProtectedOperationHint(HintType type, const std::string& customText = "");
+    bool showProtectedOperationHint(HintType type, const std::string& customText = "",
+                                    bool interruptible = false, bool refreshOnly = false);
+
+    // Startup cleanup must not clear a newer user operation.
+    bool clearProtectedOperationHint();
 
     /**
      * @brief 清除操作提示
@@ -255,7 +263,9 @@ public:
      * @param a 透明度 (0.0-1.0)
      */
     void setTextColor(float r, float g, float b, float a = 1.0f) {
+        if (textColorR_ == r && textColorG_ == g && textColorB_ == b && textColorA_ == a) return;
         textColorR_ = r; textColorG_ = g; textColorB_ = b; textColorA_ = a;
+        lastPlaylistText_.clear();
         dirty_ = true;
     }
 
@@ -267,7 +277,9 @@ public:
      * @param a 透明度 (0.0-1.0)
      */
     void setBgColor(float r, float g, float b, float a) {
+        if (bgColorR_ == r && bgColorG_ == g && bgColorB_ == b && bgAlpha_ == a) return;
         bgColorR_ = r; bgColorG_ = g; bgColorB_ = b; bgAlpha_ = a;
+        lastPlaylistText_.clear();
         dirty_ = true;
     }
 
@@ -333,7 +345,7 @@ private:
 
     // 内部渲染方法
     // render播放列表Hint：displayAlign 0=左 1=中 2=右，-1 使用成员 displayAlign_
-    // renderOperationHint：操作提示始终水平居中，不受配置影响
+    // renderOperationHint：普通操作提示在逻辑画布中央，受保护的启动提示按原策略上移
     void renderPlaylistHint(VulkanRenderer* renderer, int x, int y, int width, int height, float alpha, int displayAlign = -1);
     void renderOperationHint(VulkanRenderer* renderer, int x, int y, int width, int height, float alpha);
 
@@ -371,6 +383,8 @@ private:
     HintItem currentOperationHint_;
     bool operationHintActive_;
     bool protectedOperationHint_;
+    bool protectedHintInterruptible_ = false;
+    bool playbackOperationHintEnabled_ = true; // guarded by hintMutex_
 
     // 纹理状态跟踪（强制更新机制）
 
@@ -419,4 +433,3 @@ private:
 } // 命名空间 hsvj
 
 #endif // 结束 HSVJ_MESSAGE_HINT_RENDERER_H
-

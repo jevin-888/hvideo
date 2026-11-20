@@ -14,11 +14,14 @@
 
 #include "core/Engine.h"
 #include "core/CommandRouter.h"
-#include "core/PathConfig.h"
+#include "core/PeripheralManager.h"
+#include "core/StageControlManager.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "effect/EffectManager.h"
 #include "fusion/FusionManager.h"
 #include "layer/Layer.h"
+#include "layer/LayerImage.h"
 #include "layer/LayerVideo.h"
 #include "network/Dmx512ChannelHandler.h"
 #include "network/NetworkManager.h"
@@ -250,6 +253,10 @@ void Engine::cleanupUnnecessaryFiles() {
 
 void Engine::cleanupOnInitFailure() {
   LOG_DEBUG("Cleaning up resources after initialization failure...");
+  // 先通知并回收所有持有 Engine/配置指针的异步任务，再销毁资源。
+  // initialize() 下一次调用会重新将 shuttingDown_ 置为 false。
+  shuttingDown_.store(true);
+  waitAllEngineAsyncTasks();
   cleanupResources();
   initialized_.store(false);
   preparing_.store(false);  // 重置 preparing 状态，允许再次尝试初始化
@@ -257,7 +264,16 @@ void Engine::cleanupOnInitFailure() {
 }
 
 void Engine::cleanupResources() {
-  LOG_DEBUG("[Cleanup] Step 1: Stopping network services...");
+  if (onlineVodAdmissionRetryThread_.joinable()) {
+    LOG_DEBUG("[Cleanup] Waiting for Online VOD admission retry thread...");
+    onlineVodAdmissionRetryThread_.join();
+  }
+  LOG_DEBUG("[Cleanup] Step 1: Stopping stage control worker...");
+  StageControlManager::getInstance().shutdown();
+
+  PeripheralManager::getInstance().stopTriggerExecution();
+
+  LOG_DEBUG("[Cleanup] Step 2: Stopping network services...");
   NetworkManager::getInstance().stopAll();
 
   LOG_DEBUG("[Cleanup] Step 2: Stopping all video layers...");
@@ -277,6 +293,7 @@ void Engine::cleanupResources() {
   }
 
   LOG_DEBUG("[Cleanup] Step 3: Waiting for all async tasks...");
+  resetConfiguredQrCode();
   LayerVideo::waitAllAsyncTasks();
   MediaUtils::waitAllThumbnailTasks();
 
@@ -284,6 +301,14 @@ void Engine::cleanupResources() {
   // 特别是音频回调可能还在访问 Effect管理器 中的共享频谱缓冲
   LOG_DEBUG("[Cleanup] Step 4: Extra wait for decoder threads to fully stop...");
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  // 独立启动二维码必须在 renderer_ 销毁前释放，并清空本次初始化的运行态。
+  {
+    std::lock_guard<std::mutex> lock(startupQrMutex_);
+    startupQrOverlayLayer_.reset();
+    startupQrActiveUrl_.clear();
+    startupQrGeneratedSize_ = 0;
+  }
 
 #ifdef __ANDROID__
   LOG_DEBUG("[Cleanup] Step 5: Shutting down DMX receiver...");
@@ -336,6 +361,40 @@ void Engine::cleanupResources() {
 }
 
 #ifdef __ANDROID__
+void Engine::adaptCanvasToPhysicalOutput() {
+  if (!nativeWindow_ || !systemConfig_) return;
+  const int outputWidth = ANativeWindow_getWidth(nativeWindow_);
+  const int outputHeight = ANativeWindow_getHeight(nativeWindow_);
+  const Resolution canvas = systemConfig_->getResolution();
+  if (outputWidth <= 0 || outputHeight <= 0 || canvas.width <= outputWidth ||
+      canvas.height != outputHeight ||
+      systemConfig_->getInputLayoutCols() != 1 ||
+      systemConfig_->getInputLayoutRows() != 1 ||
+      systemConfig_->getOutputLayoutCols() != 1 ||
+      systemConfig_->getOutputLayoutRows() != 1) {
+    return;
+  }
+
+  const LayerConfigData *videoConfig = systemConfig_->getLayerConfig(1);
+  const bool videoMatchesPanel =
+      videoConfig && videoConfig->size.width > 0 &&
+      videoConfig->size.height > 0 && videoConfig->size.width <= outputWidth &&
+      videoConfig->size.height <= outputHeight;
+  if (!videoMatchesPanel) return;
+
+  LOG_WARN("检测到单屏画布与物理输出不匹配: canvas=%dx%d output=%dx%d video=%dx%d; "
+           "自动适配物理画布，避免视频只显示左半屏",
+           canvas.width, canvas.height, outputWidth, outputHeight,
+           videoConfig->size.width, videoConfig->size.height);
+  systemConfig_->setResolution(Resolution(outputWidth, outputHeight));
+  systemConfig_->setInputWidth(outputWidth);
+  systemConfig_->setInputHeight(outputHeight);
+  systemConfig_->setRegionWidth(outputWidth);
+  systemConfig_->setRegionHeight(outputHeight);
+  systemConfig_->setOutputWidth(outputWidth);
+  systemConfig_->setOutputHeight(outputHeight);
+}
+
 bool Engine::reinitializeRenderPaths() {
   if (!renderer_ || !systemConfig_) {
     LOG_ERROR("重新初始化RegionRotationRenderer失败：必要组件未初始化");
@@ -352,6 +411,7 @@ bool Engine::reinitializeRenderPaths() {
   LOG_INFO("开始重新初始化RegionRotationRenderer...");
 
   try {
+    adaptCanvasToPhysicalOutput();
     Resolution canvasResolution = systemConfig_->getResolution();
     int canvasWidth = canvasResolution.width > 0 ? canvasResolution.width : 1920;
     int canvasHeight = canvasResolution.height > 0 ? canvasResolution.height : 1080;

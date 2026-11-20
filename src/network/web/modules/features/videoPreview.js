@@ -1,5 +1,5 @@
 ﻿// 视频预览窗口功能
-import { addToCommandLog } from '../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { showError } from '../components/toast.js';
 import { getCurrentPlaylistId } from './playlist.js';
 
@@ -104,6 +104,8 @@ export async function openVideoPreview(filePath, fileName, layerId) {
     if (layerId != null && layerId >= 1 && layerId <= 4) {
         previewUrl += `&layerId=${layerId}`;
     }
+    const token = localStorage.getItem('hvideo_auth_token');
+    if (token) previewUrl += `&token=${encodeURIComponent(token)}`;
     img.src = previewUrl;
 
     // 监听图片加载错误（可能是预览开关关闭导致）

@@ -2,7 +2,7 @@
 
 #include "VulkanRenderer_Internal.h"
 
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 
 #include "utils/FileUtils.h"
 
@@ -534,6 +534,29 @@ bool VulkanRenderer::createGraphicsPipeline() {
 
       device_, pipelineCache_, 1, &pipelineInfo, nullptr, &graphicsPipeline_);
 
+  // Reuse the simple sampling shader with the RGBA descriptor layout and the
+  // exact same blend/rasterization state as the full RGBA pipeline. In
+  // particular, do not use the opaque YCbCr pipeline for transparent overlays.
+  if (result == VK_SUCCESS) {
+    const auto fastSpirv = loadSpirvFromFile("ycbcr_fast.frag.spv");
+    if (!fastSpirv.empty()) {
+      VkShaderModuleCreateInfo fastInfo{};
+      fastInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+      fastInfo.codeSize = fastSpirv.size() * sizeof(uint32_t);
+      fastInfo.pCode = fastSpirv.data();
+      VkShaderModule fastModule = VK_NULL_HANDLE;
+      if (vkCreateShaderModule(device_, &fastInfo, nullptr, &fastModule) == VK_SUCCESS) {
+        stages[1].module = fastModule;
+        const VkResult fastResult = vkCreateGraphicsPipelines(
+            device_, pipelineCache_, 1, &pipelineInfo, nullptr, &rgbaFastPipeline_);
+        if (fastResult != VK_SUCCESS) {
+          LOG_WARN("[Vulkan] RGBA fast pipeline unavailable: %d; using full shader", fastResult);
+        }
+        vkDestroyShaderModule(device_, fastModule, nullptr);
+      }
+    }
+  }
+
   vkDestroyShaderModule(device_, fragModule, nullptr);
 
   vkDestroyShaderModule(device_, vertModule, nullptr);
@@ -543,6 +566,7 @@ bool VulkanRenderer::createGraphicsPipeline() {
   if (result != VK_SUCCESS) {
 
     vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+    pipelineLayout_ = VK_NULL_HANDLE;
 
     return false;
 
@@ -659,12 +683,31 @@ bool VulkanRenderer::createCommandBuffers() {
 
 
 bool VulkanRenderer::createSyncObjects() {
+  asyncPresentNeedsRecreate_.store(false, std::memory_order_release);
+  asyncPresentStallStreak_ = 0;
+  lastAsyncWsiRecoveryRequest_ = {};
+
+  {
+    std::lock_guard<std::mutex> lk(submissionStateMutex_);
+    frameSlotSubmissionSerial_.fill(0);
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+      recordingCallbacks_[i].clear();
+      recordingTextureIds_[i].clear();
+    }
+    submissionCallbacks_.clear();
+    frameSubmissionPending_ = false;
+    nextSubmissionSerial_.store(1, std::memory_order_release);
+    completedSubmissionSerial_.store(0, std::memory_order_release);
+    submittedCount_.store(0, std::memory_order_release);
+    completedCount_.store(0, std::memory_order_release);
+    abandonedCount_.store(0, std::memory_order_release);
+  }
 
   imageAvailableSemaphores_.resize(MAX_FRAMES_IN_FLIGHT);
   asyncAcquireSemaphores_.resize(ASYNC_ACQUIRE_SLOTS);
   asyncAcquireFences_.resize(ASYNC_ACQUIRE_SLOTS);
 
-  renderFinishedSemaphores_.resize(MAX_FRAMES_IN_FLIGHT);
+  if (!recreateRenderFinishedSemaphoresAfterIdle()) return false;
 
   inFlightFences_.resize(MAX_FRAMES_IN_FLIGHT);
   asyncAcquireSlotFree_.assign(ASYNC_ACQUIRE_SLOTS, true);
@@ -697,10 +740,6 @@ bool VulkanRenderer::createSyncObjects() {
     if (vkCreateSemaphore(device_, &semaphoreInfo, nullptr,
 
                           &imageAvailableSemaphores_[i]) != VK_SUCCESS ||
-
-        vkCreateSemaphore(device_, &semaphoreInfo, nullptr,
-
-                          &renderFinishedSemaphores_[i]) != VK_SUCCESS ||
 
         vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFences_[i]) !=
 
@@ -746,5 +785,21 @@ bool VulkanRenderer::createSyncObjects() {
 }
 
 
+
+bool VulkanRenderer::recreateRenderFinishedSemaphoresAfterIdle() {
+  if (device_ == VK_NULL_HANDLE) return false;
+  for (auto semaphore : renderFinishedSemaphores_) {
+    if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device_, semaphore, nullptr);
+  }
+  renderFinishedSemaphores_.assign(swapchainImages_.size(), VK_NULL_HANDLE);
+  VkSemaphoreCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  for (auto &semaphore : renderFinishedSemaphores_) {
+    if (vkCreateSemaphore(device_, &info, nullptr, &semaphore) != VK_SUCCESS) {
+      return false;
+    }
+  }
+  return true;
+}
 
 } // 命名空间 hsvj

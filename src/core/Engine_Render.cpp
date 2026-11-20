@@ -15,6 +15,7 @@
 #include "decoder/VideoDecoder.h"
 #include "effect/EffectManager.h"
 #include "layer/Layer.h"
+#include "layer/LayerBluetoothAudio.h"
 #include "layer/LayerImage.h"
 #include "layer/LayerText.h"
 #include "layer/LayerVideo.h"
@@ -47,7 +48,7 @@
 #endif
 
 #ifdef __ANDROID__
-extern "C" void callJavaScheduleWatchdogAlarm();
+extern "C" bool callJavaScheduleWatchdogAlarm();
 #endif
 
 namespace hsvj {
@@ -276,18 +277,63 @@ bool layerHasActiveSliceRoam(const Layer &layer) {
   return active;
 }
 
-bool layersAllowDirectSwapchainRender(
+struct DirectLayerEligibility {
+  enum class Reason : uint8_t { NONE = 0, SLICES, GAUSSIAN_BLUR };
+  Reason reason = Reason::NONE;
+  int layerId = 0;
+
+  bool eligible() const { return reason == Reason::NONE; }
+};
+
+DirectLayerEligibility checkDirectLayerEligibility(
     const std::vector<std::shared_ptr<Layer>> &visibleLayers) {
   for (const auto &layerPtr : visibleLayers) {
     if (!layerPtr) {
       continue;
     }
     const Layer *layer = layerPtr.get();
-    if (layer->hasSlices() || layer->getGaussianBlur() > 0.01f) {
-      return false;
+    if (layer->hasSlices()) {
+      return {DirectLayerEligibility::Reason::SLICES, layer->getLayerId()};
+    }
+    if (layer->getGaussianBlur() > 0.01f) {
+      return {DirectLayerEligibility::Reason::GAUSSIAN_BLUR,
+              layer->getLayerId()};
     }
   }
-  return true;
+  return {};
+}
+
+const char *directBlockReasonName(DirectSwapchainBlockReason reason) {
+  switch (reason) {
+    case DirectSwapchainBlockReason::NONE: return "none";
+    case DirectSwapchainBlockReason::MANAGER_MODE: return "manager_mode";
+    case DirectSwapchainBlockReason::LICENSE_WARNING: return "license_warning";
+    case DirectSwapchainBlockReason::DMX_OVERLAY: return "dmx_overlay";
+    case DirectSwapchainBlockReason::ROTATION: return "rotation";
+    case DirectSwapchainBlockReason::INVALID_CANVAS: return "invalid_canvas";
+    case DirectSwapchainBlockReason::INVALID_GRID: return "invalid_grid";
+    case DirectSwapchainBlockReason::GRID_MISMATCH: return "grid_mismatch";
+    case DirectSwapchainBlockReason::REGION_CELL_OUT_OF_RANGE: return "region_cell";
+    case DirectSwapchainBlockReason::REGION_MAPPING_MISMATCH: return "region_mapping";
+    case DirectSwapchainBlockReason::REGION_SOURCE_MISMATCH: return "region_source";
+    case DirectSwapchainBlockReason::REGION_MESH: return "region_mesh";
+    case DirectSwapchainBlockReason::REGION_CORRECTION: return "region_correction";
+    case DirectSwapchainBlockReason::REGION_GRID_OVERLAY: return "region_grid";
+    case DirectSwapchainBlockReason::REGION_MASK: return "region_mask";
+    case DirectSwapchainBlockReason::REGION_COLOR: return "region_color";
+    case DirectSwapchainBlockReason::REGION_BLEND: return "region_blend";
+    case DirectSwapchainBlockReason::REGION_COUNT_MISMATCH: return "region_count";
+  }
+  return "unknown";
+}
+
+const char *directLayerBlockReasonName(DirectLayerEligibility::Reason reason) {
+  switch (reason) {
+    case DirectLayerEligibility::Reason::NONE: return "none";
+    case DirectLayerEligibility::Reason::SLICES: return "layer_slices";
+    case DirectLayerEligibility::Reason::GAUSSIAN_BLUR: return "layer_blur";
+  }
+  return "unknown";
 }
 
 #ifdef __ANDROID__
@@ -306,6 +352,11 @@ bool shouldRenderLayerForCanvasDiag(const std::shared_ptr<Layer> &layerPtr,
     if (layerType != LayerType::VIDEO) return true;
     auto *videoLayer = static_cast<LayerVideo *>(layer);
     return videoLayer && videoLayer->isCaptureLayer();
+  }
+  if (diagCanvasMode == 4) {
+    if (layerType != LayerType::VIDEO) return true;
+    auto *videoLayer = static_cast<LayerVideo *>(layer);
+    return videoLayer && !videoLayer->isCaptureLayer();
   }
   return true;
 }
@@ -341,7 +392,10 @@ void terminateProcessAfterVulkanDeviceLost() {
   const pid_t pid = getpid();
   LOG_ERROR("[渲染循环] Vulkan device lost fatal，已预约 Alarm/守护拉起，native 将直接终止 pid=%d",
             static_cast<int>(pid));
-  callJavaScheduleWatchdogAlarm();
+  if (!callJavaScheduleWatchdogAlarm()) {
+    LOG_ERROR("Failed to schedule watchdog alarm before terminating pid=%d",
+              static_cast<int>(pid));
+  }
 
   std::thread([pid]() {
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
@@ -476,6 +530,15 @@ void Engine::renderSliceItem(Layer *layer, const std::string &sliceKey,
                        renderY);
   LayerType layerType = layer->getType();
 
+  const auto sliceCrop = [&sliceData](const char *camel, const char *snake) {
+    const auto &value = sliceData.isMember(camel) ? sliceData[camel] : sliceData[snake];
+    return value.isNumeric() ? value.asFloat() : 0.0f;
+  };
+  const VulkanRenderer::ScopedSliceCrop cropScope(
+      *renderer_, sliceCrop("cropLeft", "crop_left"),
+      sliceCrop("cropTop", "crop_top"), sliceCrop("cropRight", "crop_right"),
+      sliceCrop("cropBottom", "crop_bottom"));
+
   if (layerType == LayerType::VIDEO) {
     LayerVideo *videoLayer = static_cast<LayerVideo *>(layer);
     if (videoLayer) {
@@ -483,12 +546,13 @@ void Engine::renderSliceItem(Layer *layer, const std::string &sliceKey,
               sliceKey, renderX, renderY, sliceWidth, sliceHeight,
               sliceRotation, sliceScale, sliceAlpha, sliceShapeType,
               sliceShapeParam, sliceBlackToTransparent, sliceInvert,
-              sliceFitMode)) {
+              sliceGaussianBlur, sliceFitMode)) {
         return;
       }
       if (videoLayer->isCaptureMode()) {
         uint32_t textureId = videoLayer->getActiveCaptureTextureId();
         if (textureId != 0) {
+          videoLayer->applyContentCrop(textureId);
           renderer_->renderLayer(textureId, renderX, renderY, sliceWidth,
                                  sliceHeight, sliceRotation, sliceScale,
                                  sliceAlpha, nullptr, sliceShapeType,
@@ -499,6 +563,7 @@ void Engine::renderSliceItem(Layer *layer, const std::string &sliceKey,
         uint32_t textureId = videoLayer->getCurrentTextureId();
         if (textureId != 0) {
           bool useEffectPath = layer->getEffectLinkedSlices();
+          videoLayer->applyContentCrop(textureId);
           if (useEffectPath) {
             videoLayer->renderSliceWithEffect(
                 textureId, renderX, renderY, sliceWidth, sliceHeight,
@@ -522,6 +587,7 @@ void Engine::renderSliceItem(Layer *layer, const std::string &sliceKey,
     if (imageLayer) {
       uint32_t textureId = imageLayer->getTextureId();
       if (textureId != 0) {
+        imageLayer->applyContentCrop(textureId);
         float imageBlur = (layerType == LayerType::IMAGE) ? sliceGaussianBlur : 0.0f;
         renderer_->renderLayer(
             textureId, renderX, renderY, sliceWidth, sliceHeight, sliceRotation,
@@ -537,6 +603,7 @@ void Engine::renderSliceItem(Layer *layer, const std::string &sliceKey,
         LyricRenderer *lyricRenderer = textLayer->getLyricRenderer();
         uint32_t lyricTextureId = lyricRenderer->getCompositeTextureId();
         if (lyricTextureId != 0) {
+          textLayer->applyContentCrop(lyricTextureId);
           // 与视频图层一致：使用 renderLayer 支持 rotation/scale/shape 等
           renderer_->renderLayer(
               lyricTextureId, renderX, renderY, sliceWidth, sliceHeight,
@@ -605,6 +672,11 @@ void Engine::renderLayersToCanvas(int canvasWidth, int canvasHeight,
     int priority;
 
     bool operator<(const RenderItem &other) const {
+      const bool isSystemHint = layer && layer->getLayerId() == 41;
+      const bool otherIsSystemHint = other.layer && other.layer->getLayerId() == 41;
+      if (isSystemHint != otherIsSystemHint) {
+        return !isSystemHint;
+      }
       return priority < other.priority;
     }
   };
@@ -734,6 +806,14 @@ void Engine::invalidateLayerGpuCachesAfterDeviceRebuild() {
     } else if (l->getType() == LayerType::IMAGE ||
                l->getType() == LayerType::QRCODE) {
       static_cast<LayerImage *>(l)->dropStaleGpuTextureHandles();
+    } else if (l->getType() == LayerType::BLUETOOTH_AUDIO) {
+      static_cast<LayerBluetoothAudio *>(l)->dropStaleGpuTextureHandles();
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(startupQrMutex_);
+    if (startupQrOverlayLayer_) {
+      startupQrOverlayLayer_->dropStaleGpuTextureHandles();
     }
   }
 }
@@ -794,9 +874,12 @@ void Engine::renderFrame() {
   }
   auto afterBeginFrame = std::chrono::steady_clock::now();
 
+  const bool bluetoothAudioOnly =
+      bluetoothAudioModeActive_.load(std::memory_order_acquire);
   auto captureUpdateStart = std::chrono::steady_clock::now();
   // 采集图层 10/11：无论是否已启采都调用 updateCaptureTexture，以便 prepareTextures 创建黑底纹理并显示”无信号”（否则未启采时从不调用 prepareTextures，渲染会跳过）
   for (int captureLayerId : {10, 11}) {
+    if (bluetoothAudioOnly) break;
     Layer *layer = mubu_->getLayer(captureLayerId);
     if (layer && layer->getType() == LayerType::VIDEO) {
       LayerVideo *videoLayer = static_cast<LayerVideo *>(layer);
@@ -813,6 +896,15 @@ void Engine::renderFrame() {
 
   auto visibleFetchStart = afterCaptureUpdate;
   auto visibleLayers = mubu_->getVisibleLayers();
+  if (bluetoothAudioOnly) {
+    visibleLayers.erase(
+        std::remove_if(visibleLayers.begin(), visibleLayers.end(),
+                       [](const std::shared_ptr<Layer>& layer) {
+                         return !layer ||
+                                layer->getType() != LayerType::BLUETOOTH_AUDIO;
+                       }),
+        visibleLayers.end());
+  }
   auto afterVisibleFetch = std::chrono::steady_clock::now();
   // 与纹理上传合并的 canvas-redraw 检测。在同一循环里：
   //   (1) 调 updateTexture/prepareTexture 上传 GPU 资源（原有逻辑）
@@ -901,6 +993,18 @@ void Engine::renderFrame() {
         canvasNeedsRedraw = true;
         layer->updateTexture();
       }
+    } else if (layerType == LayerType::BLUETOOTH_AUDIO) {
+      auto *bluetoothLayer = static_cast<LayerBluetoothAudio *>(layer);
+      // Bluetooth may become active before Vulkan initialization completes.
+      // Rebind here so the temporary layer also survives renderer recovery.
+      bluetoothLayer->setRenderer(renderer_.get());
+      if (bluetoothLayer->needsTextureUpdate()) {
+        bluetoothLayer->updateTexture();
+      }
+      if (bluetoothLayer->consumeTextureUpdated()) {
+        canvasNeedsRedraw = true;
+      }
+      texIdForSig = bluetoothLayer->getTextureId();
     }
 
     // 签名覆盖：layerId + type + pos + size + alpha + texId（若适用）
@@ -963,9 +1067,15 @@ void Engine::renderFrame() {
   //   adb shell setprop debug.hsvj.diag.canvas 1  -> clear canvas 仅
   //   adb shell setprop debug.hsvj.diag.canvas 2  -> draw non-视频 layers 仅
   //   adb shell setprop debug.hsvj.diag.canvas 3  -> draw capture + non-视频 layers
+  //   adb shell setprop debug.hsvj.diag.canvas 4  -> draw regular video + non-video layers
   const int diagCanvasMode =
       getAndroidIntProperty("debug.hsvj.diag.canvas", 0);
+  const auto *canvasRenderLayers = &visibleLayers;
+  std::vector<std::shared_ptr<Layer>> filteredCanvasLayers;
   if (diagCanvasMode > 0) {
+    filteredCanvasLayers =
+        filterLayersForCanvasDiag(visibleLayers, diagCanvasMode);
+    canvasRenderLayers = &filteredCanvasLayers;
     canvasNeedsRedraw = true;
   }
 
@@ -1012,16 +1122,60 @@ void Engine::renderFrame() {
   long long directBeginUs = 0;
   long long directDrawUs = 0;
   long long directEndUs = 0;
-  if (diagCanvasMode == 0 &&
-      dmxMasterAtFull &&
-      regionRotationRenderer_->canDirectRenderToSwapchain() &&
-      layersAllowDirectSwapchainRender(visibleLayers)) {
+  const DirectSwapchainEligibility regionEligibility =
+      regionRotationRenderer_->checkDirectSwapchainEligibility();
+  const DirectLayerEligibility layerEligibility =
+      checkDirectLayerEligibility(*canvasRenderLayers);
+  const bool directEligible = dmxMasterAtFull && regionEligibility.eligible() &&
+                              layerEligibility.eligible();
+  if (!directEligible) {
+    const char *reason = !dmxMasterAtFull
+                             ? "dmx_master"
+                             : (!regionEligibility.eligible()
+                                    ? directBlockReasonName(
+                                          regionEligibility.reason)
+                                    : directLayerBlockReasonName(
+                                          layerEligibility.reason));
+    const int blockedId = !regionEligibility.eligible()
+                              ? regionEligibility.regionId
+                              : layerEligibility.layerId;
+    static std::string s_lastDirectBlockReason;
+    static int s_lastDirectBlockId = -1;
+    if (s_lastDirectBlockReason != reason || s_lastDirectBlockId != blockedId) {
+      s_lastDirectBlockReason = reason;
+      s_lastDirectBlockId = blockedId;
+      LOG_INFO("[DirectEligibility] blocked=%s id=%d diag=%d dmx=%d "
+               "layers=%zu->%zu",
+               reason, blockedId, diagCanvasMode, dmxMaster,
+               visibleLayers.size(), canvasRenderLayers->size());
+    }
+  }
+  if (directEligible) {
     processFrameStart = afterOverlayState;
+
+    // DirectSwapchain bypasses the RegionRotation QR overlay pass.  Keep the
+    // startup mobile-debug QR as a separate temporary layer, but draw it into
+    // this pass after the regular layers so it remains visible on the direct
+    // path as well.  Prepare the texture before beginning the render pass;
+    // image upload may enqueue Vulkan transfer work that cannot run inside an
+    // active graphics pass.
+    std::unique_lock<std::mutex> startupQrLock(startupQrMutex_);
+    if (startupQrOverlayLayer_ && startupQrOverlayLayer_->isVisible()) {
+      startupQrOverlayLayer_->prepareTexture();
+    }
 
     const auto directBeginStart = std::chrono::steady_clock::now();
     if (regionRotationRenderer_->beginDirectSwapchainRenderPass()) {
       const auto afterDirectBegin = std::chrono::steady_clock::now();
-      renderLayersToCanvas(canvasRes.width, canvasRes.height, visibleLayers, true);
+      if (diagCanvasMode == 1) {
+        renderer_->clear(0.0f, 0.0f, 0.0f, 1.0f);
+      }
+      renderLayersToCanvas(canvasRes.width, canvasRes.height,
+                           *canvasRenderLayers, true);
+      if (startupQrOverlayLayer_ && startupQrOverlayLayer_->isVisible() &&
+          startupQrOverlayLayer_->getTextureId() != 0) {
+        startupQrOverlayLayer_->render();
+      }
       const auto afterDirectDraw = std::chrono::steady_clock::now();
       regionRotationRenderer_->endDirectSwapchainRenderPass();
       const auto afterDirectEnd = std::chrono::steady_clock::now();
@@ -1030,7 +1184,7 @@ void Engine::renderFrame() {
       directEndUs = durationMicros(afterDirectDraw, afterDirectEnd);
       afterProcessFrame = afterDirectEnd;
       afterCanvasPass = canvasPassStart;
-      canvasLayerCount = visibleLayers.size();
+      canvasLayerCount = canvasRenderLayers->size();
       directPathUsed = true;
       static int s_directTraceCount = 0;
       static auto s_lastDirectTraceLog = std::chrono::steady_clock::time_point{};
@@ -1044,12 +1198,14 @@ void Engine::renderFrame() {
             directTraceNow - s_lastDirectTraceLog >= std::chrono::seconds(10)))) {
         s_lastDirectTraceLog = directTraceNow;
         LOG_INFO("[DirectTrace] total=%.2fms begin=%.2fms draw=%.2fms "
-                 "end=%.2fms layers=%zu swap=%ux%u logical=%dx%d",
+                 "end=%.2fms layers=%zu->%zu diag=%d swap=%ux%u "
+                 "logical=%dx%d",
                  directTotalUs / 1000.0, directBeginUs / 1000.0,
                  directDrawUs / 1000.0, directEndUs / 1000.0,
-                 visibleLayers.size(), renderer_->getSwapchainWidth(),
-                 renderer_->getSwapchainHeight(), canvasRes.width,
-                 canvasRes.height);
+                 visibleLayers.size(), canvasRenderLayers->size(),
+                 diagCanvasMode,
+                 renderer_->getSwapchainWidth(), renderer_->getSwapchainHeight(),
+                 canvasRes.width, canvasRes.height);
       }
     } else {
       static int s_directBeginFailCount = 0;
@@ -1070,11 +1226,10 @@ void Engine::renderFrame() {
     const auto afterCanvasBegin = std::chrono::steady_clock::now();
     renderer_->clear(0.0f, 0.0f, 0.0f, 1.0f);
     const auto afterCanvasClear = std::chrono::steady_clock::now();
-    const auto canvasLayers =
-        filterLayersForCanvasDiag(visibleLayers, diagCanvasMode);
-    canvasLayerCount = canvasLayers.size();
+    canvasLayerCount = canvasRenderLayers->size();
     const auto afterCanvasFilter = std::chrono::steady_clock::now();
-    renderLayersToCanvas(canvasRes.width, canvasRes.height, canvasLayers);
+    renderLayersToCanvas(canvasRes.width, canvasRes.height,
+                         *canvasRenderLayers);
     const auto afterCanvasDraw = std::chrono::steady_clock::now();
     regionRotationRenderer_->endCanvasRenderPass();
     const auto afterCanvasEnd = std::chrono::steady_clock::now();
@@ -1086,10 +1241,17 @@ void Engine::renderFrame() {
   }
   afterCanvasPass = std::chrono::steady_clock::now();
 
+  std::unique_lock<std::mutex> startupQrLock(startupQrMutex_);
   Layer *layer71 = mubu_->getLayer(71);
+  Layer *qrOverlayLayer = layer71;
+  if (startupQrOverlayLayer_ && startupQrOverlayLayer_->isVisible()) {
+    startupQrOverlayLayer_->prepareTexture();
+    qrOverlayLayer = startupQrOverlayLayer_.get();
+  }
   const auto qrNeedStart = std::chrono::steady_clock::now();
   qrNeedRender =
-      (diagCanvasMode != 1 && regionRotationRenderer_->needsQrOverlayRender(layer71))
+      (diagCanvasMode != 1 &&
+       regionRotationRenderer_->needsQrOverlayRender(qrOverlayLayer))
           ? 1
           : 0;
   const auto afterQrNeed = std::chrono::steady_clock::now();
@@ -1099,16 +1261,15 @@ void Engine::renderFrame() {
     if (regionRotationRenderer_->beginQrOverlayRenderPass()) {
       qrPassBegan = 1;
       const auto afterQrBegin = std::chrono::steady_clock::now();
-      if (layer71 && layer71->isVisible()) {
-        if (layer71->getType() == LayerType::IMAGE) {
-          auto *imgLayer = static_cast<LayerImage *>(layer71);
+      if (qrOverlayLayer && qrOverlayLayer->isVisible()) {
+        const LayerType qrLayerType = qrOverlayLayer->getType();
+        if (qrLayerType == LayerType::IMAGE ||
+            qrLayerType == LayerType::QRCODE) {
+          auto *imgLayer = static_cast<LayerImage *>(qrOverlayLayer);
           if (imgLayer->getTextureId() != 0) {
-            layer71->render();
+            qrOverlayLayer->render();
             qrLayerDrawn = 1;
           }
-        } else {
-          layer71->render();
-          qrLayerDrawn = 1;
         }
       }
       const auto afterQrDraw = std::chrono::steady_clock::now();
@@ -1119,6 +1280,7 @@ void Engine::renderFrame() {
       qrEndUs = durationMicros(afterQrDraw, afterQrEnd);
     }
   }
+  startupQrLock.unlock();
   {
     const auto afterQrOverlay = std::chrono::steady_clock::now();
     const long long canvasTotalUs = durationMicros(canvasPassStart, afterCanvasPass);
@@ -1367,6 +1529,10 @@ int renderDemandBucketFromFps(double fps, int fallback = 30) {
 int Engine::getRenderDemandFps() const {
   if (!mubu_) return 30;
 
+  if (bluetoothAudioModeActive_.load(std::memory_order_acquire)) {
+    return 30;
+  }
+
   int demandFps = 0;
   std::vector<int> ids = mubu_->getAllLayerIds();
   for (int id : ids) {
@@ -1403,6 +1569,9 @@ int Engine::getRenderDemandFps() const {
       if (layer->needsTextureUpdate()) {
         demandFps = 60;
       }
+      break;
+    case LayerType::BLUETOOTH_AUDIO:
+      demandFps = std::max(demandFps, 30);
       break;
     case LayerType::IMAGE:
     case LayerType::QRCODE: {

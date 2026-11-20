@@ -468,7 +468,6 @@ size_t effectiveDrmPrimeCacheCapacity(int64_t successfulImports,
 
 namespace {
 
-constexpr int kCaptureAutoRot90VFlip = 1;
 
 int64_t elapsedMillisSince(std::chrono::steady_clock::time_point start) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -558,46 +557,9 @@ int captureRotationToInvertFlag(int captureRotation) {
   }
 }
 
-bool shouldAutoPortraitCaptureTransform(int captureRotation, int captureWidth,
-                                        int captureHeight,
-                                        int captureAutoTransform,
-                                        int renderWidth, int renderHeight) {
-  (void)renderWidth;
-  (void)renderHeight;
-  if (LayerVideo::normalizeCaptureRotation(captureRotation) >= 0) {
-    return false;
-  }
-  return (captureWidth == 1080 && captureHeight == 1920) ||
-         captureAutoTransform == kCaptureAutoRot90VFlip;
-}
-
-int effectiveCaptureInvert(int configuredInvert, int captureRotation,
-                           int captureAutoTransform,
-                           int captureWidth, int captureHeight,
-                           int renderWidth, int renderHeight) {
-  int mode = configuredInvert & 3;
-  int rotation = captureRotation;
-  if (shouldAutoPortraitCaptureTransform(captureRotation, captureWidth,
-                                         captureHeight, captureAutoTransform,
-                                         renderWidth, renderHeight)) {
-    rotation = 90;
-    mode |= 2;
-  }
-  mode |= captureRotationToInvertFlag(rotation);
-  return mode;
-}
-
-int effectiveCaptureFitMode(int configuredFitMode, int captureRotation,
-                            int captureAutoTransform,
-                            int captureWidth, int captureHeight,
-                            int renderWidth, int renderHeight) {
-  if (configuredFitMode == 1 &&
-      shouldAutoPortraitCaptureTransform(captureRotation, captureWidth,
-                                         captureHeight, captureAutoTransform,
-                                         renderWidth, renderHeight)) {
-    return 0;
-  }
-  return configuredFitMode;
+int effectiveCaptureInvert(int configuredInvert, int captureRotation) {
+  return (configuredInvert & 3) |
+         captureRotationToInvertFlag(captureRotation);
 }
 
 struct ScopedLayerVideoStallLog {
@@ -895,7 +857,8 @@ void LayerVideo::update(float deltaTime) {
     lastVisibleTime_ += deltaTime;
   }
 
-  if (!visible_ && lastVisibleTime_ > kHiddenDecoderKeepAliveSeconds && decoder_) {
+  if (!visible_ && !isPresentInScene() &&
+      lastVisibleTime_ > kHiddenDecoderKeepAliveSeconds && decoder_) {
       std::unique_lock<std::mutex> lifecycleLock(lifecycleOpMutex_, std::try_to_lock);
       if (!lifecycleLock.owns_lock()) {
         return;
@@ -910,7 +873,7 @@ void LayerVideo::update(float deltaTime) {
             DecodedFrame *frameToRelease = pendingFrames_[i];
             if (renderer_) {
               renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-                frameToRelease->release();
+                LayerVideo::releaseDecodedFrameAsync(frameToRelease);
               });
             } else {
               decoder_->releaseFrame(frameToRelease);
@@ -924,7 +887,7 @@ void LayerVideo::update(float deltaTime) {
         retainedLastFrame_ = nullptr;
         if (renderer_) {
           renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-            frameToRelease->release();
+            LayerVideo::releaseDecodedFrameAsync(frameToRelease);
           });
         } else {
           frameToRelease->release();
@@ -977,7 +940,7 @@ void LayerVideo::update(float deltaTime) {
   }
 
   if (state_ == PlayState::PLAYING && decoder_) {
-    decoder_->update(deltaTime * playbackRate_);
+    decoder_->update(deltaTime * playbackRate_.load(std::memory_order_acquire));
 
     if (decoder_->getState() == VideoDecoder::PlayState::STOPPED &&
         state_ != PlayState::STOPPED) {
@@ -1301,6 +1264,7 @@ void LayerVideo::renderRetainedOrFallback() {
       rh = lastFallbackH_.load(std::memory_order_acquire);
     }
     if (rw > 0 && rh > 0) {
+      applyContentCrop(retainedId);
       renderer_->renderLayer(retainedId, position_.x, position_.y, rw, rh,
                              rotation_, scale_, getAlpha(), nullptr,
                              effectShapeType, effectShapeParam,
@@ -1314,6 +1278,7 @@ void LayerVideo::renderRetainedOrFallback() {
     int fw = lastFallbackW_.load(std::memory_order_acquire);
     int fh = lastFallbackH_.load(std::memory_order_acquire);
     if (fw > 0 && fh > 0) {
+      applyContentCrop(fallbackId);
       renderer_->renderLayer(fallbackId, position_.x, position_.y, fw, fh, rotation_, scale_,
                              getAlpha(), nullptr, effectShapeType, effectShapeParam,
                              blackToTransparent_, invert_, gaussianBlur_,
@@ -1372,38 +1337,23 @@ void LayerVideo::render() {
     }
 
     if (useUsb) {
+      const bool cropEnabled = getCropLeft() > 0.0f || getCropTop() > 0.0f || getCropRight() > 0.0f || getCropBottom() > 0.0f;
+      usbRenderer_->setContentCrop(cropEnabled, getCropLeft(), getCropTop(), 1.0f - getCropLeft() - getCropRight(), 1.0f - getCropTop() - getCropBottom());
       usbRenderer_->render(
           position_.x, position_.y, renderW, renderH, rotation_, scale_,
           getAlpha(), effectShapeType, effectShapeParam, blackToTransparent_,
-          invert_, fitMode_);
+          invert_, gaussianBlur_, fitMode_);
     } else {
+      const bool cropEnabled = getCropLeft() > 0.0f || getCropTop() > 0.0f || getCropRight() > 0.0f || getCropBottom() > 0.0f;
+      captureRenderer_->setContentCrop(cropEnabled, getCropLeft(), getCropTop(), 1.0f - getCropLeft() - getCropRight(), 1.0f - getCropTop() - getCropBottom());
       const int captureRotation =
           captureRotation_.load(std::memory_order_acquire);
-      const int captureAutoTransform =
-          captureAutoTransform_.load(std::memory_order_acquire);
       const int captureInvert =
-          effectiveCaptureInvert(invert_, captureRotation, captureAutoTransform,
-                                 captureWidth_, captureHeight_, renderW,
-                                 renderH);
-      const int captureFitMode =
-          effectiveCaptureFitMode(fitMode_, captureRotation, captureAutoTransform,
-                                  captureWidth_, captureHeight_, renderW,
-                                  renderH);
-      static int64_t sLastCaptureTransformLogMs = 0;
-      const int64_t transformLogNowMs = steadyNowMs();
-      if (transformLogNowMs - sLastCaptureTransformLogMs >= 3000) {
-        sLastCaptureTransformLogMs = transformLogNowMs;
-        LOG_INFO("[采集自动方向] layer%d render autoTransform=%d "
-                 "captureRotation=%d captureSize=%dx%d draw=%dx%d "
-                 "invert=0x%x fitMode=%d",
-                 layerId_, captureAutoTransform, captureRotation,
-                 captureWidth_, captureHeight_, renderW, renderH,
-                 captureInvert, captureFitMode);
-      }
+          effectiveCaptureInvert(invert_, captureRotation);
       captureRenderer_->render(
           position_.x, position_.y, renderW, renderH, rotation_, scale_,
           getAlpha(), effectShapeType, effectShapeParam, blackToTransparent_,
-          captureInvert, captureFitMode);
+          captureInvert, gaussianBlur_, fitMode_);
     }
     return;
   }
@@ -1488,7 +1438,12 @@ void LayerVideo::render() {
   }
   ++renderSubmitCount_;
   const int64_t renderNowMs = steadyNowMs();
-  if (lastRenderedFrameNumber_ == lastUploadedFrameNumber_) {
+  if (state_ != PlayState::PLAYING) {
+    lastRenderedFrameNumber_ = lastUploadedFrameNumber_;
+    lastRenderedTextureId_ = textureIdToRender;
+    lastRenderSameFrameStartMs_ = renderNowMs;
+    lastRenderSameFrameWarnLogMs_ = 0;
+  } else if (lastRenderedFrameNumber_ == lastUploadedFrameNumber_) {
     if (lastRenderSameFrameStartMs_ == 0) {
       lastRenderSameFrameStartMs_ = renderNowMs;
     }
@@ -1817,6 +1772,7 @@ void LayerVideo::render() {
         }
         effectStackPacked = 0u;
       }
+      applyContentCrop(textureIdToRender);
       renderer_->renderLayerWithColorEffect(
           textureIdToRender, position_.x, position_.y,
           size_.width, size_.height, renderRotation,
@@ -1827,6 +1783,7 @@ void LayerVideo::render() {
       return;
   }
 
+  applyContentCrop(textureIdToRender);
   renderer_->renderLayer(textureIdToRender, position_.x, position_.y,
                          overrideWidth, overrideHeight, renderRotation,
                          renderScale, alpha_, nullptr, effectShapeType,
@@ -2086,6 +2043,7 @@ void LayerVideo::renderSliceWithEffect(uint32_t textureId, int x, int y, int wid
     } else if (!globalShaderEffectActive && parallelAutoSplitSingleEffect > 0) {
       effectStackPacked = 0u;
     }
+    applyContentCrop(textureId);
     renderer_->renderLayerWithColorEffect(
         textureId, x, y, width, height, renderRotation, renderScale,
         effectType, punchyIntensity, 1.0f, finalSliceEffectTime,
@@ -2121,6 +2079,7 @@ void LayerVideo::renderSliceWithEffect(uint32_t textureId, int x, int y, int wid
     uint32_t effectColorPacked =
         packAudioEffectStyle(audioEffectColor_.load(std::memory_order_acquire),
                              audioEffectWidth_.load(std::memory_order_acquire));
+    applyContentCrop(textureId);
     renderer_->renderLayerWithColorEffect(
         textureId, x, y, width, height, renderRotation, renderScale,
         currentUserType, punchyIntensity, alpha, effectTimeDmx,
@@ -2129,6 +2088,7 @@ void LayerVideo::renderSliceWithEffect(uint32_t textureId, int x, int y, int wid
     return;
   }
 
+  applyContentCrop(textureId);
   renderer_->renderLayer(textureId, x, y, width, height, renderRotation,
                          renderScale, alpha, nullptr, effectShapeType,
                          effectShapeParam, blackToTransparent, invert,
@@ -2263,7 +2223,7 @@ bool LayerVideo::renderSliceCapture(const std::string &sliceKey, int x, int y,
                                     float scale, float alpha, int shapeType,
                                     float shapeParam,
                                     bool blackToTransparent, int invert,
-                                    int fitMode) {
+                                    float gaussianBlur, int fitMode) {
   if (!isCaptureLayer() || !renderer_ || sliceKey.empty()) {
     return false;
   }
@@ -2288,39 +2248,41 @@ bool LayerVideo::renderSliceCapture(const std::string &sliceKey, int x, int y,
   }
 
   if (state->captureType == "USB" && state->usbRenderer) {
+    const bool cropEnabled = getCropLeft() > 0.0f || getCropTop() > 0.0f || getCropRight() > 0.0f || getCropBottom() > 0.0f;
+    state->usbRenderer->setContentCrop(cropEnabled, getCropLeft(), getCropTop(), 1.0f - getCropLeft() - getCropRight(), 1.0f - getCropTop() - getCropBottom());
     state->usbRenderer->render(x, y, width, height, rotation, scale, alpha,
                                shapeType, shapeParam, blackToTransparent,
-                               invert, fitMode);
+                               invert, gaussianBlur, fitMode);
     return true;
   }
   if (state->captureRenderer) {
+    const bool cropEnabled = getCropLeft() > 0.0f || getCropTop() > 0.0f || getCropRight() > 0.0f || getCropBottom() > 0.0f;
+    state->captureRenderer->setContentCrop(cropEnabled, getCropLeft(), getCropTop(), 1.0f - getCropLeft() - getCropRight(), 1.0f - getCropTop() - getCropBottom());
     const int captureRotation =
         captureRotation_.load(std::memory_order_acquire);
-    const int captureAutoTransform =
-        captureAutoTransform_.load(std::memory_order_acquire);
     const int captureInvert =
-        effectiveCaptureInvert(invert, captureRotation, captureAutoTransform,
-                               state->captureWidth, state->captureHeight,
-                               width, height);
-    const int captureFitMode =
-        effectiveCaptureFitMode(fitMode, captureRotation, captureAutoTransform,
-                                state->captureWidth, state->captureHeight,
-                                width, height);
+        effectiveCaptureInvert(invert, captureRotation);
     state->captureRenderer->render(x, y, width, height, rotation, scale, alpha,
                                    shapeType, shapeParam, blackToTransparent,
-                                   captureInvert, captureFitMode);
+                                   captureInvert, gaussianBlur, fitMode);
     return true;
   }
   if (state->usbRenderer) {
+    const bool cropEnabled = getCropLeft() > 0.0f || getCropTop() > 0.0f || getCropRight() > 0.0f || getCropBottom() > 0.0f;
+    state->usbRenderer->setContentCrop(cropEnabled, getCropLeft(), getCropTop(), 1.0f - getCropLeft() - getCropRight(), 1.0f - getCropTop() - getCropBottom());
     state->usbRenderer->render(x, y, width, height, rotation, scale, alpha,
                                shapeType, shapeParam, blackToTransparent,
-                               invert, fitMode);
+                               invert, gaussianBlur, fitMode);
     return true;
   }
   return false;
 }
 
 size_t LayerVideo::getDrmPrimeTextureCacheCapacityLocked() const {
+  const int overrideCapacity = getDrmPrimeCachePropertyOverride();
+  const size_t requestedCapacity = overrideCapacity >= 0
+                                       ? static_cast<size_t>(overrideCapacity)
+                                       : 0;
   if (decoder_ && decoder_->isRkmppZeroCopyEnabled()) {
     const int width = decoder_->getWidth();
     const int height = decoder_->getHeight();
@@ -2328,15 +2290,15 @@ size_t LayerVideo::getDrmPrimeTextureCacheCapacityLocked() const {
         static_cast<int64_t>(width) * static_cast<int64_t>(height);
     if ((width >= 4096 && height >= 720) ||
         pixels >= static_cast<int64_t>(3840) * 1080) {
-      return 0;
+      return overrideCapacity >= 0 ? std::min<size_t>(requestedCapacity, 1)
+                                   : 0;
     }
+  }
+  if (overrideCapacity >= 0) {
+    return std::min<size_t>(requestedCapacity, 16);
   }
   size_t capacity = effectiveDrmPrimeCacheCapacity(
       textureImportSuccessCount_, drmPrimeImportMissCount_);
-  const int overrideCapacity = getDrmPrimeCachePropertyOverride();
-  if (overrideCapacity >= 0) {
-    capacity = static_cast<size_t>(overrideCapacity);
-  }
   return std::min<size_t>(capacity, 16);
 }
 
@@ -2382,9 +2344,13 @@ void LayerVideo::releaseDrmPrimeCachedFrame(DecodedFrame *frame) {
     return;
   }
   if (renderer_) {
-    renderer_->deferUntilCurrentFrameFence([frame]() { frame->release(); });
+    // The fence callback may run on the render thread. RKMPP/DRM frame
+    // destruction can block in the driver, so hand the actual release to the
+    // decoder-release worker after the GPU is no longer sampling the frame.
+    renderer_->deferUntilCurrentFrameFence(
+        [frame]() { LayerVideo::releaseDecodedFrameAsync(frame); });
   } else {
-    frame->release();
+    LayerVideo::releaseDecodedFrameAsync(frame);
   }
 }
 
@@ -2496,6 +2462,17 @@ bool LayerVideo::updateVideoTexture() {
   if (isCaptureLayer() || !visible_ || !renderer_) {
     return false;
   }
+  const std::uint64_t syncDeadline =
+      syncPresentationDeadlineNs_.load(std::memory_order_acquire);
+  if (syncDeadline != 0) {
+    const std::uint64_t nowNs = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (nowNs < syncDeadline) {
+      return false;
+    }
+  }
   ScopedLayerVideoStallLog updateStall(layerId_, "updateVideoTexture", 33);
 
   // 音频模式下，跳过渲染。
@@ -2507,7 +2484,7 @@ bool LayerVideo::updateVideoTexture() {
       if (decoder_ && pendingFrames_[nextIdxSkip]) {
         DecodedFrame *frameToRelease = pendingFrames_[nextIdxSkip];
         renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-          frameToRelease->release();
+          LayerVideo::releaseDecodedFrameAsync(frameToRelease);
         });
         pendingFrames_[nextIdxSkip] = nullptr;
       }
@@ -2538,6 +2515,12 @@ bool LayerVideo::updateVideoTexture() {
   }
 
   // 音频模式下，跳过渲染。
+  // Keep the last uploaded texture after STOPPED, but never poll a decoder
+  // that has already reached EOF or has been stopped by the layer state machine.
+  if (state_ == PlayState::STOPPED) {
+    return false;
+  }
+
   if (isAudioOnlyMode_.load(std::memory_order_acquire)) {
     return false;
   }
@@ -2585,7 +2568,7 @@ bool LayerVideo::updateVideoTexture() {
     }
     // 新视频首帧未就绪时，不把 retained texture 塞进正常纹理槽位。
     // 解码器卡帧时，强制停止播放。
-    if (state_ == PlayState::PLAYING) {
+    if (state_ == PlayState::PLAYING && !decoder_->hasReachedVideoStreamEnd()) {
       noFrameStuckCount_++;
       if (noFrameStuckCount_ == 1) {
         noFrameStuckStartTime_ = std::chrono::duration<double>(
@@ -2610,7 +2593,7 @@ bool LayerVideo::updateVideoTexture() {
                   layerId_, stuckElapsed, stuckTimeoutSec, isHighRiskMpegPsFile ? 1 : 0, currentPath_.c_str());
         noFrameStuckCount_ = 0;
         noFrameStuckStartTime_ = 0.0;
-        // HTTP 流卡死时自动重连：unlock 后在后台触发 replay()，避免持锁死锁。
+        // HTTP 流卡死时自动重连：unlock 后在后台请求重新打开媒体，避免持锁死锁。
         // 本地文件卡死则直接 STOPPED（open 失败时 play() 会设回 STOPPED）。
         std::string stuckPath = currentPath_;
         int stuckLoop = loop_;
@@ -2628,7 +2611,7 @@ bool LayerVideo::updateVideoTexture() {
           decoder_->signalStop();
         }
         if (AudioPlayerManager::getInstance().hasAudioFocusForLayer(layerId_)) {
-          AudioPlayerManager::getInstance().setCurrentAudioLayerId(0);
+          // Engine::syncAudioOutputLayer() is the single focus-layer writer.
           if (auto *ap = AudioPlayerManager::getInstance().getAudioPlayer()) {
             ap->flush();
           }
@@ -2700,7 +2683,12 @@ bool LayerVideo::updateVideoTexture() {
                 textureIds_[currentTextureIndex_],
                 currentPath_.c_str());
     }
+    const double currentPosition = decoder_->getCurrentPosition();
+    const double duration = decoder_->getDuration();
+    const bool nearNaturalEnd = decoder_->hasReachedVideoStreamEnd() ||
+                                (duration > 0.0 && currentPosition >= duration - 1.5);
     if (state_ == PlayState::PLAYING && duplicateSameMs >= 8000 &&
+        !nearNaturalEnd &&
         (lastDuplicateFrameRecoveryMs_ == 0 ||
          nowMs - lastDuplicateFrameRecoveryMs_ >= 15000) &&
         !currentPath_.empty()) {
@@ -2886,6 +2874,25 @@ bool LayerVideo::updateVideoTexture() {
     textureIds_[nextTextureIndex] = createTargetId;
     currentTextureIndex_ = nextTextureIndex;
     lastUploadedFrameNumber_ = uploadingFrameNumber;
+    if (syncFirstFrameTraceEnabled_.load(std::memory_order_acquire) &&
+        !syncFirstFrameLogged_.exchange(true, std::memory_order_acq_rel)) {
+      const auto firstFrameNow = std::chrono::steady_clock::now();
+      const std::uint64_t firstFrameNs = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              firstFrameNow.time_since_epoch())
+              .count());
+      const std::uint64_t deadlineNs =
+          syncTraceDeadlineNs_.load(std::memory_order_acquire);
+      LOG_INFO("[SyncPlayback] layer=%d first frame submitted pts=%.3f actual=%llu deadline=%llu firstFrameDeltaMs=%.3f",
+               layerId_, uploadingFrameNumber >= 0 && importedFrameForLog
+                            ? importedFrameForLog->pts
+                            : -1.0,
+               static_cast<unsigned long long>(firstFrameNs),
+               static_cast<unsigned long long>(deadlineNs),
+               static_cast<double>(static_cast<int64_t>(firstFrameNs) -
+                                  static_cast<int64_t>(deadlineNs)) /
+                   1000000.0);
+    }
 
     // 新视频首帧就绪，释放旧 retained texture。
     uint32_t retainedId = retainedLastFrameTextureId_.load(std::memory_order_acquire);
@@ -2901,7 +2908,7 @@ bool LayerVideo::updateVideoTexture() {
         DecodedFrame *frameToRelease = retainedLastFrame_;
         retainedLastFrame_ = nullptr;
         renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-          frameToRelease->release();
+          LayerVideo::releaseDecodedFrameAsync(frameToRelease);
         });
       }
       // 释放旧 fallback texture。
@@ -2919,7 +2926,7 @@ bool LayerVideo::updateVideoTexture() {
         DecodedFrame *frameToRelease = retainedLastFrame_;
         retainedLastFrame_ = nullptr;
         renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-          frameToRelease->release();
+          LayerVideo::releaseDecodedFrameAsync(frameToRelease);
         });
       }
       // 释放旧 fallback texture。
@@ -2956,7 +2963,7 @@ bool LayerVideo::updateVideoTexture() {
               DecodedFrame *frameToRelease = cleanupFrames[i];
               if (renderer_) {
                 renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-                  frameToRelease->release();
+                  LayerVideo::releaseDecodedFrameAsync(frameToRelease);
                 });
               } else {
                 cleanupDecoder->releaseFrame(frameToRelease);

@@ -19,3 +19,12 @@ target_link_libraries(hsvj_local_vod
         hsvj_playcontrol
         hsvj_layer
 )
+
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_local_vod PRIVATE
+    hsvj_core
+    hsvj_foundation
+    hsvj_layer
+    hsvj_playcontrol
+    hsvj_utils
+)

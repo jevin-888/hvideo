@@ -16,6 +16,7 @@
 #include <aaudio/AAudio.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -23,6 +24,15 @@
 #endif
 
 namespace hsvj {
+
+#ifdef __ANDROID__
+namespace {
+int64_t audioMonotonicNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace
+#endif
 
 AudioPlayer::AudioPlayer()
 #ifdef __ANDROID__
@@ -41,12 +51,24 @@ AudioPlayer::~AudioPlayer() { shutdown(); }
 bool AudioPlayer::initialize(int32_t sampleRate, int32_t channelCount,
                              int32_t format, int32_t deviceId) {
 #ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
   LOG_DEBUG("[AudioPlayer] initialize started: sampleRate=%d, channels=%d, format=%d",
            sampleRate, channelCount, format);
 
   shutdown();
 
+  playbackPaused_ = false;
+  startTargetFrames_ = 1;
+  startMaxWaitMs_ = 0;
+  firstQueuedPcm_ = {};
+  underrunActive_.store(false, std::memory_order_release);
+  inputEnded_.store(false, std::memory_order_release);
+  underrunCallbacks_.store(0, std::memory_order_release);
   needsReinit_.store(false, std::memory_order_release);
+  appFramesConsumed_.store(0, std::memory_order_release);
+  appFramesWritten_.store(0, std::memory_order_release);
+  outputStartedAtNs_.store(0, std::memory_order_release);
+  lastOutputCallbackNs_.store(0, std::memory_order_release);
   sampleRate_ = sampleRate;
   channelCount_ = channelCount;
   format_ = format;
@@ -76,8 +98,16 @@ bool AudioPlayer::initialize(int32_t sampleRate, int32_t channelCount,
 
   // 配置音频流参数
   AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
+  // Use the normal shared mixer path for the long-running player.  The RK356x
+  // HDMI route exposes a Fast Track when LOW_LATENCY is requested; that track
+  // is periodically removed/re-added by the platform audio policy during
+  // HDMI/headphone route reconciliation, which produces a short mute even
+  // while the PCM queue is healthy.  Shared mixer output keeps the stream
+  // attached to the primary output across those policy updates.  The player
+  // already keeps about a second of PCM queued, so the extra mixer latency is
+  // preferable to a route-induced audible gap.
   AAudioStreamBuilder_setPerformanceMode(builder,
-                                         AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+                                         AAUDIO_PERFORMANCE_MODE_NONE);
   AAudioStreamBuilder_setFormat(builder, format_);
   AAudioStreamBuilder_setChannelCount(builder, channelCount_);
   AAudioStreamBuilder_setSampleRate(builder, sampleRate_);
@@ -98,17 +128,10 @@ bool AudioPlayer::initialize(int32_t sampleRate, int32_t channelCount,
   AAudioStreamBuilder_setDataCallback(builder, dataCallback, this);
   AAudioStreamBuilder_setErrorCallback(builder, errorCallback, this);
 
-  // 优先 EXCLUSIVE：直通 HAL，AAudioStream_getTimestamp() 通常可用，
-  // 视频时钟可以用真实硬件出声时间锁定，免除经验补偿。
-  // 若 EXCLUSIVE 被占用或不支持（多数情况下 RK3588 HDMI 支持），自动回退 SHARED。
-  AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_EXCLUSIVE);
-  LOG_DEBUG("[AudioPlayer] Trying AAudio EXCLUSIVE mode first...");
+  // Explicitly request SHARED.  Exclusive output is not suitable for a
+  // device whose HDMI and wired-headphone ports are managed by AudioPolicy.
+  AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
   result = AAudioStreamBuilder_openStream(builder, &stream_);
-  if (result != AAUDIO_OK) {
-    LOG_WARN("[AudioPlayer] EXCLUSIVE mode unavailable (%d), falling back to SHARED", result);
-    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
-    result = AAudioStreamBuilder_openStream(builder, &stream_);
-  }
   if (result != AAUDIO_OK) {
     LOG_ERROR("[AudioPlayer] Failed to open AAudio stream: %d", result);
     AAudioStreamBuilder_delete(builder);
@@ -166,6 +189,9 @@ bool AudioPlayer::initialize(int32_t sampleRate, int32_t channelCount,
              sampleRate_, actualSampleRate);
   }
 
+  LOG_INFO("[AudioPlayer] Long-running audio clock uses 64-bit application "
+           "counters; unsafe AAudio frame queries are disabled");
+
   // 清理构建器
   AAudioStreamBuilder_delete(builder);
 
@@ -177,6 +203,7 @@ bool AudioPlayer::initialize(int32_t sampleRate, int32_t channelCount,
 
 void AudioPlayer::shutdown() {
 #ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
   std::lock_guard<std::mutex> writeLock(writeMutex_);
   LOG_DEBUG("[AudioPlayer] Shutdown starting...");
   
@@ -235,27 +262,56 @@ void AudioPlayer::shutdown() {
 
 bool AudioPlayer::start() {
 #ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
   LOG_DEBUG("[AudioPlayer] start() called, stream_=%p", (void*)stream_);
 
   if (!stream_) {
     LOG_ERROR("[AudioPlayer] Not initialized, cannot start");
     return false;
   }
+  if (needsReinit()) return false;
 
+  playbackPaused_ = false;
   aaudio_stream_state_t state = AAudioStream_getState(stream_);
   if (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING) {
+    // pause() disarms the watchdog. A retained STARTING state must not leave
+    // it permanently disarmed when start() skips the actual requestStart.
+    int64_t unarmed = 0;
+    outputStartedAtNs_.compare_exchange_strong(unarmed, audioMonotonicNs(),
+                                               std::memory_order_acq_rel);
     playing_ = true;
     LOG_DEBUG("[AudioPlayer] Stream already started/starting (state=%d), skip requestStart", state);
     return true;
   }
 
+  const int32_t pending = getPendingFrames();
+  if (pending == 0) {
+    LOG_INFO("[AudioPlayer] start deferred until first PCM is queued");
+    return true;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (firstQueuedPcm_ == std::chrono::steady_clock::time_point{}) firstQueuedPcm_ = now;
+  const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - firstQueuedPcm_).count();
+  if (pending < startTargetFrames_ && waitedMs < startMaxWaitMs_) return true;
+
+  // Arm before requestStart, which may dispatch the first callback immediately.
+  lastOutputCallbackNs_.store(0, std::memory_order_release);
+  outputStartedAtNs_.store(audioMonotonicNs(), std::memory_order_release);
   aaudio_result_t result = AAudioStream_requestStart(stream_);
   if (result != AAUDIO_OK) {
+    playing_.store(false, std::memory_order_release);
     LOG_ERROR("[AudioPlayer] Failed to start AAudio stream: %d", result);
+    markNeedsReinit("start_request_failed");
     return false;
   }
 
   playing_ = true;
+  firstQueuedPcm_ = {};
+  LOG_INFO("[AudioPlayer] PCM ready; output started: queued=%d target=%d waited=%lldms",
+           pending, startTargetFrames_, static_cast<long long>(waitedMs));
+  startTargetFrames_ = 1;
+  startMaxWaitMs_ = 0;
 
   state = AAudioStream_getState(stream_);
   int32_t bufferSize = AAudioStream_getBufferSizeInFrames(stream_);
@@ -268,13 +324,44 @@ bool AudioPlayer::start() {
 #endif
 }
 
+void AudioPlayer::prepareForPlayback(int32_t targetFrames, int32_t maxWaitMs) {
+#ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
+
+  // Route changes must reach zero before AAudio pauses its retained buffer.
+  if (stream_ && playing_.load(std::memory_order_acquire)) fadeOut(8);
+  pause();
+  flush();
+  startTargetFrames_ = std::clamp(targetFrames, 1, 65536);
+  startMaxWaitMs_ = std::clamp(maxWaitMs, 0, 2000);
+  firstQueuedPcm_ = {};
+  playbackPaused_ = false;
+#else
+  (void)targetFrames;
+  (void)maxWaitMs;
+#endif
+}
+
 void AudioPlayer::stop() {
 #ifdef __ANDROID__
-  if (!stream_ || !playing_) {
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
+  outputStartedAtNs_.store(0, std::memory_order_release);
+  playbackPaused_ = true;
+  firstQueuedPcm_ = {};
+  if (!stream_) {
     return;
   }
 
   LOG_DEBUG("[AudioPlayer] Stopping stream...");
+
+  const auto stateBeforeStop = AAudioStream_getState(stream_);
+  if (stateBeforeStop == AAUDIO_STREAM_STATE_PAUSED ||
+      stateBeforeStop == AAUDIO_STREAM_STATE_STOPPED ||
+      stateBeforeStop == AAUDIO_STREAM_STATE_OPEN ||
+      stateBeforeStop == AAUDIO_STREAM_STATE_FLUSHED) {
+    playing_ = false;
+    return;
+  }
 
   // 浣跨敤 requestPause 鑰屼笉鏄?requestStop锛屽洜涓?pause 鏇村彲闈?
   aaudio_result_t result = AAudioStream_requestPause(stream_);
@@ -307,21 +394,94 @@ void AudioPlayer::stop() {
 #endif
 }
 
+void AudioPlayer::finishInput(uint64_t generation) {
+#ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
+  if (generation != acceptedPcmGeneration_.load(std::memory_order_acquire)) return;
+  inputEnded_.store(true, std::memory_order_release);
+  // A short clip may never fill the startup target; play all queued samples.
+  startTargetFrames_ = 1;
+  startMaxWaitMs_ = 0;
+  if (!playbackPaused_ && getPendingFrames() > 0) start();
+#else
+  (void)generation;
+#endif
+}
+
 void AudioPlayer::pause() {
 #ifdef __ANDROID__
-  if (!stream_ || !playing_) {
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
+  outputStartedAtNs_.store(0, std::memory_order_release);
+  playbackPaused_ = true;
+  firstQueuedPcm_ = {};
+  if (!stream_) {
     return;
+  }
+
+  const auto state = AAudioStream_getState(stream_);
+  if (state == AAUDIO_STREAM_STATE_PAUSED || state == AAUDIO_STREAM_STATE_STOPPED ||
+      state == AAUDIO_STREAM_STATE_OPEN || state == AAUDIO_STREAM_STATE_FLUSHED) {
+    playing_ = false;
+    return;
+  }
+  if (fadeOutRequested_.load(std::memory_order_acquire) &&
+      !shuttingDown_.load(std::memory_order_acquire) &&
+      (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING)) {
+    const auto began = std::chrono::steady_clock::now();
+    const auto deadline = began + std::chrono::milliseconds(350);
+    while (!fadeComplete_.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool faded = fadeComplete_.load(std::memory_order_acquire);
+    const int64_t silentBoundary = appFramesWritten_.load(std::memory_order_acquire);
+    // A completed callback is not yet audible: let the zero boundary reach the
+    // device timestamp before pausing. Missing timestamps use a bounded mixer
+    // buffer duration plus a small guard; no unbounded hardware wait.
+    const auto fallbackEnd = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::clamp(
+            AAudioStream_getBufferSizeInFrames(stream_) * 1000 / std::max(1, sampleRate_) + 30,
+            30, 300));
+    bool drained = false;
+    while (faded && std::chrono::steady_clock::now() < deadline) {
+      int64_t position = 0, timeNs = 0;
+      if (getAAudioPresentationTimestamp(position, timeNs)) {
+        struct timespec nowTs {};
+        clock_gettime(CLOCK_MONOTONIC, &nowTs);
+        const int64_t nowNs = static_cast<int64_t>(nowTs.tv_sec) * 1000000000LL + nowTs.tv_nsec;
+        const int64_t boundaryNs = timeNs + (silentBoundary - position) * 1000000000LL /
+                                              std::max(1, sampleRate_);
+        drained = nowNs >= boundaryNs;
+      } else {
+        drained = std::chrono::steady_clock::now() >= fallbackEnd;
+      }
+      if (drained) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    LOG_INFO("[AudioPlayer] Transition quiet: faded=%d drained=%d wait=%lldms",
+             faded ? 1 : 0, drained ? 1 : 0,
+             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - began).count()));
   }
 
   aaudio_result_t result = AAudioStream_requestPause(stream_);
   if (result == AAUDIO_OK) {
     // 等待 for stream to fully pause (max 50ms)
     aaudio_stream_state_t currentState = AAudioStream_getState(stream_);
-    aaudio_stream_state_t nextState;
+    aaudio_stream_state_t nextState = currentState;
     if (currentState == AAUDIO_STREAM_STATE_PAUSING) {
       AAudioStream_waitForStateChange(stream_, AAUDIO_STREAM_STATE_PAUSING,
                                       &nextState, 50 * 1000000LL); // 50ms
     }
+  }
+  const auto pausedState = AAudioStream_getState(stream_);
+  if (result != AAUDIO_OK ||
+      (pausedState != AAUDIO_STREAM_STATE_PAUSED &&
+       pausedState != AAUDIO_STREAM_STATE_STOPPED &&
+       pausedState != AAUDIO_STREAM_STATE_OPEN &&
+       pausedState != AAUDIO_STREAM_STATE_FLUSHED)) {
+    // Do not reuse a half-paused legacy AudioTrack in the next seek/route.
+    markNeedsReinit("pause_transition_incomplete");
   }
   playing_ = false; // 更新状态标记
   LOG_DEBUG("AudioPlayer paused");
@@ -329,34 +489,14 @@ void AudioPlayer::pause() {
 }
 
 void AudioPlayer::resume() {
-#ifdef __ANDROID__
-  if (!stream_) {
-    return;
-  }
-
-  if (playing_) {
-    return;
-  }
-
-  aaudio_stream_state_t state = AAudioStream_getState(stream_);
-  if (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING) {
-    playing_ = true;
-    LOG_DEBUG("[AudioPlayer] resume: stream already started/starting (state=%d)", state);
-    return;
-  }
-
-  aaudio_result_t result = AAudioStream_requestStart(stream_);
-  if (result != AAUDIO_OK) {
-    LOG_ERROR("[AudioPlayer] resume: requestStart failed: %d", result);
-    return;
-  }
-  playing_ = true;
-  LOG_DEBUG("[AudioPlayer] resumed");
-#endif
+  start();
 }
 
 void AudioPlayer::flush() {
 #ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
+  inputEnded_.store(false, std::memory_order_release);
+  firstQueuedPcm_ = {};
   // 清空音频队列，避免残留数据形成尾音
   {
     std::lock_guard<std::mutex> lock(queueMutex_);
@@ -365,15 +505,36 @@ void AudioPlayer::flush() {
       audioQueue_.pop();
       delete[] item.data;
     }
+    // Reset the envelope under the same lock as the PCM queue.
+    currentVolume_.store(0.0f);
+    targetVolume_.store(0.0f);
+    volumeStep_.store(0.0f);
+    fadeComplete_.store(true);
+    pendingFadeInAfterFlush_.store(true, std::memory_order_release);
   }
-  // 切歌/音轨切换防爆音：把当前音量强制归零，并标记"下次 write() 自动淡入"。
-  // 这样上层无论淡出是否完成、淡入是否按时调用，新歌首批样本一定从 0 开始爬升。
-  currentVolume_.store(0.0f);
-  targetVolume_.store(0.0f);
-  volumeStep_.store(0.0f);
-  fadeComplete_.store(true);  // 保持当前 0 音量，直到 write() 触发淡入
-  pendingFadeInAfterFlush_.store(true, std::memory_order_release);
   LOG_DEBUG("AudioPlayer queue flushed; volume zeroed, fade-in armed for next write");
+#endif
+}
+
+void AudioPlayer::switchPcmGeneration(uint64_t generation) {
+#ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
+  // Pause before clearing the queue, and serialize with producer writes.
+  // The new source applies its own preroll; realtime routes must not inherit
+  // the longer buffering policy used by DecoderCore for file playback.
+  prepareForPlayback();
+  underrunActive_.store(false, std::memory_order_release);
+  // Publish ownership while output is paused. Waiting old producers must
+  // recheck their generation after acquiring streamMutex_.
+  {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    acceptedPcmGeneration_.store(generation, std::memory_order_release);
+  }
+  queueCondition_.notify_all();
+  LOG_INFO("[AudioPlayer] PCM route switched: generation=%llu, queued audio discarded",
+           static_cast<unsigned long long>(generation));
+#else
+  (void)generation;
 #endif
 }
 
@@ -401,6 +562,7 @@ void AudioPlayer::setQueueBackpressureWaitMs(int32_t waitMs) {
 
 bool AudioPlayer::setBufferSizeInBursts(int32_t burstCount) {
 #ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
   if (!stream_) {
     return false;
   }
@@ -449,6 +611,7 @@ void AudioPlayer::setAutoFadeInDurationMs(int32_t durationMs) {
 
 void AudioPlayer::markNeedsReinit(const char* reason) {
 #ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
   bool already = needsReinit_.exchange(true, std::memory_order_acq_rel);
   if (!already) {
     aaudio_stream_state_t state = stream_ ? AAudioStream_getState(stream_) : AAUDIO_STREAM_STATE_UNINITIALIZED;
@@ -461,8 +624,12 @@ void AudioPlayer::markNeedsReinit(const char* reason) {
 #endif
 }
 
-int32_t AudioPlayer::write(const void *data, int32_t numFrames) {
+int32_t AudioPlayer::write(const void *data, int32_t numFrames, uint64_t generation) {
 #ifdef __ANDROID__
+  if (generation != acceptedPcmGeneration_.load(std::memory_order_acquire)) {
+    return 0;
+  }
+
   if (!data || numFrames <= 0) {
     static int invalidWriteCount = 0;
     if (invalidWriteCount++ % 100 == 0) {
@@ -474,7 +641,11 @@ int32_t AudioPlayer::write(const void *data, int32_t numFrames) {
 
   // CRITICAL: 浣跨敤浜掓枼閿佷繚鎶ゆ暣涓?write() 鏂规硶
   // 閬垮厤鍙岃В鐮佸櫒鍒囨崲鏃朵袱涓В鐮佸櫒鍚屾椂鍐欏叆瀵艰嚧绔炴€佸拰宕╂簝
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
   std::lock_guard<std::mutex> writeLock(writeMutex_);
+  if (generation != acceptedPcmGeneration_.load(std::memory_order_acquire)) {
+    return 0;
+  }
   
   if (!stream_) {
     static int warnNoStream = 0;
@@ -485,7 +656,7 @@ int32_t AudioPlayer::write(const void *data, int32_t numFrames) {
   }
 
   // 濡傛灉闇€瑕侀噸鏂板垵濮嬪寲锛屾嫆缁濆啓鍏?
-  if (needsReinit_.load(std::memory_order_acquire)) {
+  if (needsReinit()) {
     static int warnNeedsReinit = 0;
     if (warnNeedsReinit++ % 100 == 0) {
       LOG_WARN("AudioPlayer::write: needs reinit, dropping audio data");
@@ -493,12 +664,27 @@ int32_t AudioPlayer::write(const void *data, int32_t numFrames) {
     return 0;
   }
 
-  if (!playing_) {
-    aaudio_stream_state_t state = stream_ ? AAudioStream_getState(stream_) : AAUDIO_STREAM_STATE_UNINITIALIZED;
-    if (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING) {
-      playing_.store(true, std::memory_order_release);
+  // playing_ is only a cache. The actual AAudio state is authoritative because
+  // reinitialization can replace the stream while an older start() is completing.
+  aaudio_stream_state_t state = AAudioStream_getState(stream_);
+  if (state == AAUDIO_STREAM_STATE_STARTED ||
+      state == AAUDIO_STREAM_STATE_STARTING) {
+    if (!playing_.exchange(true, std::memory_order_acq_rel)) {
       LOG_WARN("AudioPlayer::write: repaired stale playing flag while stream state=%d", state);
     }
+  } else {
+    playing_.store(false, std::memory_order_release);
+    const bool restartable =
+        state == AAUDIO_STREAM_STATE_OPEN ||
+        state == AAUDIO_STREAM_STATE_PAUSED ||
+        state == AAUDIO_STREAM_STATE_STOPPED ||
+        state == AAUDIO_STREAM_STATE_FLUSHED;
+    if (!restartable) {
+      markNeedsReinit("write_stream_invalid_state");
+      return 0;
+    }
+
+    // Queue PCM before requesting start; never start on an empty queue.
   }
 
   // 鑳屽帇鎺у埗锛氶槦鍒楁弧鏃堕樆濉炵瓑寰呮秷璐规柟鑵惧嚭绌洪棿锛岄伩鍏嶄涪甯?
@@ -510,10 +696,14 @@ int32_t AudioPlayer::write(const void *data, int32_t numFrames) {
 
   {
     std::unique_lock<std::mutex> lock(queueMutex_);
-    bool hasSpace = queueCondition_.wait_for(lock, WAIT_TIMEOUT, [this, MAX_QUEUE_SIZE] {
+    bool hasSpace = queueCondition_.wait_for(lock, WAIT_TIMEOUT, [this, MAX_QUEUE_SIZE, generation] {
       return audioQueue_.size() < MAX_QUEUE_SIZE ||
-             shuttingDown_.load(std::memory_order_acquire);
+             shuttingDown_.load(std::memory_order_acquire) ||
+             generation != acceptedPcmGeneration_.load(std::memory_order_acquire);
       });
+    if (generation != acceptedPcmGeneration_.load(std::memory_order_acquire)) {
+      return 0;
+    }
     if (shuttingDown_.load(std::memory_order_acquire)) {
       aaudio_stream_state_t state = stream_ ? AAudioStream_getState(stream_) : AAUDIO_STREAM_STATE_UNINITIALIZED;
       static int dropCount = 0;
@@ -573,8 +763,11 @@ int32_t AudioPlayer::write(const void *data, int32_t numFrames) {
   // Add to queue (including 帧 count info)
   {
     std::lock_guard<std::mutex> lock(queueMutex_);
-    audioQueue_.push(AudioQueueItem(buffer, numFrames));
-
+    if (generation != acceptedPcmGeneration_.load(std::memory_order_acquire)) {
+      delete[] buffer;
+      return 0;
+    }
+    audioQueue_.push(AudioQueueItem(buffer, numFrames, generation));
   }
   queueCondition_.notify_one();
 
@@ -588,13 +781,34 @@ int32_t AudioPlayer::write(const void *data, int32_t numFrames) {
               durMs, volume_.load());
   }
 
+  if (!playbackPaused_ && !playing_.load(std::memory_order_acquire)) {
+    // Start only after a small queue is safely accumulated. This prevents the
+    // callback from consuming the first decoder packet while the next packet
+    // is still being demuxed.
+    start();
+  }
   return numFrames;
 #else
   return 0;
 #endif
 }
 
+void AudioPlayer::setOutputGainDb(int gainDb) {
+#ifdef __ANDROID__
+  const int value = std::clamp(gainDb, 0, 10);
+  if (outputGainDb_.exchange(value, std::memory_order_relaxed) != value) {
+    LOG_INFO("[AudioPlayer] VOD output gain=%d dB", value);
+  }
+#else
+  (void)gainDb;
+#endif
+}
+
 void AudioPlayer::setVolume(float volume) {
+#ifdef __ANDROID__
+  std::lock_guard<std::mutex> lock(queueMutex_);
+  fadeOutRequested_ = false;
+#endif
   float clampedVolume = std::max(0.0f, std::min(1.0f, volume));
   volume_ = clampedVolume;
   // 立即设置音量时，同步更新当前音量和目标音量
@@ -606,8 +820,11 @@ void AudioPlayer::setVolume(float volume) {
 
 void AudioPlayer::setTargetVolume(float volume) {
 #ifdef __ANDROID__
+  std::lock_guard<std::mutex> lock(queueMutex_);
   float clampedVolume = std::max(0.0f, std::min(1.0f, volume));
   volume_ = clampedVolume;
+  // Keep intentional transition silence until the next PCM fade-in.
+  if (fadeOutRequested_.load(std::memory_order_acquire)) return;
   if (!pendingFadeInAfterFlush_.load(std::memory_order_acquire) &&
       fadeComplete_.load(std::memory_order_acquire)) {
     targetVolume_ = clampedVolume;
@@ -633,28 +850,15 @@ void AudioPlayer::setAudioDataCallback(AudioDataCallback callback) {
 
 void AudioPlayer::fadeToVolume(float targetVolume, int32_t durationMs) {
 #ifdef __ANDROID__
-  float clampedTarget = std::max(0.0f, std::min(1.0f, targetVolume));
+  std::lock_guard<std::mutex> lock(queueMutex_);
+  const float clampedTarget = std::clamp(targetVolume, 0.0f, 1.0f);
+  fadeOutRequested_.store(clampedTarget == 0.0f, std::memory_order_release);
+  const float frames = std::max(1.0f, sampleRate_ * (durationMs / 1000.0f));
+  const float current = currentVolume_.load();
   targetVolume_ = clampedTarget;
+  volumeStep_ = (clampedTarget - current) / frames;
+  fadeComplete_ = current == clampedTarget;
 
-  // 计算每帧音量变化步长
-  // 按 48000Hz 采样率估算，每次回调约 256 帧，即每秒约 187 次回调
-  // 更精确的计算基于实际采样率和缓冲区大小
-  float framesPerCallback = 256.0f; // AAudio 典型值
-  float callbacksPerSecond = sampleRate_ / framesPerCallback;
-  float totalCallbacks = (durationMs / 1000.0f) * callbacksPerSecond;
-
-  if (totalCallbacks < 1.0f) {
-    totalCallbacks = 1.0f;
-  }
-
-  float currentVol = currentVolume_.load();
-  float volumeDiff = clampedTarget - currentVol;
-  volumeStep_ = volumeDiff / totalCallbacks;
-  fadeComplete_ = false;
-
-  LOG_DEBUG(
-      "AudioPlayer::fadeToVolume: from %.2f to %.2f, step=%.4f, duration=%dms",
-      currentVol, clampedTarget, volumeStep_.load(), durationMs);
 #endif
 }
 
@@ -700,6 +904,7 @@ void AudioPlayer::setAudioChannelMode(AudioChannelMode mode) {
 
 int32_t AudioPlayer::getBufferSizeInFrames() const {
 #ifdef __ANDROID__
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
   if (!stream_) {
     return 0;
   }
@@ -709,11 +914,51 @@ int32_t AudioPlayer::getBufferSizeInFrames() const {
 #endif
 }
 
+bool AudioPlayer::needsReinit() const {
+#ifdef __ANDROID__
+  if (needsReinit_.load(std::memory_order_acquire)) return true;
+  // Poll from the producer/demux thread, never from the real-time callback.
+  // An Android legacy output can lose its callback without an error callback
+  // and stay STARTING indefinitely. Do not treat timed-out PCM drops as sound.
+  std::unique_lock<std::recursive_mutex> lock(streamMutex_, std::try_to_lock);
+  if (lock.owns_lock() && stream_ && !playbackPaused_ &&
+      playing_.load(std::memory_order_acquire) &&
+      !shuttingDown_.load(std::memory_order_acquire)) {
+    const int64_t started = outputStartedAtNs_.load(std::memory_order_acquire);
+    const int64_t progress = lastOutputCallbackNs_.load(std::memory_order_acquire);
+    const int64_t age = audioMonotonicNs() - std::max(started, progress);
+    if (started > 0 && age >= 1500000000LL &&
+        !needsReinit_.exchange(true, std::memory_order_acq_rel)) {
+      LOG_WARN("[AudioPlayer] output callback stalled: age=%lldms state=%d; rebuild required",
+               static_cast<long long>(age / 1000000), AAudioStream_getState(stream_));
+    }
+  }
+  return needsReinit_.load(std::memory_order_acquire);
+#else
+  return false;
+#endif
+}
+
+bool AudioPlayer::isOutputProgressing() const {
+#ifdef __ANDROID__
+  const int64_t progress = lastOutputCallbackNs_.load(std::memory_order_acquire);
+  return outputStartedAtNs_.load(std::memory_order_acquire) > 0 &&
+         playing_.load(std::memory_order_acquire) &&
+         !needsReinit_.load(std::memory_order_acquire) && progress > 0 &&
+         audioMonotonicNs() - progress < 750000000LL;
+#else
+  return false;
+#endif
+}
+
 int64_t AudioPlayer::getAAudioFramesRead() const {
 #ifdef __ANDROID__
-  if (!stream_) return 0;
-  int64_t framesRead = AAudioStream_getFramesRead(stream_);
-  return framesRead > 0 ? framesRead : 0;
+  int64_t timestampFrames = 0;
+  int64_t timestampNanos = 0;
+  if (getAAudioPresentationTimestamp(timestampFrames, timestampNanos)) {
+    return std::max<int64_t>(0, timestampFrames);
+  }
+  return appFramesConsumed_.load(std::memory_order_acquire);
 #else
   return 0;
 #endif
@@ -721,9 +966,7 @@ int64_t AudioPlayer::getAAudioFramesRead() const {
 
 int64_t AudioPlayer::getAAudioFramesWritten() const {
 #ifdef __ANDROID__
-  if (!stream_) return 0;
-  int64_t framesWritten = AAudioStream_getFramesWritten(stream_);
-  return framesWritten > 0 ? framesWritten : 0;
+  return appFramesWritten_.load(std::memory_order_acquire);
 #else
   return 0;
 #endif
@@ -732,7 +975,8 @@ int64_t AudioPlayer::getAAudioFramesWritten() const {
 bool AudioPlayer::getAAudioPresentationTimestamp(int64_t &framePosition,
                                                   int64_t &timeNanos) const {
 #ifdef __ANDROID__
-  if (!stream_) return false;
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
+  if (!stream_ || needsReinit_.load(std::memory_order_acquire)) return false;
   int64_t fp = 0;
   int64_t tn = 0;
   // CLOCK_MONOTONIC：与 std::chrono::steady_clock 同源，可直接互转。
@@ -740,6 +984,8 @@ bool AudioPlayer::getAAudioPresentationTimestamp(int64_t &framePosition,
   aaudio_result_t res = AAudioStream_getTimestamp(stream_, CLOCK_MONOTONIC, &fp, &tn);
   if (res != AAUDIO_OK) return false;
   if (fp < 0 || tn <= 0) return false;
+  // AAudio's timestamp position is a 64-bit hardware timeline and does not
+  // use the Android 11 legacy getFramesRead() path that can abort on rollover.
   framePosition = fp;
   timeNanos = tn;
   return true;
@@ -752,12 +998,9 @@ bool AudioPlayer::getAAudioPresentationTimestamp(int64_t &framePosition,
 
 int32_t AudioPlayer::getAAudioInFlightFrames() const {
 #ifdef __ANDROID__
-  if (!stream_) return 0;
-  int64_t framesWritten = AAudioStream_getFramesWritten(stream_);
-  int64_t framesRead = AAudioStream_getFramesRead(stream_);
-  if (framesWritten <= 0 || framesRead < 0) return 0;
-  int64_t inFlight = framesWritten - framesRead;
-  if (inFlight < 0) inFlight = 0;
+  // The queue is the part of the stream we own. It remains meaningful across
+  // AAudio counter rollover and naturally excludes PCM discarded by flush().
+  int64_t inFlight = std::max<int32_t>(0, getPendingFrames());
   if (inFlight > INT32_MAX) inFlight = INT32_MAX;
   return static_cast<int32_t>(inFlight);
 #else
@@ -767,10 +1010,15 @@ int32_t AudioPlayer::getAAudioInFlightFrames() const {
 
 double AudioPlayer::estimatedOutputDelaySeconds() const {
 #ifdef __ANDROID__
-  if (!stream_ || sampleRate_ <= 0) return 0.0;
+  std::lock_guard<std::recursive_mutex> streamLock(streamMutex_);
+  if (!stream_ || sampleRate_ <= 0 ||
+      needsReinit_.load(std::memory_order_acquire)) {
+    return 0.0;
+  }
 
-  const int64_t framesWritten = AAudioStream_getFramesWritten(stream_);
-  if (framesWritten <= 0) return 0.0;
+  const int64_t framesSupplied =
+      appFramesWritten_.load(std::memory_order_acquire);
+  if (framesSupplied <= 0) return 0.0;
 
   // 优先：AAudioStream_getTimestamp 直接给出"该帧将于 hwTimeNs 出声"。
   //   字段说明：delay = (framesWritten - hwFramePos) / sampleRate
@@ -779,20 +1027,22 @@ double AudioPlayer::estimatedOutputDelaySeconds() const {
   double instantSec = -1.0;
   int64_t hwFramePos = 0;
   int64_t hwTimeNs = 0;
-  aaudio_result_t res = AAudioStream_getTimestamp(stream_, CLOCK_MONOTONIC,
-                                                  &hwFramePos, &hwTimeNs);
-  if (res == AAUDIO_OK && hwFramePos > 0 && hwTimeNs > 0 &&
-      framesWritten >= hwFramePos) {
-    int64_t framesAhead = framesWritten - hwFramePos;
+  const bool timestampOk = getAAudioPresentationTimestamp(hwFramePos, hwTimeNs);
+  if (timestampOk && hwFramePos >= 0 && hwTimeNs > 0 &&
+      framesSupplied >= hwFramePos) {
+    // The callback-supplied counter and the hardware timestamp are both
+    // stream-relative frame positions. Their delta is the currently buffered
+    // output, without touching AAudio's unsafe legacy cumulative getters.
+    int64_t framesAhead = framesSupplied - hwFramePos;
     instantSec = static_cast<double>(framesAhead) /
                  static_cast<double>(sampleRate_);
   } else {
     // 回退：framesWritten - framesRead 只覆盖 AAudio 应用侧缓冲，
     // HAL + DSP + HDMI sink + TV 音频处理通常另加 150-300ms，
     // 经 RK3588 HDMI 实测：inFlight ~74ms + 经验余量 0.18s ≈ 实际可闻延迟 250ms。
-    const int64_t framesRead = AAudioStream_getFramesRead(stream_);
-    int64_t inFlight = framesWritten - (framesRead > 0 ? framesRead : 0);
-    if (inFlight < 0) inFlight = 0;
+    const int64_t framesRead = getAAudioFramesRead();
+    int64_t inFlight = framesSupplied - framesRead;
+    if (inFlight < 0) inFlight = std::max<int32_t>(0, getPendingFrames());
     instantSec = static_cast<double>(inFlight) /
                  static_cast<double>(sampleRate_) + 0.18;
   }
@@ -820,6 +1070,14 @@ double AudioPlayer::estimatedOutputDelaySeconds() const {
 int32_t AudioPlayer::getPendingFrames() const {
 #ifdef __ANDROID__
   std::lock_guard<std::mutex> lock(const_cast<AudioPlayer*>(this)->queueMutex_);
+  return getPendingFramesLocked();
+#else
+  return 0;
+#endif
+}
+
+int32_t AudioPlayer::getPendingFramesLocked() const {
+#ifdef __ANDROID__
   int32_t totalFrames = 0;
   
   // 复制或遍历队列以计算总帧数
@@ -923,44 +1181,49 @@ aaudio_data_callback_result_t AudioPlayer::onAudioReady(void *audioData,
 
   memset(output, 0, static_cast<size_t>(numFrames) * bytesPerFrame_);
 
+  std::unique_lock<std::mutex> lock(queueMutex_);
   // 处理淡入/淡出并更新当前音量
   float currentVol = currentVolume_.load();
   float targetVol = targetVolume_.load();
   float step = volumeStep_.load();
   bool fading = !fadeComplete_.load();
 
-  if (fading) {
-    // 计算新的当前音量
-    if (step > 0) {
-      // 淡入
-      currentVol += step;
-      if (currentVol >= targetVol) {
-        currentVol = targetVol;
-        fadeComplete_ = true;
-      }
-    } else if (step < 0) {
-      // 淡出
-      currentVol += step;
-      if (currentVol <= targetVol) {
-        currentVol = targetVol;
-        fadeComplete_ = true;
-      }
-    } else {
-      fadeComplete_ = true;
-    }
-    currentVolume_ = currentVol;
+  // A route/replay failure can leave the shared fade-out completed at zero
+  // after the decoder has already resumed writing PCM. That state produces a
+  // silent player with a healthy queue and no AAudio underrun. Recover only
+  // when the configured volume is non-zero and the next write is not still
+  // waiting for the intentional flush fade-in.
+  if (playing_.load(std::memory_order_acquire) &&
+      currentVol <= 0.0001f && targetVol <= 0.0001f &&
+      volume_.load(std::memory_order_acquire) > 0.0001f &&
+      !pendingFadeInAfterFlush_.load(std::memory_order_acquire) &&
+      !fadeOutRequested_.load(std::memory_order_acquire)) {
+    const float configuredVolume = volume_.load(std::memory_order_relaxed);
+    currentVol = configuredVolume;
+    targetVol = configuredVolume;
+    step = 0.0f;
+    currentVolume_.store(configuredVolume, std::memory_order_relaxed);
+    targetVolume_.store(configuredVolume, std::memory_order_relaxed);
+    volumeStep_.store(0.0f, std::memory_order_relaxed);
+    fadeComplete_.store(true, std::memory_order_release);
+    fading = false;
+    LOG_WARN("[AudioPlayer] recovered stuck zero fade: volume=%.3f", configuredVolume);
   }
 
-  // 从队列读取数据
-  std::unique_lock<std::mutex> lock(queueMutex_);
-
   int32_t samplesWritten = 0;
+  const uint64_t outputGeneration = acceptedPcmGeneration_.load(std::memory_order_acquire);
   size_t queueSizeBefore = audioQueue_.size();
   int32_t samplesRemaining = totalSamples;
   int32_t outputOffset = 0;
 
   while (samplesRemaining > 0 && !audioQueue_.empty()) {
     AudioQueueItem &item = audioQueue_.front();
+    if (item.generation != acceptedPcmGeneration_.load(std::memory_order_acquire)) {
+      delete[] item.data;
+      item.data = nullptr;
+      audioQueue_.pop();
+      continue;
+    }
     int32_t itemRemainingSamples = item.getRemainingSamples(channelCount_);
 
     if (itemRemainingSamples <= 0) {
@@ -976,28 +1239,10 @@ aaudio_data_callback_result_t AudioPlayer::onAudioReady(void *audioData,
     // 计算本次要写入的采样数
     int32_t samplesToWrite = std::min(samplesRemaining, itemRemainingSamples);
 
-    // Apply volume and copy 数据 (using smoothly transitioning 当前 volume)
-    int32_t itemDataOffset = item.usedSamples;
-
-    if (fading) {
-      // 淡变模式：按采样点渐进调整音量
-      float volStart = currentVol - step; // 当前帧起始音量
-      float volEnd = currentVol;          // 当前帧结束音量
-      float volDelta = (volEnd - volStart) / samplesToWrite;
-      float sampleVol = volStart;
-
-      for (int32_t i = 0; i < samplesToWrite; i++) {
-        output[outputOffset + i] =
-            static_cast<int16_t>(item.data[itemDataOffset + i] * sampleVol);
-        sampleVol += volDelta;
-      }
-    } else {
-      // 普通模式：使用固定音量
-      for (int32_t i = 0; i < samplesToWrite; i++) {
-        output[outputOffset + i] =
-            static_cast<int16_t>(item.data[itemDataOffset + i] * currentVol);
-      }
-    }
+    // Copy raw PCM first. One envelope spans the whole callback, regardless
+    // of packet boundaries, and each channel of a frame uses the same gain.
+    std::memcpy(output + outputOffset, item.data + item.usedSamples,
+                static_cast<size_t>(samplesToWrite) * sizeof(int16_t));
 
     // 更新已使用采样数
     item.usedSamples += samplesToWrite;
@@ -1016,22 +1261,53 @@ aaudio_data_callback_result_t AudioPlayer::onAudioReady(void *audioData,
   }
 
 
+  if (fading) {
+    for (int32_t frame = 0; frame < numFrames; ++frame) {
+      for (int32_t ch = 0; ch < channelCount_; ++ch) {
+        const int32_t i = frame * channelCount_ + ch;
+        output[i] = static_cast<int16_t>(output[i] * currentVol);
+      }
+      if (step > 0.0f) currentVol = std::min(targetVol, currentVol + step);
+      else if (step < 0.0f) currentVol = std::max(targetVol, currentVol + step);
+    }
+    currentVolume_.store(currentVol, std::memory_order_relaxed);
+  } else {
+    for (int32_t i = 0; i < samplesWritten; ++i) {
+      output[i] = static_cast<int16_t>(output[i] * currentVol);
+    }
+  }
+  // Publish completion only after rendering the last ramp frame and updating
+  // the supplied-frame boundary used by the control-thread drain barrier.
+  appFramesWritten_.fetch_add(numFrames, std::memory_order_release);
+  appFramesConsumed_.fetch_add(numFrames, std::memory_order_release);
+  lastOutputCallbackNs_.store(audioMonotonicNs(), std::memory_order_release);
+  if (fading && (currentVol == targetVol || step == 0.0f)) {
+    fadeComplete_.store(true, std::memory_order_release);
+  }
   lock.unlock();
   queueCondition_.notify_one();
 
-  if (samplesWritten < totalSamples) {
-    static std::atomic<int> underrunLogCounter{0};
-    int logIndex = underrunLogCounter.fetch_add(1, std::memory_order_relaxed);
-    if (logIndex < 3 || logIndex % 2000 == 0) {
-      int64_t framesWritten = stream_ ? AAudioStream_getFramesWritten(stream_) : 0;
-      int64_t framesRead = stream_ ? AAudioStream_getFramesRead(stream_) : 0;
-      int64_t inFlight = framesWritten - framesRead;
-      if (inFlight < 0) inFlight = 0;
-      LOG_WARN("[AudioPlayer] AAudio callback underrun: supplied=%d/%d frames queueBefore=%zu inFlight=%lld state=%d",
+  if (samplesWritten < totalSamples &&
+      !inputEnded_.load(std::memory_order_acquire)) {
+    const uint64_t logIndex = underrunCallbacks_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool newEpisode = !underrunActive_.exchange(true, std::memory_order_relaxed);
+    if (newEpisode || logIndex % 2000 == 0) {
+      // The real-time callback cannot take streamMutex_. Keep diagnostics on
+      // application-side counters so this path is safe on Android 11.
+      LOG_WARN("[AudioPlayer] AAudio callback underrun: supplied=%d/%d frames "
+               "queueBefore=%zu needsReinit=%d generation=%llu totalUnderrunCallbacks=%llu",
                samplesWritten / channelCount_, numFrames, queueSizeBefore,
-               static_cast<long long>(inFlight),
-               stream_ ? static_cast<int>(AAudioStream_getState(stream_)) : -1);
+               needsReinit_.load(std::memory_order_acquire) ? 1 : 0,
+               static_cast<unsigned long long>(outputGeneration),
+               static_cast<unsigned long long>(logIndex));
     }
+  }
+
+  if (samplesWritten == totalSamples &&
+      underrunActive_.exchange(false, std::memory_order_relaxed)) {
+    LOG_INFO("[AudioPlayer] AAudio underrun recovered: generation=%llu totalUnderrunCallbacks=%llu",
+             static_cast<unsigned long long>(outputGeneration),
+             static_cast<unsigned long long>(underrunCallbacks_.load(std::memory_order_relaxed)));
   }
 
   // Apply 通道 模式 processing (after volume processing)
@@ -1055,6 +1331,58 @@ aaudio_data_callback_result_t AudioPlayer::onAudioReady(void *audioData,
       }
     }
     // STEREO 模式无需处理，保持原样
+  }
+
+  // Apply makeup gain after channel selection and fades. Both channels share
+  // the same peak limiter so stereo balance is preserved. Instant attack keeps
+  // PCM in range; 100ms release avoids per-sample hard clipping. This is not a
+  // loudness normalizer: signals below the ceiling get exactly the selected dB.
+  // 0 dB is a bit-exact bypass and resets state when leaving the VOD route.
+  const int gainDb = outputGainDb_.load(std::memory_order_relaxed);
+  if (gainDb == 0) {
+    currentOutputGain_ = 1.0f;
+    outputLimiterGain_ = 1.0f;
+  } else {
+    static constexpr float gains[] = {
+        1.0f, 1.12201845f, 1.25892541f, 1.41253754f, 1.58489319f, 1.77827941f,
+        1.99526231f, 2.23872114f, 2.51188643f, 2.81838293f, 3.16227766f};
+    const float targetGain = gains[gainDb];
+    const float gainStep = 1.0f / std::max(1.0f, sampleRate_ * 0.01f);
+    const float release = std::exp(-1.0f / std::max(1.0f, sampleRate_ * 0.1f));
+    for (int32_t frame = 0; frame < samplesWritten / channelCount_; ++frame) {
+      currentOutputGain_ += std::clamp(targetGain - currentOutputGain_, -gainStep, gainStep);
+      const int32_t base = frame * channelCount_;
+      float peak = 0.0f;
+      for (int32_t ch = 0; ch < channelCount_; ++ch) {
+        peak = std::max(peak, std::abs(output[base + ch] * currentOutputGain_));
+      }
+      const float allowed = peak > 32767.0f ? 32767.0f / peak : 1.0f;
+      outputLimiterGain_ = std::min(allowed, 1.0f - (1.0f - outputLimiterGain_) * release);
+      const float gain = currentOutputGain_ * outputLimiterGain_;
+      for (int32_t ch = 0; ch < channelCount_; ++ch) {
+        output[base + ch] = static_cast<int16_t>(std::clamp(
+            output[base + ch] * gain, -32768.0f, 32767.0f));
+      }
+    }
+  }
+
+  // Confirm real PCM after volume/channel processing, once per restored route.
+  // Stream frame counters alone also advance while callbacks supply silence.
+  if (samplesWritten > 0 &&
+      loggedOutputGeneration_.load(std::memory_order_relaxed) != outputGeneration) {
+    int peak = 0;
+    for (int32_t i = 0; i < samplesWritten; ++i) {
+      peak = std::max(peak, std::abs(static_cast<int>(output[i])));
+    }
+    if (peak > 0 &&
+        acceptedPcmGeneration_.load(std::memory_order_acquire) == outputGeneration &&
+        loggedOutputGeneration_.exchange(outputGeneration, std::memory_order_relaxed) !=
+            outputGeneration) {
+      LOG_INFO("[AudioPlayer] PCM output active: generation=%llu supplied=%d/%d "
+               "frames peak=%d volume=%.3f",
+               static_cast<unsigned long long>(outputGeneration),
+               samplesWritten / channelCount_, numFrames, peak, currentVol);
+    }
   }
 
   // 调试：记录回调状态

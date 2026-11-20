@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -54,6 +55,7 @@ struct V4L2CaptureConfig {
   int bufferCount = 6;
   uint32_t pixelFormat = 0;
   bool setupMipiPipeline = false;
+  bool lockResolution = false;
   // 软件降帧目标帧率（fps）。0 = 不限制，使用源信号满帧率。
   // MIPI 采集（如 RK628 1080p60）场景下设置为 25 可显著降低 GPU/内存带宽压力。
   float targetFps = 0.0f;
@@ -74,8 +76,12 @@ public:
   bool hasSignal() const { return hasSignal_.load(); }
   static bool queryStableMipiTiming(int &width, int &height,
                                     bool *noSignal = nullptr);
+  static int lastMipiTimingQueryError();
   bool startCapture(CaptureFrameCallback callback);
   void stopCapture();
+  // Start driver stop off the render thread; false means still stopping.
+  // Buffers and callbacks' target remain alive until stopCapture()/shutdown().
+  bool stopCaptureAsync();
   void releaseFrame(int bufferIndex);
   bool isCapturing() const { return isCapturing_.load(); }
 
@@ -102,10 +108,17 @@ private:
   bool mapBuffers();
   void cleanup();
   void captureThread();
+  void finishStopCapture();
   void resetStreamState(const char *stage);
   void releaseDriverBuffers(const char *stage);
   void forceFullFrameSelection();
   bool verifyDriverFrameState();
+  void setupMipiSourceChangeMonitor();
+  void closeMipiSourceChangeMonitor();
+  bool drainMipiSourceChangeEvents();
+  bool isFrameComplete(size_t frameBytesUsed) const;
+  bool detectVerticalDiscontinuity(const Buffer &buffer, int &row,
+                                   int &score) const;
 
   bool shouldSetupMipiPipeline() const;
   void applyRequestedFormat(v4l2_format &fmt, uint32_t requestFormat) const;
@@ -128,11 +141,20 @@ private:
   float actualFps_ = 0.0f;
   uint32_t bufferType_ = 0;
   uint64_t frameStateCheckCount_ = 0;
+  uint32_t frameIntegritySampleCount_ = 0;
+  int frameIntegrityCandidateRow_ = -1;
+  int frameIntegrityCandidateStreak_ = 0;
+  uint64_t frameIntegrityLastWarnUs_ = 0;
+  uint64_t frameIntegrityCandidateSinceUs_ = 0;
 
   std::vector<Buffer> buffers_;
+  int mipiEventFd_ = -1;
 
   std::atomic<bool> isCapturing_{false};
   bool streamStartedOnce_ = false;
+  bool streamOn_ = false;
+  std::mutex stopMutex_;
+  std::future<void> stopTask_;
   std::atomic<bool> shouldStop_{false};
   std::atomic<bool> isUnhealthy_{false};
   std::atomic<bool> hasSignal_{false};

@@ -11,6 +11,84 @@ int clampInt(int value, int minValue, int maxValue) {
   return std::max(minValue, std::min(maxValue, value));
 }
 
+CaveWallState defaultCaveWallState(int wallType) {
+  CaveWallState wall;
+  wall.wallType = clampInt(wallType, 0, 4);
+  switch (wall.wallType) {
+    case 1: // Left
+      wall.llx = -1.0f; wall.lly = -1.0f; wall.llz = 1.0f;
+      wall.ulx = -1.0f; wall.uly = 1.0f; wall.ulz = 1.0f;
+      wall.lrx = -1.0f; wall.lry = -1.0f; wall.lrz = -1.0f;
+      break;
+    case 2: // Right
+      wall.llx = 1.0f; wall.lly = -1.0f; wall.llz = -1.0f;
+      wall.ulx = 1.0f; wall.uly = 1.0f; wall.ulz = -1.0f;
+      wall.lrx = 1.0f; wall.lry = -1.0f; wall.lrz = 1.0f;
+      break;
+    case 3: // Floor
+      wall.llx = -1.0f; wall.lly = -1.0f; wall.llz = 1.0f;
+      wall.ulx = -1.0f; wall.uly = -1.0f; wall.ulz = -1.0f;
+      wall.lrx = 1.0f; wall.lry = -1.0f; wall.lrz = 1.0f;
+      break;
+    case 4: // Ceiling
+      wall.llx = -1.0f; wall.lly = 1.0f; wall.llz = -1.0f;
+      wall.ulx = -1.0f; wall.uly = 1.0f; wall.ulz = 1.0f;
+      wall.lrx = 1.0f; wall.lry = 1.0f; wall.lrz = -1.0f;
+      break;
+    case 0: // Front
+    default:
+      wall.llx = -1.0f; wall.lly = -1.0f; wall.llz = 0.0f;
+      wall.ulx = -1.0f; wall.uly = 1.0f; wall.ulz = 0.0f;
+      wall.lrx = 1.0f; wall.lry = -1.0f; wall.lrz = 0.0f;
+      break;
+  }
+  return wall;
+}
+
+bool caveWallIsDegenerate(const CaveWallState &wall) {
+  const float rightX = wall.lrx - wall.llx;
+  const float rightY = wall.lry - wall.lly;
+  const float rightZ = wall.lrz - wall.llz;
+  const float upX = wall.ulx - wall.llx;
+  const float upY = wall.uly - wall.lly;
+  const float upZ = wall.ulz - wall.llz;
+  const float normalX = rightY * upZ - rightZ * upY;
+  const float normalY = rightZ * upX - rightX * upZ;
+  const float normalZ = rightX * upY - rightY * upX;
+  const float width2 = rightX * rightX + rightY * rightY + rightZ * rightZ;
+  const float height2 = upX * upX + upY * upY + upZ * upZ;
+  const float normal2 = normalX * normalX + normalY * normalY + normalZ * normalZ;
+  return !std::isfinite(wall.llx) || !std::isfinite(wall.lly) ||
+         !std::isfinite(wall.llz) || !std::isfinite(wall.ulx) ||
+         !std::isfinite(wall.uly) || !std::isfinite(wall.ulz) ||
+         !std::isfinite(wall.lrx) || !std::isfinite(wall.lry) ||
+         !std::isfinite(wall.lrz) || width2 < 1e-8f || height2 < 1e-8f ||
+         normal2 < 1e-12f;
+}
+
+void normalizeCaveWall(CaveWallState &wall) {
+  wall.wallType = clampInt(wall.wallType, 0, 4);
+  if (!std::isfinite(wall.nearPlane) || wall.nearPlane < 0.001f) {
+    wall.nearPlane = 0.1f;
+  }
+  if (!std::isfinite(wall.farPlane) || wall.farPlane <= wall.nearPlane) {
+    wall.farPlane = std::max(100.0f, wall.nearPlane * 2.0f);
+  }
+  if (!std::isfinite(wall.eyeDistance) ||
+      wall.eyeDistance <= wall.nearPlane + 0.0001f) {
+    wall.eyeDistance = std::max(2.0f, wall.nearPlane * 2.0f);
+  }
+  if (wall.farPlane <= wall.eyeDistance + 0.0001f) {
+    wall.farPlane = std::max(100.0f, wall.eyeDistance * 2.0f);
+  }
+  if (caveWallIsDegenerate(wall)) {
+    const bool enabled = wall.enabled;
+    const int wallType = wall.wallType;
+    wall = defaultCaveWallState(wallType);
+    wall.enabled = enabled;
+  }
+}
+
 float clampFloat(float value, float minValue, float maxValue) {
   return std::max(minValue, std::min(maxValue, value));
 }
@@ -85,6 +163,39 @@ void convertUnitLocalGeometryToLegacy(GeometryRegionState &region) {
   }
 }
 
+void normalizeGeometryRowOrder(GeometryRegionState &region) {
+  if (region.rows < 2 || region.cols < 1 ||
+      region.points.size() != static_cast<size_t>(region.rows * region.cols)) {
+    return;
+  }
+
+  float firstRowV = 0.0f;
+  float lastRowV = 0.0f;
+  for (int col = 0; col < region.cols; ++col) {
+    firstRowV += region.points[static_cast<size_t>(col)].v;
+    lastRowV += region.points[static_cast<size_t>(
+        (region.rows - 1) * region.cols + col)].v;
+  }
+
+  // Geometry uses legacy coordinates: logical row 0 is the top row and
+  // therefore has a larger v than the last row. Old unit/local data could
+  // leave the point rows reversed; changing grid size then exposed a full
+  // vertical flip when rendering switched from the direct path to the mesh.
+  if (firstRowV + 0.0001f >= lastRowV) {
+    return;
+  }
+
+  for (int top = 0, bottom = region.rows - 1; top < bottom;
+       ++top, --bottom) {
+    for (int col = 0; col < region.cols; ++col) {
+      std::swap(region.points[static_cast<size_t>(top * region.cols + col)],
+                region.points[static_cast<size_t>(bottom * region.cols + col)]);
+    }
+  }
+  region.selected.row =
+      region.rows - 1 - clampInt(region.selected.row, 0, region.rows - 1);
+}
+
 void ensureGeometryPoints(GeometryRegionState &region) {
   region.rows = clampInt(region.rows, 2, 33);
   region.cols = clampInt(region.cols, 2, 33);
@@ -94,6 +205,7 @@ void ensureGeometryPoints(GeometryRegionState &region) {
   } else if (looksLikeUnitLocalGeometry(region)) {
     convertUnitLocalGeometryToLegacy(region);
   }
+  normalizeGeometryRowOrder(region);
   region.selected.row = clampInt(region.selected.row, 0, region.rows - 1);
   region.selected.col = clampInt(region.selected.col, 0, region.cols - 1);
 }
@@ -355,11 +467,17 @@ void resizeGeometryTo(GeometryRegionState &region, int nextRows, int nextCols) {
       region.points.size() == static_cast<size_t>(nextRows * nextCols)) {
     return;
   }
+  const int oldRows = region.rows;
+  const int oldCols = region.cols;
+  const int selectedRow =
+      resizeSelectedIndex(region.selected.row, oldRows, nextRows);
+  const int selectedCol =
+      resizeSelectedIndex(region.selected.col, oldCols, nextCols);
   region.points = resizePoints(region, nextRows, nextCols);
   region.rows = nextRows;
   region.cols = nextCols;
-  region.selected.row = clampInt(region.selected.row, 0, region.rows - 1);
-  region.selected.col = clampInt(region.selected.col, 0, region.cols - 1);
+  region.selected.row = selectedRow;
+  region.selected.col = selectedCol;
 }
 
 int edgeDirectionFromOp(const std::string &op) {
@@ -423,11 +541,11 @@ void applyGeometryMoveLocal(GeometryRegionState &region, const std::string &op,
     movePoint(region, region.selected.row, region.selected.col, du, dv);
   } else if (op == "row") {
     for (int col = 0; col < region.cols; ++col) {
-      movePoint(region, region.selected.row, col, du, dv);
+      movePoint(region, region.selected.row, col, 0.0f, dv);
     }
   } else if (op == "col") {
     for (int row = 0; row < region.rows; ++row) {
-      movePoint(region, row, region.selected.col, du, dv);
+      movePoint(region, row, region.selected.col, du, 0.0f);
     }
   } else if (op == "all") {
     for (int row = 0; row < region.rows; ++row) {
@@ -626,10 +744,10 @@ void patchSideFromApi(BlendSideState &side, const Json::Value &payload,
   const std::string gamma = std::string("edge_") + name + "_gamma";
   const std::string slope = std::string("edge_") + name + "_slope";
   if (payload.isMember(gamma) && payload[gamma].isNumeric()) {
-    side.gamma = std::max(0.001f, payload[gamma].asFloat());
+    side.gamma = payload[gamma].asFloat();
   }
   if (payload.isMember(slope) && payload[slope].isNumeric()) {
-    side.slope = std::max(0.001f, payload[slope].asFloat());
+    side.slope = payload[slope].asFloat();
   }
   const std::string stripStart = std::string("strip_start_") + shortName;
   const std::string stripEnd = std::string("strip_end_") + shortName;
@@ -647,11 +765,19 @@ void patchSideFromApi(BlendSideState &side, const Json::Value &payload,
   if (payload.isMember(solid) && payload[solid].isBool()) {
     side.solid = payload[solid].asBool();
   }
+  normalizeBlendSide(side);
 }
 
-float legacyMergeRangeForGrid(int gridCount) {
-  return gridCount > 2 ? 1.0f / static_cast<float>(gridCount - 1) : 0.0f;
+constexpr float defaultBlendWidthForGrid(int gridCount) {
+  return gridCount >= 2 ? 1.0f / static_cast<float>(gridCount - 1) : 0.0f;
 }
+
+static_assert(defaultBlendWidthForGrid(1) == 0.0f,
+              "merge range must be disabled for an invalid one-point grid");
+static_assert(defaultBlendWidthForGrid(2) == 1.0f,
+              "a two-point grid spans the full normalized merge range");
+static_assert(defaultBlendWidthForGrid(3) == 0.5f,
+              "a three-point grid must use one interval as its merge range");
 
 bool hasAdjacentSide(const Json::Value &adjacencyByRegion, int regionId,
                      const char *field) {
@@ -710,7 +836,7 @@ void patchCaveWallFromApi(CaveWallState &caveWall,
     caveWall.enabled = payload["enabled"].asBool();
   }
   if (payload.isMember("wall_type") && payload["wall_type"].isNumeric()) {
-    caveWall.wallType = clampInt(payload["wall_type"].asInt(), 0, 6);
+    caveWall.wallType = clampInt(payload["wall_type"].asInt(), 0, 4);
   }
   if (payload.isMember("eye_distance") && payload["eye_distance"].isNumeric()) {
     caveWall.eyeDistance = std::max(0.0f, payload["eye_distance"].asFloat());
@@ -769,6 +895,10 @@ BlendRegionState &FusionManager::blend(int regionId) {
   BlendRegionState &region = state_.blendByRegion[std::max(1, regionId)];
   region.gridRows = clampInt(region.gridRows, 2, 33);
   region.gridCols = clampInt(region.gridCols, 2, 33);
+  normalizeBlendSide(region.left);
+  normalizeBlendSide(region.right);
+  normalizeBlendSide(region.top);
+  normalizeBlendSide(region.bottom);
   return region;
 }
 
@@ -778,12 +908,7 @@ GeometryCorrectionState &FusionManager::correction(int regionId) {
 
 CaveWallState &FusionManager::caveWall(int regionId) {
   CaveWallState &wall = state_.caveWallByRegion[std::max(1, regionId)];
-  wall.wallType = clampInt(wall.wallType, 0, 6);
-  wall.eyeDistance = std::max(0.0f, wall.eyeDistance);
-  wall.nearPlane = std::max(0.001f, wall.nearPlane);
-  if (wall.farPlane <= wall.nearPlane) {
-    wall.farPlane = wall.nearPlane + 0.001f;
-  }
+  normalizeCaveWall(wall);
   return wall;
 }
 
@@ -861,8 +986,8 @@ Json::Value FusionManager::resizeBlendGrid(
   const int nextCols = resizeGridCount(region.gridCols, op, "grow_cols", "shrink_cols", 33);
   region.gridRows = nextRows;
   region.gridCols = nextCols;
-  const float rangeX = legacyMergeRangeForGrid(region.gridCols);
-  const float rangeY = legacyMergeRangeForGrid(region.gridRows);
+  const float rangeX = defaultBlendWidthForGrid(region.gridCols);
+  const float rangeY = defaultBlendWidthForGrid(region.gridRows);
   // 加减融合行列只调整融合管理网格和边宽。自动模式下按输入相邻关系回算 enabled，
   // 手动模式下保留用户逐边选择，避免行列调整后回灌旧状态。
   region.left.width = rangeX;
@@ -946,9 +1071,9 @@ Json::Value FusionManager::setGeometryPoints(int regionId,
       }
     }
   }
-  if (looksLikeUnitLocalGeometry(region)) {
-    convertUnitLocalGeometryToLegacy(region);
-  }
+  // Imported points must satisfy the same canonical row order as persisted
+  // geometry before they are returned to the renderer or resized.
+  ensureGeometryPoints(region);
   return geometryToApiJson(region);
 }
 
@@ -1124,8 +1249,8 @@ Json::Value FusionManager::setBlendState(int regionId,
   patchSideFromApi(region.right, payload, "right", 'r');
   patchSideFromApi(region.top, payload, "top", 't');
   patchSideFromApi(region.bottom, payload, "bottom", 'b');
-  const float rangeX = legacyMergeRangeForGrid(region.gridCols);
-  const float rangeY = legacyMergeRangeForGrid(region.gridRows);
+  const float rangeX = defaultBlendWidthForGrid(region.gridCols);
+  const float rangeY = defaultBlendWidthForGrid(region.gridRows);
   if (region.left.enabled && region.left.width <= 0.001f) region.left.width = rangeX;
   if (region.right.enabled && region.right.width <= 0.001f) region.right.width = rangeX;
   if (region.top.enabled && region.top.width <= 0.001f) region.top.width = rangeY;
@@ -1151,8 +1276,8 @@ Json::Value FusionManager::autoRecalculateBlend(
     region.gridRows = geo.rows;
     region.gridCols = geo.cols;
 
-    const float rangeX = legacyMergeRangeForGrid(region.gridCols);
-    const float rangeY = legacyMergeRangeForGrid(region.gridRows);
+    const float rangeX = defaultBlendWidthForGrid(region.gridCols);
+    const float rangeY = defaultBlendWidthForGrid(region.gridRows);
     // 自动重算始终刷新融合网格和宽度。自动模式下按输入相邻关系打开边，
     // 手动模式下保留用户选择，避免加减行列后手动开关表现成“随机回跳”。
     region.left.width = rangeX;
@@ -1202,6 +1327,14 @@ Json::Value FusionManager::setCaveWallState(int regionId,
                                             const Json::Value &payload) {
   CaveWallState &state = caveWall(regionId);
   patchCaveWallFromApi(state, payload);
+  normalizeCaveWall(state);
+  return caveWallToApiJson(state);
+}
+
+Json::Value FusionManager::initializeCaveWall(int regionId, int wallType) {
+  CaveWallState &state = caveWall(regionId);
+  state = defaultCaveWallState(wallType);
+  state.enabled = true;
   return caveWallToApiJson(state);
 }
 

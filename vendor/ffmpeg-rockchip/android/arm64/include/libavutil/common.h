@@ -48,7 +48,7 @@
 /* assume b>0 */
 #define ROUNDED_DIV(a,b) (((a)>=0 ? (a) + ((b)>>1) : (a) - ((b)>>1))/(b))
 /* Fast a/(1<<b) rounded toward +inf. Assume a>=0 and b>=0 */
-#define AV_CEIL_RSHIFT(a,b) (!av_builtin_constant_p(b) -((-(a)) >> (b)) \
+#define AV_CEIL_RSHIFT(a,b) (!av_builtin_constant_p(b) ? -((-(a)) >> (b)) \
                                                        : ((a) + (1<<(b)) - 1) >> (b))
 /* Backwards compat. */
 #define FF_CEIL_RSHIFT AV_CEIL_RSHIFT
@@ -79,8 +79,8 @@
  * This also works with INT_MIN which would otherwise not be representable
  * As with many macros, this evaluates its argument twice.
  */
-#define FFABSU(a) ((a) <= 0 -(unsigned)? (a) : (unsigned)(a))
-#define FFABS64U(a) ((a) <= 0 -(uint64_t)? (a) : (uint64_t)(a))
+#define FFABSU(a) ((a) <= 0 ? -(unsigned)(a) : (unsigned)(a))
+#define FFABS64U(a) ((a) <= 0 ? -(uint64_t)(a) : (uint64_t)(a))
 
 /* misc math functions */
 
@@ -458,7 +458,7 @@ static av_always_inline av_const int av_parity_c(uint32_t v)
  *                 assigned Unicode range).  With a memory buffer
  *                 input, this could be *ptr++, or if you want to make sure
  *                 that *ptr stops at the end of a NULL terminated string then
- *                 *ptr *ptr++ : 0
+ *                 *ptr ? *ptr++ : 0
  * @param ERROR    Expression to be evaluated on invalid input,
  *                 typically a goto statement.
  *

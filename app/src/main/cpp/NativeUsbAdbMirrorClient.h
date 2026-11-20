@@ -1,6 +1,6 @@
 #pragma once
 
-#include "decoder/UsbH264RkmppDecoder.h"
+#include "decoder/H264RkmppDecoder.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -17,7 +17,7 @@ namespace hsvj {
 
 class NativeUsbAdbMirrorClient {
 public:
-  using VideoFrameCallback = std::function<void(int, UsbH264RkmppFrame&)>;
+  using VideoFrameCallback = std::function<void(int, H264RkmppFrame&)>;
 
   struct Config {
     int layerId = 0;
@@ -113,7 +113,6 @@ private:
   static uint32_t checksum(const uint8_t* data, size_t size);
   static std::string packetName(uint32_t command);
   static int alignToMacroblock(int value, int maxValue);
-  static bool containsIdrFrame(const std::vector<uint8_t>& data);
   static bool readFile(const std::string& path, std::vector<uint8_t>& out);
 
   Config config_;
@@ -124,7 +123,7 @@ private:
   int nativeFd_ = -1;
   int nextLocalId_ = 1;
 
-  std::unique_ptr<UsbH264RkmppDecoder> decoder_;
+  std::unique_ptr<H264RkmppDecoder> decoder_;
   std::thread decoderThread_;
   std::mutex videoQueueMutex_;
   std::condition_variable videoQueueCv_;
@@ -160,3 +159,4 @@ private:
 };
 
 } // namespace hsvj
+

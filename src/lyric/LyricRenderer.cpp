@@ -6,13 +6,11 @@
 
 #include "renderer/VulkanRenderer.h"
 
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 
 #include "utils/Logger.h"
 
-#include "utils/FileUtils.h"
 
-#include "stb_image.h"
 
 #include <algorithm>
 
@@ -64,6 +62,48 @@ void LyricRenderer::setDisplayMode(DisplayMode mode) {
 
 }
 
+void LyricRenderer::setBackgroundVisible(bool visible) {
+  std::lock_guard<std::recursive_mutex> lock(initMutex_);
+  if (backgroundVisible_ == visible) return;
+  backgroundVisible_ = visible;
+  resetPreparedFrameState();
+}
+
+void LyricRenderer::setTypography(double titleFontSize, double titleOutlineWidth,
+                                  double textFontSize, double textOutlineWidth,
+                                  double textSpacing) {
+  std::lock_guard<std::recursive_mutex> lock(initMutex_);
+  const double newTitleFontSize = std::clamp(titleFontSize, 1.0, 300.0);
+  const double newTitleOutlineWidth = std::clamp(titleOutlineWidth, 0.0, 20.0);
+  const double newTextFontSize = std::clamp(textFontSize, 1.0, 300.0);
+  const double newTextOutlineWidth = std::clamp(textOutlineWidth, 0.0, 20.0);
+  const double newTextSpacing = std::clamp(textSpacing, -20.0, 100.0);
+  if (titleFontSize_ == newTitleFontSize &&
+      titleOutlineWidth_ == newTitleOutlineWidth &&
+      textFontSize_ == newTextFontSize &&
+      textOutlineWidth_ == newTextOutlineWidth &&
+      textSpacing_ == newTextSpacing) {
+    return;
+  }
+  titleFontSize_ = newTitleFontSize;
+  titleOutlineWidth_ = newTitleOutlineWidth;
+  textFontSize_ = newTextFontSize;
+  textOutlineWidth_ = newTextOutlineWidth;
+  textSpacing_ = newTextSpacing;
+  if (initialized_ && loaded_ && !subtitlePath_.empty()) {
+    rebuildTrackFromSubtitlePath();
+  }
+}
+
+void LyricRenderer::setProducerText(const std::string &text) {
+  std::lock_guard<std::recursive_mutex> lock(initMutex_);
+  if (producerText_ == text) return;
+  producerText_ = text;
+  if (initialized_ && loaded_ && !subtitlePath_.empty()) {
+    rebuildTrackFromSubtitlePath();
+  }
+}
+
 
 
 void LyricRenderer::setListeningEffectStyle(ListeningEffectStyle style) {
@@ -100,7 +140,7 @@ bool LyricRenderer::isValidImage(ASS_Image *img) const {
 
 
 
-// 提取 ASS_Image 颜色分量（ABGRcomponents (ASS_Image color is ABGR format)
+// libass ASS_Image uses RRGGBBAA (not the ASS file's AABBGGRR notation).
 
 void LyricRenderer::extractColor(ASS_Image *img, uint8_t &r, uint8_t &g,
 
@@ -108,11 +148,11 @@ void LyricRenderer::extractColor(ASS_Image *img, uint8_t &r, uint8_t &g,
 
   uint32_t color = img->color;
 
-  r = (color >> 8) & 0xFF;  // RR component (original 格式: ABGR)
+  r = (color >> 24) & 0xFF;
 
   g = (color >> 16) & 0xFF; // GG 分量
 
-  b = (color >> 24) & 0xFF; // BB 分量
+  b = (color >> 8) & 0xFF;
 
   a = 255 - (color & 0xFF); // AA 分量（ASS 使用 0 表示不透明，需要反转）
 
@@ -144,7 +184,7 @@ double LyricRenderer::getLyricFontSize() const {
 
 uint32_t LyricRenderer::getCompositeTextureId() const {
 
-  if (preparedFrameUsesGpuMask_ && textureId_ != 0 &&
+  if (compositeRequired_ && preparedFrameUsesGpuMask_ && textureId_ != 0 &&
 
       !preparedMaskDraws_.empty()) {
 
@@ -154,6 +194,15 @@ uint32_t LyricRenderer::getCompositeTextureId() const {
 
   return 0;
 
+}
+
+void LyricRenderer::setCompositeRequired(bool required) {
+  std::lock_guard<std::recursive_mutex> lock(initMutex_);
+  if (compositeRequired_ == required) return;
+  compositeRequired_ = required;
+  // A newly enabled composite must be regenerated even when libass reports
+  // an unchanged frame. Also invalidate the direct draw cache when switching.
+  resetPreparedFrameState();
 }
 
 
@@ -178,9 +227,6 @@ LyricRenderer::~LyricRenderer() { shutdown(); }
 
 void LyricRenderer::resetTrackRuntimeState() {
 
-  lyricStartTimes_.clear();
-
-  lyricStartTimes_.shrink_to_fit();
 
   lyricFontSize_ = 85.0;
 
@@ -192,28 +238,16 @@ void LyricRenderer::resetTrackRuntimeState() {
 
   bottomY_ = 0;
 
-  karaokeCountdownAnchorX_ = 0;
 
-  karaokeCountdownAnchorY_ = 0;
 
   centerX_ = 0;
 
-  cachedCountdownAnchorX_ = 0;
-
-  cachedCountdownTopY_ = 0;
-
-  cachedCountdownDotWidth_ = 0;
-
-  cachedCountdownDotHeight_ = 0;
 
 }
 
 
 
 void LyricRenderer::rebuildTrackRuntimeState() {
-
-  lyricStartTimes_.clear();
-
 
 
   ASS_Track *track = currentTrack();
@@ -253,34 +287,13 @@ void LyricRenderer::rebuildTrackRuntimeState() {
   }
 
 
-
-  lyricStartTimes_.reserve(static_cast<size_t>(track->n_events));
-
-  for (int i = 0; i < track->n_events; ++i) {
-
-    ASS_Event *event = &track->events[i];
-
-    if (!event || !event->Text) {
-
-      continue;
-
-    }
-
-    if (strstr(event->Text, "{\\K") != nullptr ||
-
-        strstr(event->Text, "{\\k") != nullptr) {
-
-      lyricStartTimes_.push_back(static_cast<int64_t>(event->Start));
-
-    }
-
-  }
-
 }
 
 
 
 void LyricRenderer::resetPreparedFrameState() {
+
+  maskFrameFailures_ = 0;
 
   lastRenderTimeMs_ = -1;
 
@@ -289,10 +302,9 @@ void LyricRenderer::resetPreparedFrameState() {
   preparedFrameUsesGpuMask_ = false;
 
   preparedMaskDraws_.clear();
+  cachedDraws_.clear();
 
-  countdownPrepared_ = false;
 
-  lastCountdownVisibleCount_ = -1;
 
 }
 
@@ -308,7 +320,9 @@ void LyricRenderer::invalidateTextureState(bool destroyGpuTexture) {
 
   textureId_ = 0;
 
-  maskAtlasBuffer_.clear();
+  maskAtlasBuffer_.reset();
+  scratchBuffer_.reset();
+  maskAtlasCapacity_ = scratchCapacity_ = 0;
 
   maskAtlasWidth_ = 0;
 
@@ -326,7 +340,6 @@ void LyricRenderer::dropStaleGpuTextureHandlesAfterDeviceLost() {
 
   invalidateTextureState(false);
 
-  countdownTextureId_ = 0;
 
 }
 
@@ -337,6 +350,7 @@ void LyricRenderer::clearPreparedTexture(VulkanRenderer *renderer,
                                          int64_t currentTimeMs) {
 
   preparedMaskDraws_.clear();
+  cachedDraws_.clear();
 
   preparedFrameUsesGpuMask_ = false;
 
@@ -350,7 +364,7 @@ void LyricRenderer::clearPreparedTexture(VulkanRenderer *renderer,
 
   // 否则在切换歌曲或歌词结束后的空白期，上一句歌词会残留在屏幕上（Ghost Text
 
-  if (renderer && width_ > 0 && height_ > 0) {
+  if (compositeRequired_ && renderer && width_ > 0 && height_ > 0) {
 
     std::vector<VulkanRenderer::AssMaskDrawCmd> emptyDraws;
 
@@ -393,340 +407,6 @@ LyricRenderer::Region LyricRenderer::normalizeRegion(const Region &region) const
   return normalized;
 
 }
-
-
-
-bool LyricRenderer::getCountdownPosition(const Region &region, int &countdownX,
-
-                                         int &countdownY, int &dotWidth,
-
-                                         int &dotHeight) {
-
-  if (!(countdownPrepared_ && lastCountdownVisibleCount_ > 0)) {
-
-    return false;
-
-  }
-
-
-
-  const Region contentRegion = normalizeRegion(region);
-
-  if (contentRegion.w <= 0 || contentRegion.h <= 0) {
-
-    return false;
-
-  }
-
-
-
-  const float scaleX = (width_ > 0) ? static_cast<float>(contentRegion.w) / width_ : 1.0f;
-
-  const float scaleY = (height_ > 0) ? static_cast<float>(contentRegion.h) / height_ : 1.0f;
-
-  const float uniformScale = std::max(0.0001f, std::min(scaleX, scaleY));
-
-
-
-  const int baseTopX = (karaokeCountdownAnchorX_ > 0)
-
-      ? karaokeCountdownAnchorX_
-
-      : (topX_ > 0 ? topX_ : static_cast<int>(width_ * 0.1f));
-
-  const int baseTopY = (karaokeCountdownAnchorY_ > 0)
-
-      ? karaokeCountdownAnchorY_
-
-      : (topY_ > 0 ? topY_ : std::max(0, static_cast<int>(height_ * 0.18f)));
-
-
-
-  const int fallbackAnchorX = contentRegion.x + static_cast<int>(std::lround(baseTopX * scaleX));
-
-  const int fallbackAnchorY = contentRegion.y + static_cast<int>(std::lround(baseTopY * scaleY));
-
-  int lyricAnchorX = fallbackAnchorX;
-
-  int lyricTopY = fallbackAnchorY - std::max(1, static_cast<int>(std::lround(getLyricFontSize() * uniformScale * 0.85f)));
-
-  int topLineHeightPx = 0;
-
-  int firstGlyphWidthPx = 0;
-
-  int firstGlyphHeightPx = 0;
-
-
-
-  auto updateTopLineBounds = [&](int drawX, int drawY, int drawW, int drawH,
-
-                                 bool &foundTopLineBounds,
-
-                                 int &minX, int &minY, int &maxX, int &maxY,
-
-                                 int &firstMinX, int &firstMinY,
-
-                                 int &firstMaxX, int &firstMaxY,
-
-                                 int &leftClusterThreshold) {
-
-    if (!foundTopLineBounds) {
-
-      minX = drawX;
-
-      minY = drawY;
-
-      maxX = drawX + drawW;
-
-      maxY = drawY + drawH;
-
-      firstMinX = drawX;
-
-      firstMinY = drawY;
-
-      firstMaxX = drawX + drawW;
-
-      firstMaxY = drawY + drawH;
-
-      leftClusterThreshold = drawX + drawW + std::max(1, drawW / 3);
-
-      foundTopLineBounds = true;
-
-      return;
-
-    }
-
-
-
-    minX = std::min(minX, drawX);
-
-    minY = std::min(minY, drawY);
-
-    maxX = std::max(maxX, drawX + drawW);
-
-    maxY = std::max(maxY, drawY + drawH);
-
-
-
-    if (drawX <= leftClusterThreshold) {
-
-      firstMinX = std::min(firstMinX, drawX);
-
-      firstMinY = std::min(firstMinY, drawY);
-
-      firstMaxX = std::max(firstMaxX, drawX + drawW);
-
-      firstMaxY = std::max(firstMaxY, drawY + drawH);
-
-      leftClusterThreshold = std::max(leftClusterThreshold,
-
-                                      drawX + drawW + std::max(1, drawW / 3));
-
-    }
-
-  };
-
-
-
-  bool foundTopLineBounds = false;
-
-  if (displayMode_ == DisplayMode::KARAOKE && !preparedMaskDraws_.empty()) {
-
-    const int scaledBottomY = (bottomY_ > 0)
-
-        ? contentRegion.y + static_cast<int>(std::lround(bottomY_ * scaleY))
-
-        : fallbackAnchorY + std::max(1, static_cast<int>(std::lround(getLyricFontSize() * scaleY * 1.8f)));
-
-    const int splitY = (fallbackAnchorY + scaledBottomY) / 2;
-
-
-
-    int minX = 0;
-
-    int minY = 0;
-
-    int maxX = 0;
-
-    int maxY = 0;
-
-    int firstMinX = 0;
-
-    int firstMinY = 0;
-
-    int firstMaxX = 0;
-
-    int firstMaxY = 0;
-
-    int leftClusterThreshold = 0;
-
-    for (const MaskDraw &mask : preparedMaskDraws_) {
-
-      const int drawX = contentRegion.x + static_cast<int>(std::lround(mask.assX * scaleX));
-
-      const int drawY = contentRegion.y + static_cast<int>(std::lround(mask.assY * scaleY));
-
-      const int drawW = std::max(1, static_cast<int>(std::lround(mask.assW * scaleX)));
-
-      const int drawH = std::max(1, static_cast<int>(std::lround(mask.assH * scaleY)));
-
-      const int centerY = drawY + drawH / 2;
-
-      if (centerY > splitY) {
-
-        continue;
-
-      }
-
-      updateTopLineBounds(drawX, drawY, drawW, drawH,
-
-                          foundTopLineBounds,
-
-                          minX, minY, maxX, maxY,
-
-                          firstMinX, firstMinY, firstMaxX, firstMaxY,
-
-                          leftClusterThreshold);
-
-    }
-
-
-
-    if (foundTopLineBounds) {
-
-      lyricAnchorX = minX;
-
-      lyricTopY = minY;
-
-      topLineHeightPx = std::max(1, maxY - minY);
-
-      firstGlyphWidthPx = std::max(1, firstMaxX - firstMinX);
-
-      firstGlyphHeightPx = std::max(1, firstMaxY - firstMinY);
-
-    }
-
-  }
-
-
-
-  const int verticalMargin = std::max(0, static_cast<int>(std::lround(8.0f * uniformScale)));
-
-
-
-  dotWidth = 0;
-
-  dotHeight = 0;
-
-  int sizeReferencePx = 0;
-
-  if (firstGlyphHeightPx > 0) {
-
-    sizeReferencePx = std::min(firstGlyphHeightPx,
-
-                               std::max(1, static_cast<int>(std::lround(firstGlyphWidthPx * 0.68f))));
-
-  } else if (topLineHeightPx > 0) {
-
-    sizeReferencePx = std::max(1, static_cast<int>(std::lround(topLineHeightPx * 0.24f)));
-
-  }
-
-
-
-  if (cachedCountdownDotWidth_ > 0 && cachedCountdownDotHeight_ > 0) {
-
-    dotWidth = cachedCountdownDotWidth_;
-
-    dotHeight = cachedCountdownDotHeight_;
-
-    lyricAnchorX = cachedCountdownAnchorX_ > 0 ? cachedCountdownAnchorX_ : lyricAnchorX;
-
-    lyricTopY = cachedCountdownTopY_ > 0 ? cachedCountdownTopY_ : lyricTopY;
-
-  } else if (sizeReferencePx > 0) {
-
-    const int sizeOffsetY = std::max(1, static_cast<int>(std::lround(18.0f * uniformScale)));
-
-    dotHeight = std::max(1, std::min(sizeReferencePx, sizeReferencePx - sizeOffsetY));
-
-    dotWidth = dotHeight;
-
-    cachedCountdownAnchorX_ = lyricAnchorX;
-
-    cachedCountdownTopY_ = lyricTopY;
-
-    cachedCountdownDotWidth_ = dotWidth;
-
-    cachedCountdownDotHeight_ = dotHeight;
-
-  } else {
-
-    const int fallbackDotHeight = std::max(1, static_cast<int>(std::lround(getLyricFontSize() * uniformScale * 0.24f)));
-
-    dotHeight = fallbackDotHeight;
-
-    dotWidth = fallbackDotHeight;
-
-  }
-
-  const int iconHeight = dotHeight;
-
-
-
-  countdownX = std::max(contentRegion.x, lyricAnchorX);
-
-  countdownY = std::max(contentRegion.y,
-
-                        lyricTopY - iconHeight - verticalMargin - std::max(1, static_cast<int>(std::lround(28.0f * uniformScale))));
-
-
-
-  if (cachedCountdownAnchorX_ <= 0) {
-
-    cachedCountdownAnchorX_ = countdownX;
-
-  }
-
-  if (cachedCountdownTopY_ <= 0) {
-
-    cachedCountdownTopY_ = lyricTopY;
-
-  }
-
-  return true;
-
-}
-
-
-
-bool LyricRenderer::updateCountdownState(VulkanRenderer *renderer,
-
-                                         int64_t currentTimeMs) {
-
-  const bool wasPrepared = countdownPrepared_;
-  const int previousVisibleCount = lastCountdownVisibleCount_;
-  const uint32_t previousTextureId = countdownTextureId_;
-  int64_t remainingMsForCountdown = 0;
-
-  if (computeCountdownRemainingMs(currentTimeMs, remainingMsForCountdown)) {
-
-    prepareCountdownDots(renderer, remainingMsForCountdown);
-
-  } else {
-
-    countdownPrepared_ = false;
-
-    lastCountdownVisibleCount_ = -1;
-
-  }
-
-  return wasPrepared != countdownPrepared_ ||
-         previousVisibleCount != lastCountdownVisibleCount_ ||
-         previousTextureId != countdownTextureId_;
-
-}
-
 
 
 bool LyricRenderer::hasRenderableImages(ASS_Image *images) const {
@@ -785,13 +465,14 @@ bool LyricRenderer::rebuildTrackFromSubtitlePath(const StyleOverride *targetOver
 
 
 
-  invalidateTextureState(true);
+  // Track changes invalidate the draws, not the reusable GPU atlas allocation.
+  resetPreparedFrameState();
 
   resetTrackRuntimeState();
 
 
 
-  if (!assRenderer_->loadSubtitleFile(subtitlePath_)) {
+  if (!assRenderer_->loadSubtitleFile(subtitlePath_, subtitleData_)) {
 
     LOG_ERROR("[Lyric] 重新加载歌词轨道失败 path=%s", subtitlePath_.c_str());
 
@@ -802,6 +483,7 @@ bool LyricRenderer::rebuildTrackFromSubtitlePath(const StyleOverride *targetOver
 
 
   adjustSubtitleTimingAndTracks();
+  applyHeaderVisibilityToTrack();
 
   applyStyleOverridesToTrack(targetOverride, targetModifiedCount);
 
@@ -1003,9 +685,13 @@ void LyricRenderer::setFontPath(const std::string &fontPath) {
 
   std::lock_guard<std::recursive_mutex> lock(initMutex_);
 
+  fontPath_ = fontPath;
+
   if (assRenderer_ && initialized_) {
 
     assRenderer_->updateDefaultFont(fontPath);
+
+    invalidateTextureState(false);
 
     LOG_INFO("[Lyric] 字体路径设置 fontPath=%s", fontPath.c_str());
 
@@ -1116,6 +802,8 @@ bool LyricRenderer::initialize() {
 
       assRenderer_->setAppFontsDir(appFontsDir_);
 
+    assRenderer_->updateDefaultFont(fontPath_);
+
     initialized_ = true;
 
     static int s_lyricInitCount = 0;
@@ -1148,9 +836,6 @@ void LyricRenderer::shutdown() {
 
     invalidateTextureState(true);
 
-    if (countdownTextureId_ != 0 && cachedRenderer_)
-
-      cachedRenderer_->requestDestroyTexture(countdownTextureId_);
 
     assRenderer_->cleanup();
 
@@ -1165,22 +850,15 @@ void LyricRenderer::shutdown() {
   initialized_ = false;
 
   subtitlePath_.clear();
+  subtitleData_.clear();
 
   if (effectTextureId_ != 0 && cachedRenderer_)
 
     cachedRenderer_->requestDestroyTexture(effectTextureId_);
 
-  countdownTextureId_ = 0;
 
   effectTextureId_ = 0;
 
-  countdownUseResImage_ = false;
-
-  countdownImageTried_ = false;
-
-  countdownImageWidth_ = 0;
-
-  countdownImageHeight_ = 0;
 
   cachedRenderer_ = nullptr;
 
@@ -1192,9 +870,13 @@ void LyricRenderer::shutdown() {
 
 // 加载字幕文件
 
-bool LyricRenderer::load(const std::string &filePath) {
+bool LyricRenderer::load(const std::string &filePath, const std::string &assData) {
 
   std::lock_guard<std::recursive_mutex> lock(initMutex_);
+
+  if (loaded_ && !assData.empty() && subtitlePath_ == filePath && subtitleData_ == assData) {
+    return true;
+  }
 
 
 
@@ -1209,6 +891,7 @@ bool LyricRenderer::load(const std::string &filePath) {
 
 
   subtitlePath_ = filePath;
+  subtitleData_ = assData;
 
   loaded_ = false;
 
@@ -1228,9 +911,19 @@ bool LyricRenderer::load(const std::string &filePath) {
 
   if (rebuildTrackFromSubtitlePath()) {
 
-    loaded_ = true;  // 全部处理完成后才标记为已加载
-
     int n = assRenderer_->getEventCount();
+
+    // libass accepts a header-only/incomplete progressive snapshot. Treat it
+    // as a failed load so the caller can use the sidecar .ass/.ssa fallback;
+    // otherwise the empty embedded track suppresses normal lyric loading.
+    if (n <= 0) {
+      LOG_WARN("[Lyric] 字幕轨道为空 path=%s", filePath.c_str());
+      subtitlePath_.clear();
+      subtitleData_.clear();
+      return false;
+    }
+
+    loaded_ = true;  // 全部处理完成后才标记为已加载
 
     static int s_lyricLoadCount = 0;
 
@@ -1245,6 +938,7 @@ bool LyricRenderer::load(const std::string &filePath) {
   LOG_ERROR("[Lyric] 加载歌词失败 path=%s", filePath.c_str());
 
   subtitlePath_.clear();
+  subtitleData_.clear();
 
   return false;
 
@@ -1266,6 +960,8 @@ void LyricRenderer::unload() {
 
   subtitlePath_.clear();
 
+  subtitleData_.clear();
+
   loaded_ = false;
 
   invalidateTextureState(true);
@@ -1279,8 +975,6 @@ void LyricRenderer::unload() {
   }
 
 
-
-  maskAtlasBuffer_.shrink_to_fit();
 
   resetTrackRuntimeState();
 
@@ -1306,11 +1000,29 @@ void LyricRenderer::unload() {
 
 
 
+void LyricRenderer::setPinyinEnabled(bool enabled) {
+  std::lock_guard<std::recursive_mutex> lock(initMutex_);
+  if (pinyinEnabled_ == enabled) return;
+  pinyinEnabled_ = enabled;
+  if (loaded_ && initialized_) {
+    rebuildTrackFromSubtitlePath();
+  }
+}
+
 // 在render pass 外准备当前帧纹理；ASS 同步执行，避免 ASS_Image 生命周期竞态
+void LyricRenderer::setHeaderVisible(bool visible) {
+  std::lock_guard<std::recursive_mutex> lock(initMutex_);
+  if (headerVisible_ == visible) return;
+  headerVisible_ = visible;
+  if (loaded_ && initialized_) {
+    rebuildTrackFromSubtitlePath();
+  }
+}
+
 bool LyricRenderer::prepareFrame(VulkanRenderer *renderer, double currentTime) {
 
   std::lock_guard<std::recursive_mutex> lock(initMutex_);
-  bool contentChanged = false;
+  bool contentChanged = lastRenderTimeMs_ < 0;
 
 
 
@@ -1370,14 +1082,15 @@ bool LyricRenderer::prepareFrame(VulkanRenderer *renderer, double currentTime) {
 
   if (!images) {
 
-    if (!texturePrepared_ || textureId_ == 0) {
+    maskFrameFailures_ = 0;
+
+    if (texturePrepared_ || contentChanged) {
 
       clearPreparedTexture(renderer, currentTimeMs);
       contentChanged = true;
 
     }
 
-    contentChanged = updateCountdownState(renderer, currentTimeMs) || contentChanged;
 
     return contentChanged;
 
@@ -1387,15 +1100,12 @@ bool LyricRenderer::prepareFrame(VulkanRenderer *renderer, double currentTime) {
 
   // detectChange=0 且已有有效纹理时直接复用
 
-  if (!detectChange && texturePrepared_ && textureId_ != 0) {
-
-    ass_frame_unref(images);
+  if (!detectChange && !maskFrameFailures_ && texturePrepared_ && textureId_ != 0) {
 
     lastRenderTimeMs_ = currentTimeMs;
 
-    contentChanged = updateCountdownState(renderer, currentTimeMs);
 
-    return contentChanged;
+    return false;
 
   }
 
@@ -1403,17 +1113,27 @@ bool LyricRenderer::prepareFrame(VulkanRenderer *renderer, double currentTime) {
 
   auto t2 = std::chrono::steady_clock::now();
 
-  // 无图像也交给 buildGpuMaskFrame 统一处理，避免过场帧瞬时清空导致黑闪
+  // Build changed masks; a failed upload must be retried even if libass is unchanged.
 
   bool buildOk = buildGpuMaskFrame(renderer, images, currentTimeMs);
-
-  ass_frame_unref(images);
 
 
 
   if (!buildOk) {
-
-    LOG_ERROR("[Lyric] GPU mask 路径构建失败，已禁止回退CPU 合成路径");
+    const auto now = std::chrono::steady_clock::now();
+    if (maskFrameFailures_++ == 0) maskFailureStarted_ = now;
+    int textureWidth = 0, textureHeight = 0;
+    const bool keepPrevious = texturePrepared_ && preparedFrameUsesGpuMask_ &&
+        currentTimeMs >= lastRenderTimeMs_ && currentTimeMs - lastRenderTimeMs_ <= 150 &&
+        now - maskFailureStarted_ < std::chrono::milliseconds(150) &&
+        renderer->getTextureSize(textureId_, textureWidth, textureHeight) &&
+        textureWidth == static_cast<int>(maskAtlasWidth_) &&
+        textureHeight == static_cast<int>(maskAtlasHeight_);
+    if (maskFrameFailures_ == 1 || maskFrameFailures_ % 60 == 0)
+      LOG_WARN("[Lyric] mask frame retry failures=%u keepPrevious=%d time=%lld",
+               maskFrameFailures_, keepPrevious ? 1 : 0,
+               static_cast<long long>(currentTimeMs));
+    if (keepPrevious) return false;
 
     clearPreparedTexture(renderer, currentTimeMs);
 
@@ -1422,11 +1142,14 @@ bool LyricRenderer::prepareFrame(VulkanRenderer *renderer, double currentTime) {
     texturePrepared_ = false;
 
     contentChanged = true;
-    contentChanged = updateCountdownState(renderer, currentTimeMs) || contentChanged;
 
     return contentChanged;
 
   }
+
+  if (maskFrameFailures_)
+    LOG_INFO("[Lyric] mask frame recovered failures=%u", maskFrameFailures_);
+  maskFrameFailures_ = 0;
 
   contentChanged = true;
 
@@ -1435,7 +1158,6 @@ bool LyricRenderer::prepareFrame(VulkanRenderer *renderer, double currentTime) {
 
   lastRenderTimeMs_ = currentTimeMs;
 
-  contentChanged = updateCountdownState(renderer, currentTimeMs) || contentChanged;
 
   auto t3 = std::chrono::steady_clock::now();
 
@@ -1486,9 +1208,6 @@ void LyricRenderer::renderFrame(VulkanRenderer *renderer, double currentTime,
 
 
   const Region contentRegion = normalizeRegion({x, y, layerWidth, layerHeight, alpha});
-
-  renderCountdownForRegion(renderer, contentRegion, alpha);
-
 
 
   if (shouldRebuildCachedDraws(contentRegion, alpha)) {
@@ -1543,7 +1262,6 @@ void LyricRenderer::renderFrameBatch(VulkanRenderer *renderer,
 
     const Region contentRegion = normalizeRegion(r);
 
-    renderCountdownForRegion(renderer, contentRegion, contentRegion.alpha);
 
     appendMaskDrawsForRegion(contentRegion, r.alpha, false, draws);
 
@@ -1968,221 +1686,6 @@ void LyricRenderer::ensureEffectTexture(VulkanRenderer *renderer) {
 }
 
 
-
-// Prepare countdown 纹理 (execute before 渲染 pass)
-
-void LyricRenderer::prepareCountdownDots(VulkanRenderer *renderer, int64_t remainingMs) {
-
-  std::lock_guard<std::recursive_mutex> lock(initMutex_);
-
-
-
-  if (!renderer || remainingMs <= 0 || remainingMs > 3000) {
-
-    countdownPrepared_ = false;
-
-    lastCountdownVisibleCount_ = 0;
-
-    return;
-
-  }
-
-
-
-  int visibleCount = remainingMs > 2000 ? 3 : (remainingMs > 1000 ? 2 : 1);
-
-  lastCountdownVisibleCount_ = visibleCount;
-
-
-
-  if (!countdownImageTried_) {
-
-    countdownImageTried_ = true;
-
-    const std::string normalized = FileUtils::normalizePath(RES_DIR + std::string("countdown.png"));
-
-    if (FileUtils::exists(normalized)) {
-
-      int w = 0, h = 0, n = 0;
-
-      stbi_uc *data = stbi_load(normalized.c_str(), &w, &h, &n, 4);
-
-      if (data) {
-
-        if (countdownTextureId_ == 0) {
-
-          countdownTextureId_ = 51000 + layerId_ * 1000;
-
-        }
-
-
-
-        bool uploaded = false;
-
-        void *mapped = nullptr;
-
-        size_t rowPitch = 0;
-
-        if (renderer->beginStagedTextureWrite(countdownTextureId_,
-
-                                              static_cast<uint32_t>(w),
-
-                                              static_cast<uint32_t>(h),
-
-                                              &mapped, &rowPitch) && mapped) {
-
-          const size_t rowBytes = static_cast<size_t>(w) * 4u;
-
-          const uint8_t *src = data;
-
-          uint8_t *dst = static_cast<uint8_t *>(mapped);
-
-          for (int y = 0; y < h; ++y) {
-
-            std::memcpy(dst, src, rowBytes);
-
-            dst += rowPitch;
-
-            src += rowBytes;
-
-          }
-
-          renderer->endStagedTextureWrite(countdownTextureId_);
-
-          uploaded = true;
-
-        }
-
-        stbi_image_free(data);
-
-
-
-        if (uploaded) {
-
-          countdownUseResImage_ = true;
-
-          countdownImageWidth_ = w;
-
-          countdownImageHeight_ = h;
-
-        } else {
-
-          countdownUseResImage_ = false;
-
-        }
-
-      } else {
-
-        countdownUseResImage_ = false;
-
-      }
-
-    } else {
-
-      countdownUseResImage_ = false;
-
-    }
-
-  }
-
-
-
-  countdownPrepared_ = countdownUseResImage_ && countdownTextureId_ != 0 &&
-
-                       countdownImageWidth_ > 0 && countdownImageHeight_ > 0;
-
-}
-
-
-
-bool LyricRenderer::computeCountdownRemainingMs(int64_t currentTimeMs, int64_t &remainingMs) {
-
-  // 倒计时规则：
-
-  // 1. 找到“下一句歌词”的开始时 nextStart（大currentTimeMs 的第一条含 {\K}/{\k} 事件// 2. 找到上一句歌词的开始时 prevStart（第一句则视为 0// 3. nextStart - prevStart > 10000ms10 秒空白），且 0 < nextStart - currentTimeMs <= 3000ms，则需要显示倒计 // 4. remainingMs = nextStart - currentTimeMs
-
-    if (!initialized_ || !loaded_) {
-
-    return false;
-
-  }
-
-
-
-  if (lyricStartTimes_.empty()) {
-
-    return false;
-
-  }
-
-
-
-  // 查找下一句歌 int64_t nextStart = -1;
-
-  int64_t nextStart = -1;
-
-  int64_t prevStart = 0;
-
-  for (size_t i = 0; i < lyricStartTimes_.size(); ++i) {
-
-    int64_t s = lyricStartTimes_[i];
-
-    if (s > currentTimeMs) {
-
-      nextStart = s;
-
-      if (i > 0) {
-
-        prevStart = lyricStartTimes_[i - 1];
-
-      }
-
-      break;
-
-    } else {
-
-      prevStart = s;
-
-    }
-
-  }
-
-
-
-  if (nextStart < 0) {
-
-    return false; // 后面已经没有歌词
-
-  }
-
-
-
-  int64_t gapPrev = nextStart - prevStart;
-
-  if (gapPrev <= 10000) {
-
-    return false; // 前后两句间隔不超 10 秒，不需要倒计时
-
-  }
-
-    int64_t delta = nextStart - currentTimeMs;
-
-  if (delta <= 0 || delta > 3000) {
-
-    return false; // 不在倒计时窗口内
-
-  }
-
-
-
-  remainingMs = delta;
-
-  return true;
-
-}
-
-
-
 void LyricRenderer::appendMaskDrawsForRegion(const Region &contentRegion,
 
                                              float alphaMultiplier,
@@ -2249,7 +1752,7 @@ void LyricRenderer::appendMaskDrawsForRegion(const Region &contentRegion,
 
 void LyricRenderer::uploadPreparedMaskTexture(VulkanRenderer *renderer) const {
 
-  if (!renderer || textureId_ == 0 || width_ <= 0 || height_ <= 0) {
+  if (!compositeRequired_ || !renderer || textureId_ == 0 || width_ <= 0 || height_ <= 0) {
 
     return;
 
@@ -2328,103 +1831,4 @@ void LyricRenderer::rebuildCachedDraws(const Region &contentRegion, float alpha)
 }
 
 
-
-void LyricRenderer::renderCountdownForRegion(VulkanRenderer *renderer,
-
-                                             const Region &contentRegion,
-
-                                             float alpha) {
-
-  int countdownX = 0;
-
-  int countdownY = 0;
-
-  int countdownDotWidth = 0;
-
-  int countdownDotHeight = 0;
-
-  if (getCountdownPosition(contentRegion, countdownX, countdownY,
-
-                           countdownDotWidth, countdownDotHeight)) {
-
-    renderCountdownDots(renderer, countdownX, countdownY,
-
-                        countdownDotWidth, countdownDotHeight, alpha);
-
-  }
-
-}
-
-
-
-// 传入 dotWidth/dotHeight 已经是最终像素尺寸，这里只负责排布与绘制
-void LyricRenderer::renderCountdownDots(VulkanRenderer *renderer,
-  int centerX, int y,
-                                        int dotWidth, int dotHeight,
-                                        float alpha) {
-
-  std::lock_guard<std::recursive_mutex> lock(initMutex_);
-
-
-
-  if (!renderer || !countdownPrepared_ || countdownTextureId_ == 0) {
-
-    return;
-
-  }
-
-
-
-  int visibleCount = lastCountdownVisibleCount_;
-
-  if (visibleCount <= 0 || alpha <= 0.0f) {
-
-    return;
-
-  }
-
-
-
-  const int baseDotWidth = countdownImageWidth_ > 0 ? countdownImageWidth_ : 32;
-
-  const int baseDotHeight = countdownImageHeight_ > 0 ? countdownImageHeight_ : 32;
-
-  dotHeight = std::max(1, dotHeight);
-
-  if (dotWidth <= 0) {
-
-    dotWidth = std::max(1, static_cast<int>(std::lround(static_cast<float>(baseDotWidth) *
-
-                                                        (static_cast<float>(dotHeight) / std::max(1, baseDotHeight)))));
-
-  }
-
-  int spacing = std::max(1, dotWidth / 2);
-
-
-
-  constexpr int kCountdownSlotCount = 3;
-
-  for (int slot = 0; slot < kCountdownSlotCount; ++slot) {
-
-    if (slot >= visibleCount) {
-
-      continue;
-
-    }
-
-    int drawX = centerX + slot * (dotWidth + spacing);
-
-    renderer->renderLayer(countdownTextureId_, drawX, y, dotWidth, dotHeight,
-
-                          0.0f, 1.0f, alpha);
-
-  }
-
-}
-
-
-
 } // 命名空间 hsvj
-
-

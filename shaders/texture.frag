@@ -1012,6 +1012,21 @@ vec3 applyColorEffect(vec3 rgb, int effectType, float amplitude, vec2 uv, vec2 f
         return shapeMosaicStitchEffect(rgb, tex, uv, frameUv, t, amplitude,
                                        customColor, colorMode);
     }
+    if (effectType == 42) {
+        // Bluetooth karaoke lyric: inactive glyphs stay neutral gray while a
+        // soft left-to-right sweep recolors only the bright text pixels.
+        float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
+        float textMask = smoothstep(0.16, 0.52, luma);
+        float feather = max(fwidth(frameUv.x) * 2.0, 0.004);
+        float passed = 1.0 - smoothstep(amplitude - feather,
+                                        amplitude + feather, frameUv.x);
+        vec3 activeColor = vec3(0.20, 0.58, 1.0);
+        vec3 result = mix(rgb, activeColor, textMask * passed);
+        float head = exp(-abs(frameUv.x - amplitude) /
+                         max(feather * 3.0, 0.010));
+        result += activeColor * textMask * head * 0.16;
+        return clamp(result, 0.0, 1.0);
+    }
     return rgb;
 }
 
@@ -1135,7 +1150,82 @@ float sdPetal(vec2 p, float n) {
     return d;
 }
 
+
+const float BT_SPECTRUM_BAND_COUNT = 64.0;
+
+vec4 bluetoothAudioSpectrum(vec2 frameUv, float drive) {
+    float beat = clamp(drive, 0.0, 1.0);
+    float centeredX = abs(frameUv.x - 0.5) * 2.0;
+    float bandPosition = min(centeredX * BT_SPECTRUM_BAND_COUNT,
+                             BT_SPECTRUM_BAND_COUNT - 0.001);
+    int bandIndex = int(floor(bandPosition));
+    vec2 bandSample = texelFetch(texSampler, ivec2(bandIndex, 0), 0).rg;
+    float value = clamp(max(bandSample.r, bandSample.g * 0.94), 0.0, 1.0);
+
+    float cell = abs(fract(bandPosition) - 0.5);
+    float barWidthAa = max(fwidth(bandPosition) * 0.75, 0.035);
+    float barX = 1.0 - smoothstep(0.34, 0.34 + barWidthAa, cell);
+
+    float distanceFromCenter = abs(frameUv.y - 0.50);
+    // High-energy bands can reach both physical edges. The procedural layer is
+    // already sized to the full output resolution, so no letterbox area is
+    // reserved above or below the spectrum.
+    float barHeight = min(0.50, 0.030 + value * 0.455 + beat * 0.018);
+    float edgeAa = max(fwidth(frameUv.y) * 1.5, 0.0008);
+    float barY = 1.0 - smoothstep(barHeight, barHeight + edgeAa,
+                                  distanceFromCenter);
+    float barMask = barX * barY;
+
+    float glowHeight = min(0.50, barHeight + 0.040 + value * 0.025);
+    float glowY = 1.0 - smoothstep(barHeight, glowHeight,
+                                   distanceFromCenter);
+    float glow = barX * glowY * (0.18 + value * 0.34);
+
+    float frequency = float(bandIndex) /
+                      (BT_SPECTRUM_BAND_COUNT - 1.0);
+    vec3 lowColor = vec3(0.96, 0.08, 0.72);
+    vec3 midColor = vec3(0.48, 0.16, 1.00);
+    vec3 highColor = vec3(0.05, 0.82, 1.00);
+    vec3 bandColor = mix(lowColor, midColor,
+                         smoothstep(0.00, 0.58, frequency));
+    bandColor = mix(bandColor, highColor,
+                    smoothstep(0.48, 1.00, frequency));
+
+    float horizontalGlow = 1.0 - abs(frameUv.x * 2.0 - 1.0);
+    float verticalGlow = 1.0 - abs(frameUv.y * 2.0 - 1.0);
+
+    // The spectrum owns the entire Bluetooth canvas. Keep a visible colored
+    // ambience at both edges instead of exposing the paused layer as black
+    // bands. Lyric/status pill backgrounds are rendered by their own textures.
+    vec3 edgeColor = mix(vec3(0.010, 0.018, 0.050),
+                         vec3(0.045, 0.008, 0.085), horizontalGlow);
+    vec3 centerColor = vec3(0.020, 0.006, 0.060) +
+                       vec3(0.055, 0.012, 0.115) * horizontalGlow;
+    vec3 color = mix(edgeColor, centerColor, verticalGlow);
+    color += bandColor * (0.018 + value * 0.050) *
+             (0.45 + verticalGlow * 0.55);
+    color += bandColor * glow;
+
+    float baseline = 1.0 - smoothstep(0.0015, 0.0045,
+                                      abs(frameUv.y - 0.50));
+    color += mix(lowColor, highColor, frameUv.x) * baseline * 0.32;
+    color = mix(color, bandColor * (0.90 + value * 0.42), barMask);
+
+    return vec4(clamp(color, 0.0, 1.0), 1.0);
+}
+
 void main() {
+    // Effect 41 is a procedural Bluetooth spectrum. Its 64x1 input is data,
+    // not an image, so bypass the generic image sampling/effect chain.
+    if (int(pc.extEffect.x + 0.5) == 41) {
+        vec4 spectrumColor = bluetoothAudioSpectrum(
+            fragTexCoord, clamp(pc.extEffect.y, 0.0, 1.0));
+        spectrumColor.rgb *= pc.color.rgb;
+        spectrumColor.a *= pc.color.a;
+        outColor = spectrumColor;
+        return;
+    }
+
     float shapeType = pc.shapeInfo.x;
     float shapeParam = pc.shapeInfo.y;
     float blackToTransparent = pc.shapeInfo.z;
@@ -1251,7 +1341,9 @@ void main() {
     int stackCount = int((effectBits >> 24) & 0x0Fu);
     int effectType = isParallelStack ? 0 : int(pc.extEffect.x);
     if ((isParallelStack && stackCount > 1) || effectType > 0) {
-        float amp = clamp(pc.extEffect.y * 2.0, 0.0, 1.0);
+        float amp = (!isParallelStack && effectType == 42)
+                        ? clamp(pc.extEffect.y, 0.0, 1.0)
+                        : clamp(pc.extEffect.y * 2.0, 0.0, 1.0);
         // 解码效果颜色：extEffect.w 是 packed (mode<<24|B<<16|G<<8|R)
         // mode bit0=1 → 用 (R,G,B) 固定色；bit1-5=描边宽度；bit6=七彩/颜色覆盖
         uint packed = floatBitsToUint(pc.extEffect.w);

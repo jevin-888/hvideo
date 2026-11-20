@@ -9,8 +9,11 @@
 #include "core/CommandRouter.h"
 #include "utils/Logger.h"
 #include <algorithm>
+#include <chrono>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <cstring>
+#include <cstdint>
 #include <errno.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -22,12 +25,46 @@
 namespace hsvj {
 
 namespace {
-ssize_t sendNoSignal(int fd, const void* data, size_t length) {
+bool sendAllNoSignal(int fd, const void* data, size_t length) {
+  const auto* bytes = static_cast<const char*>(data);
+  size_t offset = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
 #ifdef MSG_NOSIGNAL
-  return send(fd, data, length, MSG_NOSIGNAL);
+  constexpr int kNoSignalFlag = MSG_NOSIGNAL;
 #else
-  return send(fd, data, length, 0);
+  constexpr int kNoSignalFlag = 0;
 #endif
+#ifdef MSG_DONTWAIT
+  constexpr int kDontWaitFlag = MSG_DONTWAIT;
+#else
+  constexpr int kDontWaitFlag = 0;
+#endif
+
+  while (offset < length) {
+    const ssize_t sent = send(fd, bytes + offset, length - offset,
+                              kNoSignalFlag | kDontWaitFlag);
+    if (sent > 0) {
+      offset += static_cast<size_t>(sent);
+      continue;
+    }
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return false;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return false;
+    const int remainingMs = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    pollfd descriptor{fd, POLLOUT, 0};
+    int pollResult;
+    do {
+      pollResult = poll(&descriptor, 1, remainingMs);
+    } while (pollResult < 0 && errno == EINTR);
+    if (pollResult <= 0 ||
+        (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool recvExact(int fd, void* data, size_t length) {
@@ -227,6 +264,7 @@ void WebSocketServer::stop() {
       shutdown(fd, SHUT_RDWR);
     }
     externalClients_.clear();
+    activeClients_.clear();
     clientThreads.swap(clientThreads_);
   }
   for (auto& t : clientThreads) {
@@ -263,6 +301,10 @@ void WebSocketServer::handleClient(int clientFd) {
     if (!performHandshake(clientFd)) {
       close(clientFd);
       return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(clientsMutex_);
+      activeClients_.insert(clientFd);
     }
     LOG_INFO("WebSocketServer: client connected fd=%d port=%d clients=%zu",
              clientFd, port_, clientCount());
@@ -309,21 +351,33 @@ void WebSocketServer::handleClient(int clientFd) {
     if (connectionCallback_) {
       connectionCallback_(clientFd, false);
     }
+    {
+      std::lock_guard<std::mutex> lock(clientsMutex_);
+      activeClients_.erase(clientFd);
+    }
     close(clientFd);
     LOG_INFO("WebSocketServer: client disconnected fd=%d port=%d clients=%zu",
              clientFd, port_, clientCount());
   } catch (const std::exception& e) {
     LOG_ERROR("WebSocketServer: Exception in handleClient: %s", e.what());
+    {
+      std::lock_guard<std::mutex> lock(clientsMutex_);
+      activeClients_.erase(clientFd);
+    }
     close(clientFd);
   } catch (...) {
     LOG_ERROR("WebSocketServer: Unknown exception in handleClient");
+    {
+      std::lock_guard<std::mutex> lock(clientsMutex_);
+      activeClients_.erase(clientFd);
+    }
     close(clientFd);
   }
 }
 
 size_t WebSocketServer::clientCount() const {
   std::lock_guard<std::mutex> lock(clientsMutex_);
-  return clientThreads_.size() + externalClients_.size();
+  return activeClients_.size() + externalClients_.size();
 }
 
 bool WebSocketServer::performHandshake(int fd) {
@@ -388,17 +442,24 @@ bool WebSocketServer::performHandshakeFromHeaders(int fd, const std::string& hea
      << "Sec-WebSocket-Accept: " << acceptKey << "\r\n\r\n";
   
   std::string resp = ss.str();
-  return sendNoSignal(fd, resp.c_str(), resp.length()) == (ssize_t)resp.length();
+  return sendAllNoSignal(fd, resp.data(), resp.size());
 }
 
 void WebSocketServer::handleExternalClient(int clientFd, const std::string& handshakeHeaders) {
+  // Removal is serialized with frame sends. The HTTP worker owns close().
+  const auto unregisterExternal = [&]() {
+    std::lock_guard<std::mutex> sendLock(sendMutex_);
+    std::lock_guard<std::mutex> lock(clientsMutex_);
+    externalClients_.erase(
+        std::remove(externalClients_.begin(), externalClients_.end(), clientFd),
+        externalClients_.end());
+  };
   try {
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 0;
     setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     if (!performHandshakeFromHeaders(clientFd, handshakeHeaders)) {
-      close(clientFd);
       return;
     }
     {
@@ -428,19 +489,15 @@ void WebSocketServer::handleExternalClient(int clientFd, const std::string& hand
     if (connectionCallback_) {
       connectionCallback_(clientFd, false);
     }
-    {
-      std::lock_guard<std::mutex> lock(clientsMutex_);
-      externalClients_.erase(std::remove(externalClients_.begin(), externalClients_.end(), clientFd), externalClients_.end());
-    }
-    close(clientFd);
+    unregisterExternal();
     LOG_INFO("WebSocketServer: external client disconnected fd=%d port=%d clients=%zu",
              clientFd, port_, clientCount());
   } catch (const std::exception& e) {
     LOG_ERROR("WebSocketServer: Exception in external client: %s", e.what());
-    close(clientFd);
+    unregisterExternal();
   } catch (...) {
     LOG_ERROR("WebSocketServer: Unknown exception in external client");
-    close(clientFd);
+    unregisterExternal();
   }
 }
 
@@ -485,47 +542,78 @@ bool WebSocketServer::unframeMessage(int fd, std::string& outMessage) {
   return true;
 }
 
-bool WebSocketServer::sendToClient(int clientId, const std::string& message) {
-  std::string framed = frameMessage(message);
-  ssize_t sent = sendNoSignal(clientId, framed.data(), framed.size());
-  return sent == (ssize_t)framed.size();
+bool WebSocketServer::sendFrameToClient(int clientId,
+                                            const std::string& payload,
+                                            unsigned char opcode) {
+  const std::string framed = frameMessage(payload, opcode);
+  std::lock_guard<std::mutex> sendLock(sendMutex_);
+  {
+    std::lock_guard<std::mutex> lock(clientsMutex_);
+    const bool internal = activeClients_.count(clientId) > 0;
+    const bool external =
+        std::find(externalClients_.begin(), externalClients_.end(), clientId) !=
+        externalClients_.end();
+    if (!internal && !external) return false;
+  }
+
+  return sendAllNoSignal(clientId, framed.data(), framed.size());
 }
 
-std::string WebSocketServer::frameMessage(const std::string& message) {
-  std::string framed;
-  framed.push_back((char)0x81); // Text 帧
+bool WebSocketServer::sendToClient(int clientId, const std::string& message) {
+  return sendFrameToClient(clientId, message, 0x1);
+}
 
-  size_t len = message.length();
+bool WebSocketServer::sendBinaryToClient(int clientId,
+                                         const std::string& payload) {
+  return sendFrameToClient(clientId, payload, 0x2);
+}
+
+std::string WebSocketServer::frameMessage(const std::string& payload,
+                                          unsigned char opcode) {
+  std::string framed;
+  framed.push_back(static_cast<char>(0x80 | (opcode & 0x0F)));
+
+  const uint64_t len = static_cast<uint64_t>(payload.size());
   if (len <= 125) {
-    framed.push_back((char)len);
+    framed.push_back(static_cast<char>(len));
   } else if (len <= 65535) {
-    framed.push_back((char)126);
-    framed.push_back((char)((len >> 8) & 0xFF));
-    framed.push_back((char)(len & 0xFF));
+    framed.push_back(static_cast<char>(126));
+    framed.push_back(static_cast<char>((len >> 8) & 0xFF));
+    framed.push_back(static_cast<char>(len & 0xFF));
   } else {
-    framed.push_back((char)127);
-    for(int i=7; i>=0; --i) framed.push_back((char)((len >> (8*i)) & 0xFF));
+    framed.push_back(static_cast<char>(127));
+    for (int i = 7; i >= 0; --i) {
+      framed.push_back(static_cast<char>((len >> (8 * i)) & 0xFF));
+    }
   }
-  
-  framed.append(message);
+
+  framed.append(payload);
   return framed;
 }
 
-void WebSocketServer::broadcast(const std::string& message) {
+size_t WebSocketServer::broadcastFrame(const std::string& payload,
+                                       unsigned char opcode) {
   std::vector<int> clientFds;
   {
     std::lock_guard<std::mutex> lock(clientsMutex_);
-    clientFds.reserve(clientThreads_.size());
-    for (const auto& pair : clientThreads_) {
-      clientFds.push_back(pair.first);
-    }
-    for (int fd : externalClients_) {
-      clientFds.push_back(fd);
-    }
+    clientFds.reserve(activeClients_.size() + externalClients_.size());
+    for (int fd : activeClients_) clientFds.push_back(fd);
+    for (int fd : externalClients_) clientFds.push_back(fd);
   }
+
+  size_t successCount = 0;
   for (int fd : clientFds) {
-    sendToClient(fd, message);
+    if (sendFrameToClient(fd, payload, opcode)) ++successCount;
   }
+  return successCount;
+}
+
+size_t WebSocketServer::broadcast(const std::string& message) {
+  return broadcastFrame(message, 0x1);
+}
+
+size_t WebSocketServer::broadcastBinary(const std::string& payload) {
+  return broadcastFrame(payload, 0x2);
 }
 
 } // 命名空间 hsvj

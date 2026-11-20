@@ -1,6 +1,7 @@
 import { ensureBlendRegion, getState } from '../actions.js?v=2.95';
 import { BLEND_SIDES } from '../types.js';
 import { pushBlendUndo } from '../undo.js';
+import { defaultBlendWidthForGrid } from '../utils/blend.js';
 
 export function setBlendManagerMode(enabled) {
     getState().blend.managerMode = enabled;
@@ -52,9 +53,7 @@ export function getDefaultBlendWidth(regionId, side) {
     const blend = getState().blend.byRegionId[regionId];
     const gridCols = Number(blend?.gridCols) || 2;
     const gridRows = Number(blend?.gridRows) || 2;
-    if ((side === 'left' || side === 'right') && gridCols > 2) return 1 / (gridCols - 1);
-    if ((side === 'top' || side === 'bottom') && gridRows > 2) return 1 / (gridRows - 1);
-    return 0;
+    return defaultBlendWidthForGrid(side === 'left' || side === 'right' ? gridCols : gridRows);
 }
 
 export function ensureBlendSideWidth(regionId, side) {

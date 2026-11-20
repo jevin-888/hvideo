@@ -85,7 +85,6 @@ private:
 
     // ─── 前端 ───
     std::unique_ptr<MelFilterbank> mel_;
-    int numMel_;
 
     // ─── 上下文环形缓冲（mel 帧）───
     // melHistory_[CNN_CONTEXT_FRAMES][CNN_NUM_MEL]，row-major，环形写入

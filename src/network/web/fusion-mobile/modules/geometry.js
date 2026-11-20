@@ -124,22 +124,22 @@ export function moveLocal(target, op, du, dv, options = {}) {
     const clampPoints = options.clampPoints !== false;
     const selectedRow = normalizeIndex(target.selected?.row, target.rows - 1, 0);
     const selectedCol = normalizeIndex(target.selected?.col, target.cols - 1, 0);
-    const movePoint = (row, col) => {
+    const movePoint = (row, col, moveDu = du, moveDv = dv) => {
         const index = row * target.cols + col;
         const point = target.points[index];
         if (!point) return;
-        const u = point.u + du;
-        const v = point.v + dv;
+        const u = point.u + moveDu;
+        const v = point.v + moveDv;
         point.u = clampPoints ? clamp(u, 0, 1) : u;
         point.v = clampPoints ? clamp(v, 0, 1) : v;
     };
 
     if (op === 'point') movePoint(selectedRow, selectedCol);
     if (op === 'row') {
-        for (let col = 0; col < target.cols; col += 1) movePoint(selectedRow, col);
+        for (let col = 0; col < target.cols; col += 1) movePoint(selectedRow, col, 0, dv);
     }
     if (op === 'col') {
-        for (let row = 0; row < target.rows; row += 1) movePoint(row, selectedCol);
+        for (let row = 0; row < target.rows; row += 1) movePoint(row, selectedCol, du, 0);
     }
     if (op === 'all') {
         for (let row = 0; row < target.rows; row += 1) {

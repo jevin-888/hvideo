@@ -36,9 +36,11 @@ void CommandRouter::showLayer41Hint(int type, const std::string &customText) {
     textLayer->setVisible(true);
   }
 
-  LOG_DEBUG("CommandRouter::showLayer41Hint: Calling showOperationHint, type=%d, text='%s'", type, customText.c_str());
+  LOG_INFO("[Hint] layer41 type=%d text='%s' visible=%d", type,
+           customText.c_str(), textLayer->isVisible());
   textLayer->showOperationHint(static_cast<HintType>(type), customText);
-  LOG_DEBUG("CommandRouter::showLayer41Hint: showOperationHint called successfully, type=%d, visible=%d", type, textLayer->isVisible());
+  LOG_INFO("[Hint] layer41 showOperationHint complete type=%d visible=%d", type,
+           textLayer->isVisible());
 }
 
 bool CommandRouter::tryLoadLyricForVideo(int layerId, LayerVideo *videoLayer,

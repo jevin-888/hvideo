@@ -6,6 +6,9 @@
 #include <ctime>
 #include <cstdint>
 #include <mutex>
+#include <json/json.h>
+#include <chrono>
+#include <functional>
 
 namespace hsvj {
 
@@ -38,9 +41,21 @@ public:
 
     /**
      * @brief 检查授权
+     * @param allowCloudSync false selects network VOD server mode for startup
      * @return 是否已授权
      */
-    bool checkLicense();
+    bool checkLicense(bool allowCloudSync = true);
+
+    /** Apply the server's signed-file entitlements after terminal admission. */
+    bool authorizeServerLicense(const Json::Value& admission);
+    void revokeServerLicense(const std::string& reason);
+    bool isServerLicenseMode() const;
+    std::string getLicenseSource() const;
+    bool importLicense(const std::string& content, bool allowCloudSync = true);
+    /** 是否有需要上报云端的有效人工导入授权（排除云端已下发的 license.dat）。 */
+    bool hasValidLocalLicense() const;
+    void syncLocalLicenseToCloud(const std::string& content);
+    int getLastImportCloudSyncStatus() const;
 
     /**
      * @brief 更新授权状态（每帧调用）
@@ -52,13 +67,13 @@ public:
      * @brief 检查是否已授权
      * @return 是否已授权
      */
-    bool isLicensed() const { return licensed_; }
+    bool isLicensed() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return licensed_; }
 
     /**
      * @brief 检查是否应该显示提示
      * @return 是否应该显示提示
      */
-    bool shouldShowWarning() const { return showWarning_; }
+    bool shouldShowWarning() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return showWarning_; }
 
     /**
      * @brief 检查是否应该阻止视频播放（15天后）
@@ -70,25 +85,25 @@ public:
      * @brief 获取授权信息
      * @return 授权信息字符串
      */
-    std::string getLicenseInfo() const { return licenseInfo_; }
+    std::string getLicenseInfo() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return licenseInfo_; }
 
     /**
      * @brief 获取提示文本
      * @return 提示文本
      */
-    std::string getWarningText() const { return warningText_; }
+    std::string getWarningText() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return warningText_; }
 
     /**
      * @brief 获取当前提示阶段
      * @return 当前提示阶段
      */
-    WarningStage getWarningStage() const { return warningStage_; }
+    WarningStage getWarningStage() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return warningStage_; }
 
     /**
      * @brief 获取授权启用的图层 ID 列表（从 license.enabled_layers 解析）
      * @return 已授权图层 ID 列表；未授权或解析失败时返回空列表
      */
-    std::vector<int> getEnabledLayerIds() const { return enabledLayerIds_; }
+    std::vector<int> getEnabledLayerIds() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return enabledLayerIds_; }
 
     /**
      * @brief 获取距离到期的天数（正数=未到期，负数=已到期）
@@ -97,40 +112,47 @@ public:
     int getDaysUntilExpiry() const;
 
     /** 客户名称（来自 customer.name） */
-    std::string getCustomerName() const { return customerName_; }
+    std::string getCustomerName() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return customerName_; }
     /** 供应商名称（来自 supplier.name） */
-    std::string getSupplierName() const { return supplierName_; }
+    std::string getSupplierName() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return supplierName_; }
     /** 商业模式：buyout(正常销售) / rent / installment */
-    std::string getUsageMode() const { return usageMode_; }
+    std::string getUsageMode() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return usageMode_; }
     /** 到期日期字符串 YYYY-MM-DD */
-    std::string getExpiryDate() const { return expiryDateFormatted_; }
+    std::string getExpiryDate() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return expiryDateFormatted_; }
     /** 到期时间 Unix 时间戳（用于设备上报）；未授权/无到期时为 0 */
-    int64_t getExpiryTime() const { return expiryTime_; }
+    int64_t getExpiryTime() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return expiryTime_; }
     /** 授权开始时间 Unix 时间戳（来自 validity.issue_时间）；无时为 0 */
-    int64_t getStartTime() const { return startTime_; }
-    /** 授权模块列表：ktv, vod, effects */
-    const std::vector<std::string>& getModules() const { return modules_; }
+    int64_t getStartTime() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return startTime_; }
+    /** 授权模块列表：TV、投屏、霸屏、fusion、effects、scene、cave、stage、vod */
+    std::vector<std::string> getModules() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return modules_; }
+    /** 本地 license.dat 原文，用于启动时同步到云端。 */
+    std::string getLocalLicenseContent() const;
     /** 授权输入通道数/最大输入区域数；<=0 表示未限制（兼容旧授权） */
-    int getInputChannelCount() const { return inputChannelCount_; }
+    int getInputChannelCount() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return inputChannelCount_; }
     /** 最近一次授权加载/验证失败原因，用于调试页展示 */
-    std::string getLastError() const { return lastError_; }
+    std::string getLastError() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return lastError_; }
     /** 欠费金额 */
-    double getArrearsAmount() const { return arrearsAmount_; }
+    double getArrearsAmount() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return arrearsAmount_; }
     /** 付款二维码 URL */
-    std::string getPaymentQrUrl() const { return paymentQrUrl_; }
+    std::string getPaymentQrUrl() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return paymentQrUrl_; }
     /** 剩余天数来源：cloud / offline_state / license_duration / local_clock / 时间_invalid */
-    std::string getDaysSource() const { return daysSource_; }
+    std::string getDaysSource() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return daysSource_; }
     /** 设备本机时间是否可信 */
-    bool isDeviceTimeValid() const { return deviceTimeValid_; }
+    bool isDeviceTimeValid() const { std::lock_guard<std::recursive_mutex> lock(mutex_); return deviceTimeValid_; }
     /** 检查指定模块是否已授权 */
     bool isModuleEnabled(const std::string& module) const;
     /** 检查指定图层是否已授权 */
     bool isLayerEnabled(int layerId) const;
     /** 重新从文件加载授权（用于导入新 license 后刷新） */
-    bool reloadLicense();
+    bool reloadLicense(bool allowCloudSync = true);
 
     /** 触发云端即时同步 */
     void triggerCloudSync();
+    void setCloudLicenseAppliedCallback(std::function<void()> callback);
+    void setLocalLicenseSyncCallback(std::function<void(const std::string&)> callback);
+    void stopCloudSync();
+    void completeLocalLicenseSync(bool synced);
+    void setLastImportCloudSyncStatus(int status);
     /** 使用网页端时间辅助校正（仅允许减少剩余天数，不允许增加） */
     void applyBrowserTimeHint(int64_t browserTime);
 
@@ -144,6 +166,8 @@ private:
      * @return 是否加载成功
      */
     bool loadLicense();
+    bool validateLicenseFile(std::string raw);
+    void migrateLegacyCloudLicense();
 
     /**
      * @brief 验证授权数据
@@ -151,6 +175,7 @@ private:
      * @return 是否验证通过
      */
     bool validateLicense(const std::string& licenseData);
+    bool loadEntitlements(const Json::Value& license);
 
     /**
      * @brief 计算到期天数
@@ -173,7 +198,7 @@ private:
     /**
      * @brief 当云端授权同步时的回调
      */
-    void onCloudLicenseReceived(bool success, int64_t expiry, int64_t serverTime);
+    void onCloudLicenseReceived(bool success, int64_t serverTime, const std::string& content);
 
     /**
      * @brief 生成提示文本
@@ -183,6 +208,9 @@ private:
     std::string generateWarningText(int daysUntilExpiry) const;
 
     void clearLicenseState();
+    void refreshLoadedLicense();
+    void applyLocalFallback(const std::string& reason, int64_t serverTime);
+    void startCloudSync();
     void setLastError(const std::string& error) { lastError_ = error; }
 
     bool licensed_;                 // 是否已授权
@@ -232,8 +260,18 @@ private:
     bool deviceTimeValid_;          // 本机系统时间是否可信
     int64_t lastSaveTime_;          // 上次保存状态的时间
     std::string statePath_;         // 状态文件路径 (license_state.json)
+    std::string persistedCloudLicenseHash_; // 标记 license.dat 的云端来源，不保存第二份授权
     bool useCloudPriority_;         // 是否优先使用云端授权
+    bool startupLocalSyncRequired_ = true; // 启动首次优先上报有效本地授权，再拉取云端
+    bool transientOnlineLicense_;   // 网络 VOD 准入生成的仅运行期授权，不写入本地状态
+    bool cloudManagedLicense_ = false; // 当前 license.dat 来自云端，可被云端续签替换
+    bool serverLicensePermanent_ = false;
+    std::chrono::steady_clock::time_point serverLicenseReceivedAt_;
     class CloudLicenseClient* cloudClient_;
+    std::function<void(const std::string&)> localLicenseSyncCallback_;
+    std::function<void()> cloudLicenseAppliedCallback_;
+    int lastImportCloudSyncStatus_ = -1;
+    bool localLicenseSyncPending_ = false;
     mutable std::recursive_mutex mutex_;      // 保护 remainingDays_ 等成员
 
     // --- 授权判定核心常量 (全链路唯一基准) ---
@@ -241,7 +279,7 @@ private:
     static constexpr int DAYS_EXPIRED_PERMANENT = 15; // 过期超过 15 天进入强制拦截 (黑屏)
     static constexpr float WARNING_DURATION = 300.0f; // 启动后提示显示时长：300 秒 (5 分钟)
     static constexpr float WARNING_SAVE_PERIOD = 300.0f; // 本地状态保存周期：300 秒 (5 分钟)
-    static constexpr int CLOUD_SYNC_INTERVAL = 1800;   // 云端校准周期：30 分钟
+    static constexpr int CLOUD_SYNC_INTERVAL = 60;     // 同步周期 60 秒，另加少量随机错峰
 };
 
 } // 命名空间 hsvj

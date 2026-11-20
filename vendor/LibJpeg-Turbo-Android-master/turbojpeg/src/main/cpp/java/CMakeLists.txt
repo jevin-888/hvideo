@@ -12,9 +12,6 @@ set(CMAKE_JAVA_COMPILE_FLAGS "${CMAKE_JAVA_COMPILE_FLAGS} -J-Dfile.encoding=UTF8
 message(STATUS "CMAKE_JAVA_COMPILE_FLAGS = ${CMAKE_JAVA_COMPILE_FLAGS}")
 string(REGEX REPLACE " " ";" CMAKE_JAVA_COMPILE_FLAGS "${CMAKE_JAVA_COMPILE_FLAGS}")
 
-set(JAVAARGS "" CACHE STRING "Additional arguments to pass to java when running unit tests (example: -d32)")
-message(STATUS "JAVAARGS = ${JAVAARGS}")
-
 set(JAVA_SOURCES org/libjpegturbo/turbojpeg/TJ.java
   org/libjpegturbo/turbojpeg/TJCompressor.java
   org/libjpegturbo/turbojpeg/TJCustomFilter.java
@@ -24,7 +21,6 @@ set(JAVA_SOURCES org/libjpegturbo/turbojpeg/TJ.java
   org/libjpegturbo/turbojpeg/TJTransform.java
   org/libjpegturbo/turbojpeg/TJTransformer.java
   org/libjpegturbo/turbojpeg/YUVImage.java
-  TJUnitTest.java
   TJExample.java
   TJBench.java)
 

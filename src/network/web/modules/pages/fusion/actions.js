@@ -4,7 +4,7 @@ import {
     createDefaultGeometryRegion,
     createInitialState
 } from './state.js?v=2.95';
-import { setActiveRegionId as setBackendActiveRegionId } from './api.js?v=2.95';
+import { setActiveRegionId as setBackendActiveRegionId } from './api.js?v=2.97';
 
 const state = createInitialState();
 

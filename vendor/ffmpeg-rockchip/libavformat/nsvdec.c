@@ -36,14 +36,14 @@
 
 /*
  * References:
- * (1) ? http://www.multimedia.cx/nsv-format.txt
+ * (1) http://www.multimedia.cx/nsv-format.txt
  * seems someone came to the same conclusions as me, and updated it:
- * (2) ? http://www.stud.ktu.lt/~vitslav/nsv/nsv-format.txt
+ * (2) http://www.stud.ktu.lt/~vitslav/nsv/nsv-format.txt
  *     http://www.stud.ktu.lt/~vitslav/nsv/
  * official docs
- * (3) ? http://ultravox.aol.com/NSVFormat.rtf
+ * (3) http://ultravox.aol.com/NSVFormat.rtf
  * Sample files:
- * (S1) ? http://www.nullsoft.com/nsv/samples/
+ * (S1) http://www.nullsoft.com/nsv/samples/
  * http://www.nullsoft.com/nsv/samples/faster.nsv
  * http://streamripper.sourceforge.net/openbb/read.php?TID=492&page=4
  */

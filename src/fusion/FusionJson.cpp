@@ -1,5 +1,6 @@
 #include "fusion/FusionJson.h"
 #include <algorithm>
+#include <cmath>
 
 namespace hsvj::fusion {
 
@@ -158,20 +159,22 @@ Selection selectionFromJson(const Json::Value &value) {
 }
 
 Json::Value blendSideToJson(const BlendSideState &side) {
+  BlendSideState normalized = side;
+  normalizeBlendSide(normalized);
   Json::Value out(Json::objectValue);
-  out["enabled"] = side.enabled;
-  out["width"] = side.width;
-  out["gamma"] = side.gamma;
-  out["slope"] = side.slope;
-  out["stripStart"] = side.stripStart;
-  out["stripEnd"] = side.stripEnd;
-  out["anchor"] = side.anchor;
+  out["enabled"] = normalized.enabled;
+  out["width"] = normalized.width;
+  out["gamma"] = normalized.gamma;
+  out["slope"] = normalized.slope;
+  out["stripStart"] = normalized.stripStart;
+  out["stripEnd"] = normalized.stripEnd;
+  out["anchor"] = normalized.anchor;
   Json::Value bright(Json::arrayValue);
-  bright.append(side.bright[0]);
-  bright.append(side.bright[1]);
-  bright.append(side.bright[2]);
+  bright.append(normalized.bright[0]);
+  bright.append(normalized.bright[1]);
+  bright.append(normalized.bright[2]);
   out["bright"] = bright;
-  out["solid"] = side.solid;
+  out["solid"] = normalized.solid;
   return out;
 }
 
@@ -180,8 +183,8 @@ BlendSideState blendSideFromJson(const Json::Value &value) {
   if (!value.isObject()) return side;
   side.enabled = jsonBool(value, "enabled", side.enabled);
   side.width = clampFloat(jsonFloat(value, "width", side.width), 0.0f, 1.0f);
-  side.gamma = std::max(0.001f, jsonFloat(value, "gamma", side.gamma));
-  side.slope = std::max(0.001f, jsonFloat(value, "slope", side.slope));
+  side.gamma = jsonFloat(value, "gamma", side.gamma);
+  side.slope = jsonFloat(value, "slope", side.slope);
   side.stripStart = clampInt(jsonInt(value, "stripStart", side.stripStart), 0, 255);
   side.stripEnd = clampInt(jsonInt(value, "stripEnd", side.stripEnd), 0, 255);
   side.anchor = clampFloat(jsonFloat(value, "anchor", side.anchor), 0.0f, 1.0f);
@@ -194,6 +197,7 @@ BlendSideState blendSideFromJson(const Json::Value &value) {
     }
   }
   side.solid = jsonBool(value, "solid", side.solid);
+  normalizeBlendSide(side);
   return side;
 }
 
@@ -368,22 +372,43 @@ CaveWallState caveWallFromConfigJson(const Json::Value &value) {
 
 void appendBlendSideApi(Json::Value &out, const char *name, char shortName,
                         const BlendSideState &side) {
+  BlendSideState normalized = side;
+  normalizeBlendSide(normalized);
   const std::string prefix = std::string("blend_") + name;
   const std::string enabled = prefix + "_enabled";
-  out[prefix] = side.width;
-  out[enabled] = side.enabled;
-  out[std::string("edge_") + name + "_gamma"] = side.gamma;
-  out[std::string("edge_") + name + "_slope"] = side.slope;
-  out[std::string("strip_start_") + shortName] = side.stripStart;
-  out[std::string("strip_end_") + shortName] = side.stripEnd;
-  out[std::string("anchor_") + shortName] = side.anchor;
-  out[std::string("bright_") + shortName + "_r"] = side.bright[0];
-  out[std::string("bright_") + shortName + "_g"] = side.bright[1];
-  out[std::string("bright_") + shortName + "_b"] = side.bright[2];
-  out[std::string("solid_") + shortName] = side.solid;
+  out[prefix] = normalized.width;
+  out[enabled] = normalized.enabled;
+  out[std::string("edge_") + name + "_gamma"] = normalized.gamma;
+  out[std::string("edge_") + name + "_slope"] = normalized.slope;
+  out[std::string("strip_start_") + shortName] = normalized.stripStart;
+  out[std::string("strip_end_") + shortName] = normalized.stripEnd;
+  out[std::string("anchor_") + shortName] = normalized.anchor;
+  out[std::string("bright_") + shortName + "_r"] = normalized.bright[0];
+  out[std::string("bright_") + shortName + "_g"] = normalized.bright[1];
+  out[std::string("bright_") + shortName + "_b"] = normalized.bright[2];
+  out[std::string("solid_") + shortName] = normalized.solid;
 }
 
 } // 命名空间
+
+void normalizeBlendSide(BlendSideState &side) {
+  if (!std::isfinite(side.width)) side.width = 0.0f;
+  if (!std::isfinite(side.gamma)) side.gamma = 1.8f;
+  if (!std::isfinite(side.slope)) side.slope = 1.0f;
+  if (!std::isfinite(side.anchor)) side.anchor = 0.5f;
+  side.width = clampFloat(side.width, 0.0f, 1.0f);
+  side.gamma = std::max(kMinBlendGamma, side.gamma);
+  side.slope = std::max(kMinBlendSlope, side.slope);
+  side.stripStart = clampInt(side.stripStart, 0, 255);
+  side.stripEnd = clampInt(side.stripEnd, 0, 255);
+  if (side.stripStart > side.stripEnd) {
+    std::swap(side.stripStart, side.stripEnd);
+  }
+  side.anchor = clampFloat(side.anchor, 0.0f, 1.0f);
+  for (int &value : side.bright) {
+    value = clampInt(value, 0, 255);
+  }
+}
 
 const char *sideName(FusionSide side) {
   switch (side) {

@@ -24,7 +24,8 @@
 #include <vector>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/select.h>
+#include <poll.h>
+#include "IoctlUtils.h"
 #include <unistd.h>
 
 #ifdef __ANDROID__
@@ -50,10 +51,25 @@ constexpr uint32_t kFmtYUYV = 0x56595559;
 constexpr uint32_t kFmtUYVY = 0x59565955;
 constexpr uint32_t kFmtBGR3 = 0x33524742;
 
+// A source-change can leave the RK628/rkcif graph logically configured but
+// physically misaligned. The next MIPI open must rebuild the media graph.
+std::atomic<bool> gMipiGraphRebuildPending{false};
+thread_local int gLastMipiTimingQueryError = 0;
+
+void markMipiRecoveryRequired(const char *reason) {
+  const bool wasPending =
+      gMipiGraphRebuildPending.exchange(true, std::memory_order_acq_rel);
+  if (!wasPending) {
+    LOG_WARN("[Capture][MIPI] Media graph rebuild requested: %s",
+             reason ? reason : "unknown");
+  }
+}
+
 struct MipiTimingSample {
   int width = 0;
   int height = 0;
   uint64_t pixelclock = 0;
+  v4l2_bt_timings bt{};
   bool powerKnown = false;
   bool powerPresent = true;
   bool syncKnown = false;
@@ -91,7 +107,7 @@ bool isUsableDriverTiming(const MipiTimingSample &sample) {
   // receiver is not fully locked. Accept it 仅 when the driver also confirms
   // power and 同步; otherwise it is not a real capture resolution. For real
   // non-默认 timings, some RK628 builds still return VIDIOC_G_INPUT=2, so
-  // let the later "same timing twice" 检查 decide instead of dropping it here.
+  // let the later complete-timing stability check decide instead.
   if (isLikelyDefaultTiming(sample)) {
     return sample.powerKnown && sample.powerPresent && sample.syncKnown &&
            sample.synced;
@@ -99,17 +115,29 @@ bool isUsableDriverTiming(const MipiTimingSample &sample) {
   return true;
 }
 
+bool captureResolutionMatchesRequest(int requestedWidth, int requestedHeight,
+                                     int actualWidth, int actualHeight) {
+  return requestedWidth > 0 && requestedHeight > 0 &&
+         actualWidth == requestedWidth && actualHeight == requestedHeight;
+}
+
 bool sameTiming(const MipiTimingSample &a, const MipiTimingSample &b) {
+  const auto &x = a.bt;
+  const auto &y = b.bt;
+  // Compare waveform fields explicitly; reserved bytes/metadata may vary.
   return a.width == b.width && a.height == b.height &&
-         a.pixelclock == b.pixelclock;
+         a.pixelclock == b.pixelclock &&
+         x.interlaced == y.interlaced && x.polarities == y.polarities &&
+         x.hfrontporch == y.hfrontporch && x.hsync == y.hsync &&
+         x.hbackporch == y.hbackporch && x.vfrontporch == y.vfrontporch &&
+         x.vsync == y.vsync && x.vbackporch == y.vbackporch &&
+         x.il_vfrontporch == y.il_vfrontporch && x.il_vsync == y.il_vsync &&
+         x.il_vbackporch == y.il_vbackporch && x.flags == y.flags;
 }
 
 struct MipiTimingCache {
   bool valid = false;
   std::string path;
-  int width = 0;
-  int height = 0;
-  uint64_t pixelclock = 0;
 };
 
 std::mutex gMipiTimingCacheMutex;
@@ -124,9 +152,6 @@ void rememberMipiTiming(const MipiTimingSample &sample) {
   std::lock_guard<std::mutex> lock(gMipiTimingCacheMutex);
   gMipiTimingCache.valid = true;
   gMipiTimingCache.path = sample.path;
-  gMipiTimingCache.width = sample.width;
-  gMipiTimingCache.height = sample.height;
-  gMipiTimingCache.pixelclock = sample.pixelclock;
 }
 
 bool readMipiTimingSample(const std::string &path, MipiTimingSample &sample,
@@ -136,16 +161,14 @@ bool readMipiTimingSample(const std::string &path, MipiTimingSample &sample,
 
   int fd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) {
+    gLastMipiTimingQueryError = errno;
     return false;
   }
 
   struct v4l2_control powerControl;
   memset(&powerControl, 0, sizeof(powerControl));
   powerControl.id = V4L2_CID_DV_RX_POWER_PRESENT;
-  int powerRet;
-  do {
-    powerRet = ioctl(fd, VIDIOC_G_CTRL, &powerControl);
-  } while (powerRet == -1 && (errno == EINTR || errno == EAGAIN));
+  int powerRet = captureIoctl(fd, VIDIOC_G_CTRL, &powerControl);
   if (powerRet == 0) {
     sample.powerKnown = true;
     sample.powerPresent = powerControl.value != 0;
@@ -155,10 +178,7 @@ bool readMipiTimingSample(const std::string &path, MipiTimingSample &sample,
   }
 
   unsigned int input = 0;
-  int inputRet;
-  do {
-    inputRet = ioctl(fd, VIDIOC_G_INPUT, &input);
-  } while (inputRet == -1 && (errno == EINTR || errno == EAGAIN));
+  int inputRet = captureIoctl(fd, VIDIOC_G_INPUT, &input);
   if (inputRet == 0) {
     sample.syncKnown = true;
     sample.synced = input == 0;
@@ -166,19 +186,19 @@ bool readMipiTimingSample(const std::string &path, MipiTimingSample &sample,
 
   struct v4l2_dv_timings timings;
   memset(&timings, 0, sizeof(timings));
-  int ret;
-  do {
-    ret = ioctl(fd, VIDIOC_SUBDEV_QUERY_DV_TIMINGS, &timings);
-  } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+  int ret = captureIoctl(fd, VIDIOC_SUBDEV_QUERY_DV_TIMINGS, &timings);
   int savedErrno = errno;
   close(fd);
 
   if (ret != 0) {
+    gLastMipiTimingQueryError = savedErrno;
     LOG_DEBUG("[采集][MIPI] DV timings unavailable on %s: %s",
               path.c_str(), strerror(savedErrno));
     return false;
   }
 
+  if (timings.type != V4L2_DV_BT_656_1120) return false;
+  sample.bt = timings.bt;
   sample.width = static_cast<int>(timings.bt.width);
   sample.height = static_cast<int>(timings.bt.height);
   sample.pixelclock = static_cast<uint64_t>(timings.bt.pixelclock);
@@ -192,23 +212,22 @@ void ensureMipiDevicePermissions() {
 #ifdef __ANDROID__
   static std::once_flag permissionOnce;
   std::call_once(permissionOnce, []() {
-    if (access("/dev/video0", R_OK | W_OK) == 0 &&
-        access("/dev/media0", R_OK | W_OK) == 0 &&
-        access("/dev/v4l-subdev2", R_OK | W_OK) == 0) {
-      LOG_INFO("[采集][V4L2] MIPI device permission already usable");
-      return;
+    const bool usable = access("/dev/video0", R_OK | W_OK) == 0 &&
+                        access("/dev/media0", R_OK | W_OK) == 0 &&
+                        access("/dev/v4l-subdev2", R_OK | W_OK) == 0;
+    if (usable) {
+      LOG_INFO("[采集][V4L2] MIPI device permissions ready");
+    } else {
+      LOG_ERROR("[采集][V4L2] MIPI device permissions missing; ROM policy must grant fixed endpoints");
     }
-    const char *cmd =
-        "su 0 chmod 666 /dev/video* /dev/media* /dev/v4l-subdev* >/dev/null 2>&1 || "
-        "chmod 666 /dev/video* /dev/media* /dev/v4l-subdev* >/dev/null 2>&1";
-    int ret = system(cmd);
-    LOG_INFO("[采集][V4L2] MIPI device permission prepare ret=%d", ret);
   });
 #endif
 }
 
-bool queryMipiDvTimings(int &width, int &height, bool &noSignal) {
+bool queryMipiDvTimings(int &width, int &height, bool &noSignal,
+                       MipiTimingSample *stableTiming = nullptr) {
   noSignal = false;
+  gLastMipiTimingQueryError = 0;
 #ifdef __ANDROID__
   std::vector<std::string> candidates;
   auto addCandidate = [&candidates](const std::string &path) {
@@ -225,27 +244,23 @@ bool queryMipiDvTimings(int &width, int &height, bool &noSignal) {
   addCandidate("/dev/v4l-subdev1");
   addCandidate("/dev/v4l-subdev3");
 
-  if (DIR *dir = opendir("/dev")) {
-    while (dirent *entry = readdir(dir)) {
-      std::string name = entry->d_name;
-      if (name.rfind("v4l-subdev", 0) != 0) {
-        continue;
-      }
-      std::string path = "/dev/" + name;
-      addCandidate(path);
-    }
-    closedir(dir);
-  }
-
   for (const std::string &path : candidates) {
     MipiTimingSample previous;
     bool havePrevious = false;
-    const bool preferFastPath = !cachedPath.empty() && path == cachedPath;
-    const int maxAttempts = preferFastPath ? 3 : 4;
+    int stableSamples = 0;
+    // Do not accept a single cached timing after RK628 relock. The timing can
+    // already read 1920x1080 while the CSI line/frame phase is still settling.
+    const int requiredStableSamples = 6; // >=600 ms, including cached devices.
+    const int maxAttempts = requiredStableSamples + 3;
     for (int attempt = 0; attempt < maxAttempts; ++attempt) {
       MipiTimingSample sample;
+      errno = 0;
       if (!readMipiTimingSample(path, sample, noSignal)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        havePrevious = false;
+        stableSamples = 0;
+        // Unavailable subdevices are not candidate HDMI receivers.
+        if (attempt == 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
         continue;
       }
 
@@ -253,7 +268,7 @@ bool queryMipiDvTimings(int &width, int &height, bool &noSignal) {
         static int s_unreliableTimingLog = 0;
         if (++s_unreliableTimingLog <= 1 ||
             (s_unreliableTimingLog % 1800) == 0) {
-          LOG_DEBUG("[采集][MIPI] Ignoring unreliable DV timing %dx%d@%llu from %s "
+          LOG_DEBUG("[Capture][MIPI] Ignoring unreliable DV timing %dx%d@%llu from %s "
                     "(power=%s sync=%s count=%d)",
                     sample.width, sample.height,
                     static_cast<unsigned long long>(sample.pixelclock),
@@ -262,34 +277,29 @@ bool queryMipiDvTimings(int &width, int &height, bool &noSignal) {
                     sample.syncKnown ? (sample.synced ? "true" : "false") : "unknown",
                     s_unreliableTimingLog);
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        havePrevious = false;
+        stableSamples = 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
         continue;
       }
 
-      if ((preferFastPath || path == "/dev/v4l-subdev2") &&
-          !isLikelyDefaultTiming(sample) &&
-          (!sample.syncKnown || sample.synced) &&
-          (!sample.powerKnown || sample.powerPresent)) {
-        width = sample.width;
-        height = sample.height;
-        rememberMipiTiming(sample);
-        LOG_INFO("[采集][MIPI] Auto DV timings: %dx%d@%llu from %s (%s fast path)",
-                 width, height,
-                 static_cast<unsigned long long>(sample.pixelclock),
-                 path.c_str(),
-                 preferFastPath ? "cached" : "trusted");
-        return true;
+      if (havePrevious && sameTiming(previous, sample)) {
+        ++stableSamples;
+      } else {
+        stableSamples = 1;
       }
 
-      if (havePrevious && sameTiming(previous, sample)) {
+      if (stableSamples >= requiredStableSamples) {
         width = sample.width;
         height = sample.height;
         rememberMipiTiming(sample);
-        LOG_INFO("[采集][MIPI] Auto DV timings: %dx%d@%llu from %s "
-                 "(stable driver timing, power=%s sync=%s)",
+        if (stableTiming) *stableTiming = sample;
+        noSignal = false;
+        LOG_INFO("[Capture][MIPI] Auto DV timings: %dx%d@%llu from %s "
+                 "(%d stable samples over >=600ms, power=%s sync=%s)",
                  width, height,
                  static_cast<unsigned long long>(sample.pixelclock),
-                 path.c_str(),
+                 path.c_str(), stableSamples,
                  sample.powerKnown ? (sample.powerPresent ? "true" : "false") : "unknown",
                  sample.syncKnown ? (sample.synced ? "true" : "false") : "unknown");
         return true;
@@ -297,13 +307,14 @@ bool queryMipiDvTimings(int &width, int &height, bool &noSignal) {
 
       previous = sample;
       havePrevious = true;
-      std::this_thread::sleep_for(std::chrono::milliseconds(40));
+      std::this_thread::sleep_for(std::chrono::milliseconds(120));
     }
   }
 #else
   (void)width;
   (void)height;
   (void)noSignal;
+  (void)stableTiming;
 #endif
   return false;
 }
@@ -328,16 +339,16 @@ bool V4L2Capture::queryStableMipiTiming(int &width, int &height,
   return ok;
 }
 
+int V4L2Capture::lastMipiTimingQueryError() {
+  return gLastMipiTimingQueryError;
+}
+
 // ============================================================================
 // 说明：V4L2 ioctl 封装
 // ============================================================================
 
 int V4L2Capture::v4l2Ioctl(int fd, unsigned long request, void *arg) {
-  int ret;
-  do {
-    ret = ioctl(fd, request, arg);
-  } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
-  return ret;
+  return captureIoctl(fd, request, arg);
 }
 
 // ============================================================================
@@ -362,8 +373,9 @@ bool V4L2Capture::initialize(const V4L2CaptureConfig &config) {
     int detectedWidth = 0;
     int detectedHeight = 0;
     bool noSignal = false;
+    MipiTimingSample stableTiming;
     const bool hasReliableTiming =
-        queryMipiDvTimings(detectedWidth, detectedHeight, noSignal);
+        queryMipiDvTimings(detectedWidth, detectedHeight, noSignal, &stableTiming);
     if (!hasReliableTiming) {
       if (noSignal) {
         LOG_WARN("[采集][MIPI] No input signal detected by RK628; skip MIPI start");
@@ -373,14 +385,20 @@ bool V4L2Capture::initialize(const V4L2CaptureConfig &config) {
       return false;
     }
 
-    if ((config_.width > 0 && config_.width != detectedWidth) ||
-        (config_.height > 0 && config_.height != detectedHeight)) {
+    if (!config_.lockResolution &&
+        ((config_.width > 0 && config_.width != detectedWidth) ||
+         (config_.height > 0 && config_.height != detectedHeight))) {
       LOG_WARN("[采集][MIPI] Requested size %dx%d differs from driver timing "
                "%dx%d; using driver truth",
                config_.width, config_.height, detectedWidth, detectedHeight);
     }
-    config_.width = detectedWidth;
-    config_.height = detectedHeight;
+    if (!config_.lockResolution) {
+      config_.width = detectedWidth;
+      config_.height = detectedHeight;
+    } else {
+      LOG_INFO("[采集][MIPI] Custom capture resolution locked: %dx%d (source timing %dx%d)",
+               config_.width, config_.height, detectedWidth, detectedHeight);
+    }
 
     const long long pixels =
         static_cast<long long>(config_.width) * static_cast<long long>(config_.height);
@@ -396,9 +414,32 @@ bool V4L2Capture::initialize(const V4L2CaptureConfig &config) {
              config_.width, config_.height);
 
 #ifdef __ANDROID__
-    LOG_INFO("[采集][V4L2] MIPI device detected, establishing pipeline...");
-    hsvj::MediaController::setupMIPIPipeline("/dev/media0", devicePath_,
-                                             config_.width, config_.height);
+    const bool rebuildGraph =
+        gMipiGraphRebuildPending.exchange(false, std::memory_order_acq_rel);
+    if (rebuildGraph) {
+      LOG_WARN("[Capture][MIPI] Rebuilding media graph after source recovery");
+      hsvj::MediaController::invalidateMipiPipelineCache();
+      if (!hsvj::MediaController::resetMediaLinks("/dev/media0")) {
+        markMipiRecoveryRequired("media link reset failed; defer capture start");
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    }
+    LOG_INFO("[Capture][V4L2] MIPI device detected, establishing pipeline...");
+    const bool pipelineOk = hsvj::MediaController::setupMIPIPipeline(
+        "/dev/media0", devicePath_, config_.width, config_.height);
+    if (!pipelineOk) {
+      markMipiRecoveryRequired("pipeline setup failed; defer capture start");
+      return false;
+    }
+    // The source may switch mode while media-ctl configures the graph.
+    MipiTimingSample afterSetup;
+    if (!readMipiTimingSample(stableTiming.path, afterSetup, noSignal) ||
+        !isUsableDriverTiming(afterSetup) || !sameTiming(stableTiming, afterSetup)) {
+      hsvj::MediaController::invalidateMipiPipelineCache();
+      markMipiRecoveryRequired("DV timing changed during pipeline setup");
+      return false;
+    }
 #endif
   } else {
     if (config_.width <= 0) config_.width = 1920;
@@ -417,6 +458,7 @@ bool V4L2Capture::initialize(const V4L2CaptureConfig &config) {
 #ifdef __ANDROID__
     if (shouldSetupMipiPipeline()) {
       hsvj::MediaController::invalidateMipiPipelineCache();
+      markMipiRecoveryRequired("capture format/buffer setup failed");
     }
 #endif
     cleanup();
@@ -433,6 +475,10 @@ bool V4L2Capture::initialize(const V4L2CaptureConfig &config) {
   }
   lastDeliveredUs_ = 0;
 
+  if (shouldSetupMipiPipeline()) {
+    setupMipiSourceChangeMonitor();
+  }
+
   LOG_INFO("[采集][V4L2] %s Initialized: Truth %dx%d (Stride %d, Format 0x%08X)",
            devicePath_.c_str(), actualWidth_, actualHeight_, actualStride_, actualFormat_);
 
@@ -446,7 +492,8 @@ void V4L2Capture::shutdown() {
 }
 
 void V4L2Capture::cleanup() {
-  if (fd_ >= 0 && bufferType_ != 0) {
+  closeMipiSourceChangeMonitor();
+  if (fd_ >= 0 && bufferType_ != 0 && streamOn_) {
     resetStreamState("cleanup");
   }
   for (auto &buf : buffers_) {
@@ -471,6 +518,7 @@ void V4L2Capture::resetStreamState(const char *stage) {
   }
   int ret = v4l2Ioctl(fd_, VIDIOC_STREAMOFF, &bufferType_);
   if (ret == 0) {
+    streamOn_ = false;
     LOG_INFO("[采集][V4L2] STREAMOFF reset at %s", stage ? stage : "unknown");
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
     return;
@@ -558,13 +606,6 @@ bool V4L2Capture::verifyDriverFrameState() {
     return true;
   }
 
-  if (shouldSetupMipiPipeline()) {
-    // 说明：RK628/rkcif timing ioctl 可能扰动正在工作的 MIPI 流并导致
-    // short "not active 缓冲区" bursts. MIPI timing is validated before
-    // 示例/字段：STREAMON；推流期间依赖 select/DQBUF 错误检测信号丢失。
-    return true;
-  }
-
   struct v4l2_format fmt;
   memset(&fmt, 0, sizeof(fmt));
   fmt.type = bufferType_;
@@ -593,8 +634,17 @@ bool V4L2Capture::verifyDriverFrameState() {
                width, height, stride, format);
       isUnhealthy_.store(true);
       hasSignal_.store(false);
+      if (shouldSetupMipiPipeline()) {
+        markMipiRecoveryRequired("driver format changed");
+      }
       return false;
     }
+  }
+
+  // RK628/rkcif selection/crop queries can disturb an active CSI stream.
+  // For MIPI, only validate the side-effect-free G_FMT state above.
+  if (shouldSetupMipiPipeline()) {
+    return true;
   }
 
   struct v4l2_selection sel;
@@ -632,6 +682,251 @@ bool V4L2Capture::verifyDriverFrameState() {
     }
   }
 
+  return true;
+}
+
+void V4L2Capture::setupMipiSourceChangeMonitor() {
+  closeMipiSourceChangeMonitor();
+
+  const std::string path = cachedMipiTimingPath();
+  if (path.empty()) {
+    LOG_DEBUG("[Capture][MIPI] No cached RK628 subdev path; source-change monitor disabled");
+    return;
+  }
+
+  const int eventFd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+  if (eventFd < 0) {
+    LOG_WARN("[Capture][MIPI] Cannot open %s for source-change events: %s",
+             path.c_str(), strerror(errno));
+    return;
+  }
+
+  struct v4l2_event_subscription subscription;
+  memset(&subscription, 0, sizeof(subscription));
+  subscription.type = V4L2_EVENT_SOURCE_CHANGE;
+  if (ioctl(eventFd, VIDIOC_SUBSCRIBE_EVENT, &subscription) < 0) {
+    const int error = errno;
+    close(eventFd);
+    if (error == EINVAL || error == ENOTTY || error == ENOSYS) {
+      LOG_DEBUG("[Capture][MIPI] %s does not support source-change events",
+                path.c_str());
+    } else {
+      LOG_WARN("[Capture][MIPI] Subscribe source-change event on %s failed: %s",
+               path.c_str(), strerror(error));
+    }
+    return;
+  }
+
+  mipiEventFd_ = eventFd;
+  LOG_INFO("[Capture][MIPI] Monitoring source-change events on %s (fd=%d)",
+           path.c_str(), mipiEventFd_);
+}
+
+void V4L2Capture::closeMipiSourceChangeMonitor() {
+  if (mipiEventFd_ < 0) {
+    return;
+  }
+
+  struct v4l2_event_subscription subscription;
+  memset(&subscription, 0, sizeof(subscription));
+  subscription.type = V4L2_EVENT_SOURCE_CHANGE;
+  int ret;
+  do {
+    ret = ioctl(mipiEventFd_, VIDIOC_UNSUBSCRIBE_EVENT, &subscription);
+  } while (ret < 0 && errno == EINTR);
+
+  close(mipiEventFd_);
+  mipiEventFd_ = -1;
+}
+
+bool V4L2Capture::drainMipiSourceChangeEvents() {
+  if (mipiEventFd_ < 0) {
+    return false;
+  }
+
+  bool sourceChanged = false;
+  while (true) {
+    struct v4l2_event event;
+    memset(&event, 0, sizeof(event));
+    int ret;
+    do {
+      ret = ioctl(mipiEventFd_, VIDIOC_DQEVENT, &event);
+    } while (ret < 0 && errno == EINTR);
+
+    if (ret < 0) {
+      if (errno != EAGAIN) {
+        LOG_WARN("[Capture][MIPI] VIDIOC_DQEVENT failed: %s", strerror(errno));
+      }
+      break;
+    }
+
+    if (event.type == V4L2_EVENT_SOURCE_CHANGE) {
+      sourceChanged = true;
+      LOG_WARN("[Capture][MIPI] Source-change event received (changes=0x%08X)",
+               event.u.src_change.changes);
+    }
+  }
+  return sourceChanged;
+}
+
+bool V4L2Capture::isFrameComplete(size_t frameBytesUsed) const {
+  // Some V4L2 drivers leave bytesused at zero, so zero alone is not an error.
+  if (frameBytesUsed == 0 || actualWidth_ <= 0 || actualHeight_ <= 0) {
+    return true;
+  }
+
+  size_t stride = actualStride_ > 0 ? static_cast<size_t>(actualStride_) : 0;
+  if (stride == 0) {
+    switch (actualFormat_) {
+    case kFmtYUYV:
+    case kFmtUYVY:
+      stride = static_cast<size_t>(actualWidth_) * 2;
+      break;
+    case kFmtBGR3:
+      stride = static_cast<size_t>(actualWidth_) * 3;
+      break;
+    default:
+      stride = static_cast<size_t>(actualWidth_);
+      break;
+    }
+  }
+
+  const size_t height = static_cast<size_t>(actualHeight_);
+  size_t minimumBytes = 0;
+  switch (actualFormat_) {
+  case kFmtNV12:
+    minimumBytes = stride * height + stride * ((height + 1) / 2);
+    break;
+  case kFmtNV16:
+    minimumBytes = stride * height * 2;
+    break;
+  case kFmtNV24:
+    minimumBytes = stride * height * 3;
+    break;
+  case kFmtYUYV:
+  case kFmtUYVY:
+  case kFmtBGR3:
+    minimumBytes = stride * height;
+    break;
+  default:
+    // Unknown formats do not have a safe one-to-one size formula here.
+    return true;
+  }
+
+  return frameBytesUsed >= minimumBytes;
+}
+
+bool V4L2Capture::detectVerticalDiscontinuity(const Buffer &buffer, int &row,
+                                            int &score) const {
+  row = -1;
+  score = 0;
+  if (!buffer.start || buffer.length == 0 || actualWidth_ < 128 ||
+      actualHeight_ < 128 || actualStride_ < actualWidth_) {
+    return false;
+  }
+
+  const bool planarLuma = actualFormat_ == kFmtNV12 || actualFormat_ == kFmtNV16 ||
+                          actualFormat_ == kFmtNV24;
+  const bool packedLuma = actualFormat_ == kFmtYUYV || actualFormat_ == kFmtUYVY;
+  if (!planarLuma && !packedLuma) {
+    return false;
+  }
+
+  const auto *bytes = static_cast<const uint8_t *>(buffer.start);
+  const int xSamples = 24;
+  const int yStart = std::max(8, actualHeight_ * 8 / 100);
+  const int yEnd = std::min(actualHeight_ - 8, actualHeight_ * 92 / 100);
+  const int neighborStep = std::max(2, actualHeight_ / 180);
+  const size_t pixelStep = packedLuma ? 2u : 1u;
+  const size_t lumaPlaneBytes =
+      static_cast<size_t>(actualStride_) * static_cast<size_t>(actualHeight_);
+  if (lumaPlaneBytes > buffer.length) {
+    return false;
+  }
+
+  auto lumaAt = [&](int x, int y, uint8_t &value) {
+    const size_t offset = static_cast<size_t>(y) * actualStride_ +
+                          static_cast<size_t>(x) * pixelStep +
+                          (packedLuma && actualFormat_ == kFmtUYVY ? 1u : 0u);
+    if (offset >= buffer.length) {
+      return false;
+    }
+    value = bytes[offset];
+    return true;
+  };
+
+  auto rowDifference = [&](int upper, int lower, int &value,
+                           int *wideDifferencePercent = nullptr) {
+    unsigned int total = 0;
+    int wideDifferences = 0;
+    int count = 0;
+    for (int sample = 0; sample < xSamples; ++sample) {
+      const int x = (actualWidth_ - 1) * sample / (xSamples - 1);
+      uint8_t upperValue = 0;
+      uint8_t lowerValue = 0;
+      if (!lumaAt(x, upper, upperValue) || !lumaAt(x, lower, lowerValue)) {
+        return false;
+      }
+      const unsigned int difference = static_cast<unsigned int>(
+          upperValue > lowerValue ? upperValue - lowerValue
+                                  : lowerValue - upperValue);
+      total += difference;
+      if (difference >= 48) {
+        ++wideDifferences;
+      }
+      ++count;
+    }
+    value = count == 0 ? 0 : static_cast<int>(total / count);
+    if (wideDifferencePercent) {
+      *wideDifferencePercent = count == 0 ? 0 : wideDifferences * 100 / count;
+    }
+    return count != 0;
+  };
+
+  int bestContrast = 0;
+  int bestRow = -1;
+  for (int candidate = yStart; candidate <= yEnd; ++candidate) {
+    int seam = 0;
+    int wideDifferencePercent = 0;
+    if (!rowDifference(candidate - 1, candidate, seam,
+                       &wideDifferencePercent)) {
+      continue;
+    }
+    if (seam < 48 || wideDifferencePercent < 75) {
+      continue;
+    }
+
+    int baselineTotal = 0;
+    int baselineCount = 0;
+    for (int distance = 1; distance <= 3; ++distance) {
+      const int offset = distance * neighborStep;
+      int difference = 0;
+      if (candidate - offset - 1 >= 0 &&
+          rowDifference(candidate - offset - 1, candidate - offset, difference)) {
+        baselineTotal += difference;
+        ++baselineCount;
+      }
+      if (candidate + offset < actualHeight_ &&
+          rowDifference(candidate + offset - 1, candidate + offset, difference)) {
+        baselineTotal += difference;
+        ++baselineCount;
+      }
+    }
+    const int baseline = baselineCount == 0 ? 0 : baselineTotal / baselineCount;
+    const int contrast = seam - baseline;
+    if (contrast >= 32 && seam >= baseline * 3) {
+      if (contrast > bestContrast) {
+        bestContrast = contrast;
+        bestRow = candidate;
+      }
+    }
+  }
+
+  if (bestRow < 0) {
+    return false;
+  }
+  row = bestRow;
+  score = bestContrast;
   return true;
 }
 
@@ -854,6 +1149,13 @@ bool V4L2Capture::setFormat() {
   }
 
   updateActualFormatFromDriver(fmt);
+  if (config_.lockResolution &&
+      !captureResolutionMatchesRequest(config_.width, config_.height,
+                                       actualWidth_, actualHeight_)) {
+    LOG_ERROR("[采集][V4L2] Locked resolution rejected: requested=%dx%d actual=%dx%d",
+              config_.width, config_.height, actualWidth_, actualHeight_);
+    return false;
+  }
   if (!shouldSetupMipiPipeline()) {
     forceFullFrameSelection();
   }
@@ -967,6 +1269,8 @@ bool V4L2Capture::mapBuffers() {
 // ============================================================================
 
 bool V4L2Capture::startCapture(CaptureFrameCallback callback) {
+  std::lock_guard<std::mutex> stopLock(stopMutex_);
+  if (stopTask_.valid()) stopTask_.get();
   if (fd_ < 0) {
     LOG_ERROR("[采集][V4L2] Device not initialized");
     return false;
@@ -977,7 +1281,14 @@ bool V4L2Capture::startCapture(CaptureFrameCallback callback) {
     return true;
   }
 
+  if (captureThread_.joinable()) captureThread_.join();
+
   frameCallback_ = std::move(callback);
+  frameIntegritySampleCount_ = 0;
+  frameIntegrityCandidateRow_ = -1;
+  frameIntegrityCandidateStreak_ = 0;
+  frameIntegrityLastWarnUs_ = 0;
+  frameIntegrityCandidateSinceUs_ = 0;
 
   if (streamStartedOnce_) {
     resetStreamState("startCapture");
@@ -1021,6 +1332,7 @@ bool V4L2Capture::startCapture(CaptureFrameCallback callback) {
   }
 
   LOG_INFO("[采集][V4L2] STREAMON success, starting capture thread");
+  streamOn_ = true;
   streamStartedOnce_ = true;
 
   // 启动 采集线程
@@ -1028,7 +1340,17 @@ bool V4L2Capture::startCapture(CaptureFrameCallback callback) {
   isCapturing_.store(true);
   isUnhealthy_.store(false);
   hasSignal_.store(false);
-  captureThread_ = std::thread(&V4L2Capture::captureThread, this);
+  try {
+    captureThread_ = std::thread(&V4L2Capture::captureThread, this);
+  } catch (const std::exception &error) {
+    shouldStop_.store(true);
+    isCapturing_.store(false);
+    isUnhealthy_.store(true);
+    resetStreamState("worker creation failed");
+    frameCallback_ = nullptr;
+    LOG_ERROR("[Capture][V4L2] Cannot start worker: %s", error.what());
+    return false;
+  }
 
   LOG_INFO("[采集][V4L2] Capture thread started, fd=%d", fd_);
 
@@ -1083,32 +1405,63 @@ bool V4L2Capture::sampleLumaStats(const Buffer &buffer, unsigned int &yMin,
 }
 
 void V4L2Capture::stopCapture() {
-  if (!isCapturing_.load()) {
-    return;
+  std::lock_guard<std::mutex> stopLock(stopMutex_);
+  if (stopTask_.valid()) {
+    stopTask_.get();
+  } else {
+    finishStopCapture();
   }
+}
 
+bool V4L2Capture::stopCaptureAsync() {
+  std::unique_lock<std::mutex> stopLock(stopMutex_, std::try_to_lock);
+  if (!stopLock.owns_lock()) return false;
+  if (!stopTask_.valid()) {
+    shouldStop_.store(true);
+    isUnhealthy_.store(true);
+    // Worker only stops capture/STREAMOFF. Renderer pointers, GPU resources
+    // and buffer mappings are still cleaned up by the owning layer.
+    stopTask_ = std::async(std::launch::async, [this]() { finishStopCapture(); });
+    return false;
+  }
+  return stopTask_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+}
+
+void V4L2Capture::finishStopCapture() {
+  const auto start = std::chrono::steady_clock::now();
   LOG_DEBUG("[采集][V4L2] Stopping capture...");
 
   shouldStop_.store(true);
+  isCapturing_.store(false);
+  hasSignal_.store(false);
 
   if (captureThread_.joinable()) {
     captureThread_.join();
   }
 
-  isCapturing_.store(false);
-  hasSignal_.store(false);
-
-  // 停止 stream
-  if (fd_ >= 0) {
-    v4l2Ioctl(fd_, VIDIOC_STREAMOFF, &bufferType_);
+  // Drain any QBUF already in progress. New releases see isCapturing_=false.
+  // Do not hold this mutex during a potentially blocking STREAMOFF.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+  }
+  if (fd_ >= 0 && streamOn_) {
+    const int result = v4l2Ioctl(fd_, VIDIOC_STREAMOFF, &bufferType_);
+    if (result == 0 || errno == EINVAL || errno == ENODEV) streamOn_ = false;
+    else LOG_WARN("[CaptureStop] STREAMOFF failed: %s", strerror(errno));
   }
 
   frameCallback_ = nullptr;
 
   LOG_DEBUG("[采集][V4L2] Capture stopped");
+  const auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start).count();
+  if (cost >= 16) LOG_WARN("[CaptureStop] join/STREAMOFF=%lldms", static_cast<long long>(cost));
 }
 
 void V4L2Capture::releaseFrame(int bufferIndex) {
+  // Stream teardown returns all buffers after capture has stopped.
+  if (!isCapturing_.load()) return;
+  std::lock_guard<std::mutex> lock(mutex_);
   // 热插拔场景：采集已停止或设备已关闭时不再 QBUF，避免对无效 fd 或已关闭流做 ioctl
   if (!isCapturing_.load() || fd_ < 0) {
     return;
@@ -1136,14 +1489,16 @@ void V4L2Capture::releaseFrame(int bufferIndex) {
   }
 
   // 说明：诊断日志
-  static int releaseCount = 0;
-  if (++releaseCount <= 10) {
-    LOG_DEBUG("[采集][V4L2] releaseFrame: index=%d (count=%d)", bufferIndex, releaseCount);
+  static std::atomic<unsigned int> releaseCount{0};
+  const auto count = releaseCount.fetch_add(1) + 1;
+  if (count <= 10) {
+    LOG_DEBUG("[采集][V4L2] releaseFrame: index=%d (count=%u)", bufferIndex, count);
   }
 
   if (v4l2Ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
     LOG_ERROR("[采集][V4L2] VIDIOC_QBUF failed (index=%d): %s", bufferIndex,
              strerror(errno));
+    isUnhealthy_.store(true);
   }
 }
 
@@ -1173,6 +1528,7 @@ void V4L2Capture::captureThread() {
   int consecutiveTimeouts = 0;
   int consecutiveErrors = 0;
   const int kTimeoutsPerWarn = 50;          // 5 seconds no 数据
+  const int kMipiRecoveryTimeouts = 30;     // 3 seconds: match MIPI watchdog
   const int kMaxSignalLossTimeouts = 120;   // 12 seconds no 数据
   const int MAX_CONSECUTIVE_ERRORS = 10;    // Consecutive 错误 threshold
   auto statsStart = std::chrono::steady_clock::now();
@@ -1180,32 +1536,40 @@ void V4L2Capture::captureThread() {
   uint32_t statsDroppedSequences = 0;
   uint32_t lastDequeuedSequence = 0;
   bool hasLastDequeuedSequence = false;
+  int consecutiveCorruptFrames = 0;
+  unsigned int eagainCount = 0;
+  unsigned int frameCount = 0;
+  constexpr int kMaxConsecutiveCorruptFrames = 3;
+  uint64_t integritySamples = 0;
+  uint64_t integrityTotalUs = 0;
+  uint64_t integrityMaxUs = 0;
+  const bool mipiPipeline = shouldSetupMipiPipeline();
+  int startupFrames = 0;
+  auto startupFirstFrame = std::chrono::steady_clock::time_point{};
+  bool startupSettled = !mipiPipeline;
+  if (mipiPipeline) {
+    LOG_INFO("[Capture][FrameIntegrity] enabled: one sample per 15 delivered frames, "
+             "24 luma columns, 3 consecutive samples over >=1s, warn-only; "
+             "horizontal content boundaries can cause false positives");
+  }
 
   while (!shouldStop_.load()) {
     if (isUnhealthy_.load()) {
       break;
     }
 
-    // 使用 select to 等待 for 数据
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(fd_, &fds);
-
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000; // 100ms 时间out
-
-    int ret = select(fd_ + 1, &fds, nullptr, nullptr, &tv);
+    struct pollfd descriptors[2] = {{fd_, POLLIN, 0}, {mipiEventFd_, POLLPRI, 0}};
+    int ret = poll(descriptors, mipiEventFd_ >= 0 ? 2 : 1, 100);
 
     if (ret < 0) {
       if (errno == EINTR) {
         continue;
       }
       consecutiveErrors++;
-      LOG_ERROR("[采集][V4L2] select failed: %s (consecutive errors %d)",
+      LOG_ERROR("[采集][V4L2] poll failed: %s (consecutive errors %d)",
                 strerror(errno), consecutiveErrors);
       if (errno == ENODEV || errno == ENXIO || errno == EIO) {
-        LOG_ERROR("[采集][V4L2] Device removed during select, stopping capture thread");
+        LOG_ERROR("[采集][V4L2] Device removed during poll, stopping capture thread");
         break;
       }
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -1214,6 +1578,18 @@ void V4L2Capture::captureThread() {
         break;
       }
       continue;
+    }
+
+    if ((descriptors[0].revents | descriptors[1].revents) & (POLLHUP | POLLERR | POLLNVAL)) {
+      isUnhealthy_.store(true);
+      break;
+    }
+    if (mipiEventFd_ >= 0 && (descriptors[1].revents & POLLPRI) &&
+        drainMipiSourceChangeEvents()) {
+      hasSignal_.store(false);
+      isUnhealthy_.store(true);
+      markMipiRecoveryRequired("source-change event");
+      break;
     }
 
     if (ret == 0) {
@@ -1225,6 +1601,15 @@ void V4L2Capture::captureThread() {
         LOG_WARN("[采集][V4L2] Long time no data (%d timeouts), waiting for stable signal",
                  consecutiveTimeouts);
       }
+      if (shouldSetupMipiPipeline() &&
+          consecutiveTimeouts >= kMipiRecoveryTimeouts) {
+        LOG_ERROR("[Capture][MIPI] No frames for %d ms; restart capture and rebuild media graph",
+                  consecutiveTimeouts * 100);
+        hasSignal_.store(false);
+        isUnhealthy_.store(true);
+        markMipiRecoveryRequired("MIPI no-frame timeout");
+        break;
+      }
       if (consecutiveTimeouts >= kMaxSignalLossTimeouts) {
         hasSignal_.store(false);
       }
@@ -1235,10 +1620,11 @@ void V4L2Capture::captureThread() {
       break;
     }
 
-    consecutiveTimeouts = 0;  // Has data, reset 时间out count
-    consecutiveErrors = 0;    // 重置 错误 count
+    if (!(descriptors[0].revents & POLLIN)) {
+      continue;
+    }
 
-    if (!shouldSetupMipiPipeline() && (++frameStateCheckCount_ % 120) == 0 &&
+    if ((++frameStateCheckCount_ % 120) == 0 &&
         !verifyDriverFrameState()) {
       break;
     }
@@ -1260,11 +1646,11 @@ void V4L2Capture::captureThread() {
     if (v4l2Ioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
       if (errno == EAGAIN) {
         // EAGAIN 连续出现说明内核侧 buffer 已耗尽（上层持有 DMA-BUF 未及时归还）
-        static int s_eagainCount = 0;
-        if (++s_eagainCount % 50 == 0) {
-          LOG_WARN("[采集][V4L2] DQBUF EAGAIN x%d: possible buffer starvation "
-                   "(upper layer holding DMA-BUF too long)", s_eagainCount);
+        if (++eagainCount % 50 == 0) {
+          LOG_WARN("[采集][V4L2] DQBUF EAGAIN x%u: possible buffer starvation "
+                   "(upper layer holding DMA-BUF too long)", eagainCount);
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
       consecutiveErrors++;
@@ -1280,9 +1666,58 @@ void V4L2Capture::captureThread() {
       }
       continue;
     }
+    consecutiveTimeouts = 0;
+    consecutiveErrors = 0;
+    eagainCount = 0;
 
     int index = buf.index;
     size_t frameBytesUsed = isMplane ? planes[0].bytesused : buf.bytesused;
+    if (index < 0 || index >= static_cast<int>(buffers_.size())) {
+      LOG_ERROR("[Capture][V4L2] Driver dequeued invalid buffer index %d (total=%zu)",
+                index, buffers_.size());
+      hasSignal_.store(false);
+      isUnhealthy_.store(true);
+      break;
+    }
+
+    const bool driverMarkedError = (buf.flags & V4L2_BUF_FLAG_ERROR) != 0;
+    const bool incompleteFrame = frameBytesUsed > buffers_[index].length ||
+                                 !isFrameComplete(frameBytesUsed);
+    if (driverMarkedError || incompleteFrame) {
+      ++consecutiveCorruptFrames;
+      LOG_WARN("[Capture][V4L2] Drop corrupt frame: index=%d seq=%u flags=0x%08X "
+               "bytesused=%zu format=%s %dx%d stride=%d (%d/%d)",
+               index, buf.sequence, buf.flags, frameBytesUsed,
+               fourccToString(actualFormat_).c_str(), actualWidth_, actualHeight_,
+               actualStride_, consecutiveCorruptFrames,
+               kMaxConsecutiveCorruptFrames);
+      releaseFrame(index);
+      if (consecutiveCorruptFrames >= kMaxConsecutiveCorruptFrames) {
+        LOG_ERROR("[Capture][V4L2] Consecutive corrupt/incomplete frames; restart capture");
+        hasSignal_.store(false);
+        isUnhealthy_.store(true);
+        markMipiRecoveryRequired("three corrupt/incomplete frames");
+        break;
+      }
+      continue;
+    }
+    consecutiveCorruptFrames = 0;
+    // Return transition buffers before throttle/DMA import. Measure from the
+    // first complete frame so a slow STREAMON cannot bypass this warmup.
+    if (!startupSettled) {
+      const auto now = std::chrono::steady_clock::now();
+      if (startupFrames == 0) startupFirstFrame = now;
+      ++startupFrames;
+      if (startupFrames <= 6 || now - startupFirstFrame < std::chrono::milliseconds(200)) {
+        releaseFrame(index);
+        continue;
+      }
+      startupSettled = true;
+      LOG_INFO("[Capture][MIPI] Startup frames settled: discarded=%d elapsedMs=%lld",
+               startupFrames - 1, static_cast<long long>(
+                   std::chrono::duration_cast<std::chrono::milliseconds>(
+                       now - startupFirstFrame).count()));
+    }
     if (hasLastDequeuedSequence && buf.sequence > lastDequeuedSequence + 1) {
       statsDroppedSequences += buf.sequence - lastDequeuedSequence - 1;
     }
@@ -1341,16 +1776,81 @@ void V4L2Capture::captureThread() {
       // [Mali fix] rkcif/HDMI RX 在 DQBUF 时不一定保证 cache 已经刷写到 RAM。
       // 在交给 GPU 渲染前主动对 dmabuf 做一次 SYNC_START|SYNC_RW，确保 GPU
       // 看到的是 CPU 已经填好的数据，避免黑屏/脏数据。
+      bool contentReadable = buffers_[index].dmaBufFd < 0;
       if (buffers_[index].dmaBufFd >= 0) {
         struct dma_buf_sync sync{};
         sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
         int sret = ioctl(buffers_[index].dmaBufFd, DMA_BUF_IOCTL_SYNC, &sync);
+        contentReadable = sret == 0;
         static int s_syncLog = 0;
         if (++s_syncLog <= 1 || (s_syncLog % 3600) == 0) {
           unsigned int yMin = 0, yMax = 0, yAvg = 0;
           sampleLumaStats(buffers_[index], yMin, yMax, yAvg);
           LOG_DEBUG("[采集][V4L2] dmabuf sync ret=%d errno=%d fd=%d Y[sample] min=%u max=%u avg=%u",
                     sret, errno, buffers_[index].dmaBufFd, yMin, yMax, yAvg);
+        }
+      }
+
+      // Sample mapped luma at low frequency after DMA-BUF synchronization.
+      // This reports persistent horizontal discontinuities without restarting
+      // a stream whose driver metadata still looks healthy.
+      if (shouldSetupMipiPipeline() && contentReadable &&
+          (!isMplane || planes[0].data_offset == 0) &&
+          (++frameIntegritySampleCount_ % 15) == 0) {
+        const uint64_t captureTimestampUs =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto detectionStart = std::chrono::steady_clock::now();
+        int discontinuityRow = -1;
+        int discontinuityScore = 0;
+        const bool suspicious =
+            detectVerticalDiscontinuity(buffers_[index], discontinuityRow,
+                                        discontinuityScore);
+        const uint64_t detectionUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - detectionStart).count());
+        ++integritySamples;
+        integrityTotalUs += detectionUs;
+        integrityMaxUs = std::max(integrityMaxUs, detectionUs);
+        if (integritySamples % 120 == 0) {
+          LOG_INFO("[Capture][FrameIntegrity] sample performance: samples=%llu "
+                   "avgUs=%llu maxUs=%llu %dx%d stride=%d",
+                   static_cast<unsigned long long>(integritySamples),
+                   static_cast<unsigned long long>(integrityTotalUs / integritySamples),
+                   static_cast<unsigned long long>(integrityMaxUs),
+                   actualWidth_, actualHeight_, actualStride_);
+        }
+        if (suspicious) {
+          const int rowTolerance = std::max(12, actualHeight_ / 120);
+          if (frameIntegrityCandidateRow_ >= 0 &&
+              std::abs(discontinuityRow - frameIntegrityCandidateRow_) <= rowTolerance) {
+            frameIntegrityCandidateStreak_ =
+                std::min(frameIntegrityCandidateStreak_ + 1, 1000);
+          } else {
+            frameIntegrityCandidateStreak_ = 1;
+            frameIntegrityCandidateSinceUs_ = captureTimestampUs;
+          }
+          frameIntegrityCandidateRow_ = discontinuityRow;
+          if (frameIntegrityCandidateStreak_ >= 3 &&
+              captureTimestampUs - frameIntegrityCandidateSinceUs_ >= 1000000ULL &&
+              (frameIntegrityLastWarnUs_ == 0 ||
+               captureTimestampUs - frameIntegrityLastWarnUs_ >= 10000000ULL)) {
+            frameIntegrityLastWarnUs_ = captureTimestampUs;
+            LOG_WARN("[Capture][V4L2][FrameIntegrity] possible vertical misalignment: "
+                     "row=%d contrast=%d streak=%d seq=%u bytes=%zu "
+                     "format=%s %dx%d stride=%d sampleUs=%llu durationMs=%llu; "
+                     "content heuristic, diagnostic only",
+                     discontinuityRow, discontinuityScore,
+                     frameIntegrityCandidateStreak_, buf.sequence, frameBytesUsed,
+                     fourccToString(actualFormat_).c_str(), actualWidth_, actualHeight_,
+                     actualStride_, static_cast<unsigned long long>(detectionUs),
+                     static_cast<unsigned long long>(
+                         (captureTimestampUs - frameIntegrityCandidateSinceUs_) / 1000));
+          }
+        } else {
+          frameIntegrityCandidateStreak_ = 0;
+          frameIntegrityCandidateRow_ = -1;
+          frameIntegrityCandidateSinceUs_ = 0;
         }
       }
 
@@ -1389,16 +1889,20 @@ void V4L2Capture::captureThread() {
       frame.sequence = buf.sequence;
 
       // 正常 帧 flow is noisy at 60fps; keep it debug-仅.
-      static int frameCount = 0;
-      frameCount++;
+      ++frameCount;
       if (frameCount <= 5 || frameCount % 1800 == 0) {
-        LOG_DEBUG("[采集][V4L2] Frame %d: bufIdx=%d, seq=%d, size=%zu",
+        LOG_DEBUG("[采集][V4L2] Frame %u: bufIdx=%d, seq=%d, size=%zu",
                   frameCount, index, frame.sequence, frame.size);
       }
 
       // Call 回调 with safety 检查
       if (frameCallback_) {
-        frameCallback_(frame);
+        try {
+          frameCallback_(frame);
+        } catch (...) {
+          LOG_ERROR("[Capture][V4L2] Frame callback failed; stop and recover capture");
+          isUnhealthy_.store(true);
+        }
       }
       if (buffers_[index].dmaBufFd >= 0) {
         struct dma_buf_sync sync{};
@@ -1420,6 +1924,9 @@ void V4L2Capture::captureThread() {
     }
   }
 
+  hasSignal_.store(false);
+  if (!shouldStop_.load()) isUnhealthy_.store(true);
+  isCapturing_.store(false, std::memory_order_release);
   LOG_DEBUG("[采集][V4L2] Capture thread ended");
 }
 

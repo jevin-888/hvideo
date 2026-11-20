@@ -10,7 +10,7 @@
  */
 
 #include "utils/Logger.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "utils/FileUtils.h"
 #include <cstdarg>
 #include <ctime>

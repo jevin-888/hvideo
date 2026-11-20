@@ -1,9 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 
 namespace hsvj {
+
+struct DrmPrimeData;
 
 /**
  * @brief DRM_PRIME到MJPEG的预览流转换器
@@ -22,16 +25,17 @@ public:
     bool initialize();
 
     /**
-     * @brief 转换DRM_PRIME帧为MJPEG
-     * @param drmPrimeFd DRM_PRIME文件描述符
-     * @param 宽度 原始宽度
-     * @param 高度 原始高度
-     * @param outJpegData 输出JPEG数据指针
-     * @param outJpegSize 输出JPEG数据大小
-     * @return true 如果转换成功
+     * @brief 将 linear NV12 DRM_PRIME 帧转换为 JPEG
+     * @param drmData 包含 fourcc、modifier、object、offset 和 pitch 的完整描述符
+     * @param outJpegData 输出 JPEG 数据指针
+     * @param outJpegSize 输出 JPEG 数据大小
+     * @return 转换成功返回 true
+     *
+     * 完整描述符用于确保 stride、offset 和 modifier 均来自解码器，
+     * 禁止根据可见尺寸猜测内存布局。
      */
-    bool convertFrame(int drmPrimeFd, int width, int height,
-                     uint8_t** outJpegData, size_t* outJpegSize);
+    bool convertFrame(const DrmPrimeData& drmData,
+                      uint8_t** outJpegData, size_t* outJpegSize);
 
     /**
      * @brief 释放JPEG数据

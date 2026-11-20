@@ -12,7 +12,7 @@
 #ifndef HSVJ_VULKAN_RENDERER_H
 #define HSVJ_VULKAN_RENDERER_H
 
-#include "core/Resolution.h"
+#include "foundation/Resolution.h"
 #include "renderer/AssMaskDrawCmd.h"
 #include <algorithm>
 #include <array>
@@ -51,9 +51,12 @@ namespace hsvj {
 
 // 前向声明（hsvj 命名空间内）
 class DecodedFrame;
-class RKDRMRenderer;
 
+// Keep three submit slots so FIFO present can overlap rendering. Swapchain
+// ownership is bounded separately by the async-acquire ready limit; reducing
+// frame slots to two serializes the RK3566 pipeline behind vkQueuePresentKHR.
 constexpr int MAX_FRAMES_IN_FLIGHT = 3;
+using SubmissionSerial = uint64_t;
 
 /** 是否启用 Vulkan 校验层（在 Vulkan渲染器.cpp 中根据 DEBUG 定义） */
 extern const bool ENABLE_VALIDATION_LAYERS;
@@ -77,6 +80,19 @@ public:
   // 禁止拷贝
   VulkanRenderer(const VulkanRenderer &) = delete;
   VulkanRenderer &operator=(const VulkanRenderer &) = delete;
+
+  // 仅在渲染线程、单个切片绘制期间追加裁剪；自动恢复，不改共享纹理。
+  class ScopedSliceCrop {
+  public:
+    ScopedSliceCrop(VulkanRenderer &renderer, float left, float top,
+                    float right, float bottom);
+    ~ScopedSliceCrop();
+    ScopedSliceCrop(const ScopedSliceCrop &) = delete;
+    ScopedSliceCrop &operator=(const ScopedSliceCrop &) = delete;
+  private:
+    VulkanRenderer &renderer_;
+    std::array<float, 4> previous_;
+  };
 
   /**
    * @brief 初始化渲染器
@@ -152,12 +168,15 @@ public:
   long long getAsyncPresentCount() const {
     return asyncPresentCount_.load(std::memory_order_relaxed);
   }
+  long long getSuccessfulPresentCount() const {
+    return successfulPresentCount_.load(std::memory_order_relaxed);
+  }
   long long getSwapchainNoImageSkipCount() const {
     return swapchainNoImageSkipCount_.load(std::memory_order_relaxed);
   }
 
   void deferUntilCurrentFrameFence(std::function<void()> callback);
-  void flushDeferredFrameFenceCallbacks();
+  void flushDeferredFrameFenceCallbacks(const char *reason);
   bool isBackpressureActive() const;
 
   /**
@@ -379,14 +398,6 @@ public:
    */
   bool updateTextureFromNV24DmaBuf(uint32_t textureId, int dmaBufFd, int width,
                                    int height, int stride = 0);
-
-  /**
-   * @brief NV16 GPU shader 转换
-   * 将 NV16 作为 Y(R8) + UV(RG8) 两张纹理导入，降低 4K 片元采样成本
-   */
-  bool updateTextureFromNV16DmaBuf(uint32_t textureId, int dmaBufFd, int width,
-                                   int height, int stride = 0,
-                                   int yHeight = 0);
 
   bool updateTextureFromNV12DmaBufDual(uint32_t textureId, int dmaBufFd,
                                        int width, int height, int stride,
@@ -710,6 +721,7 @@ public:
   bool endSingleTimeCommands(VkCommandBuffer commandBuffer);
 
 private:
+  std::array<float, 4> sliceCrop_{}; // 左、上、右、下；仅渲染线程访问
 #ifdef __ANDROID__
   bool isDrmKmsBackendRequested() const;
   void runDrmKmsExportProbeIfRequested();
@@ -718,6 +730,7 @@ private:
   bool initializeDrmKmsPresenterIfRequested();
   void shutdownDrmKmsPresenter();
   bool acquireDrmKmsImageForCurrentFrame();
+  void releaseDrmKmsImageForCurrentFrame();
   bool submitAndPresentDrmKmsFrame();
   bool commitReadyDrmKmsBuffer();
   bool commitDrmKmsBufferBlocking(size_t bufferIndex, uint64_t sequence);
@@ -748,7 +761,6 @@ private:
     bool isNV12 = false;
     bool isBGR3 = false; // BGR3 格式（使用 BGR3 shader 进行 BGR→RGB 转换）
     bool isNV24 = false; // NV24 格式（使用 NV24 shader 进行 YCbCr→RGB 转换）
-    bool isNV16 = false; // NV16 格式（使用 NV16 shader 进行 YCbCr→RGB 转换）
     bool isYUYV = false; // YUYV 格式（使用 YUYV shader 进行 YCbCr→RGB 转换）
     bool isDrmPrime =
         false; // DRM PRIME 导入的纹理（外部内存，布局由生产者管理）
@@ -775,6 +787,8 @@ private:
     float contentCropH = 1.0f;
     bool forceContentCropForStretch = false;
     int dmaBufFd = -1; // 绑定的 DMA-BUF 文件描述符，用于缓存检测
+    uint32_t drmFormat = 0; // exact source fourcc for cache/contract checks
+    uint64_t drmModifier = 0; // exact producer layout modifier; 0 means linear
     uint64_t dmaBufDev = 0;
     uint64_t dmaBufIno = 0;
     uintptr_t hwBufferKey = 0; // AHardwareBuffer 指针缓存键（纹理池复用检测）
@@ -782,8 +796,9 @@ private:
     VkSamplerYcbcrConversion ycbcrConversion = VK_NULL_HANDLE;
     uint64_t ycbcrPipelineKey = 0;
 
-    // 采集纹理异步重建优化：记录上次使用该纹理的fence，避免vkDeviceWaitIdle全局阻塞
-    VkFence lastUsageFence = VK_NULL_HANDLE; // V4L2采集纹理重建前只需等待此fence，而非全局waitIdle
+    // Fence handles are recycled per frame slot. Resource lifetime must follow
+    // the immutable serial assigned only after a successful queue submission.
+    SubmissionSerial lastUsageSubmissionSerial = 0;
 
     // 统一封装格式/采集/布局判断，渲染路径不要再直接拼 isV4L2Capture
     // 与 isCaptureDmaBuf，避免 true-layout 采集路径漏判。
@@ -796,11 +811,11 @@ private:
     }
 
     bool isShaderYuvTexture() const {
-      return usesNv12ShaderPath() || isNV16 || isNV24 || isYUYV || isBGR3;
+      return usesNv12ShaderPath() || isNV24 || isYUYV || isBGR3;
     }
 
     bool isAnyYuvTexture() const {
-      return isNV12 || isNV16 || isNV24 || isYUYV || isDrmPrime ||
+      return isNV12 || isNV24 || isYUYV || isDrmPrime ||
              isV4L2Capture || isCaptureDmaBuf || ycbcrConversion != VK_NULL_HANDLE;
     }
 
@@ -827,7 +842,7 @@ private:
     }
 
     uint32_t sampleUvOffsetRows() const {
-      if (usesNv12ShaderPath() || isNV16 || isNV24) {
+      if (usesNv12ShaderPath() || isNV24) {
         return cropOffsetY > 0 ? static_cast<uint32_t>(cropOffsetY)
                                : visibleHeight();
       }
@@ -886,6 +901,7 @@ private:
 
   // 同步对象
   bool createSyncObjects();
+  bool recreateRenderFinishedSemaphoresAfterIdle();
 
   // 资源创建辅助方法
   bool createVertexBuffer();
@@ -931,11 +947,6 @@ private:
   bool createNV24Pipeline();
   bool createNV24DescriptorSetLayout();
   bool createDescriptorSetNV24(Texture &texture);
-
-  // NV16 GPU shader support (YCbCr 4:2:2→RGB 转换)
-  bool createNV16Pipeline();
-  bool createNV16DescriptorSetLayout();
-  bool createDescriptorSetNV16(Texture &texture);
 
   // YUYV GPU shader 支持
   bool createYUYVPipeline();
@@ -991,6 +1002,7 @@ private:
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline fastPipeline = VK_NULL_HANDLE;
     bool initialized = false;
     VkFormat currentFormat = VK_FORMAT_UNDEFINED;
   };
@@ -1005,7 +1017,9 @@ private:
   createYcbcrPipelineLayoutWithDescriptor(VkDescriptorSetLayout layout,
                                           VkPipelineLayout &pipelineLayout);
   bool createYcbcrGraphicsPipeline(VkPipelineLayout pipelineLayout,
-                                   VkPipeline &pipeline);
+                                   VkPipeline &pipeline,
+                                   const char *fragmentShader,
+                                   bool blendEnabled);
   void cleanupYcbcrPipelineResources(YcbcrPipelineResources &resources);
   bool initializeYcbcrPipelineCommon(const YcbcrPipelineConfig &config,
                                      YcbcrPipelineResources &resources);
@@ -1087,6 +1101,8 @@ private:
   VkDescriptorSetLayout descriptorSetLayout_;
   VkPipelineLayout pipelineLayout_;
   VkPipeline graphicsPipeline_;
+  VkPipeline rgbaFastPipeline_ = VK_NULL_HANDLE;
+  bool rgbaFastPipelineLogged_ = false;
   std::vector<VkFramebuffer> swapchainFramebuffers_;
 
   // 命令缓冲
@@ -1097,6 +1113,7 @@ private:
   std::vector<VkSemaphore> imageAvailableSemaphores_;
   std::vector<VkSemaphore> asyncAcquireSemaphores_;
   std::vector<VkFence> asyncAcquireFences_;
+  // Indexed by acquired swapchain image, not the graphics frame slot.
   std::vector<VkSemaphore> renderFinishedSemaphores_;
   std::vector<VkFence> inFlightFences_;
   size_t currentFrame_;
@@ -1130,13 +1147,22 @@ private:
   VkBuffer smallStagingBuffer_ = VK_NULL_HANDLE;
   VkDeviceMemory smallStagingMemory_ = VK_NULL_HANDLE;
   VkDeviceSize smallStagingSize_ = 0;
-  VkBuffer assMaskStagingBuffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory assMaskStagingMemory_ = VK_NULL_HANDLE;
-  VkDeviceSize assMaskStagingSize_ = 0;
-  bool assMaskStagingMapped_ = false;
-  VkBuffer assMaskInstanceBuffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory assMaskInstanceMemory_ = VK_NULL_HANDLE;
-  size_t assMaskInstanceCapacity_ = 0;
+  struct AssMaskFrameBuffers {
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkDeviceSize stagingCapacity = 0;
+    VkDeviceSize stagingUsed = 0;
+    VkDeviceSize stagingOffset = 0;
+    void* stagingMapped = nullptr;
+    bool stagingWriteActive = false;
+    VkBuffer instanceBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory instanceMemory = VK_NULL_HANDLE;
+    size_t instanceCapacity = 0;
+    size_t instanceUsed = 0;
+    VkDeviceSize instanceOffset = 0;
+    void* instanceMapped = nullptr;
+  };
+  std::array<AssMaskFrameBuffers, MAX_FRAMES_IN_FLIGHT> assMaskFrameBuffers_{};
   uint32_t nextTextureId_;
   uint32_t nextTextTextureId_ = 0x100000;  // Layer40/41 ASS，避免与视频 id 1,2 冲突
 
@@ -1144,6 +1170,8 @@ private:
   bool initialized_ = false;
   bool renderPassStarted_ = false;
   bool commandBufferRecording_ = false;
+  // True after beginFrame starts a command buffer until submission or abort.
+  bool frameSubmissionPending_ = false;
   std::atomic<bool> pendingFrameCacheReset_{false}; // resetFrameCache() 设置，beginFrame() fence 完成后安全执行
   std::atomic<bool> pendingDestroyDrain_{false}; // resetFrameCache 后立即 drain 延迟销毁队列
   std::atomic<bool> surfaceDestroyedPending_{false}; // surfaceDestroyed 只打标记，由 render 线程在 beginFrame 安全点处理
@@ -1170,6 +1198,7 @@ private:
   bool asyncPresentFrameInUse_[MAX_FRAMES_IN_FLIGHT] = {};
   std::atomic<long long> lastAsyncPresentUs_{0};
   std::atomic<long long> asyncPresentCount_{0};
+  std::atomic<long long> successfulPresentCount_{0};
   struct PendingAcquire {
     uint64_t generation = 0;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
@@ -1194,12 +1223,29 @@ private:
   std::atomic<long long> swapchainNoImageSkipCount_{0};
   std::atomic<bool> asyncAcquireNeedsRecreate_{false};
   std::atomic<bool> asyncAcquireSurfaceLost_{false};
+  // Async present runs on a separate queue.  Surface changes are reported
+  // there, but swapchain destruction/recreation must stay on the render thread.
+  std::atomic<bool> asyncPresentNeedsRecreate_{false};
+  int asyncPresentStallStreak_ = 0; // Only accessed by the present worker.
+  std::chrono::steady_clock::time_point lastAsyncWsiRecoveryRequest_{};
   void submitCurrentFrameCommandsNoPresent(const char *reason);
   void signalCurrentFenceAndAdvance(const char *reason);
+  SubmissionSerial registerSuccessfulSubmission(size_t frameIndex);
+  void retireCompletedFrameSlot(size_t frameIndex);
+  void abandonRecordingCallbacks(size_t frameIndex, const char *reason);
+  void drainSubmissionCallbacks(bool deviceIdle, const char *reason);
+  bool waitForSubmissionCompletion(SubmissionSerial serial,
+                                   uint64_t timeoutNs,
+                                   bool waitIdleOnTimeout,
+                                   const char *reason);
+  bool isSubmissionComplete(SubmissionSerial serial) const;
+  void recordTextureUsage(uint32_t textureId);
   void configureAsyncPresent();
   void startAsyncPresentThread();
   void stopAsyncPresentThread();
   void asyncPresentLoop();
+  bool shouldRecoverAsyncPresent(int64_t costMs);
+  bool recoverPendingSwapchain();
   void enqueueAsyncPresent(PendingPresent present);
   void performQueuedPresent(const PendingPresent &present);
   void configureAsyncAcquire();
@@ -1212,8 +1258,21 @@ private:
   bool recreateAsyncAcquireSemaphoresAfterIdle();
   std::mutex logicalDeviceRecreatedMutex_;
   std::function<void()> onLogicalDeviceRecreated_;
-  std::mutex gpuCompletionCallbacksMutex_;
-  std::vector<std::function<void()>> gpuCompletionCallbacks_[MAX_FRAMES_IN_FLIGHT];
+  mutable std::mutex submissionStateMutex_;
+  std::condition_variable submissionStateCv_;
+  std::array<SubmissionSerial, MAX_FRAMES_IN_FLIGHT>
+      frameSlotSubmissionSerial_{};
+  std::array<std::vector<std::function<void()>>, MAX_FRAMES_IN_FLIGHT>
+      recordingCallbacks_{};
+  std::array<std::unordered_set<uint32_t>, MAX_FRAMES_IN_FLIGHT>
+      recordingTextureIds_{};
+  std::map<SubmissionSerial, std::vector<std::function<void()>>>
+      submissionCallbacks_;
+  std::atomic<SubmissionSerial> nextSubmissionSerial_{1};
+  std::atomic<SubmissionSerial> completedSubmissionSerial_{0};
+  std::atomic<uint64_t> submittedCount_{0};
+  std::atomic<uint64_t> completedCount_{0};
+  std::atomic<uint64_t> abandonedCount_{0};
   ANativeWindow *nativeWindow_ = nullptr;
 #ifdef __ANDROID__
   bool drmKmsBackendRequested_ = false;
@@ -1253,12 +1312,6 @@ private:
   VkPipeline nv24Pipeline_ = VK_NULL_HANDLE;
   bool nv24PipelineInitialized_ = false;
 
-  // NV16 GPU shader pipeline (YCbCr 4:2:2→RGB 转换)
-  VkDescriptorSetLayout nv16DescriptorSetLayout_ = VK_NULL_HANDLE;
-  VkPipelineLayout nv16PipelineLayout_ = VK_NULL_HANDLE;
-  VkPipeline nv16Pipeline_ = VK_NULL_HANDLE;
-  bool nv16PipelineInitialized_ = false;
-
   // YUYV GPU shader 管线
   VkDescriptorSetLayout yuyvDescriptorSetLayout_ = VK_NULL_HANDLE;
   VkPipelineLayout yuyvPipelineLayout_ = VK_NULL_HANDLE;
@@ -1294,6 +1347,8 @@ private:
   VkDescriptorSetLayout drmPrimeDescriptorSetLayout_ = VK_NULL_HANDLE;
   VkPipelineLayout drmPrimePipelineLayout_ = VK_NULL_HANDLE;
   VkPipeline drmPrimePipeline_ = VK_NULL_HANDLE;
+  VkPipeline drmPrimeFastPipeline_ = VK_NULL_HANDLE;
+  bool drmPrimeFastPipelineLogged_ = false;
   bool drmPrimePipelineInitialized_ = false;
   VkFormat drmPrimePipelineFormat_ = VK_FORMAT_UNDEFINED; // 当前管线的格式
 
@@ -1304,6 +1359,8 @@ private:
   VkDescriptorSetLayout v4l2DescriptorSetLayout_ = VK_NULL_HANDLE;
   VkPipelineLayout v4l2PipelineLayout_ = VK_NULL_HANDLE;
   VkPipeline v4l2Pipeline_ = VK_NULL_HANDLE;
+  VkPipeline v4l2FastPipeline_ = VK_NULL_HANDLE;
+  bool v4l2FastPipelineLogged_ = false;
   bool v4l2PipelineInitialized_ = false;
   VkFormat v4l2PipelineFormat_ = VK_FORMAT_UNDEFINED;
 
@@ -1324,9 +1381,17 @@ private:
   };
 
   static constexpr int MAX_KAWASE_BLUR_LEVELS = 8;
-  KawaseBlurFBO kawaseBlurFBOs_[MAX_KAWASE_BLUR_LEVELS];
-  uint32_t kawaseBlurFBOBaseWidth_ = 0;
-  uint32_t kawaseBlurFBOBaseHeight_ = 0;
+  struct KawaseBlurResources {
+    std::array<KawaseBlurFBO, MAX_KAWASE_BLUR_LEVELS> fbos{};
+    uint64_t frameId = 0;
+    uint32_t inputTextureId = 0;
+    int amountBucket = -1;
+    uint32_t outputTextureId = 0;
+  };
+  // beginFrame waits for the slot fence. Each distinct blur in that frame
+  // needs its own images and immutable descriptors until the slot retires.
+  std::array<std::vector<KawaseBlurResources>, MAX_FRAMES_IN_FLIGHT>
+      kawaseBlurResources_;
 
   VkDescriptorSetLayout kawaseDescriptorSetLayout_ = VK_NULL_HANDLE;
   VkPipelineLayout kawasePipelineLayout_ = VK_NULL_HANDLE;
@@ -1336,25 +1401,19 @@ private:
   bool kawasePipelineInitialized_ = false;
   std::mutex kawaseBlurMutex_;
   uint64_t kawaseBlurFrameId_ = 0;
-  uint64_t kawaseBlurCacheFrameId_ = 0;
-  uint32_t kawaseBlurCacheInputTextureId_ = 0;
-  int kawaseBlurCacheAmountBucket_ = -1;
-  uint32_t kawaseBlurCacheOutputTextureId_ = 0;
 
   // YUV→RGBA 转换管线（用于 Kawase 模糊前将 YUV 纹理转换为 RGBA）
-  VkPipeline kawaseNV12ConvertPipeline_ = VK_NULL_HANDLE;
-  VkPipeline kawaseDrmPrimeConvertPipeline_ = VK_NULL_HANDLE;
-  VkPipeline kawaseV4L2ConvertPipeline_ = VK_NULL_HANDLE;
-  VkPipeline kawaseNV24ConvertPipeline_ = VK_NULL_HANDLE;
-  VkPipeline kawaseNV16ConvertPipeline_ = VK_NULL_HANDLE;
-  VkPipeline kawaseYUYVConvertPipeline_ = VK_NULL_HANDLE;
+  std::map<VkPipelineLayout, VkPipeline> kawaseConvertPipelines_;
+  VkPipeline getKawaseConversionPipeline(VkPipelineLayout layout,
+                                        const char *fragmentShader);
 
-  // Kawase 模糊 methods
   bool createKawasePipelines();
   void cleanupKawasePipelines();
   bool createKawaseBlurFBO(uint32_t width, uint32_t height, KawaseBlurFBO &fbo);
   void destroyKawaseBlurFBO(KawaseBlurFBO &fbo);
-  bool ensureKawaseBlurFBOs(uint32_t baseWidth, uint32_t baseHeight,
+  KawaseBlurResources &getKawaseBlurResources(uint32_t textureId, int amountBucket);
+  bool ensureKawaseBlurFBOs(KawaseBlurResources &resources,
+                            uint32_t baseWidth, uint32_t baseHeight,
                             int requiredLevels = MAX_KAWASE_BLUR_LEVELS);
   uint32_t applyKawaseBlur(uint32_t textureId, float blurAmount);
 
@@ -1365,34 +1424,11 @@ private:
   std::mutex pendingTextureBarrierMutex_;
 
   // ==========================================================================
-  // RKDRM渲染器 集成
+  // 最终帧 direct DRM/KMS 输出
   // ==========================================================================
-  //
-  // 功能：使用 DRM Overlay Plane 直接渲染视频，跳过 Vulkan pipeline
-  //
-  // 优势：
-  //   - 完全零拷贝：RKMPP → DRM Overlay → 屏幕
-  //   - 节省内存：可减少 Swapchain (~95MB) + Canvas (~32MB) ≈ 127MB
-  //   - 降低 GPU 负载：视频渲染由 VOP 硬件处理
-  //
-  // 限制：
-  //   - 需要 DRM Master 权限（可能需要 root 或系统签名）
-  //   - 只能用于视频层，UI/文字仍需 Vulkan
-  //   - 需要协调 DRM Overlay 和 Vulkan Primary Plane 的 Z-order
-  //
-  // 集成步骤：
-  //   1. 在 initialize() 中初始化 rkDrm渲染器_
-  //   2. 在 renderLayer() 中添加 DRM Overlay 渲染路径
-  //   3. 在 shutdown() 中清理 rkDrm渲染器_
-  //   4. 在 LayerVideo 中检测并启用 RK DRM 路径
-  //
-  // 相关文件：
-  //   - include/渲染器/RKDRM渲染器.h  (接口定义)
-  //   - src/渲染器/RKDRM渲染器.cpp    (完整实现)
-  // ==========================================================================
-  std::unique_ptr<RKDRMRenderer> rkDrmRenderer_;
-  bool rkDrmZeroCopyEnabled_ = false;
-
+  // 该 presenter 只在显式请求 drm-kms backend 时取得 DRM 所有权。
+  // 解码器 DRM_PRIME DMA-BUF 始终是 Vulkan 输入，不存在独立的
+  // “每视频层 DRM overlay”输出分支。
 #ifdef __ANDROID__
   struct DrmKmsOutputBuffer {
     AHardwareBuffer *buffer = nullptr;
@@ -1403,10 +1439,12 @@ private:
     int dmaBufFd = -1;
     uint32_t gemHandle = 0;
     uint32_t fbId = 0;
-    VkFence renderFence = VK_NULL_HANDLE;
+    SubmissionSerial renderSubmissionSerial = 0;
     uint64_t sequence = 0;
     bool renderPending = false;
     bool kmsPending = false;
+    bool vulkanOwned = false;
+    bool externalLayoutInitialized = false;
   };
 
   struct DrmKmsPresenterState {
@@ -1415,6 +1453,8 @@ private:
     int drmFd = -1;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
     uint32_t connectorId = 0;
     uint32_t crtcId = 0;
     int crtcIndex = -1;
@@ -1435,6 +1475,10 @@ private:
     uint32_t propPlaneCrtcH = 0;
     uint32_t propPlaneZpos = 0;
     uint64_t planeZpos = 0;
+    uint32_t propPlanePixelBlendMode = 0;
+    uint64_t planePixelBlendMode = 0;
+    uint32_t propPlaneAlpha = 0;
+    uint64_t planeAlpha = 0;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkFormat vkFormat = VK_FORMAT_UNDEFINED;
     uint32_t drmFormat = 0;
@@ -1594,7 +1638,7 @@ public:
   void deferUntilCurrentFrameFence(std::function<void()> callback) {
     if (callback) callback();
   }
-  void flushDeferredFrameFenceCallbacks() {}
+  void flushDeferredFrameFenceCallbacks(const char *) {}
   bool isBackpressureActive() const { return false; }
   void clear(float r, float g, float b, float a) {}
   uint32_t allocateTextureId() { return 0; }

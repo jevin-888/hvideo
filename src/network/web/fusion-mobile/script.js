@@ -1,5 +1,5 @@
-import '../modules/core/interactionGuards.js';
-import { backgroundApi, fusionApi, layerApi, peripheralApi, systemApi, videoApi } from './modules/api.js?v=94';
+import '/shared/interactionGuards.js';
+import { backgroundApi, fusionApi, layerApi, mobileServiceUrl, peripheralApi, systemApi, videoApi } from './modules/api.js?v=99';
 import {
     activeBlend,
     activeColor,
@@ -23,12 +23,13 @@ import {
 } from './modules/geometry.js?v=79';
 import { geometryPointFromCanvasEvent, maskPointFromCanvasEvent, regionFromCanvasEvent, renderPreview } from './modules/renderer.js?v=113';
 import {
-    blendPointToCanvas,
-    getBlendCurveAlpha,
-    getBlendCurveAnchorFromDisplayValue,
     getBlendCurveHandleLayout,
-    getBlendPlotRect
+    getBlendCurvePatchFromDisplayPoint
 } from '../modules/pages/fusion/utils/blendCurve.js';
+import { defaultBlendWidthForGrid } from '../modules/pages/fusion/utils/blend.js';
+import { drawBlendCurvePreview } from '../modules/pages/fusion/canvas/blendCurvePreview.js';
+import { bindHorizontalDragControl, renderHorizontalDragFill } from '../modules/pages/fusion/ui/horizontalDrag.js?v=1.2';
+import { createAnchorMutationQueue } from '../modules/pages/fusion/ui/anchorMutationQueue.js?v=1.0';
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -350,7 +351,8 @@ function handleVideoStatusEvent(event) {
 
 function ensureVideoStatusEvents() {
     if (appState.videoStatusEventSource || typeof EventSource === 'undefined') return;
-    appState.videoStatusEventSource = new EventSource('/api/v1/events');
+    const eventUrl = mobileServiceUrl('/api/v1/events');
+    appState.videoStatusEventSource = new EventSource(eventUrl);
     appState.videoStatusEventSource.addEventListener('video_status', handleVideoStatusEvent);
     appState.videoStatusEventSource.onerror = () => {
         if (appState.videoStatusEventSource?.readyState === EventSource.CLOSED) {
@@ -545,20 +547,6 @@ function managerSideForDirection(geo, direction) {
     return state.activeSide;
 }
 
-function isGeometryPayload(payload) {
-    return payload && typeof payload === 'object' && (
-        Array.isArray(payload.corners)
-        || Array.isArray(payload.points)
-        || Number.isFinite(Number(payload.rows))
-        || Number.isFinite(Number(payload.cols))
-    );
-}
-
-async function refreshMovedGeometry(regionId, response) {
-    const payload = isGeometryPayload(response) ? response : await fusionApi.loadGeometry(regionId);
-    state.geometry[regionId] = hydrateGeometry(regionId, payload || {});
-}
-
 async function ensureBlendMasterEnabled() {
     const master = await fusionApi.getMaster().catch(() => null);
     if (master && typeof master.enabled === 'boolean') {
@@ -573,6 +561,29 @@ async function ensureBlendMasterEnabled() {
     if (typeof response?.blend_auto_edges === 'boolean') {
         state.blendAutoEdges = response.blend_auto_edges;
     }
+}
+
+async function ensureBlendManagerEnabled() {
+    await ensureBlendMasterEnabled();
+    if (state.managerMode) return;
+    const response = await fusionApi.setManagerMode(true);
+    state.managerMode = response?.enabled === true;
+    if (!state.managerMode) {
+        throw new Error('Failed to enable blend manager mode');
+    }
+    if (typeof response?.blend_auto_edges === 'boolean') {
+        state.blendAutoEdges = response.blend_auto_edges;
+    }
+}
+
+function hydrateBlendResizeResponse(response, regionIds) {
+    const items = Array.isArray(response?.regions) ? response.regions : [];
+    const byRegionId = new Map(items.map((item) => [Number(item?.region_id), item]));
+    regionIds.forEach((regionId) => {
+        const payload = byRegionId.get(Number(regionId));
+        if (payload) state.blend[regionId] = normalizeBlend(payload);
+    });
+    return byRegionId.size === regionIds.length;
 }
 
 function blendNumber(value, min, max) {
@@ -613,23 +624,6 @@ function normalizeBlend(payload = {}) {
     };
 }
 
-function cloneBlendSide(side) {
-    return {
-        enabled: !!side?.enabled,
-        width: Number(side?.width ?? 0),
-        gamma: Number(side?.gamma ?? 1.8),
-        slope: Number(side?.slope ?? 1.0),
-        stripStart: Number(side?.stripStart ?? 0),
-        stripEnd: Number(side?.stripEnd ?? 255),
-        anchor: Number(side?.anchor ?? 0.5),
-        bright: [
-            Number(side?.bright?.[0] ?? 128),
-            Number(side?.bright?.[1] ?? 128),
-            Number(side?.bright?.[2] ?? 128)
-        ]
-    };
-}
-
 function getTargetRegionIds() {
     const ids = getRegionIds();
     return ids.length ? ids : [state.activeRegionId];
@@ -655,39 +649,9 @@ function getBlendEditRegionIds() {
     return ids.length ? ids : [state.activeRegionId];
 }
 
-async function syncAllGeometryGuideVisibility(showGrid, options = {}) {
-    const visible = !!showGrid;
-    const ids = getTargetRegionIds();
-    await Promise.all(ids.map((regionId) => ensureGeometryLoaded(regionId)));
-    ids.forEach((regionId) => {
-        if (state.geometry[regionId]) state.geometry[regionId].showGrid = visible;
-    });
-    await fusionApi.showGeometryGridAll(visible);
-    if (visible) {
-        await fusionApi.setGeometrySelection(
-            state.activeRegionId,
-            activeGeometry()?.selected?.row ?? 0,
-            activeGeometry()?.selected?.col ?? 0
-        ).catch(() => {});
-    }
-    if (options.persist !== false) await fusionApi.persist();
-}
-
 async function syncGeometryGuideVisibilityForRegions(ids, showGrid) {
     const regionIds = Array.isArray(ids) && ids.length ? ids : getTargetRegionIds();
     await Promise.all(regionIds.map((regionId) => fusionApi.showGeometryGrid(regionId, !!showGrid)));
-}
-
-async function syncMaskGuideVisibility(showGrid, options = {}) {
-    const visible = !!showGrid;
-    if (state.mask) {
-        state.mask.showGrid = visible;
-        if (visible && ((state.mask.selected?.row ?? -1) < 0 || (state.mask.selected?.col ?? -1) < 0)) {
-            state.mask.selected = { row: 0, col: 0 };
-        }
-    }
-    await fusionApi.setMaskGuideVisibility(visible);
-    if (options.persist !== false) await fusionApi.persist();
 }
 
 function isBlendSideOn(blend, side) {
@@ -700,9 +664,7 @@ function getDefaultBlendWidth(regionId, side) {
     const blend = state.blend[regionId];
     const cols = Math.max(2, Number(blend?.gridCols ?? geometry?.cols ?? 2));
     const rows = Math.max(2, Number(blend?.gridRows ?? geometry?.rows ?? 2));
-    if (side === 'left' || side === 'right') return cols > 2 ? 1 / (cols - 1) : 0;
-    if (side === 'top' || side === 'bottom') return rows > 2 ? 1 / (rows - 1) : 0;
-    return 0;
+    return defaultBlendWidthForGrid(side === 'left' || side === 'right' ? cols : rows);
 }
 
 async function ensureBlendLoaded(regionId) {
@@ -717,45 +679,6 @@ async function ensureGeometryLoaded(regionId) {
         state.geometry[regionId] = hydrateGeometry(regionId, await fusionApi.loadGeometry(regionId));
     }
     return state.geometry[regionId];
-}
-
-async function syncBlendGuideCountFromGeometry(ids = getTargetRegionIds()) {
-    const regionIds = Array.isArray(ids) && ids.length ? ids : getTargetRegionIds();
-    await Promise.all(regionIds.map(async (regionId) => {
-        const geometry = await ensureGeometryLoaded(regionId);
-        state.blend[regionId] = normalizeBlend(await fusionApi.loadBlend(regionId));
-        const blend = state.blend[regionId];
-        if (!geometry || !blend) return;
-        const rows = Math.max(2, Number(geometry.rows) || 2);
-        const cols = Math.max(2, Number(geometry.cols) || 2);
-        if (Number(blend.gridRows) === rows && Number(blend.gridCols) === cols) return;
-        blend.gridRows = rows;
-        blend.gridCols = cols;
-        const response = await fusionApi.saveBlend(regionId, {
-            blend_grid_rows: rows,
-            blend_grid_cols: cols,
-            guide_grid_only: true,
-            sync_adjacent: false
-        });
-        state.blend[regionId] = normalizeBlend(response || await fusionApi.loadBlend(regionId));
-    }));
-}
-
-async function syncGeometryGuideCountFromBlend(ids = getTargetRegionIds()) {
-    const regionIds = Array.isArray(ids) && ids.length ? ids : getTargetRegionIds();
-    await Promise.all(regionIds.map(async (regionId) => {
-        const geometry = await ensureGeometryLoaded(regionId);
-        state.blend[regionId] = normalizeBlend(await fusionApi.loadBlend(regionId));
-        const blend = state.blend[regionId];
-        if (!geometry || !blend) return;
-        const rows = Math.max(2, Number(blend.gridRows) || Number(geometry.rows) || 2);
-        const cols = Math.max(2, Number(blend.gridCols) || Number(geometry.cols) || 2);
-        if (Number(geometry.rows) === rows && Number(geometry.cols) === cols) return;
-        const response = await fusionApi.setGeometryGrid(regionId, rows, cols, geometry.interpolationMode || 0, {
-            syncBlendGrid: false
-        });
-        state.geometry[regionId] = hydrateGeometry(regionId, response || await fusionApi.loadGeometry(regionId));
-    }));
 }
 
 async function syncActiveGeometrySelection(regionId = state.activeRegionId) {
@@ -800,8 +723,8 @@ function normalizeBlendForSave(blend, regionId = state.activeRegionId) {
         const source = blend?.[side] || {};
         const width = Number(source.width ?? 0);
         const fallbackWidth = (side === 'left' || side === 'right')
-            ? (gridCols > 2 ? 1 / (gridCols - 1) : 0)
-            : (gridRows > 2 ? 1 / (gridRows - 1) : 0);
+            ? defaultBlendWidthForGrid(gridCols)
+            : defaultBlendWidthForGrid(gridRows);
         normalized[side] = {
             ...source,
             width: source.enabled && width <= 0.001 ? fallbackWidth : width
@@ -1012,11 +935,16 @@ function syncMaskPanel() {
 function syncBlendPanel() {
     const blend = activeBlend();
     if (!blend) return;
-    const geo = activeGeometry();
     const side = blend[state.activeSide];
     setChecked('blendGuideToggle', state.managerMode);
     setValue('blendGammaInput', side.gamma);
     setValue('blendSlopeInput', side.slope);
+    setValue('blendAnchorInput', side.anchor ?? 0.5);
+    renderHorizontalDragFill($('#blendAnchorInput'), side.anchor ?? 0.5, {
+        min: 0,
+        max: 1,
+        color: '245, 158, 11'
+    });
     setValue('blendBrightR', side.bright?.[0] ?? 128);
     setValue('blendBrightG', side.bright?.[1] ?? 128);
     setValue('blendBrightB', side.bright?.[2] ?? 128);
@@ -1064,7 +992,7 @@ function syncAdvancedPanel() {
     const cave = state.cave[state.activeRegionId] || {};
     setChecked('caveToggle', cave.enabled);
     setValue('wallType', cave.wall_type ?? 0);
-    setValue('eyeDistance', cave.eye_distance ?? 0.065);
+    setValue('eyeDistance', cave.eye_distance ?? 2);
     setValue('nearPlane', cave.near_plane ?? 0.1);
     setValue('farPlane', cave.far_plane ?? 100);
     ['llx', 'lly', 'llz', 'ulx', 'uly', 'ulz', 'lrx', 'lry', 'lrz'].forEach((id) => setValue(id, cave[id] ?? 0));
@@ -1081,57 +1009,19 @@ function drawBlendCurve() {
         canvas.width = width;
         canvas.height = height;
     }
-    const ctx = canvas.getContext('2d');
-    const plot = getBlendPlotRect(canvas);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#0b1220';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.strokeStyle = '#1e293b';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 4; i += 1) {
-        const gx = plot.x + (plot.width / 4) * i;
-        const gy = plot.y + (plot.height / 4) * i;
-        ctx.beginPath();
-        ctx.moveTo(gx, plot.y);
-        ctx.lineTo(gx, plot.y + plot.height);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(plot.x, gy);
-        ctx.lineTo(plot.x + plot.width, gy);
-        ctx.stroke();
-    }
-    ctx.strokeStyle = '#60a5fa';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    for (let i = 0; i <= 96; i += 1) {
-        const x = i / 96;
-        const screen = blendPointToCanvas({ x, y: 1 - getBlendCurveAlpha(side, x) }, plot);
-        if (i === 0) ctx.moveTo(screen.x, screen.y);
-        else ctx.lineTo(screen.x, screen.y);
-    }
-    ctx.stroke();
-    const layout = getBlendCurveHandleLayout(canvas, side);
-    layout.handles.forEach((handle) => {
-        ctx.fillStyle = '#f59e0b';
-        ctx.beginPath();
-        ctx.arc(handle.screen.x, handle.screen.y, handle.id === 'anchor' ? 8 : 7, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = '#f8fafc';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
+    drawBlendCurvePreview(canvas, side, {
+        sideLabel: state.activeSide,
+        handleRadius: 7,
+        anchorRadius: 8
     });
-    ctx.fillStyle = '#e2e8f0';
-    ctx.font = '12px Consolas, monospace';
-    const params = layout.params;
-    ctx.fillText(`BLEND ${state.activeSide.toUpperCase()} · gamma=${params.gamma.toFixed(2)} gain=${params.anchor.toFixed(2)} slope=${params.slope.toFixed(2)}`, 12, 14);
 }
 
 function updateBrightnessDragFill(input, value, color) {
-    const host = input?.closest('.brightness-drag-field');
-    if (!host) return;
-    const ratio = clamp(Number(value) || 0, 0, 255) / 255;
-    host.style.setProperty('--brightness-color', color);
-    host.style.setProperty('--brightness-level', `${ratio * 100}%`);
+    renderHorizontalDragFill(input, clamp(Number(value) || 0, 0, 255), {
+        min: 0,
+        max: 255,
+        color
+    });
 }
 
 function syncPreviewPlacement() {
@@ -1206,13 +1096,12 @@ async function enterMode(mode, options = {}) {
     if (mode === 'blend') {
         const regionIds = getRegionIds();
         const targetIds = regionIds.length ? regionIds : [regionId];
+        await ensureBlendManagerEnabled();
         await Promise.all(targetIds.map((id) => ensureGeometryLoaded(id)));
         await Promise.all(targetIds.map(async (id) => {
             state.blend[id] = normalizeBlend(await fusionApi.loadBlend(id));
         }));
-        if (!resetGuides) {
-            await syncActiveGeometrySelection(regionId);
-        }
+        await syncActiveGeometrySelection(regionId);
     }
 
     await setDebugBackgroundForMode(hasVisibleDebugGuide());
@@ -1311,14 +1200,12 @@ async function setBlendGuideModeVisible(visible) {
 
     await closeAllDebugGuides('blend');
     state.mode = 'blend';
-    await ensureBlendMasterEnabled();
+    await ensureBlendManagerEnabled();
     await Promise.all(ids.map((id) => ensureGeometryLoaded(id)));
     const geo = activeGeometry();
     const selection = geo ? nearestGeometryCorner(geo) : { row: 0, col: 0 };
     if (state.mask) state.mask.showGrid = false;
-    state.managerMode = true;
     if (state.mask) await fusionApi.setMask(maskPayload(state.mask));
-    await fusionApi.setManagerMode(true);
     await Promise.all(ids.map(async (id) => {
         state.blend[id] = normalizeBlend(await fusionApi.loadBlend(id));
     }));
@@ -1439,7 +1326,7 @@ async function loadActiveRegionDetails(regionId = state.activeRegionId) {
         lrz: Number(cave?.lrz ?? 0),
         near_plane: Number(cave?.near_plane ?? 0.1),
         far_plane: Number(cave?.far_plane ?? 100),
-        eye_distance: Number(cave?.eye_distance ?? 0.065)
+        eye_distance: Number(cave?.eye_distance ?? 2)
     };
 }
 
@@ -1745,9 +1632,20 @@ function renderVideoLayerPicker() {
 }
 
 function renderVideoPage() {
+    console.log('[VideoPage] renderVideoPage 被调用');
+
+    // 保护性检查：如果没有图层数据，显示提示
+    if (!appState.layers || appState.layers.length === 0) {
+        console.warn('[VideoPage] 没有图层数据，无法渲染');
+        setText('#videoStatusText', '未找到图层数据，请点击刷新按钮重试');
+        setText('#videoActiveLayerLabel', '--');
+        return;
+    }
+
     const layerId = chooseVideoLayer();
     const status = currentVideoStatus();
     const layer = mergedLayer(layerId);
+    console.log('[VideoPage] 渲染视频页面 - 图层ID:', layerId, '状态:', status);
     setText('#videoActiveLayerLabel', `图层 ${layerId}`);
     const duration = normalizeDuration(status.duration);
     const position = displayPositionForDuration(status.current_position ?? status.currentPosition ?? status.position, duration);
@@ -1784,20 +1682,58 @@ function syncSystemVolumeControl(payload) {
 }
 
 async function loadVideoPage() {
+    console.log('[VideoPage] 开始加载视频页面...');
     await withBusy('正在加载视频状态...', async () => {
-        if (!appState.layers.length || !appState.runtimeLayers.length) {
-            const [layers, runtimeLayers] = await Promise.all([
-                appState.layers.length ? appState.layers : layerApi.list().catch(() => []),
-                layerApi.listRuntime().catch(() => [])
-            ]);
-            appState.layers = Array.isArray(layers) ? layers : [];
-            appState.runtimeLayers = Array.isArray(runtimeLayers) ? runtimeLayers : [];
+        try {
+            console.log('[VideoPage] 图层数据状态:', {
+                layers: appState.layers.length,
+                runtimeLayers: appState.runtimeLayers.length
+            });
+
+            if (!appState.layers.length || !appState.runtimeLayers.length) {
+                console.log('[VideoPage] 加载图层数据...');
+                const [layers, runtimeLayers] = await Promise.all([
+                    appState.layers.length ? appState.layers : layerApi.list().catch((e) => {
+                        console.error('[VideoPage] 加载图层列表失败:', e);
+                        return [];
+                    }),
+                    layerApi.listRuntime().catch((e) => {
+                        console.error('[VideoPage] 加载运行时图层失败:', e);
+                        return [];
+                    })
+                ]);
+                appState.layers = Array.isArray(layers) ? layers : [];
+                appState.runtimeLayers = Array.isArray(runtimeLayers) ? runtimeLayers : [];
+                console.log('[VideoPage] 图层数据加载完成:', {
+                    layers: appState.layers.length,
+                    runtimeLayers: appState.runtimeLayers.length
+                });
+            }
+
+            const layerId = chooseVideoLayer();
+            console.log('[VideoPage] 选择的视频图层ID:', layerId);
+
+            appState.videoStatus = await videoApi.status(layerId).catch((e) => {
+                console.error('[VideoPage] 获取视频状态失败:', e);
+                return {};
+            });
+            console.log('[VideoPage] 视频状态:', appState.videoStatus);
+
+            const systemVolume = await videoApi.command('getSystemVolume', {}).catch((e) => {
+                console.error('[VideoPage] 获取系统音量失败:', e);
+                return null;
+            });
+            console.log('[VideoPage] 系统音量:', systemVolume);
+
+            syncSystemVolumeControl(systemVolume);
+            renderVideoPage();
+            console.log('[VideoPage] 视频页面渲染完成');
+        } catch (error) {
+            console.error('[VideoPage] loadVideoPage 发生错误:', error);
+            // 即使出错也要更新UI，避免一直显示"正在读取..."
+            setText('#videoStatusText', '加载失败: ' + (error.message || '未知错误'));
+            throw error;
         }
-        const layerId = chooseVideoLayer();
-        appState.videoStatus = await videoApi.status(layerId).catch(() => ({}));
-        const systemVolume = await videoApi.command('getSystemVolume', {}).catch(() => null);
-        syncSystemVolumeControl(systemVolume);
-        renderVideoPage();
     });
 }
 
@@ -2018,15 +1954,20 @@ function bindPreviewGridResize() {
 
             const ids = getRegionIds();
             const regionIds = ids.length ? ids : [state.activeRegionId];
-            await Promise.all(regionIds.map(async (regionId) => {
-                if (state.mode === 'blend') {
-                    const response = await fusionApi.resizeGeometry(regionId, op);
-                    state.blend[regionId] = normalizeBlend(response || await fusionApi.loadBlend(regionId));
-                } else {
+            if (state.mode === 'blend') {
+                await ensureBlendManagerEnabled();
+                const response = await fusionApi.resizeBlendGridBatch(regionIds, op);
+                if (!hydrateBlendResizeResponse(response, regionIds)) {
+                    await Promise.all(regionIds.map(async (regionId) => {
+                        state.blend[regionId] = normalizeBlend(await fusionApi.loadBlend(regionId));
+                    }));
+                }
+            } else {
+                await Promise.all(regionIds.map(async (regionId) => {
                     const response = await fusionApi.resizeGeometry(regionId, op);
                     state.geometry[regionId] = hydrateGeometry(regionId, response || await fusionApi.loadGeometry(regionId));
-                }
-            }));
+                }));
+            }
             renderAll();
         }, '网格已同步'));
     });
@@ -2212,23 +2153,63 @@ function bindBlend() {
             state.blend[regionId] = normalizeBlend(await fusionApi.loadBlend(regionId));
         }));
     };
-    const syncCurvePatch = async (patch, reload = true) => {
+    const anchorMutationQueue = createAnchorMutationQueue({
+        write: (regionId, side, value) => fusionApi.setBlendCurveParams(regionId, side, { anchor: value }),
+        onCommit: ({ side, responses }) => {
+            const suffix = { left: 'l', right: 'r', top: 't', bottom: 'b' }[side];
+            responses.forEach(({ regionId, response }) => {
+                const returned = Number(response?.[`anchor_${suffix}`]);
+                if (suffix && Number.isFinite(returned) && state.blend[regionId]?.[side]) {
+                    state.blend[regionId][side].anchor = clamp(returned, 0, 1);
+                }
+            });
+            renderAll();
+        },
+        onError: ({ failures }) => {
+            const error = failures[0]?.error;
+            console.error('fusion anchor sync failed:', error);
+            toast(error?.message || 'Anchor 同步失败', 'error');
+        }
+    });
+    const applyAnchorLocalChange = (ids, side, value) => {
+        const next = clamp(Number(value), 0, 1);
+        ids.forEach((regionId) => {
+            const blend = state.blend[regionId];
+            if (blend?.[side]) blend[side].anchor = next;
+        });
+        syncBlendPanel();
+        return next;
+    };
+    const syncCurvePatch = async (patch, reload = true, target = {}) => {
         if (!patch || !Object.keys(patch).length) return;
-        const ids = getBlendEditRegionIds();
+        const ids = Array.isArray(target.ids) ? [...target.ids] : getBlendEditRegionIds();
+        const side = target.side || state.activeSide;
+        if (Object.keys(patch).length === 1 && Object.prototype.hasOwnProperty.call(patch, 'anchor')) {
+            const value = target.localAlreadyPatched
+                ? clamp(Number(patch.anchor), 0, 1)
+                : applyAnchorLocalChange(ids, side, patch.anchor);
+            if (target.localAlreadyPatched) syncBlendPanel();
+            anchorMutationQueue.schedule({ ids, side, value, final: !!reload });
+            return;
+        }
         await Promise.all(ids.map(async (regionId) => {
             const blend = await ensureBlendLoaded(regionId);
-            Object.assign(blend[state.activeSide], patch);
+            Object.assign(blend[side], patch);
         }));
         syncBlendPanel();
-        await Promise.all(ids.map((regionId) => fusionApi.setBlendCurveParams(regionId, state.activeSide, patch)));
+        await Promise.all(ids.map((regionId) => fusionApi.setBlendCurveParams(regionId, side, patch)));
         if (reload) await reloadBlendTargets(ids);
         renderAll();
     };
-    const updateCurveInput = async (key) => {
+    const updateCurveInput = async (key, target = {}) => {
+        const ids = Array.isArray(target.ids) ? [...target.ids] : getBlendEditRegionIds();
+        const side = target.side || state.activeSide;
+        const inputId = key === 'gamma' ? '#blendGammaInput' : '#blendSlopeInput';
+        const rawValue = target.value ?? $(inputId).value;
         const patch = {};
-        if (key === 'gamma') patch.gamma = blendNumber($('#blendGammaInput').value, 1, 3);
-        if (key === 'slope') patch.slope = blendNumber($('#blendSlopeInput').value, 1, 3);
-        await syncCurvePatch(patch);
+        if (key === 'gamma') patch.gamma = blendNumber(rawValue, 1, 3);
+        if (key === 'slope') patch.slope = blendNumber(rawValue, 1, 3);
+        await syncCurvePatch(patch, true, { ids, side });
     };
     const updateSideEnabled = async (sideName, nextEnabled) => {
         const blend = activeBlend();
@@ -2266,77 +2247,6 @@ function bindBlend() {
         await reloadBlendTargets(ids);
         renderAll();
     };
-    const bindBrightnessDragControl = (input, colorId, color, updateBrightness) => {
-        const host = input.closest('.brightness-drag-field') || input;
-        if (!host || host.dataset.brightnessDragBound) return;
-        host.dataset.brightnessDragBound = 'true';
-        let pressTimer = null;
-        let dragState = null;
-        let pressPoint = null;
-        const clearPressTimer = () => {
-            if (pressTimer) {
-                clearTimeout(pressTimer);
-                pressTimer = null;
-            }
-            pressPoint = null;
-        };
-        const renderInlineDrag = (value) => updateBrightnessDragFill(input, value, color);
-        host._renderBrightnessLevel = renderInlineDrag;
-        const valueFromPointer = (event) => {
-            const rect = host.getBoundingClientRect();
-            const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-            return Math.round(ratio * 255);
-        };
-        const updateDrag = (event, final = false) => {
-            if (!dragState || dragState.pointerId !== event.pointerId) return;
-            const value = valueFromPointer(event);
-            setValue(input.id, value);
-            renderInlineDrag(value);
-            updateBrightness(value, { reload: final });
-            event.preventDefault();
-        };
-        const startDrag = (event) => {
-            const value = clamp(parseInt(input.value || 128, 10), 0, 255);
-            input.blur();
-            dragState = { pointerId: event.pointerId };
-            renderInlineDrag(value);
-            host.classList.add('is-brightness-dragging');
-            host.setPointerCapture?.(event.pointerId);
-            event.preventDefault();
-            updateDrag(event, false);
-        };
-        const finishDrag = (event) => {
-            clearPressTimer();
-            if (!dragState || dragState.pointerId !== event.pointerId) return;
-            updateDrag(event, true);
-            host.classList.remove('is-brightness-dragging');
-            host.releasePointerCapture?.(event.pointerId);
-            dragState = null;
-        };
-        host.addEventListener('pointerdown', (event) => {
-            if (event.button !== undefined && event.button !== 0) return;
-            if (event.target && event.target.closest('button')) return;
-            clearPressTimer();
-            pressPoint = { x: event.clientX, y: event.clientY };
-            pressTimer = setTimeout(() => {
-                pressTimer = null;
-                startDrag(event);
-            }, 320);
-        });
-        host.addEventListener('pointermove', (event) => {
-            if (dragState) {
-                updateDrag(event, false);
-                return;
-            }
-            if (pressPoint && Math.hypot(event.clientX - pressPoint.x, event.clientY - pressPoint.y) > 8) {
-                clearPressTimer();
-            }
-        });
-        host.addEventListener('pointerup', finishDrag);
-        host.addEventListener('pointercancel', finishDrag);
-        host.addEventListener('pointerleave', clearPressTimer);
-        renderInlineDrag(clamp(parseInt(input.value || 128, 10), 0, 255));
-    };
     const bindCurveCanvas = () => {
         const canvas = $('#blendCurveCanvas');
         if (!canvas) return;
@@ -2350,36 +2260,31 @@ function bindBlend() {
                 y: (event.clientY - rect.top) * scaleY
             };
         };
-        const valuesFromPoint = (point) => {
-            const layout = getBlendCurveHandleLayout(canvas, activeBlend()?.[state.activeSide] || {});
+        const valuesFromPoint = (point, sideName) => {
+            const layout = getBlendCurveHandleLayout(canvas, activeBlend()?.[sideName] || {});
             return {
                 x: clamp((point.x - layout.rect.x) / layout.rect.width, 0, 1),
                 y: clamp(1 - ((point.y - layout.rect.y) / layout.rect.height), 0, 1)
             };
         };
-        const patchFromDrag = (handleId, values) => {
-            const side = activeBlend()?.[state.activeSide] || {};
-            const stripStart = clamp(side.stripStart ?? 0, 0, 255);
-            const stripEnd = clamp(side.stripEnd ?? 255, 0, 255);
-            if (handleId === 'stripStart') {
-                return { stripStart: Math.round(clamp(values.x * 255, 0, Math.max(0, stripEnd - 1))) };
-            }
-            if (handleId === 'stripEnd') {
-                return { stripEnd: Math.round(clamp(values.x * 255, Math.min(255, stripStart + 1), 255)) };
-            }
-            return { anchor: Number(getBlendCurveAnchorFromDisplayValue(side, values.y).toFixed(3)) };
+        const patchFromDrag = (handleId, values, sideName) => {
+            const side = activeBlend()?.[sideName] || {};
+            return getBlendCurvePatchFromDisplayPoint(side, handleId, values);
         };
         const applyDrag = (event, reload) => {
             if (!drag) return;
-            const patch = patchFromDrag(drag.handleId, valuesFromPoint(canvasPoint(event)));
-            const ids = getBlendEditRegionIds();
-            ids.forEach((regionId) => {
-                if (state.blend[regionId]?.[state.activeSide]) {
-                    Object.assign(state.blend[regionId][state.activeSide], patch);
+            const patch = patchFromDrag(drag.handleId, valuesFromPoint(canvasPoint(event), drag.side), drag.side);
+            drag.ids.forEach((regionId) => {
+                if (state.blend[regionId]?.[drag.side]) {
+                    Object.assign(state.blend[regionId][drag.side], patch);
                 }
             });
             drawBlendCurve();
-            void syncCurvePatch(patch, reload).catch((error) => {
+            void syncCurvePatch(patch, reload, {
+                ids: drag.ids,
+                side: drag.side,
+                localAlreadyPatched: true
+            }).catch((error) => {
                 console.error(error);
                 toast(error.message || '融合曲线同步失败', 'error');
             });
@@ -2400,7 +2305,9 @@ function bindBlend() {
             if (!inside && nearest.distance > 24) return;
             drag = {
                 handleId: nearest.distance <= 24 ? nearest.handle.id : 'anchor',
-                pointerId: event.pointerId
+                pointerId: event.pointerId,
+                ids: [...getBlendEditRegionIds()],
+                side: state.activeSide
             };
             canvas.classList.add('is-dragging');
             canvas.setPointerCapture?.(event.pointerId);
@@ -2446,41 +2353,81 @@ function bindBlend() {
     $('#blendMoveModeBtn').addEventListener('click', () => {
         renderAll();
     });
-    $$('#panel-blend [data-blend-resize]').forEach((button) => {
-        button.addEventListener('click', () => withBusy('正在同步融合网格...', async () => {
-            const ids = getRegionIds();
-            const regionIds = ids.length ? ids : [state.activeRegionId];
-            await Promise.all(regionIds.map(async (regionId) => {
-                const response = await fusionApi.resizeGeometry(regionId, button.dataset.blendResize);
-                state.blend[regionId] = normalizeBlend(response || await fusionApi.loadBlend(regionId));
-            }));
-            renderAll();
-        }, '融合网格已同步'));
-    });
     [
         ['blendGammaDecrease', 'blendGammaIncrease', 'blendGammaReset', 'blendGammaInput', 'gamma', 1.8],
-        ['blendSlopeDecrease', 'blendSlopeIncrease', 'blendSlopeReset', 'blendSlopeInput', 'slope', 1.0]
+        ['blendSlopeDecrease', 'blendSlopeIncrease', 'blendSlopeReset', 'blendSlopeInput', 'slope', 1.0],
+        ['blendAnchorDecrease', 'blendAnchorIncrease', 'blendAnchorReset', 'blendAnchorInput', 'anchor', 0.5]
     ].forEach(([decreaseId, increaseId, resetId, inputId, key, defaultValue]) => {
         const input = $(`#${inputId}`);
-        input.addEventListener('input', debounce(() => updateCurveInput(key), 120));
+        if (key !== 'anchor') {
+            const syncInput = debounce((target) => updateCurveInput(key, target), 120);
+            input.addEventListener('input', () => {
+                syncInput({
+                    ids: [...getBlendEditRegionIds()],
+                    side: state.activeSide,
+                    value: input.value
+                });
+            });
+        }
         [
             [decreaseId, 'decrease'],
             [increaseId, 'increase'],
             [resetId, 'reset']
         ].forEach(([buttonId, mode]) => {
             $(`#${buttonId}`).addEventListener('click', async () => {
-                const min = Number(input.min || 0);
-                const max = Number(input.max || 1);
-                const step = Number(input.step || 0.1);
+                const min = Number(input.dataset.min ?? input.min ?? 0);
+                const max = Number(input.dataset.max ?? input.max ?? 1);
+                const step = Number(input.dataset.step ?? input.step ?? 0.1);
                 const current = Number(input.value || defaultValue);
                 let next = defaultValue;
                 if (mode === 'decrease') next = current - step;
                 if (mode === 'increase') next = current + step;
                 const decimals = String(step).includes('.') ? String(step).split('.')[1].length : 0;
                 input.value = String(Number(clamp(next, min, max).toFixed(decimals)));
-                await updateCurveInput(key);
+                const target = {
+                    ids: [...getBlendEditRegionIds()],
+                    side: state.activeSide,
+                    value: input.value
+                };
+                if (key === 'anchor') {
+                    const value = applyAnchorLocalChange(target.ids, target.side, target.value);
+                    anchorMutationQueue.schedule({ ...target, value, final: true });
+                    return;
+                }
+                await updateCurveInput(key, target);
             });
         });
+    });
+
+    let anchorDragTarget = null;
+    const anchorInput = $('#blendAnchorInput');
+    bindHorizontalDragControl(anchorInput, {
+        host: anchorInput?.closest('.anchor-drag-field'),
+        min: 0,
+        max: 1,
+        step: 0.01,
+        color: '245, 158, 11',
+        onStart: () => {
+            anchorDragTarget = {
+                ids: getBlendEditRegionIds(),
+                side: state.activeSide
+            };
+        },
+        onChange: (value, { final }) => {
+            if (!anchorDragTarget) return;
+            const next = Number(value.toFixed(2));
+            setValue('blendAnchorInput', next);
+            applyAnchorLocalChange(anchorDragTarget.ids, anchorDragTarget.side, next);
+            anchorMutationQueue.schedule({
+                ids: [...anchorDragTarget.ids],
+                side: anchorDragTarget.side,
+                value: next,
+                final
+            });
+        },
+        onEnd: () => {
+            anchorDragTarget = null;
+        }
     });
     [
         ['blendBrightR', 'blendBrightRDecrease', 'blendBrightRIncrease', 'blendBrightRReset', 0],
@@ -2510,7 +2457,14 @@ function bindBlend() {
                 await updateBlendBrightness(colorId, inputId);
             });
         });
-        bindBrightnessDragControl(input, colorId, colors[colorId], dragBrightness);
+        bindHorizontalDragControl(input, {
+            host: input.closest('.brightness-drag-field'),
+            min: 0,
+            max: 255,
+            step: 1,
+            color: colors[colorId],
+            onChange: (value, { final }) => dragBrightness(value, { reload: final })
+        });
     });
     bindCurveCanvas();
     $('#restoreBlendBtn').addEventListener('click', async () => {
@@ -2559,11 +2513,20 @@ function bindAdvanced() {
         await fusionApi.persist();
     }, '矩阵校正已应用'));
 
+    $('#initializeCaveBtn').addEventListener('click', () => withBusy('正在初始化 CAVE...', async () => {
+        const result = await fusionApi.initializeCave(
+            state.activeRegionId,
+            Math.round(numberValue('wallType', 0))
+        );
+        state.cave[state.activeRegionId] = result?.cave || result || {};
+        syncAdvancedPanel();
+    }, 'CAVE 已初始化并应用'));
+
     $('#saveCaveBtn').addEventListener('click', () => withBusy('正在应用 CAVE 配置...', async () => {
         const cave = {
             enabled: $('#caveToggle').checked,
             wall_type: Math.round(numberValue('wallType', 0)),
-            eye_distance: numberValue('eyeDistance', 0.065),
+            eye_distance: numberValue('eyeDistance', 2),
             near_plane: numberValue('nearPlane', 0.1),
             far_plane: numberValue('farPlane', 100),
             llx: numberValue('llx', 0),
@@ -2582,7 +2545,7 @@ function bindAdvanced() {
     }, 'CAVE 配置已应用'));
 
     $('#resetFusionBtn').addEventListener('click', async () => {
-        if (!confirm('确定初始化融合配置？当前几何、遮罩、融合参数会重置。')) return;
+        if (!confirm(globalThis.PlayerI18n?.t('确定初始化融合配置？当前几何、遮罩、融合参数会重置。') ?? '确定初始化融合配置？当前几何、遮罩、融合参数会重置。')) return;
         await withBusy('正在初始化融合...', async () => {
             await fusionApi.reset();
             resetLocalFusionDebugState();
@@ -2694,9 +2657,10 @@ async function removeBackgroundLayer() {
 }
 
 function cleanupBackgroundOnPageHide() {
-    fetch('/api/v1/layers/actions/remove_runtime_layer', {
+    const headers = { 'Content-Type': 'application/json' };
+    fetch(mobileServiceUrl('/api/v1/layers/actions/remove_runtime_layer'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ layerId: BACKGROUND_LAYER_ID }),
         keepalive: true
     }).catch(() => {});
@@ -3046,5 +3010,5 @@ function bindAll() {
 
 bindAll();
 loadAll().catch(() => {
-    setText('#statusLine', '连接失败，请检查 8080 调试服务');
+    setText('#statusLine', '连接失败，请检查设备网络后重试');
 });

@@ -28,10 +28,9 @@
 
 // This function will be provided to the libopenh264 library.  The function will be called
 // when libopenh264 wants to log a message (error, warning, info, etc.).  The signature for
-// this function (defined in .../codec/api/svc/codec_api.h) ? is:
+// this function (defined in .../codec/api/svc/codec_api.h) is:
 //
-//        typedef void (*WelsTraceCallback) (void* ctx, 
-  int level, const char* string);
+//        typedef void (*WelsTraceCallback) (void* ctx, int level, const char* string);
 
 void ff_libopenh264_trace_callback(void *ctx, int level, const char *msg);
 

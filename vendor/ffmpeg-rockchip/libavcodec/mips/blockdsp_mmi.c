@@ -43,7 +43,7 @@ void ff_fill_block16_mmi(uint8_t *block, uint8_t value, ptrdiff_t line_size, int
         : [ftmp0]"=&f"(ftmp[0]),
           RESTRICT_ASM_ALL64
           [block]"+&r"(block),              [h]"+&r"(h)
-        : [value]"r"(value),                [line_size]"r"((mips_reg)? line_size)
+        : [value]"r"(value),                [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }
@@ -66,7 +66,7 @@ void ff_fill_block8_mmi(uint8_t *block, uint8_t value, ptrdiff_t line_size, int 
         : [ftmp0]"=&f"(ftmp0),
           RESTRICT_ASM_ALL64
           [block]"+&r"(block),              [h]"+&r"(h)
-        : [value]"r"(value),                [line_size]"r"((mips_reg)? line_size)
+        : [value]"r"(value),                [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }
@@ -153,7 +153,7 @@ void ff_clear_blocks_mmi(int16_t *block)
         MMI_SQC1(%[ftmp0], %[ftmp1], %[block], 0x2e0)
         MMI_SQC1(%[ftmp0], %[ftmp1], %[block], 0x2f0)
         : [ftmp0]"=&f"(ftmp[0]),            [ftmp1]"=&f"(ftmp[1])
-        : [block]"r"((uint64_t *)? block)
+        : [block]"r"((uint64_t *)block)
         : "memory"
     );
 }

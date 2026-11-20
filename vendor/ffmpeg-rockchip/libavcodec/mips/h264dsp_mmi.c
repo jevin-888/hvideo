@@ -630,7 +630,7 @@ void ff_h264_idct8_add_8_mmi(uint8_t *dst, int16_t *block, int stride)
           RESTRICT_ASM_ADDRT
           [addr0]"=&r"(addr[0])
         : [dst]"r"(dst),                    [block]"r"(block),
-          [stride]"r"((mips_reg)? stride)
+          [stride]"r"((mips_reg)stride)
         : "memory"
     );
 

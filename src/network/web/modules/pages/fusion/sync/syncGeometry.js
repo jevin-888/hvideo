@@ -9,18 +9,16 @@ import {
     setGeometryPoint,
     setGeometryPoints,
     setGeometrySelection,
-    persistFusionConfig,
     resizeGeometryGridOp,
     moveGeometryOp,
     moveManagerPoint,
     moveManagerLine
-} from '../api.js?v=2.95';
+} from '../api.js?v=2.97';
 import { ensureBlendRegion, ensureGeometryRegion, getState, patchLayout } from '../actions.js?v=2.95';
 import {
     canSyncGeometryRegion,
     getManagerLineSelection,
     hydrateGeometryRegion,
-    resizeGeometryRegionByOp,
     snapManagerCornerSelection
 } from '../geometry/actions.js?v=2.95';
 
@@ -243,7 +241,6 @@ async function flushGeometrySyncQueue() {
                 }
 
                 if (pending.region) {
-                    const region = ensureGeometryRegion(regionId);
                     if (!canSyncGeometryRegion(regionId)) {
                         console.warn(`fusion geometry sync skipped: region ${regionId} is not fully hydrated`);
                     }

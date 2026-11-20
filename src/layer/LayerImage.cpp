@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <new>
@@ -66,6 +67,18 @@ static uint32_t maxTextureDimForCompactLayer(int layerId) {
     default:
         return 0;
     }
+}
+
+static uint32_t imageDecodeMaxDim(int layerId, int targetWidth,
+                                  int targetHeight) {
+    const uint32_t compactLimit = maxTextureDimForCompactLayer(layerId);
+    if (layerId != 60 || targetWidth <= 0 || targetHeight <= 0) {
+        return compactLimit;
+    }
+    const uint32_t carouselLimit = static_cast<uint32_t>(
+        std::max(targetWidth, targetHeight));
+    return compactLimit == 0 ? carouselLimit
+                             : std::min(compactLimit, carouselLimit);
 }
 
 static void downscaleFrameIfNeeded(ApngFrame& frame, uint32_t maxDim, int layerId) {
@@ -107,6 +120,17 @@ static void downscaleFrameIfNeeded(ApngFrame& frame, uint32_t maxDim, int layerI
     LOG_INFO("LayerImage %d: compact texture downscale %ux%u -> %ux%u (max=%u)",
              layerId, oldW, oldH, newW, newH, maxDim);
 }
+
+struct LayerImage::DecodedImage {
+  std::string path;
+  std::unique_ptr<ApngLoader> loader;
+  uint32_t textureId = 0;
+  int width = 0;
+  int height = 0;
+  double totalDurationMs = 0.0;
+  bool animated = false;
+  bool gpuUploadPending = false;
+};
 
 // ============================================================================
 // EXIF 方向自动识别 (JPEG Orientation Tag 0x0112)
@@ -326,12 +350,9 @@ void LayerImage::shutdown() {
 
 void LayerImage::clearImage() {
   std::lock_guard<std::recursive_mutex> lock(imageMutex_);
+  clearPreloadedImageLocked();
   releaseFrameTextures();
-  if (apngLoader_) {
-    apngLoader_.reset();
-  }
   imagePath_.clear();
-  clearPhotos();
   textureId_ = 0;
   width_ = 0;
   height_ = 0;
@@ -344,6 +365,8 @@ void LayerImage::clearImage() {
 
 void LayerImage::dropStaleGpuTextureHandles() {
   std::lock_guard<std::recursive_mutex> lock(imageMutex_);
+  collectPreloadResultLocked();
+
   textureId_ = 0;
   for (auto &p : photos_) {
     p.textureId = 0;
@@ -364,31 +387,35 @@ void LayerImage::dropStaleGpuTextureHandles() {
       break;
     }
   }
+
+  if (preloadedImage_ && preloadedImage_->loader) {
+    bool hasCpuData = false;
+    auto &frames = const_cast<std::vector<ApngFrame> &>(
+        preloadedImage_->loader->getFrames());
+    for (auto &frame : frames) {
+      frame.textureId = 0;
+      hasCpuData = hasCpuData || frame.data != nullptr;
+    }
+    preloadedImage_->textureId = 0;
+    preloadedImage_->gpuUploadPending = hasCpuData;
+    if (!hasCpuData) {
+      LOG_INFO("LayerImage %d: Dropping preloaded carousel cache after GPU rebuild: %s",
+               layerId_, preloadedImage_->path.c_str());
+      preloadedImage_.reset();
+      if (!preloadFuture_.valid()) {
+        preloadRequestedPath_.clear();
+      }
+    }
+  }
 }
 
 void LayerImage::releaseFrameTextures() {
-    std::lock_guard<std::recursive_mutex> lock(imageMutex_);
-    if (!renderer_) return;
-    
-    // 销毁静态纹
-    if (textureId_ != 0) {
-        renderer_->requestDestroyTexture(textureId_);
-        textureId_ = 0;
-    }
-    
-    // 销毁所APNG 帧显存资
-    if (apngLoader_) {
-        const auto& frames = apngLoader_->getFrames();
-        for (const auto& frame : frames) {
-            if (frame.textureId != 0) {
-                renderer_->requestDestroyTexture(frame.textureId);
-            }
-        }
-        apngLoader_.reset(); // 彻底清理，防UAF
-    }
-    
-    // 销毁照片墙纹理
-    clearPhotos();
+  std::lock_guard<std::recursive_mutex> lock(imageMutex_);
+  std::unique_ptr<DecodedImage> current = takeCurrentImageLocked();
+  if (current) {
+    releaseDecodedImageTexturesLocked(*current);
+  }
+  clearPhotos();
 }
 
 void LayerImage::update(float deltaTime) { 
@@ -459,9 +486,315 @@ void LayerImage::updateAnimationFrame() {
   }
 }
 
+std::unique_ptr<LayerImage::DecodedImage>
+LayerImage::decodeImage(const std::string &normalizedPath, bool animated,
+                        int layerId, uint32_t maxTextureDim) {
+  if (normalizedPath.empty()) return nullptr;
+  try {
+    auto image = std::make_unique<DecodedImage>();
+    image->path = normalizedPath;
+    image->animated = animated;
+    image->loader = std::make_unique<ApngLoader>();
+    if (!image->loader->load(normalizedPath)) {
+      LOG_ERROR("LayerImage %d: CPU decode failed: %s", layerId,
+                normalizedPath.c_str());
+      return nullptr;
+    }
+
+    const size_t frameCount = image->loader->getFrameCount();
+    auto &frames = const_cast<std::vector<ApngFrame> &>(image->loader->getFrames());
+    if (frames.empty()) {
+      LOG_ERROR("LayerImage %d: Decoder returned no frames: %s", layerId,
+                normalizedPath.c_str());
+      return nullptr;
+    }
+
+    const size_t framesToLoad =
+        animated ? frames.size() : std::min<size_t>(frames.size(), 1);
+    for (size_t i = 0; i < framesToLoad; ++i) {
+      downscaleFrameIfNeeded(frames[i], maxTextureDim, layerId);
+      frames[i].textureId = 0;
+    }
+    if (!animated && frames.size() > 1) {
+      for (size_t i = 1; i < frames.size(); ++i) {
+        releaseApngFrameCpuData(frames[i]);
+        frames[i].textureId = 0;
+      }
+    }
+
+    image->width = static_cast<int>(frames[0].width);
+    image->height = static_cast<int>(frames[0].height);
+    image->totalDurationMs = image->loader->getTotalDurationMs();
+    for (size_t i = 0; i < framesToLoad; ++i) {
+      const auto &frame = frames[i];
+      if (frame.textureId == 0 && frame.data && frame.width > 0 &&
+          frame.height > 0) {
+        image->gpuUploadPending = true;
+        break;
+      }
+    }
+    LOG_DEBUG("LayerImage %d: Decoded %zu/%zu CPU frames for %s (animated=%s)",
+              layerId, framesToLoad, frameCount, normalizedPath.c_str(),
+              animated ? "true" : "false");
+    return image;
+  } catch (const std::exception &e) {
+    LOG_ERROR("LayerImage %d: CPU decode exception for %s: %s", layerId,
+              normalizedPath.c_str(), e.what());
+  } catch (...) {
+    LOG_ERROR("LayerImage %d: Unknown CPU decode exception for %s", layerId,
+              normalizedPath.c_str());
+  }
+  return nullptr;
+}
+
+void LayerImage::releaseDecodedImageTexturesLocked(DecodedImage &image) {
+  bool textureAliasReleased = false;
+  if (image.loader) {
+    auto &frames = const_cast<std::vector<ApngFrame> &>(image.loader->getFrames());
+    for (auto &frame : frames) {
+      if (frame.textureId == 0) continue;
+      if (frame.textureId == image.textureId) textureAliasReleased = true;
+      if (renderer_) renderer_->requestDestroyTexture(frame.textureId);
+      frame.textureId = 0;
+    }
+  }
+  if (image.textureId != 0 && !textureAliasReleased && renderer_) {
+    renderer_->requestDestroyTexture(image.textureId);
+  }
+  image.textureId = 0;
+  image.gpuUploadPending = false;
+}
+
+std::unique_ptr<LayerImage::DecodedImage> LayerImage::takeCurrentImageLocked() {
+  if (imagePath_.empty() && !apngLoader_ && textureId_ == 0) return nullptr;
+  auto image = std::make_unique<DecodedImage>();
+  image->path = std::move(imagePath_);
+  image->loader = std::move(apngLoader_);
+  image->textureId = textureId_;
+  image->width = width_;
+  image->height = height_;
+  image->totalDurationMs = totalDurationMs_;
+  image->animated = animated_;
+  image->gpuUploadPending = gpuUploadPending_;
+  imagePath_.clear();
+  textureId_ = 0;
+  width_ = 0;
+  height_ = 0;
+  totalDurationMs_ = 0.0;
+  gpuUploadPending_ = false;
+  animationTimeMs_ = 0.0;
+  currentFrame_ = 0;
+  return image;
+}
+
+void LayerImage::installDecodedImageLocked(std::unique_ptr<DecodedImage> image) {
+  if (!image) return;
+  imagePath_ = std::move(image->path);
+  apngLoader_ = std::move(image->loader);
+  textureId_ = image->textureId;
+  width_ = image->width;
+  height_ = image->height;
+  totalDurationMs_ = image->totalDurationMs;
+  gpuUploadPending_ = image->gpuUploadPending;
+  if (size_.width == 0) size_.width = width_;
+  if (size_.height == 0) size_.height = height_;
+  displayTimer_ = 0.0f;
+  animationTimeMs_ = 0.0;
+  currentFrame_ = 0;
+}
+
+void LayerImage::collectPreloadResultLocked() {
+  if (!preloadFuture_.valid() ||
+      preloadFuture_.wait_for(std::chrono::milliseconds(0)) !=
+          std::future_status::ready) return;
+
+  const std::string requestedPath = preloadRequestedPath_;
+  std::unique_ptr<DecodedImage> decoded;
+  try {
+    decoded = preloadFuture_.get();
+  } catch (const std::exception &e) {
+    LOG_ERROR("LayerImage %d: Background preload failed for %s: %s", layerId_,
+              requestedPath.c_str(), e.what());
+  } catch (...) {
+    LOG_ERROR("LayerImage %d: Background preload failed for %s", layerId_,
+              requestedPath.c_str());
+  }
+  if (!decoded || decoded->path != requestedPath) {
+    if (decoded) releaseDecodedImageTexturesLocked(*decoded);
+    preloadRequestedPath_.clear();
+    return;
+  }
+  if (preloadedImage_) releaseDecodedImageTexturesLocked(*preloadedImage_);
+  preloadedImage_ = std::move(decoded);
+  LOG_INFO("LayerImage %d: Background preload decoded: %s", layerId_,
+           requestedPath.c_str());
+}
+
+void LayerImage::clearPreloadedImageLocked() {
+  std::unique_ptr<DecodedImage> workerResult;
+  if (preloadFuture_.valid()) {
+    try {
+      workerResult = preloadFuture_.get();
+    } catch (const std::exception &e) {
+      LOG_WARN("LayerImage %d: Preload worker cleanup failed: %s", layerId_,
+               e.what());
+    } catch (...) {
+      LOG_WARN("LayerImage %d: Preload worker cleanup failed", layerId_);
+    }
+  }
+  if (workerResult) releaseDecodedImageTexturesLocked(*workerResult);
+  if (preloadedImage_) {
+    releaseDecodedImageTexturesLocked(*preloadedImage_);
+    preloadedImage_.reset();
+  }
+  preloadRequestedPath_.clear();
+}
+
+void LayerImage::preloadImage(const std::string &path) {
+  if (path.empty()) return;
+  const std::string normalizedPath = FileUtils::normalizePath(path);
+  if (normalizedPath.empty()) return;
+
+  std::lock_guard<std::recursive_mutex> lock(imageMutex_);
+  collectPreloadResultLocked();
+  if (!imagePath_.empty() &&
+      FileUtils::normalizePath(imagePath_) == normalizedPath) return;
+  if (preloadedImage_ && preloadedImage_->path == normalizedPath &&
+      preloadedImage_->animated == animated_) return;
+  if (preloadFuture_.valid()) return;
+
+  if (preloadedImage_) {
+    releaseDecodedImageTexturesLocked(*preloadedImage_);
+    preloadedImage_.reset();
+  }
+
+  preloadRequestedPath_ = normalizedPath;
+  const bool animated = animated_;
+  const int layerId = layerId_;
+  const uint32_t maxTextureDim =
+      imageDecodeMaxDim(layerId_, size_.width, size_.height);
+  LOG_INFO("LayerImage %d: Background preload started: %s", layerId,
+           normalizedPath.c_str());
+  try {
+    preloadFuture_ = std::async(
+        std::launch::async,
+        [normalizedPath, animated, layerId, maxTextureDim]() {
+          const auto start = std::chrono::steady_clock::now();
+          auto image =
+              decodeImage(normalizedPath, animated, layerId, maxTextureDim);
+          const auto elapsedMs =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+          LOG_INFO("LayerImage %d: Background preload finished in %lld ms: %s",
+                   layerId, static_cast<long long>(elapsedMs),
+                   normalizedPath.c_str());
+          return image;
+        });
+  } catch (const std::exception &e) {
+    preloadRequestedPath_.clear();
+    LOG_ERROR("LayerImage %d: Failed to start preload worker for %s: %s",
+              layerId_, normalizedPath.c_str(), e.what());
+  }
+}
+
+bool LayerImage::uploadPreloadedImageLocked() {
+  if (!renderer_ || !preloadedImage_) return false;
+  DecodedImage &image = *preloadedImage_;
+  if (!image.loader || !image.loader->isLoaded()) return false;
+  if (!image.gpuUploadPending) return image.textureId != 0;
+
+  auto &frames =
+      const_cast<std::vector<ApngFrame> &>(image.loader->getFrames());
+  const size_t framesToUpload =
+      image.animated ? frames.size() : std::min<size_t>(frames.size(), 1);
+  bool hasPending = false;
+  bool anyUploaded = false;
+  bool hasRecoverableSource = false;
+  for (size_t i = 0; i < framesToUpload; ++i) {
+    auto &frame = frames[i];
+    if (frame.textureId != 0) {
+      anyUploaded = true;
+      continue;
+    }
+    if (!frame.data || frame.width == 0 || frame.height == 0) continue;
+    hasRecoverableSource = true;
+    const uint32_t textureId = renderer_->allocateTextureId();
+    if (renderer_->createTextureFromRGBADirect(
+            frame.data, frame.width, frame.height, textureId)) {
+      frame.textureId = textureId;
+      anyUploaded = true;
+      releaseApngFrameCpuData(frame);
+    } else {
+      renderer_->requestDestroyTexture(textureId);
+      hasPending = true;
+      LOG_ERROR("LayerImage %d: Preloaded frame %zu upload failed for %s",
+                layerId_, i, image.path.c_str());
+    }
+  }
+
+  if (!frames.empty()) {
+    image.textureId = frames[0].textureId;
+  }
+  image.gpuUploadPending =
+      hasPending || (hasRecoverableSource && !anyUploaded);
+  const bool ready = image.textureId != 0 && !image.gpuUploadPending;
+  if (ready) {
+    LOG_INFO("LayerImage %d: Carousel image ready without switch blocking: %s",
+             layerId_, image.path.c_str());
+  }
+  return ready;
+}
+
+bool LayerImage::activatePreloadedImage(const std::string &path) {
+  const std::string normalizedPath = FileUtils::normalizePath(path);
+  if (normalizedPath.empty()) return false;
+
+  std::lock_guard<std::recursive_mutex> lock(imageMutex_);
+  if (!imagePath_.empty() &&
+      FileUtils::normalizePath(imagePath_) == normalizedPath &&
+      (textureId_ != 0 || gpuUploadPending_ ||
+       (apngLoader_ && apngLoader_->isLoaded()))) {
+    displayTimer_ = 0.0f;
+    animationTimeMs_ = 0.0;
+    currentFrame_ = 0;
+    return true;
+  }
+
+  collectPreloadResultLocked();
+  if (!preloadedImage_ || preloadedImage_->path != normalizedPath) return false;
+  if (preloadedImage_->animated != animated_) {
+    releaseDecodedImageTexturesLocked(*preloadedImage_);
+    preloadedImage_.reset();
+    preloadRequestedPath_.clear();
+    return false;
+  }
+  if (preloadedImage_->gpuUploadPending || preloadedImage_->textureId == 0) {
+    return false;
+  }
+
+  std::unique_ptr<DecodedImage> next = std::move(preloadedImage_);
+  std::unique_ptr<DecodedImage> previous = takeCurrentImageLocked();
+  installDecodedImageLocked(std::move(next));
+  if (previous && !previous->path.empty()) {
+    preloadRequestedPath_ = previous->path;
+    preloadedImage_ = std::move(previous);
+  } else {
+    preloadRequestedPath_.clear();
+  }
+  LOG_INFO("LayerImage %d: Carousel switched without synchronous decode: %s",
+           layerId_, normalizedPath.c_str());
+  return true;
+}
+
 void LayerImage::prepareTexture() {
-    std::lock_guard<std::recursive_mutex> lock(imageMutex_);
-    uploadPendingFramesLocked();
+  std::lock_guard<std::recursive_mutex> lock(imageMutex_);
+  collectPreloadResultLocked();
+  const bool currentUploadWasPending = gpuUploadPending_;
+  uploadPendingFramesLocked();
+  if (!currentUploadWasPending) {
+    uploadPreloadedImageLocked();
+  }
 }
 
 bool LayerImage::uploadPendingFramesLocked() {
@@ -558,7 +891,7 @@ bool LayerImage::hasPendingFrameDataLocked() const {
 
 void LayerImage::render() {
   std::lock_guard<std::recursive_mutex> lock(imageMutex_);
-  if (!visible_ || !renderer_) {
+  if (!visible_ || !renderer_ || !contentReady_.load()) {
     return;
   }
   
@@ -566,6 +899,7 @@ void LayerImage::render() {
   if (isPhotoWallMode_) {
       for (const auto& photo : photos_) {
           if (photo.textureId != 0) {
+              applyContentCrop(photo.textureId);
               // 注意：照片墙每个 item 独立缩放旋转，叠加在 layer 基础属性之
               renderer_->renderLayer(photo.textureId, 
                                    photo.x, photo.y, 
@@ -625,12 +959,14 @@ void LayerImage::render() {
   }
 
 
+  applyContentCrop(currentTexId);
   renderer_->renderLayer(currentTexId, renderX, renderY, renderW,
                          renderH, rotation_, scale_, alpha_, nullptr,
                          shapeType_, shapeParam_, blackToTransparent_, invert_);
 }
 
 uint32_t LayerImage::getTextureId() const {
+  if (!contentReady_.load()) return 0;
   std::lock_guard<std::recursive_mutex> lock(imageMutex_);
   // 检查是否有 APNG 加载器且已加
   if (apngLoader_ && apngLoader_->isLoaded()) {
@@ -672,105 +1008,54 @@ bool LayerImage::loadImage(const std::string &path) {
   std::lock_guard<std::recursive_mutex> lock(imageMutex_);
   if (!renderer_ || path.empty()) return false;
 
-  std::string normalizedPath = FileUtils::normalizePath(path);
-  
-  // 路径判等锁定，防止重复加载导致内存泄露
-  if (!imagePath_.empty() && FileUtils::normalizePath(imagePath_) == normalizedPath &&
-      (textureId_ != 0 || gpuUploadPending_ || (apngLoader_ && apngLoader_->isLoaded()))) {
-      static int s_skipLog = 0;
-      if (s_skipLog++ < 3) LOG_DEBUG("LayerImage %d: Image [%s] already loaded, skipping.", layerId_, normalizedPath.c_str());
-
-      // 修复：即使跳过加载，也要重置显示计时器，确保幻灯片正常循环
-      displayTimer_ = 0.0f;
-      animationTimeMs_ = 0.0;
-      currentFrame_ = 0;
-
-      return true;
-  }
-
-  LOG_DEBUG("LayerImage %d: Loading [%s] with Pre-warm Pool strategy", 
-           layerId_, normalizedPath.c_str());
-
-  // 清理旧资
-  shutdown();
-  imagePath_ = normalizedPath;
-  
-  apngLoader_ = std::make_unique<ApngLoader>();
-  if (apngLoader_->load(normalizedPath)) {
-    size_t frameCount = apngLoader_->getFrameCount();
-    totalDurationMs_ = apngLoader_->getTotalDurationMs();
-    
-    // 强制转换为非 const 以便写入纹理 ID
-    auto& frames = const_cast<std::vector<ApngFrame>&>(apngLoader_->getFrames());
-    
-    // 根据动画模式决定加载策略
-    size_t framesToLoad = animated_ ? frames.size() : std::min<size_t>(frames.size(), 1);
-    
-    LOG_DEBUG("LayerImage %d: Preparing %zu/%zu frames for render-thread upload (animated=%s)",
-             layerId_, framesToLoad, frameCount, animated_ ? "true" : "false");
-    
-    // 这里只保留 CPU 帧数据，GPU 上传统一在 render thread 的 prepareTexture() 中执行。
-    for (size_t i = 0; i < framesToLoad; ++i) {
-        auto& frame = frames[i];
-        
-        downscaleFrameIfNeeded(frame, maxTextureDimForCompactLayer(layerId_), layerId_);
-
-        frame.textureId = 0;
+  const std::string normalizedPath = FileUtils::normalizePath(path);
+  if (!imagePath_.empty() &&
+      FileUtils::normalizePath(imagePath_) == normalizedPath &&
+      (textureId_ != 0 || gpuUploadPending_ ||
+       (apngLoader_ && apngLoader_->isLoaded()))) {
+    static int s_skipLog = 0;
+    if (s_skipLog++ < 3) {
+      LOG_DEBUG("LayerImage %d: Image [%s] already loaded, skipping.",
+                layerId_, normalizedPath.c_str());
     }
-    
-    // 静态模式下，释放未使用的帧资源
-    if (!animated_ && frames.size() > 1) {
-        LOG_DEBUG("LayerImage %d: Static mode - releasing %zu unused frames", 
-                 layerId_, frames.size() - 1);
-        for (size_t i = 1; i < frames.size(); ++i) {
-            auto& frame = frames[i];
-            releaseApngFrameCpuData(frame);
-            // 未分配纹理ID，所以不需要销毁纹
-            frame.textureId = 0;
-        }
-    }
-
-    if (!frames.empty()) {
-        width_ = frames[0].width;
-        height_ = frames[0].height;
-        textureId_ = 0;
-    }
-
-    if (size_.width == 0) size_.width = width_;
-    if (size_.height == 0) size_.height = height_;
-    
-    // 重置显示计时器和动画状态，确保图像从头开始显
     displayTimer_ = 0.0f;
     animationTimeMs_ = 0.0;
     currentFrame_ = 0;
-    gpuUploadPending_ = hasPendingFrameDataLocked();
-    
-    LOG_DEBUG("LayerImage %d: Loaded %zu/%zu CPU frames (animated=%s), GPU upload pending.",
-             layerId_, framesToLoad, frameCount, animated_ ? "true" : "false");
-    
-    // Layer71 二维码加载成功日志
-    if (layerId_ == 71) {
-      LOG_INFO("[Layer71加载] 二维码图片加载成功: %s, 帧数=%zu, 第一帧textureId=%u, 尺寸=%ux%u",
-               normalizedPath.c_str(), framesToLoad, 
-               frames.empty() ? 0 : frames[0].textureId,
-               frames.empty() ? 0 : frames[0].width,
-               frames.empty() ? 0 : frames[0].height);
-    }
-    
     return true;
   }
 
-  LOG_ERROR("LayerImage %d: Load failed from %s", layerId_, normalizedPath.c_str());
-  imagePath_.clear();
-  gpuUploadPending_ = false;
-  
-  // Layer71 二维码加载失败日志
-  if (layerId_ == 71) {
-    LOG_ERROR("[Layer71加载] 二维码图片加载失败: %s, 文件存在=%d",
-              normalizedPath.c_str(), FileUtils::exists(normalizedPath));
+  LOG_DEBUG("LayerImage %d: Loading [%s] synchronously", layerId_,
+            normalizedPath.c_str());
+  clearPreloadedImageLocked();
+  std::unique_ptr<DecodedImage> current = takeCurrentImageLocked();
+  if (current) releaseDecodedImageTexturesLocked(*current);
+  clearPhotos();
+
+  const uint32_t maxTextureDim =
+      imageDecodeMaxDim(layerId_, size_.width, size_.height);
+  std::unique_ptr<DecodedImage> decoded =
+      decodeImage(normalizedPath, animated_, layerId_, maxTextureDim);
+  if (!decoded) {
+    imagePath_.clear();
+    gpuUploadPending_ = false;
+    if (layerId_ == 71) {
+      LOG_ERROR("[Layer71] QR image load failed: %s, exists=%d",
+                normalizedPath.c_str(), FileUtils::exists(normalizedPath));
+    }
+    return false;
   }
-  
-  return false;
+
+  const size_t frameCount = decoded->loader
+                                ? decoded->loader->getFrameCount()
+                                : 0;
+  installDecodedImageLocked(std::move(decoded));
+  LOG_DEBUG("LayerImage %d: Loaded %zu CPU frames; GPU upload pending=%s",
+            layerId_, frameCount, gpuUploadPending_ ? "true" : "false");
+  if (layerId_ == 71) {
+    LOG_INFO("[Layer71] QR image loaded: %s, frames=%zu, size=%dx%d",
+             normalizedPath.c_str(), frameCount, width_, height_);
+  }
+  return true;
 }
 
 bool LayerImage::isApngAnimation() const {

@@ -6,6 +6,7 @@ namespace hsvj::fusion::projection_correction_api {
 inline constexpr const char kGetAction[] = "get_projection_correction";
 inline constexpr const char kSetAction[] = "set_projection_correction";
 inline constexpr const char kSaveConfigAction[] = "save_projection_correction_config";
+inline constexpr const char kInitializeCaveAction[] = "initialize_cave_wall";
 
 } // 命名空间 hsvj::fusion::projection_correction_api
 

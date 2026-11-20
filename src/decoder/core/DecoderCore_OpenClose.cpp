@@ -3,8 +3,14 @@
  * @brief 解码核心：打开/关闭与流选择（文件、V4L2、视频流、音轨流）
  */
 
+#ifdef __ANDROID__
+#include "utils/EncryptedMedia.h"
+#endif
 #include "decoder/core/DecoderCore.h"
+#include "decoder/VideoProfile.h"
 #include "decoder/RkmppMpeg2Probe.h"
+#include "utils/AndroidProperty.h"
+#include "utils/FfmpegStreamInfo.h"
 #include "utils/Logger.h"
 #include "audio/AudioPlayerManager.h"
 #include "decoder/core/HardwareManager.h"
@@ -22,13 +28,13 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
+#include <libavutil/parseutils.h>
 #include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
 }
 #endif
 
 namespace {
-
 /**
  * @brief FFmpeg 中断回调
  *
@@ -64,6 +70,8 @@ bool DecoderCore::open(const std::string &path, bool fastOpen) {
   hasReleasedFocus_ = false;
   hasRequestedFocus_ = false;
   audioOutputSuppressed_.store(false, std::memory_order_release);
+  resetAudioMasterClock(0.0);
+  lastPresentedVideoPts_.store(-1.0, std::memory_order_release);
   interruptDeadlineMs_.store(0, std::memory_order_release);
   mpegPsVideoPtsOffsetInitialized_ = false;
   mpegPsVideoPtsOffset_ = 0.0;
@@ -126,10 +134,22 @@ bool DecoderCore::open(const std::string &path, bool fastOpen) {
   std::string loweredPath = path;
   std::transform(loweredPath.begin(), loweredPath.end(), loweredPath.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  const bool isLikelyMp4 = (loweredPath.find(".mp4") != std::string::npos ||
+  const bool isYoutubeProxyMp4 =
+      loweredPath.find("/api/v1/youtube/stream?") != std::string::npos &&
+      (loweredPath.find("mime%3dvideo%252fmp4") != std::string::npos ||
+       loweredPath.find("mime=video%2fmp4") != std::string::npos ||
+       loweredPath.find("mime=video/mp4") != std::string::npos);
+  // HVideo files are produced by our encryption pipeline with +faststart,
+  // so the MP4 index is guaranteed to be at the beginning of the response.
+  // Keep generic HTTP MP4 handling conservative because external files may
+  // still place moov at the end.
+  const bool isHvideo = loweredPath.find(".hvideo") != std::string::npos;
+  const bool isLikelyMp4 = (isHvideo ||
+                            loweredPath.find(".mp4") != std::string::npos ||
                             loweredPath.find(".m4v") != std::string::npos ||
                             loweredPath.find(".mov") != std::string::npos ||
-                            loweredPath.find(".f4v") != std::string::npos);
+                            loweredPath.find(".f4v") != std::string::npos ||
+                            isYoutubeProxyMp4);
   const bool isLikelyStreamLike = (loweredPath.find(".ts") != std::string::npos ||
                                    loweredPath.find(".mpeg") != std::string::npos ||
                                    loweredPath.find(".mpg") != std::string::npos ||
@@ -145,7 +165,7 @@ bool DecoderCore::open(const std::string &path, bool fastOpen) {
                                loweredPath.find(".vob") != std::string::npos ||
                                loweredPath.find(".dat") != std::string::npos);
   isMpegPsStream_ = isLikelyMpegPs;
-  const bool effectiveFastOpen = fastOpen && !(isHttpUrl && isLikelyMp4);
+  const bool effectiveFastOpen = fastOpen && !(isHttpUrl && isLikelyMp4 && !isHvideo);
 
   // 针对 HTTP 流，即使没有扩展名，如果不是 MP4 也视为 StreamLike 或增加探测深度
   int baseProbe = isLikelyMpegPs ? (2 * 1024 * 1024) : (isLikelyStreamLike ? 5000000 : 2000000);
@@ -178,6 +198,8 @@ bool DecoderCore::open(const std::string &path, bool fastOpen) {
     av_dict_set(&formatOpts, "rw_timeout", std::to_string(httpTimeoutUs).c_str(), 0);
     av_dict_set(&formatOpts, "reconnect", "1", 0);
     av_dict_set(&formatOpts, "reconnect_streamed", "1", 0);
+    av_dict_set(&formatOpts, "reconnect_on_network_error", "1", 0);
+    av_dict_set(&formatOpts, "reconnect_on_http_error", "4xx,5xx", 0);
     av_dict_set(&formatOpts, "reconnect_at_eof", "0", 0);
     av_dict_set(&formatOpts, "reconnect_delay_max", "3", 0);
     av_dict_set(&formatOpts, "buffer_size", isLikelyMp4 ? "2097152" : "16777216", 0);
@@ -241,6 +263,8 @@ bool DecoderCore::open(const std::string &path, bool fastOpen) {
       av_dict_set(&retryOpts, "rw_timeout", std::to_string(httpTimeoutUs).c_str(), 0);
       av_dict_set(&retryOpts, "reconnect", "1", 0);
       av_dict_set(&retryOpts, "reconnect_streamed", "1", 0);
+      av_dict_set(&retryOpts, "reconnect_on_network_error", "1", 0);
+      av_dict_set(&retryOpts, "reconnect_on_http_error", "4xx,5xx", 0);
       av_dict_set(&retryOpts, "reconnect_at_eof", "0", 0);
       av_dict_set(&retryOpts, "reconnect_delay_max", "3", 0);
       av_dict_set(&retryOpts, "buffer_size", isLikelyMp4 ? "2097152" : "8388608", 0);
@@ -255,10 +279,10 @@ bool DecoderCore::open(const std::string &path, bool fastOpen) {
       interruptDeadlineMs_.store(nowMs2 + (httpTimeoutUs / 1000) + 1500,
                                  std::memory_order_release);
       LOG_INFO("[DecoderCore] HTTP open retry %d/%d: %s", attempt + 1, maxAttempts, path.c_str());
-      ret = avformat_open_input(&formatCtx_, path.c_str(), nullptr, &retryOpts);
+      ret = encrypted_media::openInput(&formatCtx_, path.c_str(), nullptr, &retryOpts);
       av_dict_free(&retryOpts);
     } else {
-      ret = avformat_open_input(&formatCtx_, path.c_str(), nullptr, &formatOpts);
+      ret = encrypted_media::openInput(&formatCtx_, path.c_str(), nullptr, &formatOpts);
       av_dict_free(&formatOpts);
     }
     if (ret == 0) break; // 成功
@@ -312,15 +336,19 @@ bool DecoderCore::open(const std::string &path, bool fastOpen) {
     formatCtx_->max_ts_probe = isLikelyStreamLike ? 3000000 : 1000000;
   }
 
-  ret = avformat_find_stream_info(formatCtx_, nullptr);
+  const bool useContainerStreamInfo = effectiveFastOpen && !isHttpUrl &&
+                                      isLikelyMp4 &&
+                                      ffmpeg_stream_info::hasUsableContainerMetadata(formatCtx_);
+  ret = useContainerStreamInfo ? 0 : avformat_find_stream_info(formatCtx_, nullptr);
   const auto streamInfoEnd = std::chrono::steady_clock::now();
   {
     const auto openInputMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         openInputEnd - openStageStart).count();
     const auto streamInfoMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         streamInfoEnd - openInputEnd).count();
-    LOG_INFO("[DecoderOpenCost] open_input=%lldms find_stream_info=%lldms path=%s fastOpen=%d probeSize=%d",
-             (long long)openInputMs, (long long)streamInfoMs, path.c_str(),
+    LOG_INFO("[DecoderOpenCost] open_input=%lldms find_stream_info=%lldms source=%s path=%s fastOpen=%d probeSize=%d",
+             (long long)openInputMs, (long long)streamInfoMs,
+             useContainerStreamInfo ? "container" : "probe", path.c_str(),
              effectiveFastOpen ? 1 : 0, probeSize);
   }
   interruptDeadlineMs_.store(0, std::memory_order_release);
@@ -561,6 +589,7 @@ bool DecoderCore::openV4L2Device(const std::string &devicePath,
 
 bool DecoderCore::openVideoStream() {
 #ifdef __ANDROID__
+  videoStreamEndPts_ = -1.0;
   for (unsigned int i = 0; i < formatCtx_->nb_streams; i++) {
     if (formatCtx_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
       videoStreamIdx_ = i;
@@ -581,6 +610,7 @@ bool DecoderCore::openVideoStream() {
   videoHeight_ = codecpar->height;
 
   AVStream *stream = formatCtx_->streams[videoStreamIdx_];
+  videoStreamEndPts_ = ffmpeg_stream_info::getStreamEndSeconds(stream);
   if (stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0) {
     frameRate_ = av_q2d(stream->avg_frame_rate);
   } else {
@@ -590,9 +620,9 @@ bool DecoderCore::openVideoStream() {
   LOG_DEBUG("[DecoderCore] Video stream info: %dx%d @ %.2f fps, codec_id=%d, timebase=%d/%d",
            videoWidth_, videoHeight_, frameRate_, codecpar->codec_id,
            videoTimeBase_.num, videoTimeBase_.den);
-  LOG_INFO("[VideoLayerDiag] stream layer=%d streamVideo=%dx%d fps=%.2f codec_id=%d timebase=%d/%d",
+  LOG_INFO("[VideoLayerDiag] stream layer=%d streamVideo=%dx%d fps=%.2f codec_id=%d timebase=%d/%d videoEnd=%.3f",
            layerId_, videoWidth_, videoHeight_, frameRate_, codecpar->codec_id,
-           videoTimeBase_.num, videoTimeBase_.den);
+           videoTimeBase_.num, videoTimeBase_.den, videoStreamEndPts_);
 
   // 根据帧率动态设置 lateThreshold_：低帧率视频帧间隔大，需要更宽松的阈值。
   // 阈值 = 帧间隔 × 1.5，最小 200ms，最大 2000ms
@@ -605,9 +635,7 @@ bool DecoderCore::openVideoStream() {
     frameSyncManager_->setSyncThresholds(10.0, lateMs);
   }
 
-  if (formatCtx_->duration != AV_NOPTS_VALUE) {
-    duration_ = formatCtx_->duration / static_cast<double>(AV_TIME_BASE);
-  }
+  duration_ = ffmpeg_stream_info::getContainerDurationSeconds(formatCtx_);
 
   const int maxRetries = 1;
   const AVCodec *codec = nullptr;
@@ -750,32 +778,57 @@ bool DecoderCore::openVideoStream() {
       continue;
     }
 
-    // 设置 RKMPP 额外的帧缓冲：仅 MPEG-PS 的 MPEG1/2 预滚需要扩容。
-    // 普通 H264/HEVC MP4 使用 rkmppdec 默认池，避免超宽片源起播时给 VPU/CMA 施加过深压力。
+    // Set a bounded RKMPP output cushion. MPEG-PS MPEG-1/2 keeps its larger
+    // startup pool; ordinary high-resolution H264/HEVC gets only a modest
+    // extra count so VPU/CMA pressure remains bounded.
     AVDictionary* codecOpts = nullptr;
     if (strstr(codec->name, "rkmpp")) {
         // fast_parse 会让 MPP 解析/解码并行更激进；在 4096x768 H264 起播日志中会触发
         // rkvdec process task 时间out。稳定播放优先，统一关闭。
         av_dict_set(&codecOpts, "fast_parse", "0", 0);
-        const char* bufferCount = "0";
+        const bool codecSupportsAfbc =
+            codec->id == AV_CODEC_ID_H264 || codec->id == AV_CODEC_ID_HEVC ||
+            codec->id == AV_CODEC_ID_VP9 || codec->id == AV_CODEC_ID_AV1;
+        const bool enableAfbc =
+            codecSupportsAfbc &&
+            getAndroidBooleanProperty("debug.hsvj.rkmpp_afbc", false);
+        av_dict_set(&codecOpts, "afbc", enableAfbc ? "on" : "off", 0);
+        LOG_INFO("[DecoderCore] RKMPP AFBC %s (codec=%s size=%dx%d property=debug.hsvj.rkmpp_afbc)",
+                 enableAfbc ? "enabled" : "disabled", codec->name,
+                 videoWidth_, videoHeight_);
+        int extraHwFrames = 0;
         const int64_t videoPixels = static_cast<int64_t>(videoWidth_) * static_cast<int64_t>(videoHeight_);
         bool is4K = videoPixels >= static_cast<int64_t>(3840) * 2160;
         bool is1080P = videoWidth_ >= 1920 || videoHeight_ >= 1080;
+        const bool isUltraWide = video_profile::isUltraWideVideo(videoWidth_, videoHeight_);
         const bool isMpeg12 = (codec->id == AV_CODEC_ID_MPEG2VIDEO || codec->id == AV_CODEC_ID_MPEG1VIDEO);
 
         if (isMpegPsStream_ && isMpeg12) {
-            bufferCount = "32";
-            LOG_INFO("[DecoderCore] RKMPP MPEG-PS startup buffer expansion: extra_hw_frames=%s", bufferCount);
-        } else if (is4K) {
-            bufferCount = "2";  // 从4减少到2，降低CMA内存压力
-            LOG_INFO("[DecoderCore] 4K video detected (%dx%d), throttled RKMPP extra buffers to %s (low-memory optimization)",
-                     videoWidth_, videoHeight_, bufferCount);
+            extraHwFrames = 32;
+            LOG_INFO("[DecoderCore] RKMPP MPEG-PS startup buffer expansion: extra_hw_frames=%d",
+                     extraHwFrames);
+        } else if (is4K || isUltraWide) {
+            extraHwFrames = 3;
+            LOG_INFO("[DecoderCore] high-resolution video detected (%dx%d ultraWide=%d), "
+                     "default extra_hw_frames=%d",
+                     videoWidth_, videoHeight_, isUltraWide ? 1 : 0, extraHwFrames);
         } else if (is1080P) {
             LOG_INFO("[DecoderCore] RKMPP using default frame pool (codec=%s size=%dx%d pixels=%lld)",
                      codec->name, videoWidth_, videoHeight_, (long long)videoPixels);
         }
-        if (strcmp(bufferCount, "0") != 0) {
-            av_dict_set(&codecOpts, "extra_hw_frames", bufferCount, 0);
+        if (!(isMpegPsStream_ && isMpeg12)) {
+            const int propertyOverride =
+                getAndroidIntProperty("debug.hsvj.rkmpp_extra_hw_frames", -1);
+            if (propertyOverride >= 0) {
+                extraHwFrames = std::max(0, std::min(propertyOverride, 8));
+                LOG_INFO("[DecoderCore] RKMPP extra_hw_frames override=%d "
+                         "(property=debug.hsvj.rkmpp_extra_hw_frames)",
+                         extraHwFrames);
+            }
+        }
+        if (extraHwFrames > 0) {
+            const std::string bufferCount = std::to_string(extraHwFrames);
+            av_dict_set(&codecOpts, "extra_hw_frames", bufferCount.c_str(), 0);
         }
     }
 
@@ -835,6 +888,7 @@ bool DecoderCore::openVideoStream() {
 
 bool DecoderCore::openAudioStream() {
 #ifdef __ANDROID__
+  audioStreamEndPts_ = -1.0;
   LOG_DEBUG("[AudioTrack] openAudioStream: currentAudioTrack_=%d, audioTrackCount_=%d, layerId=%d",
            currentAudioTrack_, audioTrackCount_, layerId_);
 
@@ -896,6 +950,8 @@ bool DecoderCore::openAudioStream() {
     LOG_WARN("[AudioTrack] No usable audio stream selected");
     return false;
   }
+  const AVStream *selectedAudio = formatCtx_->streams[audioStreamIdx_];
+  audioStreamEndPts_ = ffmpeg_stream_info::getStreamEndSeconds(selectedAudio);
 
   // 保留所有音频流可读。切轨需要目标音轨的历史 packet 缓存，不能把非当前音轨设为 AVDISCARD_ALL。
   for (unsigned int i = 0; i < formatCtx_->nb_streams; i++) {
@@ -1029,19 +1085,16 @@ void DecoderCore::close() {
   // Some RKMPP drivers tie AVFrame buffers to the 解码器-side MPP pool; returning
   // 说明：如果在 avcodec_free_context 之后归还它们，可能触发 mpp_mem_pool_put invalid mem pool。
   {
-    auto tQ0 = std::chrono::steady_clock::now();
-    int releasedQueuedFrames = 0;
-    std::lock_guard<std::mutex> qLock(queueMutex_);
-    while (!frameQueue_.empty()) {
-      frameQueue_.front()->release();
-      frameQueue_.pop_front();
-      ++releasedQueuedFrames;
-    }
-    auto tQ1 = std::chrono::steady_clock::now();
-    LOG_DEBUG("[DecoderCore] close() frameQueue release done in %lldms layer=%d frames=%d",
+    const auto tQ0 = std::chrono::steady_clock::now();
+    const size_t releasedQueuedFrames = flushFrameQueue();
+    const auto tQ1 = std::chrono::steady_clock::now();
+    LOG_DEBUG("[DecoderCore] close() frameQueue release done in %lldms layer=%d frames=%zu",
              (long long)std::chrono::duration_cast<std::chrono::milliseconds>(tQ1 - tQ0).count(),
              layerId_, releasedQueuedFrames);
   }
+  // The renderer never waits for RKMPP frame destruction, but the codec and
+  // its FramePool cannot be freed until those background releases finish.
+  waitPendingFrameReleaseTasks();
 
   // 释放 音频 focus if it wasn't already released by stopDecoding()
   if (!hasReleasedFocus_ && hasRequestedFocus_) {
@@ -1123,6 +1176,20 @@ void DecoderCore::close() {
 #endif // 结束 __ANDROID__
 
   // 重置 all 状态 members
+  // A pooled decoder must not apply the previous media's seek/track filters
+  // to its next open, otherwise every new frame below the old target is lost.
+  seekDropActive_.store(false, std::memory_order_release);
+  seekAudioDropActive_.store(false, std::memory_order_release);
+  seekDropTarget_.store(0.0, std::memory_order_release);
+  seekVideoDropLogCount_ = 0;
+  seekAudioDropLogCount_ = 0;
+  audioTrackSwitching_.store(false, std::memory_order_release);
+  audioTrackSwitchTargetPts_ = -1.0;
+  audioTrackSwitchDropCount_ = 0;
+  audioTrackRestoreNeedsDecodeCatchup_.store(false, std::memory_order_release);
+  audioTrackReplayThrottleEndPts_.store(-1.0, std::memory_order_release);
+  preparedAudioRouteGeneration_.store(0, std::memory_order_release);
+  pausedPosition_.store(0.0, std::memory_order_release);
   videoStreamIdx_ = -1;
   audioStreamIdx_ = -1;
   videoWidth_ = 0;
@@ -1130,15 +1197,14 @@ void DecoderCore::close() {
   frameRate_ = 0.0;
   duration_ = 0.0;
   totalDecodedFrames_ = 0;
+  videoStreamEndPts_ = -1.0;
   firstFrameAligned_ = false;
+  explicitSyncStart_ = false;
   consecutiveDrops_ = 0;
   severeDriftStreak_ = 0;
   lastClockRealignMs_ = 0;
-  lastClockRealignPts_ = -1.0;
-  repeatedClockRealignCount_ = 0;
   consecutiveAudioWriteFailures_ = 0;
   lastAudioWriteFailureMs_ = 0;
-  skippedAudioDuringCatchup_ = false;
   audioFirstFrameLogged_ = false;
   isHttpStream_ = false;
   isMpegPsStream_ = false;
@@ -1182,11 +1248,14 @@ void DecoderCore::close() {
   lastFlowGetFrameDropLogMs_ = 0;
   stats_.reset();
   startTime_ = 0.0;
+  continuousWallClockOffset_.store(0.0, std::memory_order_release);
   pausedTime_ = 0.0;
   pauseStartTime_ = 0.0;
   isCaptureMode_ = false;
   captureDevice_.clear();
   audioOutputSuppressed_.store(false, std::memory_order_release);
+  resetAudioMasterClock(0.0);
+  lastPresentedVideoPts_.store(-1.0, std::memory_order_release);
   consecutiveAudioErrors_ = 0;
   // 重置日志计数器，避免对象池复用时带入旧状态
   vpuDropLogCounter_ = 0;

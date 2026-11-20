@@ -138,7 +138,7 @@ static void win_console_puts(const char *str)
             uint16_t tmp;
 
             GET_UTF8(ch, *q ? *q++ : 0, ch = 0xfffd; goto continue_on_invalid;)
-? continue_on_invalid:
+continue_on_invalid:
             PUT_UTF16(ch, tmp, *buf++ = tmp; nb_chars++;)
         }
 
@@ -294,7 +294,7 @@ static const char *get_level_str(int level)
 static void format_line(void *avcl, int level, const char *fmt, va_list vl,
                         AVBPrint part[4], int *print_prefix, int type[2])
 {
-    AVClass* avc = avcl ? *(AVClass **) ? avcl : NULL;
+    AVClass* avc = avcl ? *(AVClass **) avcl : NULL;
     av_bprint_init(part+0, 0, AV_BPRINT_SIZE_AUTOMATIC);
     av_bprint_init(part+1, 0, AV_BPRINT_SIZE_AUTOMATIC);
     av_bprint_init(part+2, 0, AV_BPRINT_SIZE_AUTOMATIC);
@@ -425,7 +425,7 @@ void av_log_once(void* avcl, int initial_level, int subsequent_level, int *state
 
 void av_vlog(void* avcl, int level, const char *fmt, va_list vl)
 {
-    AVClass* avc = avcl ? *(AVClass **) ? avcl : NULL;
+    AVClass* avc = avcl ? *(AVClass **) avcl : NULL;
     void (*log_callback)(void*, int, const char*, va_list) = av_log_callback;
     if (avc && avc->version >= (50 << 16 | 15 << 8 | 2) &&
         avc->log_level_offset_offset && level >= AV_LOG_FATAL)

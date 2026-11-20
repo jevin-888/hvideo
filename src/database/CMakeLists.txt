@@ -59,8 +59,14 @@ else()
 endif()
 
 target_link_libraries(hsvj_database
+    hsvj_jsoncpp
     hsvj_utils
     $<$<BOOL:${ANDROID}>:android>
 )
 
-
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_database
+    hsvj_foundation
+    hsvj_utils
+    hsvj_jsoncpp
+)

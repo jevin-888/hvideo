@@ -17,16 +17,52 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <algorithm>
+#include <chrono>
+#include <poll.h>
 
 namespace hsvj {
 
 namespace {
-ssize_t sendNoSignal(int fd, const void* data, size_t length) {
+bool sendAllNoSignal(int fd, const void* data, size_t length) {
+  const auto* bytes = static_cast<const char*>(data);
+  size_t offset = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
 #ifdef MSG_NOSIGNAL
-  return send(fd, data, length, MSG_NOSIGNAL);
+  constexpr int kNoSignalFlag = MSG_NOSIGNAL;
 #else
-  return send(fd, data, length, 0);
+  constexpr int kNoSignalFlag = 0;
 #endif
+#ifdef MSG_DONTWAIT
+  constexpr int kDontWaitFlag = MSG_DONTWAIT;
+#else
+  constexpr int kDontWaitFlag = 0;
+#endif
+
+  while (offset < length) {
+    const ssize_t sent = send(fd, bytes + offset, length - offset,
+                              kNoSignalFlag | kDontWaitFlag);
+    if (sent > 0) {
+      offset += static_cast<size_t>(sent);
+      continue;
+    }
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return false;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return false;
+    const int remainingMs = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    pollfd descriptor{fd, POLLOUT, 0};
+    int pollResult;
+    do {
+      pollResult = poll(&descriptor, 1, remainingMs);
+    } while (pollResult < 0 && errno == EINTR);
+    if (pollResult <= 0 ||
+        (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void closeSocket(int fd) {
@@ -154,6 +190,17 @@ void TcpServer::acceptLoop() {
 
     LOG_DEBUG("TcpServer: New connection from %s:%d (fd: %d)", ip, port, clientFd);
 
+    std::thread oldClientThread;
+    {
+      std::lock_guard<std::mutex> lock(clientsMutex_);
+      auto it = clientThreads_.find(clientFd);
+      if (it != clientThreads_.end()) {
+        oldClientThread = std::move(it->second);
+        clientThreads_.erase(it);
+      }
+    }
+    if (oldClientThread.joinable()) oldClientThread.join();
+
     bool notifyConnected = false;
     {
       std::lock_guard<std::mutex> lock(clientsMutex_);
@@ -203,8 +250,9 @@ void TcpServer::handleClient(int clientFd) {
     }
 
     std::string response = processMessage(clientFd, msg);
-    if (!response.empty()) {
-      sendNoSignal(clientFd, response.c_str(), response.length());
+    if (!response.empty() && !sendToClient(clientFd, response)) {
+      LOG_WARN("TcpServer: Failed to send response to fd %d", clientFd);
+      break;
     }
   }
 
@@ -321,7 +369,7 @@ size_t TcpServer::getClientCount() const {
   return clients_.size();
 }
 
-void TcpServer::broadcast(const std::string& message) {
+size_t TcpServer::broadcast(const std::string& message) {
   std::vector<int> clientFds;
   {
     std::lock_guard<std::mutex> lock(clientsMutex_);
@@ -330,20 +378,21 @@ void TcpServer::broadcast(const std::string& message) {
       clientFds.push_back(pair.first);
     }
   }
+
+  size_t successCount = 0;
   for (int fd : clientFds) {
-    sendNoSignal(fd, message.c_str(), message.length());
+    if (sendToClient(fd, message)) ++successCount;
   }
+  return successCount;
 }
 
 bool TcpServer::sendToClient(int clientFd, const std::string& message) {
   {
     std::lock_guard<std::mutex> lock(clientsMutex_);
-    if (!clients_.count(clientFd)) {
-      return false;
-    }
+    if (!clients_.count(clientFd)) return false;
   }
-  ssize_t sent = sendNoSignal(clientFd, message.c_str(), message.length());
-  return sent == (ssize_t)message.length();
+  std::lock_guard<std::mutex> sendLock(sendMutex_);
+  return sendAllNoSignal(clientFd, message.data(), message.size());
 }
 
 } // 命名空间 hsvj

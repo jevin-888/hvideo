@@ -1,4 +1,6 @@
 #include "HttpServer_Internal.h"
+#include "core/Engine.h"
+#include "core/LicenseManager.h"
 #include <cmath>
 
 namespace {
@@ -73,7 +75,9 @@ HttpServer::HttpServer(int port, bool registerApi)
 
 void HttpServer::registerApiRoutes() {
   // 注册认证路由（必须在其他路由之前）
-  impl_->registerAuthRoutes();
+  impl_->registerAuthRoutes([this] {
+    return systemConfig_ ? systemConfig_->getLicenseServerUrl() : std::string();
+  });
   
   // 注册各功能模块的路由
   registerSceneRoutes();       // 场景管理
@@ -95,6 +99,7 @@ void HttpServer::registerApiRoutes() {
 HttpServer::~HttpServer() {
   stopVideoProgressBroadcast();
   impl_->stop();
+  waitBackgroundTasks();
 }
 
 bool HttpServer::start() {
@@ -108,6 +113,32 @@ bool HttpServer::start() {
 void HttpServer::stop() {
   stopVideoProgressBroadcast();
   impl_->stop();
+  waitBackgroundTasks();
+}
+
+void HttpServer::launchBackgroundTask(std::function<void()> task) {
+  if (!task) return;
+  auto future = std::async(std::launch::async, std::move(task));
+  std::lock_guard<std::mutex> lock(backgroundTasksMutex_);
+  backgroundTasks_.erase(
+      std::remove_if(backgroundTasks_.begin(), backgroundTasks_.end(),
+                     [](std::future<void> &pending) {
+                       return pending.wait_for(std::chrono::milliseconds(0)) ==
+                              std::future_status::ready;
+                     }),
+      backgroundTasks_.end());
+  backgroundTasks_.push_back(std::move(future));
+}
+
+void HttpServer::waitBackgroundTasks() {
+  std::vector<std::future<void>> pending;
+  {
+    std::lock_guard<std::mutex> lock(backgroundTasksMutex_);
+    pending.swap(backgroundTasks_);
+  }
+  for (auto &task : pending) {
+    if (task.valid()) task.wait();
+  }
 }
 
 void HttpServer::setStaticDir(const std::string &dir) {
@@ -125,31 +156,47 @@ void HttpServer::setKtvStaticDir(const std::string &dir) {
 void HttpServer::addRoute(
     const std::string &method, const std::string &path,
     std::function<void(const HttpRequest &, HttpResponse &)> handler) {
-  impl_->addRoute(method, path, handler);
+  std::string module;
+  // 动作授权由 CommandRouter 按 action 统一判断，避免把基础保存/加载也当作场景模板拦截。
+  const bool sceneActionRoute = method == "POST" && path == "/api/v1/scenes/actions/{action}";
+  if (path != "/api/v1/scenes/current" && !sceneActionRoute &&
+      (path == "/api/v1/scenes" || path.rfind("/api/v1/scenes/", 0) == 0)) module = "scene";
+  else if (path.rfind("/api/v1/fusion/", 0) == 0) module = "fusion";
+  impl_->addRoute(method, path, [this, module, handler](const HttpRequest &request, HttpResponse &response) {
+    if (!module.empty() && !checkModuleLicense(module, response)) return;
+    handler(request, response);
+  });
+}
+
+bool HttpServer::checkModuleLicense(const std::string &module, HttpResponse &response) {
+  auto *license = engine_ ? engine_->getLicenseManager() : nullptr;
+  if (license && license->isModuleEnabled(module)) return true;
+  setJsonErrorResponse(response, 403, module + " module not licensed");
+  return false;
 }
 
 void HttpServer::get(
     const std::string &path,
     std::function<void(const HttpRequest &, HttpResponse &)> handler) {
-  impl_->get(path, handler);
+  addRoute("GET", path, handler);
 }
 
 void HttpServer::post(
     const std::string &path,
     std::function<void(const HttpRequest &, HttpResponse &)> handler) {
-  impl_->post(path, handler);
+  addRoute("POST", path, handler);
 }
 
 void HttpServer::put(
     const std::string &path,
     std::function<void(const HttpRequest &, HttpResponse &)> handler) {
-  impl_->put(path, handler);
+  addRoute("PUT", path, handler);
 }
 
 void HttpServer::del(
     const std::string &path,
     std::function<void(const HttpRequest &, HttpResponse &)> handler) {
-  impl_->del(path, handler);
+  addRoute("DELETE", path, handler);
 }
 
 void HttpServer::setMubu(hsvj::Mubu *mubu) {
@@ -326,14 +373,12 @@ void HttpServer::setSystemConfig(hsvj::SystemConfig *config) {
 void HttpServer::setEngine(hsvj::Engine *engine) {
   engine_ = engine;
   if (engine_) {
-    initializeEffectServices();
     registerAudioEffectRoutes();
   }
 }
 
 void HttpServer::refreshAudioEffectRoutes() {
   if (engine_) {
-    initializeEffectServices();
     registerAudioEffectRoutes();
   }
 }

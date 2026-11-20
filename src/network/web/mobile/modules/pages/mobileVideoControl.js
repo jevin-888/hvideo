@@ -4,7 +4,7 @@
  */
 
 import { apiGet, apiPost, apiPut, apiAction, apiActionOrThrow } from '../core/api.js';
-import { addToCommandLog } from '../core/commandLog.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 
 async function postVideoCommand(action, param = {}) {
     const videoEndpointActionMap = {
@@ -75,6 +75,9 @@ let isMuted = false;
 let videoList = [];
 let imageUploadListenerAttached = false; // 标志：图片上传事件监听器是否已绑定
 let mediaTypeListenerAttached = false;
+let materialLoadGeneration = 0;
+let previewPlayGeneration = 0;
+let previewStatePendingPath = '';
 
 // 当前选中的播放列表ID
 let currentPlaylistId = null;
@@ -302,13 +305,20 @@ function initializeVideoStatusSSE() {
     }
 
     try {
-        videoStatusEventSource = new EventSource('/api/v1/events');
+        const token = localStorage.getItem('hvideo_auth_token');
+        const eventUrl = token
+            ? `/api/v1/events?token=${encodeURIComponent(token)}` : '/api/v1/events';
+        videoStatusEventSource = new EventSource(eventUrl);
 
         videoStatusEventSource.addEventListener('video_status', (event) => {
             try {
                 const data = selectCurrentLayerStatus(JSON.parse(event.data));
+                // 点击后的设备状态可能仍是上一个素材，不能覆盖本地即时反馈。
+                const canApplyPendingPreviewEvent = !previewStatePendingPath ||
+                    (data.path && normalizePath(data.path) === normalizePath(previewStatePendingPath));
+
                 // 更新播放状态
-                if (data.state) {
+                if (data.state && canApplyPendingPreviewEvent) {
                     const playing = data.state === 'playing';
                     isPlaying = playing;
                     updatePlayPauseButton(isPlaying);
@@ -322,17 +332,17 @@ function initializeVideoStatusSSE() {
 
                 // 更新播放标题
                 const statusText = document.getElementById('playback-status-text');
-                if (statusText && data.path) {
+                if (statusText && data.path && canApplyPendingPreviewEvent) {
                     let displayName = getFileNameFromPath(data.path);
-                    
+
                     // 尝试从视频列表中查找完整名称
                     if (videoList && videoList.length > 0) {
                         const apiPath = normalizePath(data.path);
                         const video = videoList.find(v => {
                             if (!v || !v.path) return false;
                             const videoPath = normalizePath(v.path);
-                            return videoPath === apiPath || 
-                                   videoPath.endsWith(apiPath) || 
+                            return videoPath === apiPath ||
+                                   videoPath.endsWith(apiPath) ||
                                    apiPath.endsWith(videoPath);
                         });
                         if (video) {
@@ -350,7 +360,7 @@ function initializeVideoStatusSSE() {
                 }
 
                 // 更新视频卡片的激活状态
-                if (data.path) {
+                if (data.path && canApplyPendingPreviewEvent) {
                     const apiPath = normalizePath(data.path);
                     document.querySelectorAll('.video-card').forEach(card => {
                         const cardPath = normalizePath(card.dataset.path || '');
@@ -421,9 +431,14 @@ function getFilteredVideos(videos) {
     });
 }
 
+function updateActiveVideoCard(path) {
+    document.querySelectorAll('.video-card').forEach(card => {
+        card.classList.toggle('active', card.dataset.path === path);
+    });
+}
+
 function createVideoCard(v) {
     // 根据后缀判断是否为音频，音频不再请求缩略图接口，避免产生 404 日志
-    const videoExtensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg', '.ts', '.vob', '.dat'];
     const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg'];
     const audioExtensions = ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma'];
     const ext = v.path.toLowerCase().substring(v.path.lastIndexOf('.'));
@@ -454,15 +469,30 @@ function createVideoCard(v) {
             <div class="video-title" title="${(v.name || '未知视频').replace(/"/g, '&quot;')}">${v.name || '未知视频'}</div>
             <div class="video-meta">
                 <span class="video-size">${((v.size || 0) / (1024 * 1024)).toFixed(1)} MB</span>
-                <span class="video-tag">${v.type || 'defaultVideo'}</span>
+                <span class="video-tag">${getCatFolderName(v.path)}</span>
             </div>
         </div>`;
     card.addEventListener('click', async () => {
+        const playGeneration = ++previewPlayGeneration;
+        const previousActivePath = document.querySelector('.video-card.active')?.dataset.path || '';
+        const previousIsPlaying = isPlaying;
+        const previousStatus = (globalThis.PlayerI18n?.sourceText(document.getElementById('playback-status-text')) ?? document.getElementById('playback-status-text')?.textContent) || '';
+        const displayName = v.name || getFileNameFromPath(v.path);
+        previewStatePendingPath = v.path;
+
+        // 先更新本地 UI，再等待设备 API 返回，避免视频已切换但预览状态滞后。
+        updateActiveVideoCard(v.path);
+        const statusText = document.getElementById('playback-status-text');
+
         // 判断媒体类型
         const ext = v.path.toLowerCase().substring(v.path.lastIndexOf('.'));
         const isImage = imageExtensions.includes(ext);
 
         if (isImage) {
+            if (statusText) {
+                statusText.textContent = `正在加载图片：${displayName}`;
+            }
+
             // 图片类型：使用图层60，发送 loadImage 命令
             const layerId = 60; // 图片专用图层
             try {
@@ -477,75 +507,113 @@ function createVideoCard(v) {
                 }
                 const { action, ...imageParams } = param;
                 const res = await apiAction('rendering', action, imageParams);
+                if (playGeneration !== previewPlayGeneration) {
+                    return;
+                }
                 if (res !== null) {
-                    const statusText = document.getElementById('playback-status-text');
+                    previewStatePendingPath = '';
                     if (statusText) {
-                        const displayName = v.name || getFileNameFromPath(v.path);
                         statusText.textContent = `已加载图片：${displayName}`;
                     }
-                    // 设置当前卡片为选中状态
-                    document.querySelectorAll('.video-card').forEach(c => c.classList.remove('active'));
-                    card.classList.add('active');
+                } else {
+                    previewStatePendingPath = '';
+                    updateActiveVideoCard(previousActivePath);
+                    if (statusText) {
+                        statusText.textContent = '图片加载失败';
+                    }
                 }
             } catch (err) {
+                if (playGeneration !== previewPlayGeneration) {
+                    return;
+                }
+                previewStatePendingPath = '';
+                updateActiveVideoCard(previousActivePath);
+                if (statusText) {
+                    statusText.textContent = '图片加载失败';
+                }
                 console.error('加载图片失败:', err);
             }
-        } else {
-            // 视频/音频类型：使用 /video/play 接口
-            // 获取目标图层：优先使用播放列表绑定的图层，否则使用默认图层
-            let targetLayerId = currentLayerId;
-            if (currentPlaylistId) {
-                targetLayerId = await getPlaylistTargetLayer(currentPlaylistId);
+            return;
+        }
+
+        // 视频/音频类型：先乐观更新播放状态，再等待 /video/play 接口返回。
+        isPlaying = true;
+        updatePlayPauseButton(true);
+        if (statusText) {
+            statusText.textContent = `正在切换：${displayName}`;
+        }
+
+        // 获取目标图层：优先使用点击时绑定的播放列表图层，避免等待期间状态变化。
+        const playlistId = currentPlaylistId;
+        let targetLayerId = currentLayerId;
+        if (playlistId) {
+            targetLayerId = await getPlaylistTargetLayer(playlistId);
+        }
+        if (playGeneration !== previewPlayGeneration) {
+            return;
+        }
+
+        // 构建播放参数（与电脑端一致）
+        const playParams = {
+            layerId: targetLayerId,
+            path: v.path,
+            loop: 2,  // 预览/直播放模式：单个循环
+            playbackRate: 1.0  // 播放速率
+        };
+
+        // 如果有播放列表，添加播放列表ID
+        if (playlistId) {
+            playParams.playlistId = playlistId;
+        }
+
+        try {
+            const res = await apiPost('/video/play', playParams);
+            if (playGeneration !== previewPlayGeneration) {
+                return;
             }
-
-            // 构建播放参数（与电脑端一致）
-            const playParams = {
-                layerId: targetLayerId,
-                path: v.path,
-                loop: 2,  // 预览/直播放模式：单个循环
-                playbackRate: 1.0  // 播放速率
-            };
-
-            // 如果有播放列表，添加 播放列表Id
-            if (currentPlaylistId) {
-                playParams.playlistId = currentPlaylistId;
+            if (res == null) {
+                previewStatePendingPath = '';
+                const errorMsg = '播放失败';
+                updateActiveVideoCard(previousActivePath);
+                isPlaying = previousIsPlaying;
+                updatePlayPauseButton(previousIsPlaying);
+                if (statusText) {
+                    statusText.textContent = `播放失败：${errorMsg}`;
+                }
+                addToCommandLog('播放视频', 'error', `播放失败: ${errorMsg}`);
+                return;
             }
-
-            try {
-                const res = await apiPost('/video/play', playParams);
-                if (res == null) {
-                    const errorMsg = '播放失败';
-                    const statusText = document.getElementById('playback-status-text');
-                    if (statusText) {
-                        statusText.textContent = `播放失败：${errorMsg}`;
-                    }
-                    addToCommandLog('播放视频', 'error', `播放失败: ${errorMsg}`);
-                    return;
+            if (res && typeof res === 'object' && (res.state === 'blocked' || res.softBlocked || res.notice)) {
+                previewStatePendingPath = '';
+                const blockedMsg = res.message || '当前设备不能同时播放两个4K视频';
+                updateActiveVideoCard(previousActivePath);
+                isPlaying = previousIsPlaying;
+                updatePlayPauseButton(previousIsPlaying);
+                if (statusText) {
+                    statusText.textContent = `播放受限：${blockedMsg}`;
                 }
-                if (res && typeof res === 'object' && (res.state === 'blocked' || res.softBlocked || res.notice)) {
-                    const blockedMsg = res.message || '当前设备不能同时播放两个4K视频';
-                    const statusText = document.getElementById('playback-status-text');
-                    if (statusText) {
-                        statusText.textContent = `播放受限：${blockedMsg}`;
-                    }
-                    addToCommandLog('播放视频', 'warning', blockedMsg);
-                    return;
-                }
-                if (res !== null) {
-                    isPlaying = true;
-
-                    updatePlayPauseButton(true);
-                    const statusText = document.getElementById('playback-status-text');
-                    if (statusText) {
-                        const displayName = v.name || getFileNameFromPath(v.path);
-                        statusText.textContent = `正在播放：${displayName}`;
-                    }
-                    document.querySelectorAll('.video-card').forEach(c => c.classList.toggle('active', c.dataset.path === v.path));
-                    setTimeout(syncSimpleStatus, 300);
-                }
-            } catch (err) {
-                console.error('播放视频失败:', err);
+                addToCommandLog('播放视频', 'warning', blockedMsg);
+                return;
             }
+            if (res !== null) {
+                previewStatePendingPath = '';
+                if (statusText) {
+                    statusText.textContent = `正在播放：${displayName}`;
+                }
+                setTimeout(syncSimpleStatus, 300);
+            }
+        } catch (err) {
+            if (playGeneration !== previewPlayGeneration) {
+                return;
+            }
+            previewStatePendingPath = '';
+            updateActiveVideoCard(previousActivePath);
+            isPlaying = previousIsPlaying;
+            updatePlayPauseButton(previousIsPlaying);
+            if (statusText) {
+                statusText.textContent = previousStatus || '播放失败';
+            }
+            console.error('播放视频失败:', err);
         }
     });
     return card;
@@ -631,7 +699,8 @@ function renderCategoryNav(videos) {
         const btn = document.createElement('button');
         btn.className = 'cat-tab' + (currentCategory === cat ? ' active' : '');
         btn.dataset.category = cat;
-        btn.textContent = cat;
+        btn.setAttribute('translate', 'no');
+            btn.textContent = cat;
         btn.addEventListener('click', () => selectCategory(cat));
         navContainer.appendChild(btn);
     });
@@ -641,9 +710,14 @@ function renderCategoryNav(videos) {
  * 选择分类
  */
 export function selectCategory(cat) {
-    currentCategory = cat;
+    const requestedCategory = typeof cat === 'string' ? cat : '';
+    const categoryExists = requestedCategory === '' ||
+        videoList.some(video => getCatFolderName(video?.path) === requestedCategory);
+
+    // Fall back to "All" when a requested category no longer exists or is empty.
+    currentCategory = categoryExists ? requestedCategory : '';
     document.querySelectorAll('.cat-tab').forEach(btn => {
-        btn.classList.toggle('active', btn.dataset.category === cat);
+        btn.classList.toggle('active', btn.dataset.category === currentCategory);
     });
     renderVideoGrid(videoList);
 }
@@ -655,6 +729,9 @@ export async function loadVideos() {
     const grid = document.getElementById('video-grid');
     if (!grid) return;
 
+    const loadGeneration = ++materialLoadGeneration;
+    const requestedMediaType = currentMediaType;
+
     // 显示加载状态
     grid.innerHTML = '<div class="grid-status-tip">加载中...</div>';
 
@@ -664,6 +741,11 @@ export async function loadVideos() {
 
     try {
         const res = await apiGet(`/materials?type=${apiType}`);
+
+        if (loadGeneration !== materialLoadGeneration ||
+            currentSource !== 'local' || currentMediaType !== requestedMediaType) {
+            return;
+        }
 
         if (res === null) {
             // API请求失败（网络错误、超时等）
@@ -686,9 +768,17 @@ export async function loadVideos() {
 
         // 列表加载后，立即同步一次状态以更新显示
         setTimeout(() => {
-            syncSimpleStatus();
+            if (loadGeneration === materialLoadGeneration &&
+                currentSource === 'local' && currentMediaType === requestedMediaType) {
+                syncSimpleStatus();
+            }
         }, 100);
     } catch (error) {
+        if (loadGeneration !== materialLoadGeneration ||
+            currentSource !== 'local' || currentMediaType !== requestedMediaType) {
+            return;
+        }
+
         // 捕获异常
         grid.innerHTML = '<div class="grid-status-tip">加载失败：' + (error.message || '未知错误') + '</div>';
         console.error('[loadVideos] 加载素材时发生异常:', error);
@@ -801,6 +891,8 @@ async function loadUsbMedia(forceRefresh = false) {
         return [];
     }
 
+    const loadGeneration = ++materialLoadGeneration;
+
     // 进入 U 盘模式时，无论扫描是否成功，都不再显示原来的分类行
     const navContainer = document.getElementById('category-nav');
     if (navContainer) {
@@ -815,20 +907,22 @@ async function loadUsbMedia(forceRefresh = false) {
         videoList = allUsbFiles;
         currentCategory = '';
         currentSource = 'usb';
-        
+
         // 渲染文件夹导航
         if (usbDataCache.folderMap) {
             renderUsbFolderNav(usbDataCache.folderMap);
         }
-        
+
         // 渲染所有文件
         renderVideoGrid(allUsbFiles);
-        
+
         // 同步状态
         setTimeout(() => {
-            syncSimpleStatus();
+            if (loadGeneration === materialLoadGeneration && currentSource === 'usb') {
+                syncSimpleStatus();
+            }
         }, 100);
-        
+
         return allUsbFiles;
     }
 
@@ -837,19 +931,23 @@ async function loadUsbMedia(forceRefresh = false) {
 
     let allFiles = [];
     let scanMeta = null;
-    
+
     try {
         const result = await apiGet(
             `/filesystem/usb/media?type=all&limit=${USB_SCAN_LIMIT}&timeoutMs=9000`,
             USB_SCAN_TIMEOUT_MS
         );
+        if (loadGeneration !== materialLoadGeneration || currentSource !== 'usb') {
+            return [];
+        }
+
         const normalized = normalizeUsbScanResult(result);
         allFiles = normalized.files;
         scanMeta = normalized.meta;
-        
+
         // 保存所有文件到全局变量
         allUsbFiles = allFiles;
-        
+
         // 按文件夹分组（使用所有文件）
         const folderMap = buildUsbFolderMap(allFiles);
 
@@ -863,8 +961,12 @@ async function loadUsbMedia(forceRefresh = false) {
         };
         // 渲染文件夹导航（显示所有文件夹）
         renderUsbFolderNav(folderMap);
-        
+
     } catch (error) {
+        if (loadGeneration !== materialLoadGeneration || currentSource !== 'usb') {
+            return [];
+        }
+
         console.error('[loadUsbMedia] 扫描所有媒体类型失败:', error);
         // 扫描失败时清除缓存
         clearUsbCache();
@@ -874,13 +976,13 @@ async function loadUsbMedia(forceRefresh = false) {
     videoList = allUsbFiles;
     currentCategory = '';
     currentSource = 'usb';
-    
+
     if (allUsbFiles.length === 0) {
         grid.innerHTML = '<div class="grid-status-tip">未检测到 U 盘媒体文件</div>';
         console.warn('[loadUsbMedia] U盘中没有找到媒体文件');
         return [];
     }
-    
+
     // 渲染所有文件
     renderVideoGrid(allUsbFiles);
     if (scanMeta && scanMeta.truncated) {
@@ -892,7 +994,9 @@ async function loadUsbMedia(forceRefresh = false) {
 
     // 列表加载后，同步一次状态
     setTimeout(() => {
-        syncSimpleStatus();
+        if (loadGeneration === materialLoadGeneration && currentSource === 'usb') {
+            syncSimpleStatus();
+        }
     }, 100);
 
     return allUsbFiles;
@@ -915,8 +1019,6 @@ function updateUsbToolbarVisibility() {
 /**
  * 渲染U盘文件夹导航
  */
-let usbFolderData = {};
-let currentUsbFolder = null;
 let allUsbFiles = []; // 保存所有扫描到的文件（不分类型）
 let usbToolbarInitialized = false;
 
@@ -949,7 +1051,6 @@ function setUsbPlayMode(mode) {
 }
 
 function renderUsbFolderNav(folderMap) {
-    usbFolderData = folderMap;
     const navContainer = document.getElementById('usb-folder-nav');
     if (!navContainer) {
         console.error('[renderUsbFolderNav] 未找到 usb-folder-nav 元素');
@@ -957,7 +1058,7 @@ function renderUsbFolderNav(folderMap) {
     }
 
     navContainer.innerHTML = '';
-    
+
     const allFolders = Object.values(folderMap)
         .sort((a, b) => (b.files?.length || 0) - (a.files?.length || 0));
     const folders = allFolders.slice(0, USB_MAX_FOLDERS_IN_NAV);
@@ -990,7 +1091,8 @@ function renderUsbFolderNav(folderMap) {
         if (folders.length === 1) {
             btn.classList.add('active');
         }
-        btn.textContent = folder.name;
+        btn.setAttribute('translate', 'no');
+            btn.textContent = folder.name;
         btn.dataset.folder = folder.path;
         btn.addEventListener('click', () => filterByUsbFolder(folder.path));
         navContainer.appendChild(btn);
@@ -1016,8 +1118,7 @@ function renderUsbFolderNav(folderMap) {
  * 按文件夹过滤U盘文件
  */
 function filterByUsbFolder(folderPath) {
-    currentUsbFolder = folderPath;
-    
+
     // 更新按钮状态
     const navContainer = document.getElementById('usb-folder-nav');
     if (navContainer) {
@@ -1211,13 +1312,14 @@ export function initializeEventListeners() {
     if (!mediaTypeListenerAttached) {
         mediaTypeListenerAttached = true;
         document.querySelectorAll('.media-type-btn').forEach(btn => {
-            btn.addEventListener('click', function () {
-                document.querySelectorAll('.media-type-btn').forEach(b => b.classList.remove('active'));
-                this.classList.add('active');
+            btn.addEventListener('click', function (event) {
+                event.preventDefault();
+
                 const mediaType = this.dataset.type;
-                filterByMediaType(mediaType);
+                void filterByMediaType(mediaType);
             });
         });
+        updateMediaTypeButtonState(currentSource === 'usb' ? 'usb' : currentMediaType);
     }
 
     // 图片上屏按钮 - 确保事件监听器只绑定一次
@@ -1332,6 +1434,14 @@ export function initializeEventListeners() {
 // 当前选中的媒体类型
 let currentMediaType = 'video';
 
+function updateMediaTypeButtonState(type) {
+    document.querySelectorAll('.media-type-btn').forEach(button => {
+        const isActive = button.dataset.type === type;
+        button.classList.toggle('active', isActive);
+        button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+    });
+}
+
 /**
  * 根据媒体类型和来源显示/隐藏图片上屏按钮
  */
@@ -1351,8 +1461,15 @@ function updateImageToScreenButtonVisibility() {
  * 切换媒体类型并重新加载数据
  */
 async function filterByMediaType(type) {
+    if (!['video', 'image', 'audio', 'usb'].includes(type)) {
+        return;
+    }
+
+    updateMediaTypeButtonState(type);
+
     // 点击 U 盘按钮：进入U盘模式
     if (type === 'usb') {
+        materialLoadGeneration++;
         currentSource = 'usb';
         currentCategory = '';
         // 立即隐藏原有分类行
@@ -1361,7 +1478,7 @@ async function filterByMediaType(type) {
             navContainer.innerHTML = '';
             navContainer.style.display = 'none';
         }
-        
+
         // 检查是否有缓存数据
         if (isUsbCacheValid()) {
             // 使用缓存数据，不强制刷新
@@ -1373,7 +1490,7 @@ async function filterByMediaType(type) {
                 grid.innerHTML = '<div class="grid-status-tip">点击右侧"扫描"开始扫描 U 盘媒体</div>';
             }
         }
-        
+
         updateImageToScreenButtonVisibility();
         updateUsbToolbarVisibility();
         return;
@@ -1383,9 +1500,17 @@ async function filterByMediaType(type) {
     currentSource = 'local';
     currentMediaType = type;
     currentCategory = '';
-    await loadVideos();
+
     updateImageToScreenButtonVisibility();
     updateUsbToolbarVisibility();
+
+    const navContainer = document.getElementById('category-nav');
+    if (navContainer) {
+        navContainer.innerHTML = '';
+        navContainer.style.display = 'none';
+    }
+
+    await loadVideos();
 }
 
 
@@ -1439,7 +1564,7 @@ function initUsbToolbar() {
     if (scanBtn) {
         scanBtn.addEventListener('click', async () => {
             if (scanBtn.disabled) return;
-            const originalText = scanBtn.textContent;
+            const originalText = globalThis.PlayerI18n?.sourceText(scanBtn) ?? scanBtn.textContent;
             scanBtn.disabled = true;
             scanBtn.textContent = '扫描中';
             try {
@@ -1683,4 +1808,3 @@ export async function loadSystemVolume() {
 }
 
 export function initializeThumbnailSSE() { }
-

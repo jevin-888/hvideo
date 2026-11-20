@@ -15,7 +15,14 @@ target_include_directories(hsvj_fusion PUBLIC
 )
 
 target_link_libraries(hsvj_fusion PUBLIC
+    hsvj_jsoncpp
     hsvj_utils
 )
 
 target_compile_features(hsvj_fusion PUBLIC cxx_std_17)
+
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_fusion PRIVATE
+    hsvj_utils
+    hsvj_jsoncpp
+)

@@ -12,7 +12,7 @@
 #ifndef HSVJ_LAYER_H
 #define HSVJ_LAYER_H
 
-#include "core/Resolution.h"
+#include "foundation/Resolution.h"
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -32,7 +32,8 @@ enum class LayerType {
   TEXT = 3,   ///< 文本图层
   QRCODE = 4, ///< 二维码图层
   EFFECT = 5, ///< 特效图层
-  MIRROR = 6  ///< 投屏图层
+  MIRROR = 6,
+  BLUETOOTH_AUDIO = 7 ///< Engine-owned temporary A2DP spectrum layer
 };
 
 /**
@@ -130,6 +131,21 @@ public:
    * @param visible 是否可见
    */
   void setVisible(bool visible) { visible_ = visible; }
+
+  /**
+   * @brief 标记图层是否属于当前场景
+   *
+   * 场景成员关系与可见性分离：场景内的隐藏视频可以继续解码，只有
+   * 已从当前场景移除的图层才允许进入隐藏资源回收路径。
+   */
+  void setPresentInScene(bool present) {
+    presentInScene_.store(present, std::memory_order_release);
+  }
+
+  /** @brief 检查图层是否属于当前场景 */
+  bool isPresentInScene() const {
+    return presentInScene_.load(std::memory_order_acquire);
+  }
 
   /**
    * @brief 获取图层位置
@@ -233,6 +249,19 @@ public:
   int getInvert() const { return invert_; }
 
   /**
+   * @brief 设置图层独立内容裁剪（归一化源坐标，0..1）。
+   * left/top 为裁剪起点，right/bottom 为从对应边裁掉的比例。
+   */
+  void setContentCrop(float left, float top, float right, float bottom);
+  float getCropLeft() const { return cropLeft_; }
+  float getCropTop() const { return cropTop_; }
+  float getCropRight() const { return cropRight_; }
+  float getCropBottom() const { return cropBottom_; }
+
+  /** 将当前图层裁剪参数应用到指定纹理；纹理不存在时安全忽略。 */
+  void applyContentCrop(uint32_t textureId) const;
+
+  /**
    * @brief 设置效果关联切片模式
    * @param enable 是否启用
    */
@@ -256,7 +285,7 @@ public:
    */
   float getGaussianBlur() const { return gaussianBlur_; }
 
-  void setFitMode(int mode) { fitMode_ = mode > 0 ? 1 : 0; }
+  virtual void setFitMode(int mode) { fitMode_ = mode > 0 ? 1 : 0; }
   int getFitMode() const { return fitMode_; }
 
   /**
@@ -366,9 +395,12 @@ public:
   }
 
   /**
-   * @brief 清除所有切片配置
-   * 用于场景切换时重置图层切片状态
+   * @brief 原子替换全部切片配置
+   * @param slices 新的完整切片集合
    */
+  void replaceAllSlices(const std::map<std::string, Json::Value> &slices);
+
+  /** @brief 清除所有切片配置 */
   void clearAllSlices();
 
   /**
@@ -404,6 +436,7 @@ protected:
   int layerId_;
   LayerType type_;
   bool visible_;
+  std::atomic<bool> presentInScene_{true};
   Position position_;
   Size size_;
   float rotation_;
@@ -414,6 +447,10 @@ protected:
   float shapeParam_;
   bool blackToTransparent_ = false; // 是否将黑色变为透明（默认关闭）
     int invert_ = 0; // 图像反转模式 (0=无, 1=水平, 2=垂直, 3=水平+垂直)
+    float cropLeft_ = 0.0f;
+    float cropTop_ = 0.0f;
+    float cropRight_ = 0.0f;
+    float cropBottom_ = 0.0f;
     bool effectLinkedSlices_ = false; // 效果关联切片模式
     float gaussianBlur_ = 0.0f;       // 高斯模糊强度
     int fitMode_ = 0;                 // 视频适配模式 (0=铺满显示, 1=保持视频比例显示)

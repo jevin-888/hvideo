@@ -43,7 +43,6 @@ static const FFOutputFormat * const muxer_list[] = {
     &ff_f4v_muxer,
     &ff_ffmetadata_muxer,
     &ff_fifo_muxer,
-    &ff_fifo_test_muxer,
     &ff_filmstrip_muxer,
     &ff_fits_muxer,
     &ff_flac_muxer,

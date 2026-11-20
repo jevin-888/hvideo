@@ -10,7 +10,9 @@ PlaybackResult PlaybackRequestDispatcher::requestPlay(Mubu *mubu, int layerId,
                                                       const std::string &path,
                                                       int loop,
                                                       PlaybackSource source,
-                                                      bool userInitiated) {
+                                                      bool userInitiated,
+                                                      double syncStartTime,
+                                                      bool restartFromBeginning) {
   PlaybackCoordinator &coordinator = PlaybackCoordinator::getInstance();
   coordinator.setLayerResolver([mubu](int targetLayerId) -> LayerVideo * {
     if (!mubu) {
@@ -29,6 +31,8 @@ PlaybackResult PlaybackRequestDispatcher::requestPlay(Mubu *mubu, int layerId,
   request.loop = loop;
   request.source = source;
   request.userInitiated = userInitiated;
+  request.syncStartTime = syncStartTime;
+  request.restartFromBeginning = restartFromBeginning;
   return coordinator.requestPlay(request);
 }
 

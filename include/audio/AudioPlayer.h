@@ -17,6 +17,7 @@
 #include <queue>
 #include <functional>
 #include <memory>
+#include <chrono>
 
 #ifdef __ANDROID__
 #include <aaudio/AAudio.h>
@@ -72,6 +73,7 @@ public:
 
     int32_t getSampleRate() const {
 #ifdef __ANDROID__
+        std::lock_guard<std::recursive_mutex> lock(streamMutex_);
         return sampleRate_;
 #else
         return 0;
@@ -80,6 +82,7 @@ public:
 
     int32_t getChannelCount() const {
 #ifdef __ANDROID__
+        std::lock_guard<std::recursive_mutex> lock(streamMutex_);
         return channelCount_;
 #else
         return 0;
@@ -88,6 +91,7 @@ public:
 
     int32_t getFormat() const {
 #ifdef __ANDROID__
+        std::lock_guard<std::recursive_mutex> lock(streamMutex_);
         return format_;
 #else
         return 0;
@@ -96,6 +100,7 @@ public:
 
     int32_t getDeviceId() const {
 #ifdef __ANDROID__
+        std::lock_guard<std::recursive_mutex> lock(streamMutex_);
         return deviceId_;
 #else
         return 0;
@@ -110,6 +115,16 @@ public:
     /**
      * @brief 寮€濮嬫挱鏀* @return 鏄惁寮€濮嬫垚鍔*/
     bool start();
+
+    /**
+     * Pause and discard old PCM before rebuilding output. Wait for targetFrames
+     * without blocking the decoder; after the first PCM, maxWaitMs bounds the
+     * delay for file playback. Realtime routes use the immediate defaults.
+     */
+    void prepareForPlayback(int32_t targetFrames = 1, int32_t maxWaitMs = 0);
+
+    /** Drain this PCM generation without treating its silent tail as starvation. */
+    void finishInput(uint64_t generation);
     
     /**
      * @brief 鍋滄鎾斁
@@ -130,6 +145,9 @@ public:
      * @brief 娓呯┖闊抽闃熷垪锛堢敤浜巗eek/replay鏃舵竻闄ゆ畫鐣欐暟鎹級
      */
     void flush();
+
+    /** Route ownership change: discard queued PCM and reject every old-generation write. */
+    void switchPcmGeneration(uint64_t generation);
 
     /**
      * @brief 设置 write() 到 AAudio 回调之间允许缓存的队列块数。
@@ -159,12 +177,14 @@ public:
      * @param data PCM闊抽鏁版嵁
      * @param numFrames 甯ф暟
      * @return 瀹為檯鍐欏叆鐨勫抚鏁*/
-    int32_t write(const void* data, int32_t numFrames);
+    int32_t write(const void* data, int32_t numFrames, uint64_t generation);
     
     /**
      * @brief 璁剧疆闊抽噺
      * @param volume 闊抽噺锛?.0-1.0锛*/
     void setVolume(float volume);
+    // Independent of mute/fades; used only for the selected VOD output route.
+    void setOutputGainDb(int gainDb);
 
     /**
      * @brief 更新目标音量但保留当前淡入/淡出包络。
@@ -209,6 +229,10 @@ public:
      * @brief 鑾峰彇鎾斁鐘舵€* @return 鏄惁姝ｅ湪鎾斁
      */
     bool isPlaying() const { return playing_; }
+
+    // Callback progress, not queued PCM or AAudio's STARTING/STARTED state.
+    // Lock-free so a failed output cannot block the video master clock.
+    bool isOutputProgressing() const;
     
     /**
      * @brief 鑾峰彇缂撳啿鍖哄ぇ灏忥紙甯ф暟锛* @return 缂撳啿鍖哄ぇ灏忥紙甯ф暟锛*/
@@ -220,9 +244,9 @@ public:
 
     /**
      * @brief 获取 AAudio 已写入但尚未真正播出的总帧数（含 AAudio 内部缓冲 + HAL 链路）。
-     *        使用 AAudioStream_getFramesWritten - AAudioStream_getFramesRead 计算，
+     *        使用播放器内部 64 位计数计算，
      *        是估算"从现在写入到真正出声"延迟最准确的口径。
-     * @return AAudio 流上 in-flight 帧数；流未启动或不可用返回 0。
+     * @return 应用侧音频队列中的 in-flight 帧数；不可用返回 0。
      */
     int32_t getAAudioInFlightFrames() const;
 
@@ -236,16 +260,16 @@ public:
                                         int64_t &timeNanos) const;
 
     /**
-     * @brief AAudio 已经真正播出的总帧数（AAudioStream_getFramesRead）。
-     *        用于判定 AAudio 是否已开始消费数据（>0 表示出声链路就绪）。
-     * @return 已读出的总帧数；流未启动或不可用返回 0。
+     * @brief 播放器内部累计的已消费帧数。
+     *        使用 64 位应用侧计数，避免 Android 11 AAudio 帧计数溢出。
+     * @return 当前音频流生命周期内已由硬件 timestamp/回调消费的帧数。
      */
     int64_t getAAudioFramesRead() const;
 
     /**
-     * @brief AAudio 已写入的总帧数（AAudioStream_getFramesWritten）。
-     *        与 getAAudioFramesRead 配对用于精确测算"本次起播以来"的播放进度。
-     * @return 已写入的总帧数；流未启动或不可用返回 0。
+     * @brief 播放器内部累计的已供给 AAudio 回调帧数。
+     *        使用 64 位应用侧计数，与 getAAudioFramesRead 共用同一时间轴。
+     * @return 当前音频流生命周期内已由回调供给的帧数。
      */
     int64_t getAAudioFramesWritten() const;
 
@@ -291,7 +315,7 @@ public:
      * @brief 妫€鏌ユ槸鍚﹂渶瑕侀噸鏂板垵濮嬪寲
      * @return 鏄惁闇€瑕侀噸鏂板垵濮嬪寲
      */
-    bool needsReinit() const { return needsReinit_.load(std::memory_order_acquire); }
+    bool needsReinit() const;
     
     /**
      * @brief 娓呴櫎閲嶆柊鍒濆鍖栨爣蹇*/
@@ -307,13 +331,14 @@ private:
         int16_t* data;              // 闊抽鏁版嵁鎸囬拡
     int32_t numFrames;          // 甯ф暟
     int32_t usedSamples;        // 宸蹭娇鐢ㄧ殑鏍锋湰鏁帮紙鐢ㄤ簬閮ㄥ垎浣跨敤鐨勬儏鍐碉級
+        uint64_t generation;        // Shared PCM route generation
         
         /**
          * @brief 鏋勯€犲嚱鏁* @param d 闊抽鏁版嵁鎸囬拡
          * @param frames 甯ф暟
          */
-        AudioQueueItem(int16_t* d, int32_t frames) 
-            : data(d), numFrames(frames), usedSamples(0) {}
+        AudioQueueItem(int16_t* d, int32_t frames, uint64_t routeGeneration)
+            : data(d), numFrames(frames), usedSamples(0), generation(routeGeneration) {}
         
         /**
          * @brief 鑾峰彇鍓╀綑鏍锋湰鏁* @param channelCount 澹伴亾鏁* @return 鍓╀綑鏍锋湰鏁*/
@@ -322,10 +347,16 @@ private:
         }
     };
     
+    // Protects stream_ and all non-callback AAudioStream_* calls. Recursive because
+    // initialize()->shutdown() and shutdown()->stop() are intentional nested calls.
+    // Lock order is always streamMutex_ -> writeMutex_ -> queueMutex_.
+    mutable std::recursive_mutex streamMutex_;
     AAudioStream* stream_;                          // AAudio娴?
     std::queue<AudioQueueItem> audioQueue_;         // 闊抽鏁版嵁闃熷垪
     std::mutex queueMutex_;                         // 闃熷垪浜掓枼閿?
-    std::condition_variable queueCondition_;        // 闃熷垪鏉′欢鍙橀噺
+    std::condition_variable queueCondition_;
+    std::atomic<uint64_t> acceptedPcmGeneration_{0}; // Current accepted shared PCM route generation
+    std::atomic<uint64_t> loggedOutputGeneration_{0}; // First non-silent callback per route
     std::atomic<int32_t> maxQueueItems_{8};
     std::atomic<int32_t> queueBackpressureWaitMs_{5};
     int32_t sampleRate_;                            // 閲囨牱鐜?
@@ -335,18 +366,35 @@ private:
     int32_t deviceId_;                              // 璁惧ID
     std::atomic<bool> playing_;                     // 鏄惁姝ｅ湪鎾斁
     std::atomic<bool> shuttingDown_{false};         // 姝ｅ湪鍏抽棴鏃跺洖璋冨彧杈撳嚭闈欓煶锛岄伩鍏嶆竻闃熷垪瀵艰嚧 use-after-free
-    std::atomic<bool> needsReinit_{false};          // 鏄惁闇€瑕侀噸鏂板垵濮嬪寲锛圓udioFlinger宕╂簝鍚庯級
+    mutable std::atomic<bool> needsReinit_{false}; // Errors or missing output callbacks request rebuild.
+    std::atomic<int64_t> outputStartedAtNs_{0};
+    std::atomic<int64_t> lastOutputCallbackNs_{0};
+    bool playbackPaused_{false}; // Guarded by streamMutex_; writes cannot undo user pause/stop
+    int32_t startTargetFrames_{1};
+    int32_t startMaxWaitMs_{0};
+    std::chrono::steady_clock::time_point firstQueuedPcm_{};
+    std::atomic<bool> underrunActive_{false};
+    std::atomic<bool> inputEnded_{false};
+    std::atomic<uint64_t> underrunCallbacks_{0};
+    // 64-bit application counters keep long-running clocks independent from
+    // Android 11's legacy AAudio frame-counter rollover.
+    std::atomic<int64_t> appFramesConsumed_{0};
+    std::atomic<int64_t> appFramesWritten_{0};
     // EMA 平滑后的输出链路延迟（纳秒），仅由 estimatedOutputDelaySeconds() 维护
     mutable std::atomic<int64_t> smoothedOutputDelayNs_{0};
     // flush() 时置位，下一次 write() 成功入队时自动启动淡入，防止切歌首包爆音
     std::atomic<bool> pendingFadeInAfterFlush_{false};
     std::atomic<int32_t> pendingFadeInDurationMs_{120};
     std::atomic<float> volume_;                     // 闊抽噺
+    std::atomic<int> outputGainDb_{0};
+    float currentOutputGain_ = 1.0f; // Audio callback only.
+    float outputLimiterGain_ = 1.0f;
     
     // 娣″叆娣″嚭鐩稿叧
     std::atomic<float> targetVolume_;               // 鐩爣闊抽噺
     std::atomic<float> currentVolume_;              // 褰撳墠瀹為檯闊抽噺锛堢敤浜庡钩婊戣繃娓★級
     std::atomic<float> volumeStep_;                  // 姣忓抚闊抽噺鍙樺寲姝ラ暱
+    std::atomic<bool> fadeOutRequested_{false}; // Intentional zero must not trigger silence recovery.
     std::atomic<bool> fadeComplete_;                // 娣″叆娣″嚭鏄惁瀹屾垚
     float volumeBeforeFade_;                        // 娣″叆娣″嚭鍓嶇殑闊抽噺锛堢敤浜庢仮澶嶏級
     
@@ -361,6 +409,7 @@ private:
      * @return 鍥炶皟缁撴灉
      */
     aaudio_data_callback_result_t onAudioReady(void* audioData, int32_t numFrames);
+    int32_t getPendingFramesLocked() const;
 #endif
 };
 

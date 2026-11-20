@@ -687,8 +687,7 @@ static const uint16_t * const amr_bit_orderings_by_mode[] = {
 
 // Extracted from 3GPP TS 26.173 V9.0.0 (qpisf_2s.tab)
 // The *_36b tables are used in 6k60 mode
-// Stored in fixed-po
-  int to save some space
+// Stored in fixed-point to save some space
 /** Indexed tables for retrieval of quantized ISF vectors in Q15 */
 static const int16_t dico1_isf[256][9] = {
  {  579,  1081,  1035,   390,     3,  -263,  -198,   -82,    38},

@@ -11,16 +11,23 @@
  */
 
 #include "core/Engine.h"
+#include "capture/Rk628Edid.h"
+#include "core/AudioOutputLayerPolicy.h"
 #include "core/InitProgress.h"
 #include "core/LayerDefinitions.h"
-#include "lyric/SharedLibassHolder.h"
 #include "audio/AudioPlayerManager.h"
 #include "audio/AudioProcessor.h"
 #include "core/LicenseManager.h"
-#include "core/PathConfig.h"
+#include "core/LicenseVerify.h"
+#include "foundation/PathConfig.h"
 #include "core/PeripheralManager.h"
+#include "platform/AssociatedDeviceName.h"
+#include "core/StageControlManager.h"
 #include "core/SystemConfig.h"
-#include "utils/SliceConfigJson.h"
+#include "core/StartupConfig.h"
+#include "core/OnlineVodDiscovery.h"
+#include "network/DeviceDiscoveryService.h"
+#include "core/SliceConfigJson.h"
 #include "database/PlaylistDatabase.h"
 #include "database/VodDatabase.h"
 #include "decoder/VideoDecoder.h"
@@ -117,6 +124,10 @@ double Engine::getLastAsyncAcquireMs() const {
 
 double Engine::getLastAsyncAcquireFenceMs() const {
   return renderer_ ? renderer_->getLastAsyncAcquireFenceMs() : 0.0;
+}
+
+long long Engine::getSuccessfulPresentCount() const {
+  return renderer_ ? renderer_->getSuccessfulPresentCount() : 0;
 }
 
 long long Engine::getSwapchainNoImageSkipCount() const {
@@ -349,14 +360,349 @@ extern "C" void setEngineJavaObject(jobject obj) {
     }
 }
 
-// 设备初始化上报：向授权服务 POST /api/device/register。
-// 调用方决定是否放到后台线程执行。
-void reportDeviceToLicenseServer(const std::string& baseUrl, int64_t expiry, int64_t start) {
+#ifdef __ANDROID__
+bool postDeviceReportAcrossAndroidNetworks(const std::string& url,
+                                           const std::string& body,
+                                           int timeoutSeconds,
+                                           std::string* response) {
+  if (!response || !g_jvm || !g_engine_java_object) return false;
+
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  const jint envResult = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  if (envResult == JNI_EDETACHED) {
+    if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+      LOG_WARN("[Step 4.9] 无法附加 JVM 线程，回退普通 HTTP");
+      return false;
+    }
+    attached = true;
+  } else if (envResult != JNI_OK || !env) {
+    LOG_WARN("[Step 4.9] 无法获取 JNIEnv，回退普通 HTTP");
+    return false;
+  }
+
+  bool invoked = false;
+  jclass engineClass = env->GetObjectClass(g_engine_java_object);
+  jmethodID method = engineClass
+      ? env->GetMethodID(engineClass, "postDeviceReportAcrossNetworks",
+                         "(Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;")
+      : nullptr;
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    method = nullptr;
+  }
+
+  if (method) {
+    jstring jUrl = env->NewStringUTF(url.c_str());
+    jstring jBody = env->NewStringUTF(body.c_str());
+    jobject result = env->CallObjectMethod(
+        g_engine_java_object, method, jUrl, jBody,
+        static_cast<jint>(std::max(1, timeoutSeconds) * 1000));
+    env->DeleteLocalRef(jUrl);
+    env->DeleteLocalRef(jBody);
+    if (env->ExceptionCheck()) {
+      env->ExceptionDescribe();
+      env->ExceptionClear();
+      LOG_WARN("[Step 4.9] Java 双网络上报抛出异常，回退普通 HTTP");
+    } else if (result) {
+      invoked = true;
+      jstring resultString = static_cast<jstring>(result);
+      const char* chars = env->GetStringUTFChars(resultString, nullptr);
+      if (chars) {
+        *response = chars;
+        env->ReleaseStringUTFChars(resultString, chars);
+      }
+      env->DeleteLocalRef(result);
+    }
+  }
+
+  if (engineClass) env->DeleteLocalRef(engineClass);
+  if (attached) g_jvm->DetachCurrentThread();
+  return invoked;
+}
+#endif
+
+bool isDeviceReportResponseSuccessful(const std::string& response) {
+  if (response.empty()) return false;
+  Json::Value root;
+  return JsonUtils::parseJson(response, root) && root.isObject() &&
+         root.isMember("code") && root["code"].asInt() == 0;
+}
+
+// Terminal admission carries the exact rights from the signed server.lic.
+enum class OnlineVodAdmissionStatus {
+  AUTHORIZED,
+  RETRYABLE_FAILURE,
+  DENIED,
+};
+
+struct OnlineVodAdmissionResult {
+  OnlineVodAdmissionStatus status = OnlineVodAdmissionStatus::RETRYABLE_FAILURE;
+  Json::Value data;
+  std::string error;
+};
+
+// Persist only routing/mode fields, preserving unrelated device settings.
+// FileUtils uses a same-directory temporary file and atomic rename.
+bool applyServerOnlineVodMode(SystemConfig& config, const std::string& path,
+                             const std::string& host, const Json::Value& admission) {
+  if (!requestsOnlineVodSwitch(admission)) return false;
+  if (config.isNetworkVodEnabled() && config.getOnlineVodHost() == host) return true;
+  if (FileUtils::isFile(path)) {
+    Json::Value local, updated;
+    if (!JsonUtils::parseJson(FileUtils::readTextFile(path), local) ||
+        !prepareOnlineVodConfig(local, host, admission, updated) ||
+        !FileUtils::writeTextFile(path, JsonUtils::toFormattedString(updated, 2))) {
+      LOG_WARN("[OnlineVod] Auto-switch config save failed; retaining current mode");
+      return false;
+    }
+  }
+  // On first boot the normal default-config creation below saves these values.
+  config.setOnlineVodHost(host);
+  config.setOnlineVodRoomId("current");
+  config.setVodMode(2);
+  LOG_INFO("[OnlineVod] Server requested online VOD; selected server=%s", host.c_str());
+  return true;
+}
+
+bool disableUnavailableOnlineVod(SystemConfig& config, const std::string& path) {
+  if (!config.isNetworkVodEnabled()) return false;
+  if (FileUtils::isFile(path)) {
+    Json::Value local, updated;
+    if (!JsonUtils::parseJson(FileUtils::readTextFile(path), local) ||
+        !prepareOfflineVodConfig(local, updated) ||
+        !FileUtils::writeTextFile(path, JsonUtils::toFormattedString(updated, 2))) {
+      LOG_WARN("[OnlineVod] Offline fallback config save failed; retaining current mode");
+      return false;
+    }
+  }
+  config.setVodMode(0);
+  LOG_WARN("[OnlineVod] Server unavailable after 3 admission rounds; VOD disabled, continuing discovery");
+  return true;
+}
+
+std::string onlineVodServerBaseUrl(const SystemConfig& config, const std::string& serverHost = "") {
+  std::string host = serverHost.empty() ? config.getOnlineVodHost() : serverHost;
+  while (!host.empty() &&
+         (host.back() == '/' || std::isspace(static_cast<unsigned char>(host.back())))) {
+    host.pop_back();
+  }
+  if (host.empty()) {
+    return {};
+  }
+  std::string baseUrl = (host.compare(0, 7, "http://") == 0 || host.compare(0, 8, "https://") == 0) ? host : "http://" + host;
+  const size_t schemeEnd = baseUrl.find("://");
+  const size_t authorityStart = schemeEnd == std::string::npos ? 0 : schemeEnd + 3;
+  if (baseUrl.find(':', authorityStart) == std::string::npos) {
+    baseUrl += ":" + std::to_string(config.getOnlineVodPort());
+  }
+  return baseUrl;
+}
+
+bool loadServerStartupConfig(std::unique_ptr<SystemConfig>& config, const std::string& path) {
+  if (!config->isNetworkVodEnabled()) {
+    LOG_INFO("[StartupConfig] Online VOD disabled; using local config");
+    return false;
+  }
+  const auto baseUrl = onlineVodServerBaseUrl(*config);
+  if (baseUrl.empty()) return false;
+  // Validate with the real config loader before atomically replacing config.json.
+  struct StagingFile {
+    std::string path;
+    ~StagingFile() { std::remove(path.c_str()); }
+  } staging{path + ".server-startup"};
+  try {
+    int status = 0;
+    std::string response;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      response = httpGet(baseUrl + "/api/v1/terminals/startup-config", 3, "", &status);
+      if (status > 0 && status < 500) break;
+      if (attempt < 2) std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    Json::Value envelope, local(Json::objectValue), merged;
+    if (status != 200 || response.size() > 4 * 1024 * 1024 ||
+        !JsonUtils::parseJson(response, envelope) || !envelope.isObject() ||
+        !envelope["code"].isInt() || envelope["code"].asInt() != 0) {
+      LOG_WARN("[StartupConfig] Server unavailable or invalid response (HTTP %d); keeping local config", status);
+      return false;
+    }
+    if (envelope["data"].isNull()) {
+      LOG_INFO("[StartupConfig] No server profile; keeping local config");
+      return false;
+    }
+    const auto& data = envelope["data"];
+    if (!data.isObject() || !data["mode"].isString() ||
+        (data["mode"].asString() != "template" && data["mode"].asString() != "custom") ||
+        (FileUtils::isFile(path) && !JsonUtils::parseJson(FileUtils::readTextFile(path), local)) ||
+        !prepareStartupConfig(data["config"], local, merged)) {
+      LOG_WARN("[StartupConfig] Invalid profile; keeping local config");
+      return false;
+    }
+    SystemConfig::retainOnlyConfigJsonKeys(merged);
+    const std::string content = JsonUtils::toString(merged);
+    auto candidate = std::make_unique<SystemConfig>();
+    if (!FileUtils::writeTextFile(staging.path, content) || !candidate->load(staging.path) ||
+        !FileUtils::writeTextFile(path, content)) {
+      LOG_WARN("[StartupConfig] Profile validation or save failed; keeping local config");
+      return false;
+    }
+    config = std::move(candidate);
+    LOG_INFO("[StartupConfig] Applied %s profile before layer initialization", data["mode"].asCString());
+    return true;
+  } catch (const std::exception& error) {
+    LOG_WARN("[StartupConfig] Invalid profile: %s; keeping local config", error.what());
+    return false;
+  }
+}
+
+OnlineVodAdmissionResult requestOnlineVodAdmission(const SystemConfig& config, const std::string& serverHost = "") {
+  OnlineVodAdmissionResult result;
+  try {
+  const std::string baseUrl = onlineVodServerBaseUrl(config, serverHost);
+  if (baseUrl.empty()) {
+    result.error = "onlineVodHost is empty";
+    return result;
+  }
+
+  const std::string ethernetMac = SystemUtils::getMacAddress();
+  if (ethernetMac.empty()) {
+    result.error = "Ethernet MAC is not available yet";
+    return result;
+  }
+  const std::string serial = SystemUtils::getRegistrationSerial();
+  if (serial.empty()) {
+    result.error = "Valid hardware serial is not available yet";
+    return result;
+  }
+
+  Json::Value request;
+  request["protocolVersion"] = "2.0";
+  request["deviceRole"] = "player";
+  request["appId"] = "com.hsvj.engine";
+  request["deviceName"] = SystemUtils::getDeviceName();
+  request["macAddress"] = ethernetMac;
+  request["serial"] = serial;
+  request["model"] = SystemUtils::getHardwareModel();
+  request["softwareVersion"] = HSVJ_VERSION;
+  request["httpPort"] = 8080;
+
+  const std::string admissionUrl = baseUrl + "/api/v1/terminals/admission";
+  LOG_INFO("[License] Online VOD admission POST %s", admissionUrl.c_str());
+  int httpStatus = 0;
+  const std::string response = httpPostJson(
+      admissionUrl, [&request](const std::string& localIp) {
+        const Json::Value network = SystemUtils::getNetworkReport(localIp);
+        if (!network.isObject()) return std::string();
+        request["network"] = network;
+        return JsonUtils::toString(request);
+      }, 3, "", &httpStatus);
+  if (response.empty()) {
+    result.error = httpStatus > 0
+                       ? ("empty server response (HTTP " + std::to_string(httpStatus) + ")")
+                       : "server did not respond";
+    LOG_WARN("[License] Online VOD admission empty response: HTTP %d", httpStatus);
+    return result;
+  }
+  LOG_INFO("[License] Online VOD admission response HTTP %d body=%zu", httpStatus, response.size());
+  LOG_INFO("[License] Online VOD admission response body: %.512s", response.c_str());
+  Json::Value root;
+  std::string parseError;
+  if (!JsonUtils::parseJson(response, root, parseError) || !root.isObject()) {
+    result.error = "invalid server response: " + parseError;
+    LOG_WARN("[License] Online VOD admission response: %.512s", response.c_str());
+    return result;
+  }
+  const int responseCode = root["code"].isInt() ? root["code"].asInt() : -1;
+  if (responseCode != 0) {
+    result.error = root.get("message", "server denied terminal admission").asString();
+    const Json::Value& denial = root["data"];
+    if (denial.isObject() && denial.isMember("remainingPoints") &&
+        denial["remainingPoints"].isIntegral()) {
+      result.error += " (remaining points: " +
+                       std::to_string(denial["remainingPoints"].asInt()) +
+                       ", registered: " +
+                       std::to_string(denial.get("registeredTerminals", 0).asInt()) +
+                       "/" +
+                       std::to_string(denial.get("terminalLimit", 0).asInt()) + ")";
+    }
+    result.status = responseCode >= 500 || responseCode < 0
+                        ? OnlineVodAdmissionStatus::RETRYABLE_FAILURE
+                        : OnlineVodAdmissionStatus::DENIED;
+    return result;
+  }
+  const Json::Value& data = root["data"];
+  if (!data.isObject()) {
+    result.error = "server admission response is incomplete";
+    return result;
+  }
+  if (!data["authorized"].isBool() || !data["authorized"].asBool()) {
+    result.status = OnlineVodAdmissionStatus::DENIED;
+    result.error = data.get("message", "server denied terminal admission").asString();
+    if (result.error.empty()) result.error = "server denied terminal admission";
+    return result;
+  }
+  if (!data["contractVersion"].isInt() || data["contractVersion"].asInt() != 2 ||
+      !data["license"].isObject()) {
+    result.status = OnlineVodAdmissionStatus::DENIED;
+    result.error = "服务器未返回新版授权范围，请升级服务器并重新签发 server.lic";
+    return result;
+  }
+  result.data = data;
+  result.status = OnlineVodAdmissionStatus::AUTHORIZED;
+  return result;
+  } catch (const std::exception& error) {
+    result.status = OnlineVodAdmissionStatus::RETRYABLE_FAILURE;
+    result.error = std::string("invalid server admission response: ") + error.what();
+    return result;
+  }
+}
+
+bool reportDeviceToLicenseServer(const std::string& baseUrl,
+                                 int64_t expiry,
+                                 int64_t start,
+                                 const std::vector<std::string>& modules,
+                                 const std::vector<int>& enabledLayers,
+                                 int inputChannelCount,
+                                 const std::string& usageMode,
+                                 const std::string& licenseSource,
+                                 const std::string& licenseContent) {
+  int64_t reportedExpiry = expiry;
+  int64_t reportedStart = start;
+  auto reportedModules = modules;
+  auto reportedLayers = enabledLayers;
+  int reportedInputChannelCount = inputChannelCount;
+  std::string reportedUsageMode = usageMode;
+  std::string reportedLicenseSource = licenseSource;
+  if (!licenseContent.empty()) {
+    const std::string licenseJson = licenseContent.front() == '{'
+        ? licenseContent : licenseBase64Decode(licenseContent);
+    Json::Value licenseRoot;
+    std::string parseError;
+    if (JsonUtils::parseJson(licenseJson, licenseRoot, parseError)) {
+      const auto& validity = licenseRoot["validity"];
+      const auto& license = licenseRoot["license"];
+      reportedStart = validity.get("issue_time", 0).asInt64();
+      reportedExpiry = validity.get("expiry_time", 0).asInt64();
+      reportedModules.clear();
+      for (const auto& module : license["modules"]) {
+        if (module.isString()) reportedModules.push_back(module.asString());
+      }
+      reportedLayers.clear();
+      for (const auto& layer : license["enabled_layers"]) {
+        if (layer.isInt()) reportedLayers.push_back(layer.asInt());
+      }
+      reportedInputChannelCount = license.get("input_channel_count", 0).asInt();
+      reportedUsageMode = license.get("usage_mode", "").asString();
+      reportedLicenseSource = "local";
+    } else {
+      LOG_WARN("[Step 4.9] 本地授权文件无法解析，使用授权管理器快照: %s", parseError.c_str());
+    }
+  }
   std::string trimmedBaseUrl = baseUrl;
   while (!trimmedBaseUrl.empty() && (trimmedBaseUrl.back() == '/' || trimmedBaseUrl.back() == ' ')) trimmedBaseUrl.pop_back();
   if (trimmedBaseUrl.empty()) {
     LOG_WARN("[Step 4.9] 跳过设备上报：license server url 为空");
-    return;
+    return false;
   }
 
   // 必须确保以 http:// 开头，HttpClient 才能识别
@@ -370,7 +716,7 @@ void reportDeviceToLicenseServer(const std::string& baseUrl, int64_t expiry, int
       std::chrono::system_clock::now().time_since_epoch()).count());
   std::string fingerprint = SystemUtils::generateDeviceFingerprint();
   Json::Value root;
-  root["version"] = 1;
+  root["version"] = 2;
   root["export_time"] = static_cast<Json::Int64>(now);
   Json::Value device;
   device["model"] = SystemUtils::getHardwareModel();
@@ -379,17 +725,39 @@ void reportDeviceToLicenseServer(const std::string& baseUrl, int64_t expiry, int
   device["storage_serial"] = SystemUtils::getStorageSerial();
   device["mac"] = SystemUtils::getMacAddress();
   device["fingerprint"] = fingerprint;
-  if (expiry > 0) device["license_expiry"] = static_cast<Json::Int64>(expiry);
-  if (start > 0) device["license_start"] = static_cast<Json::Int64>(start);
+  if (reportedExpiry > 0) device["license_expiry"] = static_cast<Json::Int64>(reportedExpiry);
+  if (reportedStart > 0) device["license_start"] = static_cast<Json::Int64>(reportedStart);
+  Json::Value moduleArray(Json::arrayValue);
+  for (const auto& module : reportedModules) moduleArray.append(module);
+  device["license_modules"] = moduleArray;
+  Json::Value layerArray(Json::arrayValue);
+  for (const int layerId : reportedLayers) layerArray.append(layerId);
+  device["license_enabled_layers"] = layerArray;
+  if (reportedInputChannelCount > 0) {
+    device["license_input_channel_count"] = reportedInputChannelCount;
+  }
+  if (!reportedUsageMode.empty()) device["license_usage_mode"] = reportedUsageMode;
+  if (!reportedLicenseSource.empty()) device["license_source"] = reportedLicenseSource;
+  if (!licenseContent.empty()) device["license_content"] = licenseContent;
   root["device"] = device;
   std::string body = JsonUtils::toString(root);
-  LOG_INFO("[Step 4.9] 开始设备上报: expiry=%lld start=%lld bodyBytes=%zu",
-           (long long)expiry, (long long)start, body.size());
-  std::string out = hsvj::httpPostJson(url, body, 15);
-  if (!out.empty() && out.find("\"code\":0") != std::string::npos) {
+  LOG_INFO("[Step 4.9] 开始设备上报: expiry=%lld start=%lld modules=%zu layers=%zu source=%s bodyBytes=%zu",
+           (long long)reportedExpiry, (long long)reportedStart, reportedModules.size(), reportedLayers.size(),
+           reportedLicenseSource.empty() ? "unknown" : reportedLicenseSource.c_str(), body.size());
+  std::string out;
+  bool usedBoundAndroidNetworks = false;
+#ifdef __ANDROID__
+  usedBoundAndroidNetworks = postDeviceReportAcrossAndroidNetworks(url, body, 15, &out);
+#endif
+  if (!usedBoundAndroidNetworks) {
+    out = hsvj::httpPostJson(url, body, 15);
+  }
+  if (isDeviceReportResponseSuccessful(out)) {
     LOG_INFO("[Step 4.9] 设备上报成功");
+    return true;
   } else {
     LOG_WARN("[Step 4.9] 设备上报失败或未响应: %s", out.empty() ? "(无输出)" : out.substr(0, 120).c_str());
+    return false;
   }
 }
 
@@ -437,48 +805,46 @@ std::string readDebugHotspotValueFromStatusFile(const std::string& key) {
 }
 
 constexpr const char* kDebugHotspotSsid = "HVIDEO";
+constexpr const char* kDebugHotspotPassphrase = "88888888";
+
+struct StartupNetworkInfo {
+  bool debugHotspotMode = false;
+  std::string hotspotIp;
+  std::string ethernetIp;
+  std::string wifiIp;
+
+  std::string mobileAccessIp() const {
+    if (debugHotspotMode) return hotspotIp;
+    if (!ethernetIp.empty()) return ethernetIp;
+    return wifiIp;
+  }
+};
 
 bool isLikelyDebugHotspotInterface(const std::string& name) {
-  return name == "wlan0" || startsWith(name, "softap") ||
-         startsWith(name, "ap") || name.find("wlan") != std::string::npos;
+  // wlan*/wifi* are also used by the normal STA connection.  Treating every
+  // wireless interface as a hotspot makes a stale ready status reuse the local
+  // address after the boot provisioning window has ended.  The boot mode is
+  // handled separately by isDebugHotspotModeActive(), so only AP-specific
+  // interface names are accepted here.
+  return startsWith(name, "softap") || startsWith(name, "ap") ||
+         startsWith(name, "swlan") || startsWith(name, "ap_br") ||
+         startsWith(name, "bridge");
 }
 
-bool isIpAssignedToDebugHotspotInterface(const std::string& ip) {
-  if (ip.empty()) {
-    return false;
+bool isInterfaceCarrierUp(const std::string& name) {
+  std::ifstream carrier("/sys/class/net/" + name + "/carrier");
+  std::string value;
+  if (!carrier.is_open() || !std::getline(carrier, value)) {
+    return true;
+  }
+  return trimCopy(value) == "1";
+}
+
+std::string getInterfaceIp(const std::string& interfaceName, bool requireCarrier = false) {
+  if (requireCarrier && !isInterfaceCarrierUp(interfaceName)) {
+    return "";
   }
 
-  Json::Value interfaces = SystemUtils::getNetworkInterfaces();
-  for (const auto& iface : interfaces) {
-    if (!iface.isMember("name") || !iface.isMember("ip")) {
-      continue;
-    }
-    if (iface["ip"].asString() != ip) {
-      continue;
-    }
-    std::string name = iface["name"].asString();
-    if (isLikelyDebugHotspotInterface(name)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-std::string getDebugHotspotSsid() {
-  return kDebugHotspotSsid;
-}
-
-std::string getDebugHotspotIp() {
-  std::string state = readDebugHotspotValueFromStatusFile("state");
-  std::string ip = readDebugHotspotValueFromStatusFile("ip");
-  if (state == "ready" && isIpAssignedToDebugHotspotInterface(ip)) {
-    return ip;
-  }
-
-  return "";
-}
-
-std::string getInterfaceIp(const std::string& interfaceName) {
   Json::Value interfaces = SystemUtils::getNetworkInterfaces();
   for (const auto& iface : interfaces) {
     if (!iface.isMember("name") || !iface.isMember("ip")) {
@@ -491,25 +857,128 @@ std::string getInterfaceIp(const std::string& interfaceName) {
   return "";
 }
 
-std::string getStartupMobileAccessIp() {
-  std::string ip = getDebugHotspotIp();
-  if (!ip.empty()) {
+std::string getFirstInterfaceIp(const std::vector<std::string>& preferredNames,
+                                bool requireCarrier = false) {
+  for (const std::string& name : preferredNames) {
+    std::string ip = getInterfaceIp(name, requireCarrier);
+    if (!ip.empty()) return ip;
+  }
+  return "";
+}
+
+std::string getFirstDebugHotspotInterfaceIp() {
+  const Json::Value interfaces = SystemUtils::getNetworkInterfaces();
+  for (const auto& iface : interfaces) {
+    if (!iface.isMember("name") || !iface.isMember("ip")) continue;
+    const std::string name = iface["name"].asString();
+    const std::string ip = iface["ip"].asString();
+    if (isLikelyDebugHotspotInterface(name) && !ip.empty()) return ip;
+  }
+  return "";
+}
+
+bool isIpAssignedToDebugHotspotInterface(const std::string& ip) {
+  if (ip.empty()) return false;
+
+  Json::Value interfaces = SystemUtils::getNetworkInterfaces();
+  for (const auto& iface : interfaces) {
+    if (!iface.isMember("name") || !iface.isMember("ip")) continue;
+    if (iface["ip"].asString() != ip) continue;
+    if (isLikelyDebugHotspotInterface(iface["name"].asString())) return true;
+  }
+  return false;
+}
+
+std::string getDebugHotspotSsid() {
+  return kDebugHotspotSsid;
+}
+
+std::string getDebugHotspotIp() {
+  const std::string state = readDebugHotspotValueFromStatusFile("state");
+  const std::string ip = readDebugHotspotValueFromStatusFile("ip");
+  if (state == "ready" && isIpAssignedToDebugHotspotInterface(ip)) {
     return ip;
   }
+  return "";
+}
 
-  ip = getInterfaceIp("wlan0");
-  if (!ip.empty()) {
-    return ip;
+std::string readBootWifiMode() {
+#ifdef __ANDROID__
+  return trimCopy(FileUtils::executeCommand(
+      "getprop persist.hsvj.boot_wifi_mode 2>/dev/null"));
+#else
+  return "";
+#endif
+}
+
+bool isBootSoftApWindowActive() {
+  const std::string mode = readBootWifiMode();
+  // The boot Wi-Fi state machine exposes a short preparation state, the
+  // provisioning window, and a client-connected steady state.  All three
+  // mean that the debug hotspot is the active startup network.
+  return mode == "softap_preparing" || mode == "softap_window" ||
+         mode == "softap";
+}
+
+bool isDebugHotspotModeActive(SystemConfig* systemConfig) {
+  if (readDebugHotspotValueFromStatusFile("managed") == "system_settings") {
+    const std::string state = readDebugHotspotValueFromStatusFile("state");
+    return state == "ready" || state == "starting";
+  }
+  const std::string bootMode = readBootWifiMode();
+  // `sta` is the ROM's terminal decision when nobody joined the provisioning
+  // hotspot.  It must override a stale ready/starting status file from the
+  // previous boot, otherwise wlan0 can be reported as the hotspot forever.
+  if (bootMode == "sta") return false;
+  if (isBootSoftApWindowActive()) return true;
+
+  const std::string hotspotState = readDebugHotspotValueFromStatusFile("state");
+  if (hotspotState == "ready" && !getDebugHotspotIp().empty()) return true;
+
+  const bool configured = systemConfig && systemConfig->getStartupWirelessMode() == "hotspot";
+  if (!configured) return false;
+
+  return hotspotState.empty() || hotspotState == "starting" ||
+         hotspotState == "boot_window" ||
+         hotspotState == "pending_java";
+}
+
+StartupNetworkInfo getStartupNetworkInfo(SystemConfig* systemConfig) {
+  StartupNetworkInfo info;
+  info.debugHotspotMode = isDebugHotspotModeActive(systemConfig);
+  if (info.debugHotspotMode) {
+    info.hotspotIp = getDebugHotspotIp();
+    if (info.hotspotIp.empty()) {
+      info.hotspotIp = getFirstInterfaceIp(
+          {"softap0", "ap0", "swlan0", "wlan0", "wlan1"});
+    }
+    if (info.hotspotIp.empty()) {
+      info.hotspotIp = getFirstDebugHotspotInterfaceIp();
+    }
   }
 
-  return SystemUtils::getLocalIp();
+  info.ethernetIp = getFirstInterfaceIp({"eth0", "eth1"}, true);
+  if (info.ethernetIp.empty() && systemConfig &&
+      systemConfig->getNetworkIpMode() == "static" &&
+      !systemConfig->getNetworkStaticIp().empty() &&
+      isInterfaceCarrierUp("eth0")) {
+    info.ethernetIp = systemConfig->getNetworkStaticIp();
+  }
+
+  if (!info.debugHotspotMode) {
+    info.wifiIp = getFirstInterfaceIp({"wlan0", "wlan1", "wifi0", "wifi1"});
+  }
+  return info;
+}
+
+std::string getStartupMobileAccessIp(SystemConfig* systemConfig) {
+  return getStartupNetworkInfo(systemConfig).mobileAccessIp();
 }
 
 constexpr int kStartupQrVersion = 3;
 constexpr int kStartupQrSize = 21 + 4 * (kStartupQrVersion - 1);
 constexpr int kStartupQrDataCodewords = 44;
 constexpr int kStartupQrEccCodewords = 26;
-constexpr int kStartupQrImageSize = 360;
 using StartupQrGrid = std::array<std::array<bool, kStartupQrSize>, kStartupQrSize>;
 
 struct StartupQrMatrix {
@@ -525,10 +994,6 @@ struct StartupRegionHintLayout {
   int qrX = 0;
   int qrY = 0;
   int qrSize = 360;
-  int textX = 0;
-  int textY = 0;
-  int textWidth = 1920;
-  int textHeight = 1080;
 };
 
 void setStartupQrModule(StartupQrMatrix& qr, int x, int y, bool dark, bool isFunction) {
@@ -904,22 +1369,25 @@ std::vector<uint8_t> makeUncompressedZlibStream(const std::vector<uint8_t>& data
   return out;
 }
 
-bool writeStartupQrPng(const std::string& text, const std::string& path) {
+bool writeStartupQrPng(const std::string& text, const std::string& path,
+                       int imageSize) {
   StartupQrGrid grid{};
   if (!makeStartupQrMatrix(text, grid)) return false;
 
+  imageSize = std::clamp(imageSize, 64, 2048);
+
   const int quiet = 2;
   const int totalModules = kStartupQrSize + quiet * 2;
-  const int scale = std::max(1, kStartupQrImageSize / totalModules);
+  const int scale = std::max(1, imageSize / totalModules);
   const int imageModulesPx = totalModules * scale;
-  const int offset = std::max(0, (kStartupQrImageSize - imageModulesPx) / 2);
+  const int offset = std::max(0, (imageSize - imageModulesPx) / 2);
   constexpr uint8_t darkR = 0x11, darkG = 0x18, darkB = 0x27;
 
-  std::vector<uint8_t> scanlines(static_cast<size_t>((kStartupQrImageSize * 4 + 1) * kStartupQrImageSize), 0);
-  for (int y = 0; y < kStartupQrImageSize; ++y) {
-    const size_t row = static_cast<size_t>(y * (kStartupQrImageSize * 4 + 1));
+  std::vector<uint8_t> scanlines(static_cast<size_t>((imageSize * 4 + 1) * imageSize), 0);
+  for (int y = 0; y < imageSize; ++y) {
+    const size_t row = static_cast<size_t>(y * (imageSize * 4 + 1));
     scanlines[row] = 0;
-    for (int x = 0; x < kStartupQrImageSize; ++x) {
+    for (int x = 0; x < imageSize; ++x) {
       int moduleX = (x - offset) / scale - quiet;
       int moduleY = (y - offset) / scale - quiet;
       bool dark = false;
@@ -937,8 +1405,8 @@ bool writeStartupQrPng(const std::string& text, const std::string& path) {
 
   std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
   std::vector<uint8_t> ihdr;
-  appendU32Be(ihdr, kStartupQrImageSize);
-  appendU32Be(ihdr, kStartupQrImageSize);
+  appendU32Be(ihdr, static_cast<uint32_t>(imageSize));
+  appendU32Be(ihdr, static_cast<uint32_t>(imageSize));
   ihdr.push_back(8);
   ihdr.push_back(6);
   ihdr.push_back(0);
@@ -955,8 +1423,8 @@ bool writeStartupQrPng(const std::string& text, const std::string& path) {
   return out.good();
 }
 
-std::string getStartupFusionDebugUrl() {
-  std::string ip = getStartupMobileAccessIp();
+std::string getStartupFusionDebugUrl(SystemConfig* systemConfig) {
+  std::string ip = getStartupMobileAccessIp(systemConfig);
   if (ip.empty()) {
     return "";
   }
@@ -971,14 +1439,29 @@ StartupRegionHintLayout resolveStartupRegionHintLayout(SystemConfig* systemConfi
   if (systemConfig) {
     res = systemConfig->getResolution();
   }
-  const int canvasW = res.width > 0 ? res.width : 1920;
-  const int canvasH = res.height > 0 ? res.height : 1080;
+  const int configuredCanvasW = systemConfig && systemConfig->getInputWidth() > 0
+                                    ? systemConfig->getInputWidth()
+                                    : res.width;
+  const int configuredCanvasH = systemConfig && systemConfig->getInputHeight() > 0
+                                    ? systemConfig->getInputHeight()
+                                    : res.height;
+  const int canvasW = configuredCanvasW > 0 ? configuredCanvasW : 1920;
+  const int canvasH = configuredCanvasH > 0 ? configuredCanvasH : 1080;
   const int inputCols = systemConfig ? std::max(1, systemConfig->getInputLayoutCols()) : 1;
   const int inputRows = systemConfig ? std::max(1, systemConfig->getInputLayoutRows()) : 1;
+  const int derivedRegionW = std::max(1, canvasW / inputCols);
+  const int derivedRegionH = std::max(1, canvasH / inputRows);
   int regionW = systemConfig ? systemConfig->getRegionWidth() : 0;
   int regionH = systemConfig ? systemConfig->getRegionHeight() : 0;
-  if (regionW <= 0) regionW = std::max(1, canvasW / inputCols);
-  if (regionH <= 0) regionH = std::max(1, canvasH / inputRows);
+  // Older matrix files sometimes stored the complete canvas in tileInWidth/
+  // tileInHeight. A startup QR must use one input tile, otherwise the region
+  // mapper stretches the QR texture with the full-canvas aspect ratio.
+  if (regionW <= 0 || (inputCols > 1 && regionW >= canvasW)) {
+    regionW = derivedRegionW;
+  }
+  if (regionH <= 0 || (inputRows > 1 && regionH >= canvasH)) {
+    regionH = derivedRegionH;
+  }
 
   layout.x = 0;
   layout.y = 0;
@@ -987,20 +1470,14 @@ StartupRegionHintLayout resolveStartupRegionHintLayout(SystemConfig* systemConfi
 
   const int shortSide = std::min(layout.width, layout.height);
   const int margin = std::clamp(shortSide / 16, 18, 64);
-  const int maxQrByRegion = std::max(96, std::min(layout.width, layout.height) - margin * 2);
-  const int qrUpper = std::max(72, std::min(180, maxQrByRegion));
+  const int maxQrByRegion = std::max(1, shortSide - margin * 2);
+  const int qrUpper = std::max(1, std::min(180, maxQrByRegion));
   const int qrLower = std::min(90, qrUpper);
   layout.qrSize = std::clamp(shortSide / 6, qrLower, qrUpper);
 
-  layout.textX = layout.x + margin;
-  layout.textY = layout.y + margin;
-  layout.textWidth = layout.width - margin * 2;
-  layout.textHeight = layout.height - margin * 2;
   layout.qrX = layout.x + layout.width - margin - layout.qrSize;
   layout.qrY = layout.y + layout.height - margin - layout.qrSize;
 
-  layout.textWidth = std::max(1, layout.textWidth);
-  layout.textHeight = std::max(1, layout.textHeight);
   layout.qrX = std::clamp(layout.qrX, layout.x,
                           layout.x + std::max(0, layout.width - layout.qrSize));
   layout.qrY = std::clamp(layout.qrY, layout.y,
@@ -1025,12 +1502,43 @@ void Engine::triggerStartupDeviceReport() {
     LOG_INFO("[Step 4.9] 触发设备初始化上报（异步）");
     int64_t expiry = licenseManager_->getExpiryTime();
     int64_t start = licenseManager_->getStartTime();
+    auto modules = licenseManager_->getModules();
+    auto enabledLayers = licenseManager_->getEnabledLayerIds();
+    int inputChannelCount = licenseManager_->getInputChannelCount();
+    std::string usageMode = licenseManager_->getUsageMode();
+    std::string licenseSource = licenseManager_->getLicenseSource();
+    std::string licenseContent = licenseManager_->getLocalLicenseContent();
+    const bool hasLocalLicense =
+        (!systemConfig_ || !systemConfig_->isNetworkVodEnabled()) &&
+        licenseManager_->hasValidLocalLicense();
+    if (hasLocalLicense) {
+      licenseManager_->syncLocalLicenseToCloud(licenseContent);
+      LOG_INFO("[Step 4.9] 有效本地授权已加入后台云端同步队列");
+      return;
+    }
+    licenseContent.clear();
+    const uint64_t reportGeneration = localLicenseSyncGeneration_.load(std::memory_order_acquire);
     LOG_INFO("[Step 4.9] 上报参数: expiry=%lld start=%lld",
              (long long)expiry, (long long)start);
-    trackEngineAsyncTask(std::async(std::launch::async, [this, licenseServerUrl, expiry, start]() {
-      std::this_thread::sleep_for(std::chrono::seconds(2));
+    trackEngineAsyncTask(std::async(std::launch::async, [this, licenseServerUrl, expiry, start,
+                                                          modules = std::move(modules),
+                                                          enabledLayers = std::move(enabledLayers),
+                                                          inputChannelCount, usageMode = std::move(usageMode),
+                                                          licenseSource = std::move(licenseSource),
+                                                          licenseContent = std::move(licenseContent),
+                                                          reportGeneration, hasLocalLicense]() {
       if (shuttingDown_.load()) return;
-      reportDeviceToLicenseServer(licenseServerUrl, expiry, start);
+      std::lock_guard<std::mutex> reportLock(licenseReportMutex_);
+      if (!licenseManager_ ||
+          localLicenseSyncGeneration_.load(std::memory_order_acquire) != reportGeneration ||
+          (hasLocalLicense && licenseManager_->getLocalLicenseContent() != licenseContent)) {
+        LOG_INFO("[Step 4.9] 启动授权上报已过期，跳过旧授权快照");
+        return;
+      }
+      const bool reported = reportDeviceToLicenseServer(licenseServerUrl, expiry, start, modules, enabledLayers,
+                                                        inputChannelCount, usageMode, licenseSource, licenseContent);
+      if (localLicenseSyncGeneration_.load(std::memory_order_acquire) != reportGeneration) return;
+      if (reported && !shuttingDown_.load() && licenseManager_) licenseManager_->triggerCloudSync();
     }));
   } else {
     LOG_WARN("[Step 4.9] 跳过设备上报：licenseManager_ 为空");
@@ -1059,6 +1567,8 @@ void Engine::initializeNetworkServices() {
       if (NetworkManager::getInstance().getMobileHttpServer()) {
           std::string mobileWebDir = webDir + "mobile/";
           NetworkManager::getInstance().getMobileHttpServer()->setStaticDir(mobileWebDir);
+          // 设置共享目录，使 mobile/ 可以访问父目录的 modules/、shared/ 等资源
+          NetworkManager::getInstance().getMobileHttpServer()->setSharedStaticDir(webDir + "shared/");
       }
       if (NetworkManager::getInstance().getVodHttpServer()) {
           NetworkManager::getInstance().getVodHttpServer()->setStaticDir(hsvj::VOD_WEB_DIR);
@@ -1069,6 +1579,7 @@ void Engine::initializeNetworkServices() {
       LOG_INFO("  HttpServer(9898) 点歌 /ktv、/vod");
       LOG_INFO("  TcpServer(9000)");
       LOG_INFO("  UdpServer(8000)");
+      LOG_INFO("  SyncUdpGroup(4322)");
       LOG_INFO("  WebSocketServer(%d)", NetworkManager::getInstance().getWebSocketPort());
   } catch (const std::exception &e) {
       LOG_WARN("  网络模块初始化异常：%s", e.what());
@@ -1088,6 +1599,7 @@ void Engine::startNetworkServices() {
       LOG_INFO("  HTTP :9898 点歌 /ktv、/vod");
       LOG_INFO("  TCP  :9000");
       LOG_INFO("  UDP  :8000");
+      LOG_INFO("  SYNC :4322 (UDP multicast, when enabled)");
       LOG_INFO("  WebSocket :%d", NetworkManager::getInstance().getWebSocketPort());
   } catch (const std::exception &e) {
       LOG_WARN("  网络启动异常：%s", e.what());
@@ -1268,16 +1780,183 @@ bool Engine::initializeStep1Environment(const std::chrono::steady_clock::time_po
   createRequiredDirectories();
   populateDefaultCommandListFiles();
   LOG_INFO("  必要目录检查完成");
+  try {
+    Rk628Edid(CONFIG_DIR).restoreSaved();
+  } catch (const std::exception& error) {
+    LOG_WARN("[RK628] Saved EDID restore failed: %s", error.what());
+  }
   sendProgress(0, 1, "创建目录结构...", 10);
 
   // Step 1.2.1: 更新 apiConfig.js 中的 IP 地址
   updateApiConfigIp();
 
+  systemConfig_ = std::make_unique<SystemConfig>();
+  const std::string configPath = CONFIG_PATH;
+  bool configLoaded = false;
+  if (FileUtils::isFile(configPath)) {
+    if (!systemConfig_->load(configPath)) {
+      LOG_ERROR("  config.json load failed before license selection");
+      return false;
+    }
+    configLoaded = true;
+  }
+
   // Step 1.3: 授权检查并构建内存授权图层池
   LOG_INFO("[Step 1.3] 授权检查");
   licenseManager_ = std::make_unique<LicenseManager>();
+  licenseManager_->setCloudLicenseAppliedCallback([this]() {
+    if (!shuttingDown_.load(std::memory_order_acquire)) refreshLicenseLayers();
+  });
   licenseManager_->initialize(LICENSE_DIR);
-  licenseManager_->checkLicense();
+  licenseManager_->setLocalLicenseSyncCallback([this](const std::string& content) {
+    const uint64_t generation = localLicenseSyncGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    trackEngineAsyncTask(std::async(std::launch::async, [this, content, generation]() {
+      for (;;) {
+        if (shuttingDown_.load(std::memory_order_acquire) ||
+            localLicenseSyncGeneration_.load(std::memory_order_acquire) != generation ||
+            !licenseManager_) return;
+        bool reported = false;
+        {
+          std::lock_guard<std::mutex> reportLock(licenseReportMutex_);
+          if (localLicenseSyncGeneration_.load(std::memory_order_acquire) != generation) return;
+          licenseManager_->stopCloudSync();
+          std::string serverUrl = systemConfig_ ? systemConfig_->getLicenseServerUrl() : "";
+          if (serverUrl.empty()) {
+            serverUrl = "http://" + std::string(LicenseManager::DEFAULT_CLOUD_HOST) + ":" +
+                        std::to_string(LicenseManager::DEFAULT_CLOUD_PORT);
+          }
+          reported = reportDeviceToLicenseServer(serverUrl, licenseManager_->getExpiryTime(),
+              licenseManager_->getStartTime(), licenseManager_->getModules(),
+              licenseManager_->getEnabledLayerIds(), licenseManager_->getInputChannelCount(),
+              licenseManager_->getUsageMode(), "local", content);
+          if (localLicenseSyncGeneration_.load(std::memory_order_acquire) != generation) return;
+          licenseManager_->completeLocalLicenseSync(reported);
+        }
+        if (reported) return;
+        licenseManager_->setLastImportCloudSyncStatus(0);
+        LOG_WARN("[License] 本地授权云端同步未成功，30 秒后重试");
+        for (int second = 0; second < 30; ++second) {
+          if (shuttingDown_.load(std::memory_order_acquire) ||
+              localLicenseSyncGeneration_.load(std::memory_order_acquire) != generation) return;
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+      }
+    }));
+  });
+  // Network VOD mode uses the VOD server admission path exclusively. When it
+  // is off, the normal local/cloud player authorization path is enabled.
+  licenseManager_->checkLicense(!systemConfig_->isNetworkVodEnabled());
+  LOG_INFO("[License] Selected authorization mode: %s", systemConfig_->isNetworkVodEnabled() ? "VOD server" : "cloud with local fallback");
+  onlineVodAdmissionAuthorized_.store(false, std::memory_order_release);
+  auto serverHosts = DeviceDiscoveryService::getInstance().probeOnlineVodServers();
+  const auto configuredHost = systemConfig_->getOnlineVodHost();
+  serverHosts.erase(std::remove(serverHosts.begin(), serverHosts.end(), configuredHost), serverHosts.end());
+  if (!configuredHost.empty()) serverHosts.insert(serverHosts.begin(), configuredHost);
+  for (const auto& host : serverHosts) {
+    const auto admission = requestOnlineVodAdmission(*systemConfig_, host);
+    if (host != configuredHost && !requestsOnlineVodSwitch(admission.data)) continue;
+    if (admission.status == OnlineVodAdmissionStatus::AUTHORIZED) {
+      if (requestsOnlineVodSwitch(admission.data) &&
+          !applyServerOnlineVodMode(*systemConfig_, configPath, host, admission.data)) continue;
+      if (!systemConfig_->isNetworkVodEnabled()) continue;
+      if (!licenseManager_->authorizeServerLicense(admission.data)) continue;
+      onlineVodAdmissionAuthorized_.store(true, std::memory_order_release);
+      break;
+    } else {
+      LOG_WARN("[License] Server admission pending: %s", admission.error.c_str());
+    }
+  }
+  // Continue after initialization; apply responses on the render thread so
+  // permissions and the runtime layer pool change together, never mid-frame.
+  onlineVodAdmissionRetryThread_ = std::thread([this]() {
+    int ticks = 0;
+    OnlineVodConnectionHealth health;
+    while (!shuttingDown_.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      if (shuttingDown_.load(std::memory_order_acquire)) break;
+      const bool admitted = onlineVodAdmissionAuthorized_.load(std::memory_order_acquire);
+      if (++ticks < (admitted && health.failures() == 0 ? 120 : 20)) continue;
+      ticks = 0;
+      if (!initialized_.load()) continue;
+      if (!systemConfig_ || !licenseManager_) continue;
+      const auto expectedHost = systemConfig_->getOnlineVodHost();
+      const int expectedMode = systemConfig_->getVodMode();
+      auto hosts = DeviceDiscoveryService::getInstance().onlineVodServers();
+      hosts.erase(std::remove(hosts.begin(), hosts.end(), expectedHost), hosts.end());
+      if (!expectedHost.empty()) hosts.insert(hosts.begin(), expectedHost);
+      // Exhaust the candidates before counting a failed round. A dead saved
+      // address must not hide a reachable server discovered on another subnet.
+      std::string host = expectedHost;
+      OnlineVodAdmissionResult admission;
+      for (const auto& candidate : hosts) {
+        auto reply = requestOnlineVodAdmission(*systemConfig_, candidate);
+        if (candidate != expectedHost && !requestsOnlineVodSwitch(reply.data)) continue;
+        if (reply.status == OnlineVodAdmissionStatus::RETRYABLE_FAILURE) continue;
+        host = candidate;
+        admission = std::move(reply);
+        break;
+      }
+      const bool unavailable = admission.status == OnlineVodAdmissionStatus::RETRYABLE_FAILURE;
+      const bool disableVod = health.observe(expectedMode, expectedHost, unavailable);
+      if (unavailable) {
+        if (expectedMode == 2) {
+          LOG_WARN("[OnlineVod] Admission round failed (%d/%d), configured server=%s",
+                   health.failures(), OnlineVodConnectionHealth::failureLimit, expectedHost.c_str());
+        }
+        if (disableVod) {
+          enqueueOnlineVodServerAction([this, expectedHost, expectedMode]() {
+            if (shuttingDown_.load() || !systemConfig_ || !licenseManager_ ||
+                systemConfig_->getVodMode() != expectedMode ||
+                systemConfig_->getOnlineVodHost() != expectedHost) return;
+            if (!disableUnavailableOnlineVod(*systemConfig_, CONFIG_PATH)) return;
+            onlineVodAdmissionAuthorized_.store(false, std::memory_order_release);
+            stopOnlineVodSync();
+            applyVodConfigNow();
+            refreshLicenseScreenHint();
+          });
+        }
+        continue;
+      }
+      if (host != expectedHost && !requestsOnlineVodSwitch(admission.data)) continue;
+      enqueueOnlineVodServerAction([this, admission, host, expectedHost, expectedMode]() {
+            if (shuttingDown_.load() || !systemConfig_ || !licenseManager_) return;
+            if (systemConfig_->getOnlineVodHost() != expectedHost || systemConfig_->getVodMode() != expectedMode) return;
+            const bool hadAdmission = onlineVodAdmissionAuthorized_.load(std::memory_order_acquire);
+            if (!systemConfig_->isNetworkVodEnabled() &&
+                !requestsOnlineVodSwitch(admission.data)) return;
+            if (admission.status == OnlineVodAdmissionStatus::DENIED) {
+              onlineVodAdmissionAuthorized_.store(false, std::memory_order_release);
+              licenseManager_->revokeServerLicense(admission.error);
+              if (hadAdmission) stopOnlineVodSync();
+              activateOnlineVodAfterAdmission();
+              return;
+            }
+            // Compare effective rights on the render thread against the grant
+            // already applied at startup, not a retry-thread response cache.
+            const auto previousLayers = licenseManager_->getEnabledLayerIds();
+            const auto previousModules = licenseManager_->getModules();
+            const bool modeChanged = requestsOnlineVodSwitch(admission.data) &&
+                (!systemConfig_->isNetworkVodEnabled() || systemConfig_->getOnlineVodHost() != host);
+            if (modeChanged && !applyServerOnlineVodMode(*systemConfig_, CONFIG_PATH, host, admission.data)) return;
+            if (!systemConfig_->isNetworkVodEnabled()) return;
+            if (!licenseManager_->authorizeServerLicense(admission.data)) {
+              LOG_WARN("[License] Invalid server grant: %s", licenseManager_->getLastError().c_str());
+              return; // Retain the last valid grant until its actual expiry.
+            }
+            onlineVodAdmissionAuthorized_.store(true, std::memory_order_release);
+            const bool changed =
+                previousLayers != licenseManager_->getEnabledLayerIds() ||
+                previousModules != licenseManager_->getModules();
+            if (!hadAdmission || modeChanged || changed) activateOnlineVodAfterAdmission();
+            if (modeChanged) {
+              if (localVodPlayer_) localVodPlayer_->disable();
+              applyVodConfigNow();
+            } else if (!hadAdmission && isOnlineVodRuntimeEnabled()) {
+              startOnlineVodSync(systemConfig_->getOnlineVodHost(), systemConfig_->getOnlineVodPort(), "current");
+            }
+          });
+    }
+  });
 
   LOG_INFO("  授权图层池 OK");
   {
@@ -1295,8 +1974,6 @@ bool Engine::initializeStep1Environment(const std::chrono::steady_clock::time_po
 
   // Step 1.3: 检查配置文件
   LOG_INFO("[Step 1.4] 检查配置文件");
-  systemConfig_ = std::make_unique<SystemConfig>();
-  std::string configPath = CONFIG_PATH;
   if (!FileUtils::isFile(configPath)) {
     LOG_WARN("  config.json 不存在，尝试创建默认配置文件 path=%s", configPath.c_str());
 
@@ -1361,12 +2038,18 @@ bool Engine::initializeStep1Environment(const std::chrono::steady_clock::time_po
       return false;
     }
   }
+  if (loadServerStartupConfig(systemConfig_, configPath)) configLoaded = true;
   LOG_INFO("  config.json OK");
   sendProgress(0, 2, "加载配置文件...", 15);
 
-  if (!systemConfig_->load(configPath)) {
+  if (!configLoaded && !systemConfig_->load(configPath)) {
     LOG_ERROR("  config.json 加载失败");
     return false;
+  }
+
+  if (!SystemUtils::applyUsbOtgMode(systemConfig_->getUsbOtgMode())) {
+    LOG_WARN("  USB OTG mode apply failed: %s",
+             systemConfig_->getUsbOtgMode().c_str());
   }
 
   {
@@ -1445,7 +2128,9 @@ bool Engine::initializeStep1Environment(const std::chrono::steady_clock::time_po
            (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - initStart).count());
 
-  triggerStartupDeviceReport();
+  if (!isOnlineVodRuntimeEnabled()) {
+    triggerStartupDeviceReport();
+  }
 
   return true;
 }
@@ -1460,25 +2145,10 @@ void Engine::initializeStep2Framework(const std::chrono::steady_clock::time_poin
 
   LOG_INFO("[Step 2.2] 构造管理器骨架");
   {
-    std::vector<int> enabledIds = licenseManager_->getEnabledLayerIds();
-    bool licenseHas21 = std::find(enabledIds.begin(), enabledIds.end(), 21) != enabledIds.end();
-    bool configHas21 = systemConfig_->hasLayerConfig(21);
-    if (licenseHas21 && configHas21) {
-      sharedLibassHolder_ = std::make_shared<SharedLibassHolder>();
-      LOG_INFO("  SharedLibassHolder（Layer 21 歌词）按需创建（授权+config 均有）");
-    } else {
-      if (!licenseHas21) {
-        LOG_INFO("  SharedLibassHolder 未创建（授权无 Layer 21，节省 ~10MB）");
-      } else {
-        LOG_INFO("  SharedLibassHolder 未创建（config 未配置 Layer 21，节省 ~10MB）");
-      }
-    }
-
     sharedTextOverlayHolder_ = std::make_shared<SharedTextOverlayHolder>();
     LOG_INFO("  SharedTextOverlayHolder（Layer 40/41 共享字体）已创建");
   }
   mubu_ = std::make_unique<Mubu>();
-  mubu_->setSharedLibassHolder(sharedLibassHolder_);
   mubu_->setSharedTextOverlayHolder(sharedTextOverlayHolder_);
   LOG_INFO("  Mubu（图层管理器）已注入共享文本资源");
   sendProgress(1, 1, "构造管理器骨架...", 25);
@@ -1547,7 +2217,7 @@ bool Engine::initializeStep3Modules(bool& hasAudioLayer,
     }
 
     // [HSVJ_VOD_SAFETY] enable_vod=true：删除所有占用 VOD 目标播放图层的手动播放列表，避免与点歌抢占冲突
-    if (systemConfig_ && systemConfig_->isVodEnabled() && playlistManager_->getDatabase()) {
+    if (isVodRuntimeEnabled() && playlistManager_->getDatabase()) {
       int vodLayerId = systemConfig_->getVodLayerId();
       int deleted = 0;
       if (vodLayerId > 0) {
@@ -1620,7 +2290,10 @@ void Engine::initializeStep4CloudSync() {
     config.intervalSeconds = 600; // 默认 10 分钟同步一次，避免播放期间频繁后台 IO 抢占音频线程
 
     cloudSyncService_ = std::make_unique<CloudSyncService>();
-    cloudSyncService_->start(config, playlistManager_->getDatabase());
+    cloudSyncService_->start(config, playlistManager_->getDatabase(),
+        [](const std::string& path, const std::string& displayName, const CloudMaterialMetadata& metadata) {
+          NetworkManager::getInstance().indexCloudMaterial(path, displayName, metadata);
+        });
 }
 
 #ifdef __ANDROID__
@@ -1645,6 +2318,8 @@ bool Engine::initialize() {
   }
 
   shuttingDown_.store(false);
+  // Admission is valid only for this initialization and its exact config.
+  onlineVodAdmissionAuthorized_.store(false, std::memory_order_release);
 
     pthread_setname_np(pthread_self(), "EngineInitThread");
     auto initStart = std::chrono::steady_clock::now();
@@ -1722,6 +2397,9 @@ bool Engine::initialize() {
     } else {
       LOG_INFO("  DRM/KMS 无 Surface 初始化，物理尺寸由 connector mode 决定");
     }
+    adaptCanvasToPhysicalOutput();
+    configRes = systemConfig_->getResolution();
+
     LOG_INFO("  虚拟幕布分辨率: %dx%d", configRes.width, configRes.height);
 
     // Surface 使用窗口尺寸；DRM/KMS 会在 presenter 初始化时改为 connector mode。
@@ -1808,40 +2486,6 @@ bool Engine::initialize() {
             }
         }
 
-        // 仅补加载二维码图片（渲染器 此时才就绪；尺寸/位置已在 createLayersFromConfig 中应用，此处不重复设置）
-        Layer *layer71 = mubu_->getLayer(71);
-        if (layer71 && (layer71->getType() == LayerType::IMAGE ||
-                        layer71->getType() == LayerType::QRCODE)) {
-            LayerImage *imageLayer = static_cast<LayerImage *>(layer71);
-            if (imageLayer->getWidth() == 0 || imageLayer->getHeight() == 0) {
-                const LayerConfigData *config = systemConfig_->getLayerConfig(71);
-                if (config) {
-                    bool imageLoaded = false;
-                    if (!config->imagePath.empty()) {
-                        std::string imagePath = config->imagePath;
-                        if (imagePath.length() > 0 && imagePath[0] != '/' && imagePath[0] != '.') {
-                            if (imagePath.find("huoshan/") == 0) {
-                                imagePath = ROOT_PATH + imagePath.substr(8);
-                            } else if (imagePath.find("QRCode/") == 0 || imagePath.find("qrcode/") == 0) {
-                                imagePath = ROOT_PATH + imagePath;
-                            }
-                        }
-                        std::string normalizedPath = FileUtils::normalizePath(imagePath);
-                        if (FileUtils::exists(normalizedPath) && imageLayer->loadImage(normalizedPath)) {
-                            imageLoaded = true;
-                        }
-                    }
-                    if (!imageLoaded) {
-                        std::string fixedPath = ROOT_PATH + "QRCode/qrcode_71.png";
-                        std::string normalizedQRPath = FileUtils::normalizePath(fixedPath);
-                        if (FileUtils::exists(normalizedQRPath)) {
-                            imageLayer->loadImage(normalizedQRPath);
-                        }
-                    }
-                }
-            }
-        }
-
         // 补加载 Logo 图片（渲染器_ 此时才已赋值给各图层；loadImage 第一行检查 !渲染器_ 会返回 false）
         // 与上方 Layer71 二维码补加载同理：createLayersFromConfig 阶段 渲染器_ 尚未设置
         Layer *layer70 = mubu_->getLayer(70);
@@ -1913,12 +2557,21 @@ bool Engine::initialize() {
     // Step 4.3: 业务能力初始化（播放列表管理器 已在 Step 3 初始化以支持云同步）
     LOG_INFO("[Step 4.3] 业务能力初始化");
 
-    if (hasKtvLayer) {
+    // Online VOD owns the authorized video layer even when config.json only
+    // contains the status/hint layer (for example layer 41). Its sync database
+    // must therefore not depend on a configured local KTV layer.
+    // 网络 VOD 的数据库必须在“准入成功”之前就准备好。启动时网线未插入
+    // 时，准入会先失败并进入后台重试；如果这里仅按运行态授权判断，
+    // VodDatabase_ 会被跳过初始化，后台准入成功后 startOnlineVodSync()
+    // 只能得到“VodDatabase not ready”，随后重试线程退出，画面永久黑屏。
+    const bool networkVodConfigured =
+        systemConfig_ && systemConfig_->isNetworkVodEnabled();
+    if (hasKtvLayer || networkVodConfigured || isOnlineVodRuntimeEnabled()) {
       {
         auto tCall = std::chrono::steady_clock::now();
         const int vodMode = systemConfig_ ? systemConfig_->getVodMode() : 0;
         const bool LocalVodEnabled = systemConfig_ && vodMode == 1 && systemConfig_->isLocalVodEnabled();
-        const bool networkVodEnabled = systemConfig_ && systemConfig_->isNetworkVodEnabled();
+        const bool networkVodEnabled = isOnlineVodRuntimeEnabled();
         LOG_INFO("  [VOD] init mode=%d local=%d network=%d host=%s roomId=%s",
                  vodMode, LocalVodEnabled ? 1 : 0, networkVodEnabled ? 1 : 0,
                  systemConfig_ ? systemConfig_->getOnlineVodHost().c_str() : "",
@@ -1929,7 +2582,8 @@ bool Engine::initialize() {
           if (!localSongDatabase_->initialize(runtimeSongDbPath)) {
               LOG_WARN("  LocalSongDatabase 未打开（单机本地离线 song.db 不可用）: %s", runtimeSongDbPath.c_str());
           } else {
-              LOG_INFO("  LocalSongDatabase（新 song.db）已打开: %s", runtimeSongDbPath.c_str());
+              LOG_INFO("  LocalSongDatabase 已就绪: %s temporary=%d", runtimeSongDbPath.c_str(),
+                       localSongDatabase_->isTemporary() ? 1 : 0);
           }
           localVodDatabase_ = std::make_unique<LocalVodDatabase>();
           if (!localVodDatabase_->initialize(PLAYLIST_DB_PATH)) {
@@ -1953,7 +2607,7 @@ bool Engine::initialize() {
           } else {
               localVodPlayer_->enable();
           }
-        } else if (networkVodEnabled) {
+        } else if (networkVodConfigured) {
           vodDatabase_ = std::make_unique<VodDatabase>();
           if (!vodDatabase_->initOnlineVodSyncDb()) {
               LOG_WARN("  VodDatabase OnlineVod 同步库未打开（vod_queue.db 初始化失败）");
@@ -1969,7 +2623,8 @@ bool Engine::initialize() {
       }
       if (systemConfig_ && systemConfig_->getVodMode() == 1 && systemConfig_->isLocalVodEnabled()) {
         const std::string runtimeSongDbPath = DB_DIR + "song.db";
-        if (systemConfig_->isLocalSongFileScanEnabled()) {
+        if (systemConfig_->isLocalSongFileScanEnabled() && localSongDatabase_ &&
+            localSongDatabase_->isOpen() && !localSongDatabase_->isTemporary()) {
           std::vector<std::string> mediaRoots = {
             ROOT_PATH,
             ROOT_PATH + "VOD",
@@ -1984,6 +2639,8 @@ bool Engine::initialize() {
           localSongFileScanner_ = std::make_unique<LocalSongFileScanner>();
           LOG_INFO("  [LocalVod] 启动本地歌曲文件扫描器: %s", runtimeSongDbPath.c_str());
           localSongFileScanner_->startAsync(runtimeSongDbPath, mediaRoots);
+        } else if (systemConfig_->isLocalSongFileScanEnabled()) {
+          LOG_WARN("  [LocalVod] 正式曲库不可用，暂缓本地歌曲文件扫描: %s", runtimeSongDbPath.c_str());
         } else {
           LOG_INFO("  [LocalVod] 本地歌曲文件扫描器已关闭: %s", runtimeSongDbPath.c_str());
         }
@@ -2005,6 +2662,8 @@ bool Engine::initialize() {
     commandRouter_->setSceneManager(sceneManager_.get());
     commandRouter_->setEngine(this);
 
+    StageControlManager::getInstance().initialize(mubu_.get(), commandRouter_.get(),
+                                                       playlistManager_.get());
     initializeNetworkServices();
     sendProgress(3, 4, "初始化网络模块...", 69);
 
@@ -2106,7 +2765,8 @@ bool Engine::initialize() {
           videoLayer->setCaptureRotation(cfg->captureRotation);
           LOG_INFO("[Step 4.8] 图层 %d: 启动后台采集预热 type=%s",
                    layerId, preferredType.c_str());
-          videoLayer->checkAndAutoCapture(preferredType, width, height, cfg->captureIndex);
+          videoLayer->checkAndAutoCapture(preferredType, width, height, cfg->captureIndex,
+                                          cfg->captureResolutionLocked);
           LOG_INFO("[Step 4.8] 图层 %d: 加载配图层成功", layerId);
           startedFromDefaultConfig = true;
         }
@@ -2154,28 +2814,14 @@ bool Engine::initialize() {
       }));
     }
 
-    // Step 4.9: 设备初始化上报（异步，不阻塞；config 中 license_server_url 非空时上报）
-    // 如果 config 为空，则尝试使用 License管理器 的默认服务器地址作为 fallback
-    triggerStartupDeviceReport();
-    sendProgress(3, 8, "设备上报...", 93);
+    // Local-license device reporting is not needed after online VOD admission.
+    if (!isOnlineVodRuntimeEnabled()) {
+      triggerStartupDeviceReport();
+      sendProgress(3, 8, "设备上报...", 93);
+    }
 
     // 初始化完成后在屏幕上提示本地 IP 与授权信息；授权到期后保持永久提示。
     refreshLicenseScreenHint();
-    if (getDebugHotspotIp().empty()) {
-      trackEngineAsyncTask(std::async(std::launch::async, [this]() {
-        for (int attempt = 1; attempt <= 60; ++attempt) {
-          std::this_thread::sleep_for(std::chrono::seconds(2));
-          if (shuttingDown_.load()) return;
-          if (!getDebugHotspotIp().empty()) {
-            LOG_INFO("调试热点地址已就绪，刷新启动提示");
-            refreshLicenseScreenHint();
-            return;
-          }
-        }
-        LOG_INFO("调试热点地址暂未就绪，保留首次启动提示");
-      }));
-    }
-
 
     applyVodConfigNow();
     startNetworkServices();
@@ -2200,6 +2846,15 @@ bool Engine::initialize() {
 
 void Engine::showNetworkIpHint(const std::string& mode, const std::string& ip) {
   if (!mubu_) return;
+  if (licenseManager_ && !licenseManager_->isLicensed()) {
+    // Keep both access addresses visible when a network save replaces the hint.
+    refreshLicenseScreenHint();
+    return;
+  }
+  // A network/configuration event supersedes the asynchronous startup hint.
+  // Invalidate its cleanup worker before touching Layer 41, otherwise the
+  // worker can clear a freshly displayed status message a few seconds later.
+  startupHintGeneration_.fetch_add(1, std::memory_order_relaxed);
   Layer* layer41 = mubu_->getLayer(41);
   if (!layer41 || layer41->getType() != LayerType::TEXT) return;
   LayerText* textLayer = static_cast<LayerText*>(layer41);
@@ -2213,81 +2868,106 @@ void Engine::showNetworkIpHint(const std::string& mode, const std::string& ip) {
   }
   LOG_INFO("网络配置提示: %s", msg.c_str());
   textLayer->setVisible(true);
-  textLayer->showOperationHint(HintType::CUSTOM, msg, 8.0f);
+  // Startup/license hints use protected renderer state. Release it before
+  // replacing the startup text with a higher-priority network message.
+  if (auto* hint = textLayer->getMessageHintRenderer()) {
+    hint->clearOperationHint();
+  }
+  textLayer->showOperationHint(HintType::CUSTOM, msg, 30.0f);
 }
 
 void Engine::showNetworkStatusHint(const std::string& message) {
   if (!mubu_ || message.empty()) return;
+  if (licenseManager_ && !licenseManager_->isLicensed()) {
+    LOG_INFO("网络状态变化，刷新未授权连接提示: %s", message.c_str());
+    refreshLicenseScreenHint();
+    return;
+  }
+  // Network loss/restoration messages have priority over the startup hint.
+  startupHintGeneration_.fetch_add(1, std::memory_order_relaxed);
   Layer* layer41 = mubu_->getLayer(41);
   if (!layer41 || layer41->getType() != LayerType::TEXT) return;
   LayerText* textLayer = static_cast<LayerText*>(layer41);
   LOG_INFO("网络状态提示: %s", message.c_str());
   textLayer->setVisible(true);
-  textLayer->showOperationHint(HintType::CUSTOM, message, 8.0f);
+  // Network loss must replace a protected startup hint immediately.
+  if (auto* hint = textLayer->getMessageHintRenderer()) {
+    hint->clearOperationHint();
+  }
+  textLayer->showOperationHint(HintType::CUSTOM, message, 30.0f);
 }
 
 void Engine::showStartupFusionQrOverlay() {
   if (!mubu_ || !systemConfig_) return;
-  Layer* layer71 = mubu_->getLayer(71);
-  if (!layer71 || (layer71->getType() != LayerType::IMAGE &&
-                   layer71->getType() != LayerType::QRCODE)) {
+  // The IP hint switch controls all startup connection hints, including this QR.
+  if (!systemConfig_->isStartupIpHintEnabled() ||
+      !systemConfig_->isFusionDebugEnabled()) {
+    restoreStartupFusionQrOverlay();
     return;
   }
-  Layer* layer41 = mubu_->getLayer(41);
+#ifdef __ANDROID__
+  if (!renderer_) return;
+#endif
 
-  LayerImage* qrLayer = static_cast<LayerImage*>(layer71);
-  const std::string qrUrl = getStartupFusionDebugUrl();
+  Layer* layer41 = mubu_->getLayer(41);
+  const std::string qrUrl = getStartupFusionDebugUrl(systemConfig_.get());
   if (qrUrl.empty()) {
     LOG_WARN("启动融合二维码没有可用网络地址，跳过显示");
     return;
   }
   const std::string qrPath =
       FileUtils::normalizePath(QR_CODE_DIR + "fusion_mobile_debug_qr_runtime.png");
+  const StartupRegionHintLayout layout =
+      resolveStartupRegionHintLayout(systemConfig_.get());
 
   std::lock_guard<std::mutex> lock(startupQrMutex_);
-  if (!startupQrStateSaved_) {
-    startupQrOriginalVisible_ = layer71->isVisible();
-    startupQrOriginalAlpha_ = layer71->getAlpha();
-    startupQrOriginalPosition_ = layer71->getPosition();
-    startupQrOriginalSize_ = layer71->getSize();
-    startupQrOriginalImagePath_ = qrLayer->getImagePath();
-    if (layer41) {
-      startupHintTextStateSaved_ = true;
-      startupHintTextOriginalVisible_ = layer41->isVisible();
-      startupHintTextOriginalPosition_ = layer41->getPosition();
-      startupHintTextOriginalSize_ = layer41->getSize();
-    }
-    startupQrStateSaved_ = true;
+  if (!startupQrOverlayLayer_) {
+    // 启动二维码是系统临时覆盖层，不能复用业务二维码 Layer71。
+    // 两者一对一持有各自图片与几何状态，避免启动提示覆盖正常二维码边框/内容。
+    startupQrOverlayLayer_ =
+        std::make_unique<LayerImage>(-71, LayerType::QRCODE);
+    startupQrOverlayLayer_->initialize();
+#ifdef __ANDROID__
+    startupQrOverlayLayer_->setRenderer(renderer_.get());
+#endif
+    startupQrOverlayLayer_->setFilterMode(1);
+    startupQrOverlayLayer_->setScaleMode(3);
+    startupQrOverlayLayer_->setFadeInTime(0.0f);
+    startupQrOverlayLayer_->setFadeOutTime(0.0f);
+    startupQrOverlayLayer_->setDisplayDuration(0.0f);
+    startupQrOverlayLayer_->setVisible(false);
   }
 
-  const bool qrNeedsUpdate = startupQrActiveUrl_ != qrUrl || !FileUtils::exists(qrPath);
+  const bool qrNeedsUpdate =
+      startupQrActiveUrl_ != qrUrl ||
+      startupQrGeneratedSize_ != layout.qrSize || !FileUtils::exists(qrPath);
   if (qrNeedsUpdate) {
-    if (!writeStartupQrPng(qrUrl, qrPath)) {
+    if (!writeStartupQrPng(qrUrl, qrPath, layout.qrSize)) {
       LOG_WARN("启动融合二维码生成失败: %s -> %s", qrUrl.c_str(), qrPath.c_str());
       return;
     }
     startupQrActiveUrl_ = qrUrl;
-    qrLayer->invalidateCache();
-    LOG_INFO("启动融合二维码已按当前网络生成: %s", qrUrl.c_str());
+    startupQrGeneratedSize_ = layout.qrSize;
+    startupQrOverlayLayer_->invalidateCache();
+    LOG_INFO("启动融合二维码已按输入区域生成: region=%dx%d qr=%dx%d url=%s",
+             layout.width, layout.height, layout.qrSize, layout.qrSize,
+             qrUrl.c_str());
   }
 
-  if (qrLayer->getImagePath() != qrPath || qrNeedsUpdate) {
-    if (!qrLayer->loadImage(qrPath)) {
+  if (startupQrOverlayLayer_->getImagePath() != qrPath || qrNeedsUpdate) {
+    if (!startupQrOverlayLayer_->loadImage(qrPath)) {
       LOG_WARN("启动融合二维码加载失败: %s", qrPath.c_str());
       return;
     }
   }
 
-  const StartupRegionHintLayout layout = resolveStartupRegionHintLayout(systemConfig_.get());
   if (layer41) {
-    layer41->setPosition(Position(layout.textX, layout.textY));
-    layer41->setSize(Size(layout.textWidth, layout.textHeight));
     layer41->setVisible(true);
   }
-  layer71->setSize(Size(layout.qrSize, layout.qrSize));
-  layer71->setPosition(Position(layout.qrX, layout.qrY));
-  layer71->setAlpha(1.0f);
-  layer71->setVisible(true);
+  startupQrOverlayLayer_->setSize(Size(layout.qrSize, layout.qrSize));
+  startupQrOverlayLayer_->setPosition(Position(layout.qrX, layout.qrY));
+  startupQrOverlayLayer_->setAlpha(1.0f);
+  startupQrOverlayLayer_->setVisible(true);
 #ifdef __ANDROID__
   if (regionRotationRenderer_) {
     regionRotationRenderer_->invalidateQrOverlayCache();
@@ -2297,119 +2977,171 @@ void Engine::showStartupFusionQrOverlay() {
 
 void Engine::restoreStartupFusionQrOverlay() {
   if (!mubu_) return;
-  Layer* layer71 = mubu_->getLayer(71);
-  if (!layer71 || (layer71->getType() != LayerType::IMAGE &&
-                   layer71->getType() != LayerType::QRCODE)) {
-    return;
-  }
 
-  LayerImage* qrLayer = static_cast<LayerImage*>(layer71);
   std::lock_guard<std::mutex> lock(startupQrMutex_);
-  if (!startupQrStateSaved_) return;
+  const bool qrWasVisible =
+      startupQrOverlayLayer_ && startupQrOverlayLayer_->isVisible();
+  if (startupQrOverlayLayer_) {
+    startupQrOverlayLayer_->setVisible(false);
+  }
 
-  if (!startupQrOriginalImagePath_.empty() &&
-      qrLayer->getImagePath() != startupQrOriginalImagePath_) {
-    qrLayer->loadImage(startupQrOriginalImagePath_);
-  }
-  Layer* layer41 = mubu_->getLayer(41);
-  if (layer41 && startupHintTextStateSaved_) {
-    layer41->setPosition(startupHintTextOriginalPosition_);
-    layer41->setSize(startupHintTextOriginalSize_);
-    // Layer 41 is an overlay. After the startup QR/hint window ends, keep it
-    // hidden unless a fresh operation or playlist hint explicitly re-enables it.
-    layer41->setVisible(false);
-  }
-  layer71->setPosition(startupQrOriginalPosition_);
-  layer71->setSize(startupQrOriginalSize_);
-  layer71->setAlpha(startupQrOriginalAlpha_);
-  layer71->setVisible(startupQrOriginalVisible_);
-  startupQrStateSaved_ = false;
-  startupHintTextStateSaved_ = false;
-  startupQrOriginalImagePath_.clear();
+  // This helper owns only the temporary QR layer. Layer 41 may already be
+  // displaying a network or operation hint and must not be hidden here.
 #ifdef __ANDROID__
-  if (regionRotationRenderer_) {
+  if (qrWasVisible && regionRotationRenderer_) {
     regionRotationRenderer_->invalidateQrOverlayCache();
   }
 #endif
-  LOG_INFO("启动融合二维码提示已恢复原 Layer71 状态");
+  if (qrWasVisible) {
+    LOG_INFO("启动融合二维码提示已关闭，业务二维码 Layer71 保持不变");
+  }
 }
-
 void Engine::refreshLicenseScreenHint() {
   if (!mubu_) return;
   Layer* layer41 = mubu_->getLayer(41);
   if (!layer41 || layer41->getType() != LayerType::TEXT) return;
   LayerText* textLayer = static_cast<LayerText*>(layer41);
 
-  std::string localIp = getStartupMobileAccessIp();
-  if (systemConfig_ && systemConfig_->getNetworkIpMode() == "static" &&
-      !systemConfig_->getNetworkStaticIp().empty()) {
-    localIp = systemConfig_->getNetworkStaticIp();
-  }
+  struct StartupHintState {
+    std::string message;
+    bool permanent = false;
+    bool visible = true;
+  };
 
-  std::string msg = "引擎就绪";
-  if (!localIp.empty()) msg += " | IP: " + localIp;
-  std::string hotspotSsid = getDebugHotspotSsid();
-  std::string hotspotIp = getDebugHotspotIp();
-  msg += " | 调试热点: " + hotspotSsid;
-  if (!hotspotIp.empty()) {
-    msg += " | 地址: " + hotspotIp;
-  } else {
-    msg += " | 地址获取中";
-  }
+  auto buildStartupHintState = [this]() -> StartupHintState {
+    const StartupNetworkInfo network =
+        getStartupNetworkInfo(systemConfig_.get());
 
-  bool permanentHint = false;
-  if (licenseManager_) {
-    const int days = licenseManager_->getDaysUntilExpiry();
-    const std::string daysSource = licenseManager_->getDaysSource();
-    if (days <= 15) {
-      if (days < 0) {
-        msg += " | 授权已过期 " + std::to_string(std::abs(days)) + " 天";
-      } else {
-        msg += " | 授权剩 " + std::to_string(days) + " 天";
+    StartupHintState state;
+    const bool ipHintEnabled = !systemConfig_ || systemConfig_->isStartupIpHintEnabled();
+    state.visible = ipHintEnabled;
+    state.message = "引擎就绪";
+    bool hasConfiguredVideoLayer = false;
+    if (systemConfig_) {
+      for (const auto& pair : systemConfig_->getAllLayerConfigs()) {
+        if (pair.first >= 1 && pair.first <= 4) {
+          hasConfiguredVideoLayer = true;
+          break;
+        }
       }
-      permanentHint = licenseManager_->isLicensed() && days <= 0 &&
-          daysSource != "time_invalid" && daysSource != "license_duration";
     }
-  }
+    if (!hasConfiguredVideoLayer && systemConfig_ &&
+        (systemConfig_->isLocalVodEnabled() || isOnlineVodRuntimeEnabled())) {
+      state.message += " | 未配置视频图层";
+      state.permanent = true;
+      state.visible = true;
+    }
 
+    if (licenseManager_) {
+      if (!licenseManager_->isLicensed()) {
+        state.message += " | 未授权 | 请连接设备完成授权";
+        state.visible = true;
+        // Keep connection details visible; LicenseManager still blocks licensed features.
+        state.permanent = true;
+      } else {
+        const int days = licenseManager_->getDaysUntilExpiry();
+        const std::string daysSource = licenseManager_->getDaysSource();
+        if (days <= 15) {
+          state.visible = true;
+          if (days < 0) {
+            state.message += " | 授权已过期" + std::to_string(std::abs(days)) + " 天";
+          } else {
+            state.message += " | 授权剩" + std::to_string(days) + " 天";
+          }
+          state.permanent = days <= 0 && daysSource != "time_invalid" &&
+              daysSource != "license_duration";
+        }
+      }
+    }
+    // The display switch hides connection details while preserving warnings.
+    if (!ipHintEnabled) return state;
+    if (network.debugHotspotMode) {
+      state.message += "\n热点: " + getDebugHotspotSsid();
+      state.message += " | IP: " +
+          (network.hotspotIp.empty() ? std::string("获取中") : network.hotspotIp);
+      state.message += " | 密码: " + std::string(kDebugHotspotPassphrase);
+    } else {
+      state.message += "\n热点: 未开启";
+      if (!network.wifiIp.empty()) {
+        state.message += " | Wi-Fi IP: " + network.wifiIp;
+      }
+    }
+    state.message += "\n有线IP: " +
+        (network.ethernetIp.empty() ? std::string("未连接或获取中") : network.ethernetIp);
+    return state;
+  };
+
+  const StartupHintState initialState = buildStartupHintState();
   textLayer->setVisible(true);
   const unsigned long long hintGeneration =
       startupHintGeneration_.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (permanentHint) {
-    textLayer->showProtectedOperationHint(HintType::CUSTOM, msg);
-  } else {
-    showStartupFusionQrOverlay();
-    textLayer->showProtectedOperationHint(HintType::CUSTOM, msg);
-    trackEngineAsyncTask(std::async(std::launch::async, [this, hintGeneration, msg]() {
-      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-      while (std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        if (shuttingDown_.load()) return;
-        if (startupHintGeneration_.load(std::memory_order_relaxed) != hintGeneration) return;
-        if (!mubu_) return;
-        Layer* layer41 = mubu_->getLayer(41);
-        if (!layer41 || layer41->getType() != LayerType::TEXT) return;
-        LayerText* textLayer = static_cast<LayerText*>(layer41);
-        textLayer->setVisible(true);
-        textLayer->showProtectedOperationHint(HintType::CUSTOM, msg);
-        showStartupFusionQrOverlay();
+  if (initialState.visible) {
+    textLayer->showProtectedOperationHint(HintType::CUSTOM, initialState.message,
+                                          !initialState.permanent);
+  } else if (auto* hint = textLayer->getMessageHintRenderer()) {
+    hint->clearProtectedOperationHint();
+  }
+
+  showStartupFusionQrOverlay();
+  trackEngineAsyncTask(std::async(std::launch::async,
+      [this, hintGeneration, buildStartupHintState, initialState]() {
+    const auto startedAt = std::chrono::steady_clock::now();
+    std::string previousMessage = initialState.message;
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (shuttingDown_.load()) return;
+      if (startupHintGeneration_.load(std::memory_order_relaxed) != hintGeneration) return;
+      if (!mubu_) return;
+
+      const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - startedAt).count();
+      const StartupHintState currentState = buildStartupHintState();
+      Layer* currentLayer41 = mubu_->getLayer(41);
+      if (!currentLayer41 || currentLayer41->getType() != LayerType::TEXT) return;
+      LayerText* currentTextLayer = static_cast<LayerText*>(currentLayer41);
+      if (currentState.message != previousMessage) {
+        LOG_INFO("Startup connection hint updated elapsed=%lld: %s",
+                 static_cast<long long>(elapsed), currentState.message.c_str());
+        previousMessage = currentState.message;
       }
-      if (startupHintGeneration_.load(std::memory_order_relaxed) == hintGeneration &&
-          !shuttingDown_.load() && mubu_) {
-        Layer* layer41 = mubu_->getLayer(41);
-        if (layer41 && layer41->getType() == LayerType::TEXT) {
-          LayerText* textLayer = static_cast<LayerText*>(layer41);
-          if (auto* hint = textLayer->getMessageHintRenderer()) {
-            hint->clearOperationHint();
-            LOG_INFO("启动调试热点提示已显示 30 秒，解除保护");
-          }
-          textLayer->setVisible(false);
+      if (elapsed >= 35 && !currentState.permanent) break;
+      if (!currentState.visible) {
+        if (auto* hint = currentTextLayer->getMessageHintRenderer()) {
+          hint->clearProtectedOperationHint();
         }
+      } else if (!currentTextLayer->showProtectedOperationHint(
+              HintType::CUSTOM, currentState.message, !currentState.permanent, true)) {
+        restoreStartupFusionQrOverlay();
+        LOG_INFO("Startup hint dismissed by operation; background refresh stopped");
+        return;
+      }
+      if (elapsed < 20) {
+        showStartupFusionQrOverlay();
+      } else {
         restoreStartupFusionQrOverlay();
       }
-    }));
-  }
-  LOG_INFO("刷新大屏授权提示: %s", msg.c_str());
+      // Permanent hints continue sampling both interfaces, including hotspot
+      // address changes that the primary-IP network monitor does not observe.
+    }
+
+    if (startupHintGeneration_.load(std::memory_order_relaxed) == hintGeneration &&
+        !shuttingDown_.load() && mubu_) {
+      Layer* currentLayer41 = mubu_->getLayer(41);
+      if (currentLayer41 && currentLayer41->getType() == LayerType::TEXT) {
+        LayerText* currentTextLayer = static_cast<LayerText*>(currentLayer41);
+        if (auto* hint = currentTextLayer->getMessageHintRenderer()) {
+          if (hint->clearProtectedOperationHint()) {
+            LOG_INFO("Startup network hint completed; protection cleared");
+          }
+        }
+        // The renderer cleared only its own startup content. Do not hide the
+        // layer here: a concurrent PAD/web action may already have replaced it.
+      }
+      restoreStartupFusionQrOverlay();
+    }
+  }));
+
+  LOG_INFO("Startup license hint: %s", initialState.message.c_str());
 }
 
 void Engine::prewarmCaptureLayersFromScenesAsync() {
@@ -2468,7 +3200,8 @@ void Engine::prewarmCaptureLayersFromScenesAsync() {
         int height = runtimeConfig.captureHeight;
         LOG_INFO("[采集预热] 场景采集图层 %d type=%s scene=%s，后台启动并保活",
                  layerId, captureType.c_str(), scenePath.c_str());
-        videoLayer->checkAndAutoCapture(captureType, width, height, runtimeConfig.captureIndex);
+        videoLayer->checkAndAutoCapture(captureType, width, height, runtimeConfig.captureIndex,
+                                        runtimeConfig.captureResolutionLocked);
         prewarmedLayers.insert(layerId);
       }
     }
@@ -2493,6 +3226,8 @@ void Engine::shutdown() {
   shuttingDown_.store(true);
 
   LOG_DEBUG("Shutting down HSVJEngine...");
+  if (lyricLoadCancelled_) lyricLoadCancelled_->store(true);
+  if (lyricLoadFuture_.valid()) lyricLoadFuture_.wait();
   waitAllEngineAsyncTasks();
   cleanupResources();
   initialized_.store(false);
@@ -2562,13 +3297,29 @@ void Engine::refreshOnlineVodQueueAndApplyAsync(const char* reason) {
       VodDatabase::OnlineVodQueueItem q;
       q.id = it.get("id", "").asString();
       q.roomId = it.get("roomId", "").asString();
-      q.songId = it.get("songId", "").asString();
+      q.songId = it.get("songId", it.get("songNo", "")).asString();
       q.songTitle = it.get("songName", it.get("songTitle", "")).asString();
-      q.artistName = it.get("singerName", it.get("artistName", "")).asString();
+      q.artistName =
+          it.get("singerNames",
+                 it.get("singerName", it.get("artistName", "")))
+              .asString();
       q.position = it.get("position", 0).asInt();
       q.status = it.get("status", 0).asInt();
-      q.songPath = it.get("songPath", "").asString();
+      q.isPriority = it.get("isPriority", 0).asInt();
+      q.addedAt = it.get("addedAt", "").asString();
+      q.songNo = it.get("songNo", it.get("songId", "")).asString();
+      q.languageCode = it.get("languageCode", "").asString();
+      q.classifyCode =
+          it.get("categoryCode", it.get("classifyCode", "")).asString();
+      q.lightCode = it.get("lightCode", "").asString();
+      q.songPath =
+          it.get("relativePath", it.get("songPath", "")).asString();
+      q.videoFileType = it.get("videoFileType", "").asString();
       q.track = it.get("track", 0).asInt();
+      q.scoreEnabled = it.get("scoreEnabled", 0).asInt();
+      q.singerNo =
+          it.get("primarySingerNo", it.get("singerNo", "")).asString();
+      q.rawJson = JsonUtils::toString(it);
       refreshed.push_back(std::move(q));
     }
 
@@ -2578,21 +3329,59 @@ void Engine::refreshOnlineVodQueueAndApplyAsync(const char* reason) {
       LOG_DEBUG("[OnlineVod] async queue refresh ok: %zu items", onlineVodQueue_.size());
     }
 
-    if (reasonCopy == "websocket_reconnected") {
-      std::lock_guard<std::mutex> lock(onlineVodQueueMutex_);
-      if (onlineVodQueue_.empty()) {
-        LOG_INFO("[OnlineVod] queue empty after reconnect, requesting server skip instead of local playback fallback");
-        requestOnlineVodSkipAsync("reconnect_queue_empty");
-      }
-    }
   }));
 }
 
-void Engine::requestOnlineVodSkipAsync(const std::string& reason) {
+void Engine::requestOnlineVodSkipAsync(const std::string& reason,
+                                           const std::string& queueItemId) {
+  if (shuttingDown_.load() || onlineVodPauseRequested_.load()) return;
+  if (queueItemId.empty()) {
+    LOG_ERROR("[OnlineVod] skip request rejected: missing queueItemId reason=%s",
+              reason.c_str());
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+    if (onlineVodCompletedQueueItemId_ == queueItemId) return;
+    // Keep the current room's intent even while a previous skip is in flight
+    // or rate limited. Consecutive failed opens may arrive only milliseconds apart.
+    onlineVodPendingSkipQueueItemId_ = queueItemId;
+    onlineVodPendingSkipReason_ = reason;
+    onlineVodPendingSkipGeneration_ = onlineVodRoomStateGeneration_.load();
+  }
+  retryOnlineVodSkipAsync();
+}
+
+void Engine::retryOnlineVodSkipAsync() {
+  if (shuttingDown_.load()) return;
+  std::string queueItemId;
+  std::string reason;
+  uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+    if (onlineVodPendingSkipQueueItemId_.empty()) return;
+    if (onlineVodPauseRequested_.load() ||
+        onlineVodPendingSkipGeneration_ != onlineVodRoomStateGeneration_.load() ||
+        onlineVodCompletedQueueItemId_ == onlineVodPendingSkipQueueItemId_) {
+      onlineVodPendingSkipQueueItemId_.clear();
+      onlineVodPendingSkipReason_.clear();
+      return;
+    }
+    if (std::chrono::steady_clock::now() < onlineVodSkipRetryAfter_ ||
+        onlineVodSkipInFlight_.exchange(true)) return;
+    onlineVodSkipRetryAfter_ = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(1);
+    queueItemId = onlineVodPendingSkipQueueItemId_;
+    reason = onlineVodPendingSkipReason_;
+    generation = onlineVodPendingSkipGeneration_;
+  }
+
   std::string host = systemConfig_ ? systemConfig_->getOnlineVodHost() : "";
   int port = 9898;
   if (host.empty()) host = lastOnlineVodWsHost_;
   if (host.empty()) {
+    onlineVodSkipInFlight_.store(false);
     LOG_WARN("[OnlineVod] skip request ignored, missing server host: %s", reason.c_str());
     return;
   }
@@ -2601,26 +3390,122 @@ void Engine::requestOnlineVodSkipAsync(const std::string& reason) {
   std::string url = "http://" + host;
   if (port != 80 && port > 0) url += ":" + std::to_string(port);
   url += "/api/v1/rooms/" + roomId + "/skip";
-  trackEngineAsyncTask(std::async(std::launch::async, [this, url, reason]() {
-    if (shuttingDown_.load()) return;
-    std::string resp = httpPostJson(url, "{}", 3);
-    LOG_INFO("[OnlineVod] skip request (%s): %s -> %s", reason.c_str(), url.c_str(), resp.c_str());
-  }));
+  Json::Value request(Json::objectValue);
+  request["queueItemId"] = queueItemId;
+  const std::string requestBody = JsonUtils::toString(request);
+  trackEngineAsyncTask(std::async(
+      std::launch::async, [this, url, reason, queueItemId, requestBody, generation]() {
+        struct ResetInFlight {
+          std::atomic<bool>& flag;
+          ~ResetInFlight() { flag.store(false); }
+        } reset{onlineVodSkipInFlight_};
+        if (shuttingDown_.load() || onlineVodPauseRequested_.load() ||
+            generation != onlineVodRoomStateGeneration_.load()) return;
+        const std::string resp = httpPostJson(url, requestBody, 3);
+        Json::Value result;
+        std::string error;
+        if (JsonUtils::parseJson(resp, result, error) &&
+            result.get("code", -1).asInt() == 0) {
+          std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+          // advanced=false is also an acknowledgement: the exact queue row
+          // was already consumed or is no longer current. Never skip its successor.
+          if (result["data"].get("advanced", false).asBool()) {
+            onlineVodCompletedQueueItemId_ = queueItemId;
+          }
+          if (onlineVodPendingSkipQueueItemId_ == queueItemId &&
+              onlineVodPendingSkipGeneration_ == generation) {
+            onlineVodPendingSkipQueueItemId_.clear();
+            onlineVodPendingSkipReason_.clear();
+          }
+        }
+        LOG_INFO(
+            "[OnlineVod] skip request (%s): queueItemId=%s %s -> %s",
+            reason.c_str(), queueItemId.c_str(), url.c_str(), resp.c_str());
+      }));
+}
+
+void Engine::refreshLicenseLayers() {
+  enqueueOnlineVodServerAction([this]() { activateOnlineVodAfterAdmission(); });
+}
+
+void Engine::activateOnlineVodAfterAdmission() {
+  if (shuttingDown_.load() || !mubu_ || !systemConfig_ || !licenseManager_) {
+    return;
+  }
+
+  for (int layerId : mubu_->getAllLayerIds()) {
+    if (!isAuthorizedLayerId(licenseManager_->getEnabledLayerIds(), layerId)) {
+      if (Layer* layer = mubu_->getLayer(layerId)) layer->setVisible(false);
+      mubu_->removeLayer(layerId);
+    }
+  }
+
+  const auto preservedLayerIds = mubu_->getAllLayerIds();
+  const size_t layersBefore = preservedLayerIds.size();
+  preCreateAuthorizedLayers();
+  // Reapply configuration only to newly admitted layers. Existing layers own
+  // live playback, audio, geometry and lyric state that must survive refresh.
+  createLayersFromConfig(preservedLayerIds);
+
+  // The normal startup path wires these callbacks after the renderer and Mubu
+  // are ready. Repeat that small piece for layers that were intentionally
+  // absent while the device was waiting for network admission.
+  for (int layerId : mubu_->getAllLayerIds()) {
+    if (std::find(preservedLayerIds.begin(), preservedLayerIds.end(), layerId) !=
+        preservedLayerIds.end()) continue;
+    Layer* layer = mubu_->getLayer(layerId);
+    if (!layer) continue;
+#ifdef __ANDROID__
+    if (!layer->getRenderer() && renderer_) {
+      layer->setRenderer(renderer_.get());
+    }
+#endif
+    if (layer->getType() != LayerType::VIDEO) continue;
+    auto* videoLayer = static_cast<LayerVideo*>(layer);
+    videoLayer->setPreloadNextPathCallback([this](int lid) -> std::string {
+      if (!playlistManager_) return "";
+      const std::string playlistId = playlistManager_->getActivePlaylistId(lid);
+      if (playlistId.empty()) return "";
+      const NextVideoInfo info = playlistManager_->peekNextVideoInfo(playlistId);
+      if (!info.valid || info.item.uri.empty()) return "";
+      const std::string normalized = FileUtils::normalizePath(info.item.uri);
+      if (normalized.empty() || !FileUtils::isFile(normalized)) return "";
+      return normalized;
+    });
+  }
+
+  refreshLicenseScreenHint();
+  NetworkManager::getInstance().refreshAudioEffectRoutes();
+  const size_t layersAfter = mubu_->getAllLayerIds().size();
+  LOG_INFO("[License] Online VOD layers activated after admission: before=%zu after=%zu preserved=%zu",
+           layersBefore, layersAfter, preservedLayerIds.size());
 }
 
 bool Engine::startOnlineVodSync(const std::string& host, int port, const std::string& roomId) {
+  if (!isOnlineVodRuntimeEnabled()) {
+    LOG_WARN("startOnlineVodSync: Online VOD admission is not active, sync is disabled");
+    return false;
+  }
   if (!vodDatabase_) {
-    LOG_WARN("startOnlineVodSync: VodDatabase not ready");
-    return false;
+    auto database = std::make_unique<VodDatabase>();
+    if (!database->initOnlineVodSyncDb()) {
+      LOG_WARN("startOnlineVodSync: failed to initialize online VOD database");
+      return false;
+    }
+    vodDatabase_ = std::move(database);
   }
-  if (systemConfig_ && !systemConfig_->isNetworkVodEnabled()) {
-    LOG_WARN("startOnlineVodSync: vodMode is not network, sync is disabled");
-    return false;
-  }
+  setOnlineVodFreesongSource(host, port);
 #if defined(_WIN32) || defined(_WIN64)
   if (!onlineVodHttpSyncClient_) {
     onlineVodHttpSyncClient_ = std::make_unique<OnlineVodHttpSyncClient>();
   }
+  onlineVodHttpSyncClient_->setOnRoomStateChanged(
+      [this](const VodDatabase::OnlineVodState& state) {
+        onlineVodPauseRequested_.store(state.playState != 1);
+        enqueueOnlineVodServerAction([this, state]() {
+          onOnlineVodStateChanged(state);
+        });
+      });
   if (onlineVodHttpSyncClient_->isRunning()) return true;
   LOG_INFO("OnlineVodSync: start http-poll=%s:%d roomId=%s", host.c_str(), port, roomId.c_str());
   return onlineVodHttpSyncClient_->start(host, port, roomId, vodDatabase_.get(), 1000);
@@ -2654,29 +3539,13 @@ bool Engine::startOnlineVodSync(const std::string& host, int port, const std::st
 
     // 注入连接状态回调，用于显示连接状态提示
     onlineVodWsClient_->setOnFreesongNotify([this]() {
-      // 服务器通知 freesongs 列表有变化：重新拉取列表，然后立即播放
+      // Idle-media list changes are not playback state. Refresh the cache only;
+      // actual playback remains driven by the server's complete room state.
       if (shuttingDown_.load()) return;
-      int vodLayerId = systemConfig_ ? systemConfig_->getVodLayerId() : 1;
-      if (vodLayerId < 1) vodLayerId = 1;
-      const int capturedLayerId = vodLayerId;
-      LOG_INFO("[OnlineVod] freesong notify received, refreshing list and playing on layer %d", capturedLayerId);
-      onlineVodNextEmptyCount_ = 0;  // 服务器有新内容，重置空响应计数器恢复正常轮询
-      trackEngineAsyncTask(std::async(std::launch::async, [this, capturedLayerId]() {
-        if (shuttingDown_.load()) return;
-        // 重新拉取空闲歌曲列表
-        fetchAndCacheFreesongs();
-        // 只有当前没有点歌在播时才切换到 freesong
-        if (!mubu_) return;
-        Layer* layer = mubu_->getLayer(capturedLayerId);
-        if (!layer || layer->getType() != LayerType::VIDEO) return;
-        LayerVideo* vl = static_cast<LayerVideo*>(layer);
-        if (vl->getState() == LayerVideo::PlayState::PLAYING) {
-          // 当前有歌在播（点歌），不打断
-          LOG_INFO("[OnlineVod] freesong notify: layer %d is playing, skip freesong", capturedLayerId);
-          return;
-        }
-        tryPlayFreesongOnLayer(capturedLayerId);
-      }));
+      onlineVodNextEmptyCount_ = 0;
+      scheduleOnlineVodFreesongFetchAsync(
+          -1, false, true, "idle_media_list_changed");
+      LOG_INFO("[OnlineVod] idle-media list changed; cache refresh requested, waiting for authoritative room state");
     });
 
     onlineVodWsClient_->setOnConnectionStateChanged([this](bool connected) {
@@ -2686,10 +3555,10 @@ bool Engine::startOnlineVodSync(const std::string& host, int port, const std::st
           if (layer41 && layer41->getType() == LayerType::TEXT) {
             LayerText* textLayer = static_cast<LayerText*>(layer41);
             if (!onlineVodWsEverConnected_.load()) {
-              textLayer->setTextColor(Color(1.0f, 0.31f, 0.31f, 1.0f));
+              // Keep the configured Layer 41 color for transient connection hints.
+              // Mutating the layer style here made later playlist text stay red/orange.
               textLayer->showOperationHint(HintType::CUSTOM, "连接服务器失败\n请检查网络", 12.0f);
             } else {
-              textLayer->setTextColor(Color(1.0f, 0.75f, 0.0f, 1.0f));
               textLayer->showOperationHint(HintType::CUSTOM, "点播服务器已断开\n正在重连...", 8.0f);
             }
           }
@@ -2697,6 +3566,8 @@ bool Engine::startOnlineVodSync(const std::string& host, int port, const std::st
         LOG_WARN("[OnlineVod] WebSocket disconnected, showing hint (everConnected=%d)",
                  onlineVodWsEverConnected_.load() ? 1 : 0);
       } else {
+        onlineVodTransportGeneration_.fetch_add(1);
+        scheduleOnlineVodFreesongFetchAsync(-1, false, true, "ws_connected");
         bool wasEverConnected = onlineVodWsEverConnected_.exchange(true);
         if (wasEverConnected) {
           if (mubu_) {
@@ -2706,35 +3577,108 @@ bool Engine::startOnlineVodSync(const std::string& host, int port, const std::st
               textLayer->showOperationHint(HintType::CUSTOM, "已重新连接", 2.0f);
             }
           }
-          // 重连后主动发 joinRoom，触发服务器重新推送当前房态
-          if (!lastOnlineVodWsRoomId_.empty()) {
-            onlineVodWsClient_->postJoinRoom(lastOnlineVodWsRoomId_);
-            LOG_INFO("[OnlineVod] WebSocket reconnected, re-joining room: %s", lastOnlineVodWsRoomId_.c_str());
-          }
-          refreshOnlineVodQueueAndApplyAsync("websocket_reconnected");
-          LOG_INFO("[OnlineVod] WebSocket reconnected successfully");
+          // The WS client owns join_room and retries until a valid room state arrives.
+          LOG_INFO("[OnlineVod] WebSocket reconnected successfully; waiting for authoritative room state");
         } else {
-          // 首次连接：发 joinRoom
-          if (!lastOnlineVodWsRoomId_.empty()) {
-            onlineVodWsClient_->postJoinRoom(lastOnlineVodWsRoomId_);
-            LOG_INFO("[OnlineVod] WebSocket connected (first time), joining room: %s", lastOnlineVodWsRoomId_.c_str());
-          } else {
-            LOG_INFO("[OnlineVod] WebSocket connected successfully (first time)");
-          }
-          refreshOnlineVodQueueAndApplyAsync("websocket_first_connected");
+          LOG_INFO("[OnlineVod] first WebSocket connection established; waiting for authoritative room state");
         }
       }
     });
 
     // 注入状态变化回调，用于触发图层41操作提示
     onlineVodWsClient_->setOnRoomStateChanged([this](const VodDatabase::OnlineVodState& st) {
-      onOnlineVodStateChanged(st);
+      onlineVodPauseRequested_.store(st.playState != 1);
+      enqueueOnlineVodServerAction([this, st]() {
+        onOnlineVodStateChanged(st);
+      });
     });
 
     onlineVodWsClient_->setOnPlaybackCommand([this](const std::string& action,
                                                  const Json::Value& param,
                                                  const std::string& rawJson) {
-      return handleOnlineVodPlaybackCommand(action, param, rawJson);
+      if (action == "Pause" || action == "Stop") {
+        onlineVodPauseRequested_.store(true);
+      } else if (action == "Play" || action == "Resume") {
+        onlineVodPauseRequested_.store(false);
+      }
+      return enqueueOnlineVodServerAction([this, action, param, rawJson]() {
+        const bool ok = handleOnlineVodPlaybackCommand(action, param, rawJson);
+        if (onlineVodWsClient_) {
+          onlineVodWsClient_->postCommandResult(
+              action, ok, ok ? 0 : 1, ok ? "执行成功" : "播放命令执行失败");
+        }
+      });
+    });
+
+    onlineVodWsClient_->setOnPeripheralCommand([this](const std::string& action,
+                                                   const Json::Value& param,
+                                                   const std::string& rawJson) {
+      return enqueueOnlineVodServerAction([this, action, param, rawJson]() {
+        const auto forwarded = PeripheralManager::getInstance().dispatchVodEvent(action, param);
+        if (forwarded.get("matched", 0).asInt() > 0 || !forwarded.get("ok", true).asBool()) {
+          const bool ok = forwarded.get("ok", false).asBool();
+          if (onlineVodWsClient_) onlineVodWsClient_->postCommandResult(
+              action, ok, ok ? 0 : 1, forwarded.get("message", "VOD转发完成").asString());
+          return;
+        }
+        (void)rawJson;
+        CommandResponse response;
+        response.ok = false;
+        response.error = 1;
+        response.message = "外设命令路由不可用";
+        if (commandRouter_) {
+          std::string routerAction;
+          Json::Value routerParam(Json::objectValue);
+
+          if (action == "SetLight") {
+            const std::string scene = param.get("scene", "").asString();
+            if (scene.empty()) {
+              response.error = 0x0002;
+              response.message = "SetLight requires scene";
+            } else {
+              routerAction = "execute_function_button";
+              routerParam["region"] = "lighting";
+              routerParam["button_id"] = scene;
+            }
+          } else if (action == "SetEffect") {
+            const std::string mode = param.get("mode", "").asString();
+            if (mode.empty()) {
+              response.error = 0x0002;
+              response.message = "SetEffect requires mode";
+            } else {
+              routerAction = "execute_function_button";
+              routerParam["region"] = "effect";
+              routerParam["button_id"] = mode;
+            }
+          } else if (action == "SetAC") {
+            // SetAC is an idempotent absolute-state API. Native HVAC buttons are
+            // relative/toggle actions and cannot safely map power/temp/mode/wind.
+            response.error = 0x000A;
+            response.message =
+                "SetAC absolute-state hardware adapter is not configured";
+          } else {
+            response.error = 0x000A;
+            response.message = "unsupported online VOD peripheral action: " + action;
+          }
+
+          if (!routerAction.empty()) {
+            routerParam["action"] = routerAction;
+            Json::Value routerCommand;
+            routerCommand["type"] = 0;
+            routerCommand["code"] = 0x50;
+            routerCommand["param"] = routerParam;
+            response = commandRouter_->processCommand(
+                JsonUtils::toString(routerCommand));
+          }
+        }
+        LOG_INFO("[OnlineVod] peripheral command execute: action=%s ok=%d error=0x%04X message=%s",
+                 action.c_str(), response.ok ? 1 : 0, response.error,
+                 response.message.c_str());
+        if (onlineVodWsClient_) {
+          onlineVodWsClient_->postCommandResult(action, response.ok, response.error,
+                                                response.message);
+        }
+      });
     });
 
     onlineVodWsClient_->setOnPlayListUpdated([this](std::vector<VodDatabase::OnlineVodQueueItem> items, int listType) {
@@ -2780,15 +3724,20 @@ bool Engine::startOnlineVodSync(const std::string& host, int port, const std::st
   LOG_INFO("[OnlineVod] cleared in-memory queue");
   onlineVodSuppressInitialEmptyPlaylistRefresh_.store(true);
 
+  // 连接线程可能立即回调，必须在 start() 前发布房间和媒体地址快照。
+  lastOnlineVodWsHost_ = host;
+  lastOnlineVodWsPort_ = port;
+  lastOnlineVodWsRoomId_ = roomId;
+
   LOG_INFO("[OnlineVod] starting WebSocket connection: host=%s port=%d roomId=%s",
            host.c_str(), port, roomId.c_str());
   bool started = onlineVodWsClient_->start(host, port, roomId, vodDatabase_.get());
-  if (started) {
-    lastOnlineVodWsHost_ = host;
-    lastOnlineVodWsPort_ = port;
-    lastOnlineVodWsRoomId_ = roomId;
-    onlineVodFreesongBaseUrl_ = "http://" + host;
-    if (port != 80 && port > 0) onlineVodFreesongBaseUrl_ += ":" + std::to_string(port);
+  if (!started) {
+    LOG_WARN("[OnlineVod] failed to start WebSocket connection: host=%s port=%d roomId=%s",
+             host.c_str(), port, roomId.c_str());
+    lastOnlineVodWsHost_.clear();
+    lastOnlineVodWsPort_ = 0;
+    lastOnlineVodWsRoomId_.clear();
   }
   return started;
 #endif
@@ -2796,8 +3745,8 @@ bool Engine::startOnlineVodSync(const std::string& host, int port, const std::st
 
 static bool isVideoExtension(const std::string& name) {
   static const char* exts[] = {
-    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv",
-    ".ts", ".m4v", ".webm", ".mpg", ".mpeg", ".3gp"
+    ".hvideo", ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv",
+    ".ts", ".m4v", ".webm", ".mpg", ".mpeg", ".3gp", ".vob", ".dat"
   };
   auto dotPos = name.rfind('.');
   if (dotPos == std::string::npos) return false;
@@ -2809,18 +3758,32 @@ static bool isVideoExtension(const std::string& name) {
   return false;
 }
 
-void Engine::fetchAndCacheFreesongs() {
-  if (onlineVodFreesongBaseUrl_.empty()) return;
+void Engine::setOnlineVodFreesongSource(const std::string& host, int port) {
+  std::string baseUrl = host.empty() ? "" : "http://" + host;
+  if (!baseUrl.empty() && port != 80 && port > 0) baseUrl += ":" + std::to_string(port);
+  std::lock_guard<std::mutex> fetchLock(onlineVodFreesongFetchMutex_);
+  std::lock_guard<std::mutex> listLock(onlineVodFreesongsMutex_);
+  if (baseUrl == onlineVodFreesongBaseUrl_) return;
+  onlineVodFreesongBaseUrl_ = baseUrl;
+  onlineVodFreesongsList_.clear();
+  onlineVodFreesongLastAttemptPath_.clear();
+  onlineVodFreesongPendingPlayLayerId_ = -1;
+  onlineVodFreesongPendingPlayGeneration_ = 0;
+  onlineVodFreesongPendingPlayPaused_ = false;
+  onlineVodFreesongNextFetchAllowed_ = {};
+  onlineVodFreesongNextRefresh_ = {};
+  onlineVodFreesongFetchRetryCount_.store(0);
+  if (onlineVodFreesongFetchInFlight_) onlineVodFreesongRefetchPending_ = true;
+}
 
-  auto trimCopy = [](std::string s) -> std::string {
-    size_t start = 0;
-    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) ++start;
-    size_t end = s.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) --end;
-    return s.substr(start, end - start);
-  };
+bool Engine::fetchAndCacheFreesongs() {
+  std::string baseUrl;
+  {
+    std::lock_guard<std::mutex> lock(onlineVodFreesongsMutex_);
+    baseUrl = onlineVodFreesongBaseUrl_;
+  }
+  if (baseUrl.empty()) return false;
 
-  std::string idleSongPathForUrl;
   auto normalizeSubPath = [](std::string path) -> std::string {
     for (auto& c : path) {
       if (c == '\\') c = '/';
@@ -2830,207 +3793,321 @@ void Engine::fetchAndCacheFreesongs() {
     return path;
   };
 
-  auto makeAbsoluteUrl = [this, trimCopy, normalizeSubPath, &idleSongPathForUrl](std::string raw) -> std::string {
-    raw = trimCopy(raw);
-    if (raw.empty()) return "";
-
-    if ((raw.front() == '"' && raw.back() == '"') ||
-        (raw.front() == '\'' && raw.back() == '\'')) {
-      raw = raw.substr(1, raw.size() - 2);
-    }
-
-    if (raw.rfind("http://", 0) == 0 || raw.rfind("https://", 0) == 0) {
-      size_t schemeEnd = raw.find("://");
-      size_t hostStart = (schemeEnd == std::string::npos) ? 0 : (schemeEnd + 3);
-      size_t pathStart = raw.find('/', hostStart);
-      if (pathStart != std::string::npos) {
-        return onlineVodFreesongBaseUrl_ + raw.substr(pathStart);
-      }
-      return raw;
-    }
-
-    if (raw.rfind("/", 0) == 0) {
-      return onlineVodFreesongBaseUrl_ + raw;
-    }
-
-    const std::string subPath = normalizeSubPath(idleSongPathForUrl);
-    if (subPath.empty()) {
-      return onlineVodFreesongBaseUrl_ + "/" + raw;
-    }
-    return onlineVodFreesongBaseUrl_ + "/" + subPath + "/" + raw;
-  };
-
-  auto appendCandidate = [&](const std::string& candidate, std::vector<std::string>& out,
-                             std::set<std::string>& dedup) {
-    std::string normalized = trimCopy(candidate);
-    if (normalized.empty()) return;
-
-    std::string checkName = normalized;
-    size_t queryPos = checkName.find_first_of("?#");
-    if (queryPos != std::string::npos) {
-      checkName = checkName.substr(0, queryPos);
-    }
-
-    size_t slashPos = checkName.find_last_of('/');
-    if (slashPos != std::string::npos) {
-      checkName = checkName.substr(slashPos + 1);
-    }
-
-    if (!isVideoExtension(checkName)) return;
-
-    std::string absoluteUrl = makeAbsoluteUrl(normalized);
-    if (absoluteUrl.empty()) return;
-    if (dedup.insert(absoluteUrl).second) {
-      out.push_back(absoluteUrl);
-    }
-  };
-
-  auto extractFromRawResponse = [&](const std::string& resp, std::vector<std::string>& out) -> bool {
-    std::set<std::string> dedup;
-    out.clear();
-
-    // 1. 逐行文本：兼容纯文本列表、目录索引、直接 URL
-    size_t start = 0;
-    while (start <= resp.size()) {
-      size_t end = resp.find('\n', start);
-      std::string line = trimCopy(resp.substr(start, end == std::string::npos ? std::string::npos : end - start));
-      if (!line.empty()) {
-        appendCandidate(line, out, dedup);
-      }
-      if (end == std::string::npos) break;
-      start = end + 1;
-    }
-
-    // 2. HTML href：兼容目录页/静态文件索引
-    const std::string hrefKey = "href=";
-    size_t pos = 0;
-    while ((pos = resp.find(hrefKey, pos)) != std::string::npos) {
-      pos += hrefKey.size();
-      if (pos >= resp.size()) break;
-
-      char quote = resp[pos];
-      if (quote == '"' || quote == '\'') {
-        ++pos;
-        size_t end = resp.find(quote, pos);
-        if (end == std::string::npos) break;
-        appendCandidate(resp.substr(pos, end - pos), out, dedup);
-        pos = end + 1;
-      }
-    }
-
-    return !out.empty();
-  };
-
-  auto fetchFromApi = [&extractFromRawResponse, makeAbsoluteUrl, &idleSongPathForUrl](const std::string& apiUrl, int timeoutSec,
-                             std::vector<std::string>& out) -> bool {
+  auto fetchFromApi = [baseUrl, normalizeSubPath](const std::string& apiUrl,
+                                                int timeoutSec,
+                                                std::vector<std::string>& out) -> bool {
     LOG_INFO("[OnlineVod] fetching freesongs: %s", apiUrl.c_str());
-    std::string resp = hsvj::httpGet(apiUrl, timeoutSec);
-    if (resp.empty()) {
-      LOG_WARN("[OnlineVod] freesongs fetch: empty response (timeout or network error), url=%s", apiUrl.c_str());
+    int status = 0;
+    const std::string resp = hsvj::httpGet(apiUrl, timeoutSec, "", &status);
+    if (status != 200 || resp.empty()) {
+      LOG_WARN("[OnlineVod] freesongs fetch failed: HTTP=%d url=%s",
+               status, apiUrl.c_str());
       return false;
     }
 
     Json::Value root;
     std::string err;
-    if (!JsonUtils::parseJson(resp, root, err) || !root.isMember("data")) {
-      if (extractFromRawResponse(resp, out)) {
-        LOG_INFO("[OnlineVod] freesongs response is non-JSON, extracted %zu video files from raw body", out.size());
-        return true;
-      }
-      LOG_WARN("[OnlineVod] freesongs parse failed: %s, url=%s", err.c_str(), apiUrl.c_str());
+    if (!JsonUtils::parseJson(resp, root, err)) {
+      LOG_WARN("[OnlineVod] freesongs parse failed: %s, url=%s",
+               err.c_str(), apiUrl.c_str());
+      return false;
+    }
+    if (!root.isObject() || !root["code"].isInt() || root["code"].asInt() != 0 ||
+        !root.isMember("data") || !root["data"].isObject()) {
+      LOG_WARN("[OnlineVod] freesongs schema error: data must be an object, url=%s",
+               apiUrl.c_str());
       return false;
     }
 
-    if (root["data"].isObject() && root["data"].isMember("files") && root["data"]["files"].isArray()) {
-      const auto& data = root["data"];
-      if (data.isMember("idle_song_path") && data["idle_song_path"].isString()) {
-        idleSongPathForUrl = data["idle_song_path"].asString();
-      }
+    const auto& data = root["data"];
+    if (!data.isMember("media_root") || !data["media_root"].isString() ||
+        !data.isMember("idle_song_path") ||
+        !data["idle_song_path"].isString() ||
+        !data.isMember("files") || !data["files"].isArray()) {
+      LOG_WARN("[OnlineVod] freesongs schema error: expected media_root, idle_song_path and files, url=%s",
+               apiUrl.c_str());
+      return false;
+    }
 
-      int skipped = 0;
-      std::set<std::string> dedup;
-      out.clear();
-      for (Json::ArrayIndex i = 0; i < data["files"].size(); i++) {
-        if (!data["files"][i].isString()) { ++skipped; continue; }
-        std::string name = data["files"][i].asString();
-        if (!isVideoExtension(name)) { ++skipped; continue; }
-        std::string absoluteUrl = makeAbsoluteUrl(name);
-        if (!absoluteUrl.empty() && dedup.insert(absoluteUrl).second) {
-          out.push_back(absoluteUrl);
+    std::string subPath =
+        normalizeSubPath(data["idle_song_path"].asString());
+    // The scan API returns the configured Windows directory, while room state
+    // uses a path relative to media_root. Use the same root mapping for both.
+    if (subPath.size() >= 3 && subPath[1] == ':' && subPath[2] == '/') {
+      const auto lowerPath = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        return value;
+      };
+      const std::string pathLower = lowerPath(subPath);
+      std::istringstream roots(data["media_root"].asString());
+      std::string mediaRoot;
+      bool matchedRoot = false;
+      while (std::getline(roots, mediaRoot, ';')) {
+        const auto first = mediaRoot.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        mediaRoot = normalizeSubPath(mediaRoot.substr(
+            first, mediaRoot.find_last_not_of(" \t\r\n") - first + 1));
+        const std::string rootLower = lowerPath(mediaRoot);
+        if (pathLower == rootLower ||
+            pathLower.rfind(rootLower + "/", 0) == 0) {
+          subPath = normalizeSubPath(subPath.substr(mediaRoot.size()));
+          matchedRoot = true;
+          break;
         }
       }
-      if (skipped > 0) LOG_INFO("[OnlineVod] freesongs scan: skipped %d non-video entries", skipped);
-      return !out.empty();
+      if (!matchedRoot) {
+        LOG_WARN("[OnlineVod] idle_song_path is outside media_root; ignoring scan");
+        return false;
+      }
     }
-
-    if (!root["data"].isArray()) {
-      LOG_WARN("[OnlineVod] freesongs parse failed: data is neither array nor scan object, url=%s", apiUrl.c_str());
-      return false;
-    }
-
-    int skipped = 0;
     std::set<std::string> dedup;
+    int skipped = 0;
     out.clear();
-    for (Json::ArrayIndex i = 0; i < root["data"].size(); i++) {
-      const auto& f = root["data"][i];
-      std::string fileUrl = f.get("url", "").asString();
-      std::string name = f.get("name", "").asString();
-      std::string checkName = name.empty() ? fileUrl : name;
-      if (!isVideoExtension(checkName)) { ++skipped; continue; }
-
-      if (!fileUrl.empty()) {
-        fileUrl = makeAbsoluteUrl(fileUrl);
-        if (!fileUrl.empty() && dedup.insert(fileUrl).second) {
-          out.push_back(fileUrl);
-        }
-      } else if (!name.empty()) {
-        std::string absoluteUrl = makeAbsoluteUrl(name);
-        if (!absoluteUrl.empty() && dedup.insert(absoluteUrl).second) {
-          out.push_back(absoluteUrl);
-        }
+    for (Json::ArrayIndex i = 0; i < data["files"].size(); ++i) {
+      if (!data["files"][i].isString()) {
+        ++skipped;
+        continue;
       }
+      std::string relativePath = data["files"][i].asString();
+      for (char& c : relativePath) {
+        if (c == '\\') c = '/';
+      }
+      bool safeRelativePath = !relativePath.empty() && relativePath.front() != '/';
+      size_t segmentStart = 0;
+      while (safeRelativePath && segmentStart <= relativePath.size()) {
+        const size_t slash = relativePath.find('/', segmentStart);
+        const std::string segment = relativePath.substr(
+            segmentStart, slash == std::string::npos
+                              ? std::string::npos
+                              : slash - segmentStart);
+        if (segment.empty() || segment == "." || segment == ".." ||
+            segment.find(':') != std::string::npos) {
+          safeRelativePath = false;
+          break;
+        }
+        if (slash == std::string::npos) break;
+        segmentStart = slash + 1;
+      }
+      if (!safeRelativePath || !isVideoExtension(relativePath)) {
+        ++skipped;
+        continue;
+      }
+
+      std::string url = baseUrl + "/media/";
+      if (!subPath.empty()) url += subPath + "/";
+      url += relativePath;
+      if (dedup.insert(url).second) out.push_back(std::move(url));
     }
 
-    if (skipped > 0) LOG_INFO("[OnlineVod] freesongs: skipped %d non-video files", skipped);
-    return !out.empty();
+    if (skipped > 0) {
+      LOG_INFO("[OnlineVod] freesongs scan: skipped %d invalid entries", skipped);
+    }
+    return true;
   };
 
   std::vector<std::string> found;
-  const std::string api1 = onlineVodFreesongBaseUrl_ + "/api/v1/idle-media/scan";
+  const std::string apiUrl =
+      baseUrl + "/api/v1/idle-media/scan";
 
-  bool ok = fetchFromApi(api1, 5, found);
-
-  if (!ok || found.empty()) {
-    std::lock_guard<std::mutex> lock(onlineVodFreesongsMutex_);
-    if (!onlineVodFreesongsCache_.empty()) {
-      if (onlineVodFreesongsList_.empty()) {
-        onlineVodFreesongsList_ = onlineVodFreesongsCache_;
-        onlineVodFreesongsIndex_ = 0;
-      }
-      LOG_INFO("[OnlineVod] freesongs fetch failed, keep cached list: %zu files", onlineVodFreesongsCache_.size());
-    } else {
-      onlineVodFreesongsList_.clear();
-      onlineVodFreesongsCache_.clear();
-      onlineVodFreesongsIndex_ = 0;
-      LOG_WARN("[OnlineVod] freesongs fetch failed and no cache available; idle list remains empty");
-    }
-    return;
-  }
+  const bool ok = fetchFromApi(apiUrl, 5, found);
 
   {
     std::lock_guard<std::mutex> lock(onlineVodFreesongsMutex_);
-    const int preservedIndex = onlineVodFreesongsList_.empty()
-        ? 0
-        : (onlineVodFreesongsIndex_ % static_cast<int>(found.size()));
+    if (baseUrl != onlineVodFreesongBaseUrl_) {
+      LOG_INFO("[OnlineVod] discard freesongs response from previous server: %s", baseUrl.c_str());
+      return false;
+    }
+    if (!ok) {
+      LOG_WARN("[OnlineVod] freesongs fetch failed; retain %zu cached files and retry",
+               onlineVodFreesongsList_.size());
+      return false;
+    }
+    // A valid empty list is authoritative (e.g. files were removed).
     onlineVodFreesongsList_ = found;
-    onlineVodFreesongsCache_ = found;
-    onlineVodFreesongsIndex_ = preservedIndex;
   }
   LOG_INFO("[OnlineVod] freesongs indexed: %zu video files", found.size());
   const size_t sampleCount = std::min<size_t>(found.size(), 3);
   for (size_t i = 0; i < sampleCount; ++i) {
     LOG_INFO("[OnlineVod] freesongs sample[%zu]=%s", i, found[i].c_str());
   }
+  return !found.empty();
+}
+
+bool Engine::scheduleOnlineVodFreesongFetchAsync(
+    int layerId, bool playAfterFetch, bool force, const char* reason,
+    uint64_t stateGeneration, bool paused) {
+  const std::string fetchReason = reason ? reason : "unknown";
+  const auto now = std::chrono::steady_clock::now();
+  {
+    // Serialize backoff, pending playback and in-flight transitions. Without a
+    // single completion boundary, a request can arrive after pending is consumed
+    // but before in-flight is cleared and then remain unprocessed indefinitely.
+    std::lock_guard<std::mutex> lock(onlineVodFreesongFetchMutex_);
+    if (shuttingDown_.load()) return false;
+    if (playAfterFetch && layerId >= 0) {
+      if (stateGeneration != onlineVodRoomStateGeneration_.load()) return false;
+      // Preserve the requested playback even when a previous scan is backing off.
+      onlineVodFreesongPendingPlayLayerId_ = layerId;
+      onlineVodFreesongPendingPlayGeneration_ = stateGeneration;
+      onlineVodFreesongPendingPlayPaused_ = paused;
+    }
+    if (!force &&
+        onlineVodFreesongNextFetchAllowed_ !=
+            std::chrono::steady_clock::time_point{} &&
+        now < onlineVodFreesongNextFetchAllowed_) {
+      const auto waitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          onlineVodFreesongNextFetchAllowed_ - now).count();
+      LOG_INFO("[OnlineVod] freesongs fetch deferred by backoff: reason=%s wait_ms=%lld",
+               fetchReason.c_str(), static_cast<long long>(waitMs));
+      return false;
+    }
+
+    if (onlineVodFreesongFetchInFlight_) {
+      // A settings notification can arrive while an older scan is still in flight.
+      if (force) onlineVodFreesongRefetchPending_ = true;
+      LOG_INFO("[OnlineVod] freesongs fetch already in flight: reason=%s",
+               fetchReason.c_str());
+      return false;
+    }
+    onlineVodFreesongFetchInFlight_ = true;
+  }
+
+  trackEngineAsyncTask(std::async(
+      std::launch::async, [this, fetchReason]() {
+        for (;;) {
+          const bool available = !shuttingDown_.load() && fetchAndCacheFreesongs();
+          int delaySeconds = 0;
+          int failureCount = 0;
+          if (available) {
+            onlineVodFreesongFetchRetryCount_.store(0, std::memory_order_relaxed);
+          } else {
+            failureCount = onlineVodFreesongFetchRetryCount_.fetch_add(
+                               1, std::memory_order_relaxed) + 1;
+            delaySeconds = 30;
+            switch (failureCount) {
+              case 1: delaySeconds = 1; break;
+              case 2: delaySeconds = 2; break;
+              case 3: delaySeconds = 4; break;
+              case 4: delaySeconds = 8; break;
+              case 5: delaySeconds = 16; break;
+              default: break;
+            }
+            LOG_WARN("[OnlineVod] freesongs fetch unavailable; retry backoff=%ds failures=%d reason=%s",
+                     delaySeconds, failureCount, fetchReason.c_str());
+          }
+
+          int pendingLayer = -1;
+          uint64_t pendingGeneration = 0;
+          bool pendingPaused = false;
+          {
+            std::lock_guard<std::mutex> lock(onlineVodFreesongFetchMutex_);
+            if (onlineVodFreesongRefetchPending_ && !shuttingDown_.load()) {
+              onlineVodFreesongRefetchPending_ = false;
+              continue;
+            }
+            onlineVodFreesongRefetchPending_ = false;
+            onlineVodFreesongNextFetchAllowed_ =
+                available
+                    ? std::chrono::steady_clock::time_point{}
+                    : std::chrono::steady_clock::now() +
+                          std::chrono::seconds(delaySeconds);
+            onlineVodFreesongNextRefresh_ = std::chrono::steady_clock::now() +
+                std::chrono::seconds(available ? 30 : delaySeconds);
+            pendingLayer = onlineVodFreesongPendingPlayLayerId_;
+            pendingGeneration = onlineVodFreesongPendingPlayGeneration_;
+            pendingPaused = onlineVodFreesongPendingPlayPaused_;
+            // A failed scan is retried by the update loop. It must not consume
+            // the sole startup play request and wait for another room event.
+            if (available) {
+              onlineVodFreesongPendingPlayLayerId_ = -1;
+              onlineVodFreesongPendingPlayGeneration_ = 0;
+              onlineVodFreesongPendingPlayPaused_ = false;
+            }
+            onlineVodFreesongFetchInFlight_ = false;
+          }
+
+          if (!available || pendingLayer < 0 || shuttingDown_.load()) return;
+          // The scan can finish after a new song or pause state arrives. Apply
+          // cached idle playback under the same lock as room-state media opens.
+          std::unique_lock<std::mutex> applyLock(onlineVodPlaybackApplyMutex_);
+          if (shuttingDown_.load() ||
+              pendingGeneration != onlineVodRoomStateGeneration_.load() ||
+              !isOnlineVodRuntimeEnabled()) {
+            LOG_INFO("[OnlineVod] discard stale freesong fetch playback: generation=%llu",
+                     static_cast<unsigned long long>(pendingGeneration));
+            return;
+          }
+          if (onlineVodPauseRequested_.load() && !pendingPaused) {
+            deferOnlineVodFreesongPlayback(pendingLayer, pendingGeneration,
+                                          pendingPaused);
+            return;
+          }
+          bool stillIdle = false;
+          {
+            std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+            stillIdle = onlineVodLastPlaybackWasIdle_;
+          }
+          if (stillIdle) {
+            if (!tryPlayFreesongOnLayer(pendingLayer, pendingGeneration,
+                                       pendingPaused)) {
+              deferOnlineVodFreesongPlayback(pendingLayer, pendingGeneration,
+                                            pendingPaused);
+            }
+          } else {
+            LOG_INFO("[OnlineVod] freesongs fetched but room is no longer idle; playback not started");
+          }
+          return;
+        }
+      }));
+  LOG_INFO("[OnlineVod] freesongs fetch scheduled: reason=%s force=%d play_after=%d",
+           fetchReason.c_str(), force ? 1 : 0, playAfterFetch ? 1 : 0);
+  return true;
+}
+
+void Engine::deferOnlineVodFreesongPlayback(int layerId,
+                                           uint64_t stateGeneration,
+                                           bool paused) {
+  std::lock_guard<std::mutex> lock(onlineVodFreesongFetchMutex_);
+  if (shuttingDown_.load() ||
+      stateGeneration != onlineVodRoomStateGeneration_.load()) return;
+  onlineVodFreesongPendingPlayLayerId_ = layerId;
+  onlineVodFreesongPendingPlayGeneration_ = stateGeneration;
+  onlineVodFreesongPendingPlayPaused_ = paused;
+  // Bound media-open retries too; the server can be reachable before its media
+  // disk/share is ready. No decoder/network work runs on the update thread.
+  onlineVodFreesongNextFetchAllowed_ = std::max(
+      onlineVodFreesongNextFetchAllowed_,
+      std::chrono::steady_clock::now() + std::chrono::seconds(2));
+}
+
+void Engine::retryOnlineVodFreesongPlayback() {
+  if (shuttingDown_.load() || !isOnlineVodRuntimeEnabled()) return;
+  int layerId = -1;
+  uint64_t generation = 0;
+  bool paused = false;
+  {
+    std::lock_guard<std::mutex> lock(onlineVodFreesongFetchMutex_);
+    if (onlineVodFreesongFetchInFlight_) return;
+    if (onlineVodFreesongPendingPlayLayerId_ >= 0 &&
+        onlineVodFreesongPendingPlayGeneration_ !=
+        onlineVodRoomStateGeneration_.load()) {
+      onlineVodFreesongPendingPlayLayerId_ = -1;
+      onlineVodFreesongPendingPlayGeneration_ = 0;
+      onlineVodFreesongPendingPlayPaused_ = false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < onlineVodFreesongNextFetchAllowed_) return;
+    if (onlineVodFreesongPendingPlayLayerId_ >= 0 && !onlineVodPauseRequested_.load()) {
+      layerId = onlineVodFreesongPendingPlayLayerId_;
+      generation = onlineVodFreesongPendingPlayGeneration_;
+      paused = onlineVodFreesongPendingPlayPaused_;
+    } else if (now < onlineVodFreesongNextRefresh_) {
+      return;
+    }
+  }
+  scheduleOnlineVodFreesongFetchAsync(layerId, layerId >= 0, false,
+      layerId >= 0 ? "idle_playback_retry" : "idle_list_reconcile", generation, paused);
 }
 
 void Engine::onlineVodWsPostJoinRoom(const std::string& roomId) {
@@ -3044,13 +4121,47 @@ void Engine::onlineVodWsPostAppPing() {
     onlineVodWsClient_->postAppLayerPing();
 }
 
-void Engine::processOnlineVodServerPendingActions() {
-  if (!vodDatabase_ || shuttingDown_.load()) return;
+bool Engine::enqueueOnlineVodServerAction(std::function<void()> action) {
+  if (!action || shuttingDown_.load()) return false;
+  std::lock_guard<std::mutex> lock(onlineVodPendingActionsMutex_);
+  if (shuttingDown_.load()) return false;
+  onlineVodPendingActions_.push_back(std::move(action));
+  return true;
+}
 
-  std::string routerJson = vodDatabase_->getOnlineVodSyncMeta("online_vod_pending_router_json", "");
-  if (!routerJson.empty() && commandRouter_) {
-    vodDatabase_->setOnlineVodSyncMeta("online_vod_pending_router_json", "");
-    commandRouter_->processCommand(routerJson);
+void Engine::processOnlineVodServerPendingActions() {
+  if (shuttingDown_.load()) return;
+
+  // This runs on the render/update thread. Never drain an unbounded command
+  // burst in one frame: stream open/close and resource state changes can be
+  // expensive even when their I/O preparation is delegated to workers.
+  constexpr size_t kMaxActionsPerFrame = 2;
+  constexpr auto kFrameBudget = std::chrono::milliseconds(2);
+  const auto start = std::chrono::steady_clock::now();
+  size_t processed = 0;
+  while (processed < kMaxActionsPerFrame && !shuttingDown_.load()) {
+    std::function<void()> action;
+    size_t remaining = 0;
+    {
+      std::lock_guard<std::mutex> lock(onlineVodPendingActionsMutex_);
+      if (onlineVodPendingActions_.empty()) break;
+      action = std::move(onlineVodPendingActions_.front());
+      onlineVodPendingActions_.pop_front();
+      remaining = onlineVodPendingActions_.size();
+    }
+    if (action) action();
+    ++processed;
+    if (std::chrono::steady_clock::now() - start >= kFrameBudget) {
+      if (remaining > 0) {
+        static int budgetLogCount = 0;
+        if (++budgetLogCount <= 5 || budgetLogCount % 300 == 0) {
+          LOG_WARN("[RenderBudget] OnlineVod actions deferred: processed=%zu "
+                   "remaining=%zu budgetMs=2",
+                   processed, remaining);
+        }
+      }
+      break;
+    }
   }
 }
 
@@ -3059,6 +4170,9 @@ bool Engine::handleOnlineVodPlaybackCommand(const std::string& action,
                                      const std::string& rawJson) {
   (void)rawJson;
   if (!commandRouter_ || !systemConfig_) return false;
+  // A control must affect the decoder committed by any in-flight room open.
+  // Otherwise Pause can hit the outgoing decoder and the new song starts again.
+  std::unique_lock<std::mutex> playbackLock(onlineVodPlaybackApplyMutex_);
 
   auto dispatchPlaybackCommand = [this, &action](const Json::Value& cmdParam) -> bool {
     Json::Value cmdJson;
@@ -3073,9 +4187,17 @@ bool Engine::handleOnlineVodPlaybackCommand(const std::string& action,
   };
 
   Json::Value cmdParam(Json::objectValue);
-  const int audioLayerId = systemConfig_->getAudioOutputLayerId() > 0
-                               ? systemConfig_->getAudioOutputLayerId()
-                               : 1;
+  const int configuredAudioLayerId = systemConfig_->getAudioOutputLayerId();
+  const int audioLayerId =
+      configuredAudioLayerId > 0 &&
+              AudioOutputLayerPolicy::isValidConfiguredLayer(
+                  mubu_.get(), configuredAudioLayerId)
+          ? configuredAudioLayerId
+          : 1;
+  if (configuredAudioLayerId > 0 && audioLayerId != configuredAudioLayerId) {
+    LOG_WARN("[OnlineVod] Ignore non-audio configured layer %d; use layer 1",
+             configuredAudioLayerId);
+  }
   cmdParam["layerId"] = audioLayerId;
 
   if (action == "Play" || action == "Resume") {
@@ -3118,11 +4240,16 @@ bool Engine::handleOnlineVodPlaybackCommand(const std::string& action,
   }
 
   if (action == "Unmute") {
+    if (!param.isMember("volume") || !param["volume"].isNumeric()) {
+      LOG_ERROR("[OnlineVod] Unmute rejected: missing numeric volume");
+      return false;
+    }
+    const int volume = param["volume"].asInt();
+    if (volume < 0 || volume > 100) {
+      LOG_ERROR("[OnlineVod] Unmute rejected: volume out of range (%d)", volume);
+      return false;
+    }
     cmdParam["action"] = "setSystemVolume";
-    int volume = (param.isMember("volume") && param["volume"].isNumeric())
-                     ? param["volume"].asInt()
-                     : static_cast<int>(systemConfig_->getSystemVolume() * 100.0f + 0.5f);
-    if (volume <= 0) volume = 60;
     cmdParam["volume"] = static_cast<float>(volume) / 100.0f;
     return dispatchPlaybackCommand(cmdParam);
   }
@@ -3207,12 +4334,34 @@ void Engine::stopOnlineVodSync() {
   if (stoppedAny) LOG_INFO("OnlineVodSync: stop");
 }
 
+void Engine::applyPlaybackOperationHintConfig() {
+  if (!systemConfig_ || !mubu_) return;
+  Layer* layer = mubu_->getLayer(41);
+  if (!layer || layer->getType() != LayerType::TEXT) return;
+  auto* renderer = static_cast<LayerText*>(layer)->getMessageHintRenderer();
+  if (renderer) {
+    renderer->setPlaybackOperationHintEnabled(
+        systemConfig_->isPlaybackOperationHintEnabled());
+  }
+}
+
 void Engine::applyVodConfigNow() {
   if (!systemConfig_) return;
+  applyPlaybackOperationHintConfig();
+  const bool serverMode = systemConfig_->isNetworkVodEnabled();
+  // Leave a valid player grant active when network VOD is enabled. Only a
+  // server-only grant needs to be restored to the normal local/cloud path
+  // when network VOD is turned off.
+  if (licenseManager_ && !serverMode && licenseManager_->isServerLicenseMode()) {
+    onlineVodAdmissionAuthorized_.store(false, std::memory_order_release);
+    stopOnlineVodSync();
+    licenseManager_->checkLicense(true);
+    refreshLicenseLayers();
+  }
   const int vodMode = systemConfig_->getVodMode();
-  const bool anyVodEnabled = systemConfig_->isAnyVodEnabled();
+  const bool anyVodEnabled = isVodRuntimeEnabled();
   const bool localVodEnabled = systemConfig_->isLocalVodEnabled();
-  const bool networkVodEnabled = systemConfig_->isNetworkVodEnabled();
+  const bool networkVodEnabled = isOnlineVodRuntimeEnabled();
   const std::string host = systemConfig_->getOnlineVodHost();
   const int port = 9898;
   const std::string roomId = systemConfig_->getOnlineVodRoomId().empty() ? "current" : systemConfig_->getOnlineVodRoomId();
@@ -3230,14 +4379,16 @@ void Engine::applyVodConfigNow() {
            vodMode, localVodLayer, host.c_str(), port, roomId.c_str());
 
   if (localVodEnabled) {
-    if (!localSongDatabase_) {
+    if (!localSongDatabase_ || !localSongDatabase_->isOpen() || localSongDatabase_->isTemporary()) {
       const std::string runtimeSongDbPath = DB_DIR + "song.db";
-      localSongDatabase_ = std::make_unique<LocalSongDatabase>();
+      if (!localSongDatabase_) {
+        localSongDatabase_ = std::make_unique<LocalSongDatabase>();
+      }
       if (!localSongDatabase_->initialize(runtimeSongDbPath)) {
         LOG_WARN("[VOD] LocalSongDatabase hot init failed: %s", runtimeSongDbPath.c_str());
-        localSongDatabase_.reset();
       } else {
-        LOG_INFO("[VOD] LocalSongDatabase hot init ok: %s", runtimeSongDbPath.c_str());
+        LOG_INFO("[VOD] LocalSongDatabase hot init ok: %s temporary=%d", runtimeSongDbPath.c_str(),
+                 localSongDatabase_->isTemporary() ? 1 : 0);
       }
     }
     if (!localVodDatabase_) {
@@ -3281,161 +4432,433 @@ void Engine::applyVodConfigNow() {
   }
 }
 
-void Engine::onOnlineVodStateChanged(const VodDatabase::OnlineVodState& st) {
-  // command-only：播放控制统一走 command；这里仅负责歌曲同步播放与必要提示
-  if (!mubu_ || !systemConfig_) return;
-  HintType hint = HintType::NONE;
-
-  const bool hadPreviousRoomState = onlineVodStateSeen_;
-  bool roomStatePlaySubmitted = false;
-  if (!onlineVodStateSeen_) {
-    onlineVodStateSeen_ = true;
-    // 首次不预设 lastOnlineVodSongId_，确保 songChanged=true 触发播放
+void Engine::applyOnlineVodRoomDeviceName(const std::string& roomName) {
+  std::string normalized = roomName;
+  normalized.erase(normalized.begin(),
+                   std::find_if(normalized.begin(), normalized.end(),
+                                [](unsigned char ch) { return !std::isspace(ch); }));
+  normalized.erase(
+      std::find_if(normalized.rbegin(), normalized.rend(),
+                   [](unsigned char ch) { return !std::isspace(ch); }).base(),
+      normalized.end());
+  const bool hasControlCharacter = std::any_of(
+      normalized.begin(), normalized.end(),
+      [](unsigned char ch) { return std::iscntrl(ch) != 0; });
+  if (normalized.empty() || normalized.size() > 63 || hasControlCharacter) {
+    if (!normalized.empty()) {
+      LOG_WARN("[OnlineVod] ignored invalid roomName for device naming");
+    }
+    return;
   }
 
-  // 保存旧 songId，供函数末尾 hint 判断使用（播放分支会提前更新 lastOnlineVodSongId_）
-  const std::string prevSongId = lastOnlineVodSongId_;
+#ifdef __ANDROID__
+  const auto now = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(onlineVodDeviceNameMutex_);
+    requestedOnlineVodDeviceName_ = normalized;
+    if (normalized == appliedOnlineVodDeviceName_ ||
+        onlineVodDeviceNameApplyInFlight_) {
+      return;
+    }
+    if (normalized == failedOnlineVodDeviceName_ &&
+        onlineVodDeviceNameLastFailure_.time_since_epoch().count() != 0 &&
+        now - onlineVodDeviceNameLastFailure_ < std::chrono::seconds(30)) {
+      return;
+    }
+    onlineVodDeviceNameApplyInFlight_ = true;
+  }
 
-  // roomStateChanged 驱动播放：song 非空 -> 直接播放；song 为空 -> stop
-  LOG_DEBUG("[OnlineVod] config: vodMode=%d", systemConfig_->getVodMode());
-  if (systemConfig_->isNetworkVodEnabled()) {
+  trackEngineAsyncTask(std::async(std::launch::async, [this]() {
+    while (!shuttingDown_.load()) {
+      std::string target;
+      {
+        std::lock_guard<std::mutex> lock(onlineVodDeviceNameMutex_);
+        target = requestedOnlineVodDeviceName_;
+      }
+
+      std::string error;
+      const bool ok = applyJavaAssociatedDeviceName(target, error);
+      bool needsAnotherPass = false;
+      {
+        std::lock_guard<std::mutex> lock(onlineVodDeviceNameMutex_);
+        if (ok) {
+          appliedOnlineVodDeviceName_ = target;
+          failedOnlineVodDeviceName_.clear();
+          onlineVodDeviceNameLastFailure_ = {};
+        } else {
+          failedOnlineVodDeviceName_ = target;
+          onlineVodDeviceNameLastFailure_ = std::chrono::steady_clock::now();
+        }
+        needsAnotherPass = requestedOnlineVodDeviceName_ != target;
+        if (!needsAnotherPass) onlineVodDeviceNameApplyInFlight_ = false;
+      }
+
+      if (ok) {
+        LOG_INFO("[OnlineVod] associated device name applied from roomName: %s",
+                 target.c_str());
+      } else {
+        LOG_ERROR("[OnlineVod] associated device name apply failed: %s",
+                  error.empty() ? "unknown" : error.c_str());
+      }
+      if (!needsAnotherPass) return;
+    }
+
+    std::lock_guard<std::mutex> lock(onlineVodDeviceNameMutex_);
+    onlineVodDeviceNameApplyInFlight_ = false;
+  }));
+#else
+  (void)normalized;
+#endif
+}
+
+void Engine::onOnlineVodStateChanged(const VodDatabase::OnlineVodState& st) {
+  applyOnlineVodRoomDeviceName(st.name);
+  if (!mubu_ || !systemConfig_) return;
+
+  HintType hint = HintType::NONE;
+  const bool hadPreviousRoomState = onlineVodStateSeen_;
+  onlineVodStateSeen_ = true;
+  const std::string prevSongId = lastOnlineVodSongId_;
+  if (st.currentQueueItemId.empty()) {
+    lastVodForwardQueueId_.clear();
+  } else if (st.playState == 1 && st.currentQueueItemId != lastVodForwardQueueId_) {
+    lastVodForwardQueueId_ = st.currentQueueItemId;
+    Json::Value fields(Json::objectValue);
+    fields["lightCode"] = st.currentSongLightCode;
+    fields["categoryCode"] = st.currentSongCategoryCode;
+    Json::Value raw;
+    std::string error;
+    if (JsonUtils::parseJson(st.rawJson, raw, error)) {
+      fields["songNo"] = raw["playingNow"].get("songNo", "");
+    }
+    PeripheralManager::getInstance().dispatchVodEvent("Song", fields);
+  }
+  const uint64_t stateGeneration = onlineVodRoomStateGeneration_.fetch_add(1) + 1;
+  bool roomStatePlaySubmitted = false;
+
+  // 房态是首次启动和断线重连后的权威值；音量/静音不能只依赖增量 command。
+  const int serverVolume = std::max(0, std::min(100, st.volume));
+  const float appliedVolume = st.muteStatus != 0
+                                  ? 0.0f
+                                  : static_cast<float>(serverVolume) / 100.0f;
+  systemConfig_->setSystemVolume(appliedVolume);
+  LOG_INFO("[OnlineVod] authoritative room state: generation=%llu playState=%d volume=%d mute=%d micStatus=%d songId=%s",
+           static_cast<unsigned long long>(stateGeneration), st.playState,
+           serverVolume, st.muteStatus, st.micStatus, st.currentSongId.c_str());
+
+  if (isOnlineVodRuntimeEnabled()) {
     int vodLayerId = systemConfig_->getVodLayerId();
     if (vodLayerId < 1) vodLayerId = 1;
     Layer* layer = mubu_->getLayer(vodLayerId);
-    LOG_DEBUG("[OnlineVod] config check: networkVod=true vodLayerId=%d layer=%s",
-             vodLayerId, layer ? (layer->getType() == LayerType::VIDEO ? "VIDEO" : "NOT_VIDEO") : "NULL");
     if (layer && layer->getType() == LayerType::VIDEO) {
-      LayerVideo* vl = static_cast<LayerVideo*>(layer);
-      LOG_DEBUG("[OnlineVod] roomStateChanged: playState=%d songId=%s title=%s",
-               st.playState, st.currentSongId.c_str(), st.currentSongTitle.c_str());
-
-      // 核心逻辑：只关心 songPath，有路径就播，没有就不动
-      // 从 rawJson 中提取 playingNow.songPath
-      std::string songPath;
-      {
-        Json::Value root;
-        std::string err;
-        if (JsonUtils::parseJson(st.rawJson, root, err)) {
-          const Json::Value* playingNow = nullptr;
-          if (root.isMember("playingNow") && root["playingNow"].isObject()) {
-            playingNow = &root["playingNow"];
-          }
-          if (playingNow) {
-            songPath = playingNow->get("songPath", "").asString();
-          }
-        }
+      LayerVideo* videoLayer = static_cast<LayerVideo*>(layer);
+      // Serialize room-state decisions with asynchronous media opens. A newer
+      // state increments the generation before waiting here, so it always gets
+      // the final stop/pause/play decision after an older open completes.
+      const auto decisionLockWaitStart = std::chrono::steady_clock::now();
+      std::unique_lock<std::mutex> playbackApplyLock(onlineVodPlaybackApplyMutex_);
+      const auto decisionLockWaitMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - decisionLockWaitStart)
+              .count();
+      if (decisionLockWaitMs >= 100) {
+        LOG_WARN("[OnlineVodTiming] room-state decision waited %lldms for playback lock: generation=%llu songId=%s",
+                 static_cast<long long>(decisionLockWaitMs),
+                 static_cast<unsigned long long>(stateGeneration),
+                 st.currentSongId.c_str());
+      }
+      if (stateGeneration != onlineVodRoomStateGeneration_.load()) {
+        LOG_INFO("[OnlineVod] discard stale room-state decision: generation=%llu",
+                 static_cast<unsigned long long>(stateGeneration));
+        return;
       }
 
-      const bool invalidSongPath = songPath.empty() || songPath.back() == '/';
-      if (invalidSongPath) {
-        LOG_WARN("[OnlineVod] invalid songPath in roomState, will request skip if playback request fails: songId=%s title=%s path=%s",
-                 st.currentSongId.c_str(), st.currentSongTitle.c_str(), songPath.c_str());
-        requestOnlineVodSkipAsync("invalid_room_state_song_path");
-        goto hint_section;
+      Json::Value roomStateJson(Json::objectValue);
+      std::string parseError;
+      Json::Value playingNow(Json::nullValue);
+      if (JsonUtils::parseJson(st.rawJson, roomStateJson, parseError) &&
+          roomStateJson.isObject() && roomStateJson.isMember("playingNow") &&
+          roomStateJson["playingNow"].isObject()) {
+        playingNow = roomStateJson["playingNow"];
       }
+
+      std::string songPath = playingNow.isObject()
+                                 ? playingNow.get("songPath", "").asString()
+                                 : "";
+      for (char& c : songPath) {
+        if (c == '\\') c = '/';
+      }
+      const int configuredTrack = playingNow.isObject()
+                                      ? playingNow.get("track", 0).asInt()
+                                      : 0;
+      const int desiredTrack = (configuredTrack == 4 || configuredTrack == 5)
+                                   ? (st.micStatus == 1 ? 5 : 4)
+                                   : (st.micStatus == 1 ? 3 : 2);
+      const bool isIdleState = st.currentSongId == "IDLE";
+      const bool hasQueueSong = !st.currentSongId.empty() &&
+                                st.currentSongId != "IDLE" &&
+                                st.currentSongId != "ERROR";
+      const bool validSongPath = !songPath.empty() && songPath.back() != '/';
+      const auto layerState = videoLayer->getState();
+      const std::string currentLayerPath = videoLayer->getCurrentPath();
+      const bool layerHasActiveMedia =
+          layerState == LayerVideo::PlayState::PLAYING ||
+          layerState == LayerVideo::PlayState::PAUSED;
+      std::string boundPlaybackPath;
+      std::string boundQueueItemId;
+      bool boundPlaybackWasIdle = false;
       {
-        // 去重：若图层正在播放同一路径，直接跳过，避免打断正在播放的视频
-        // 额外保留 500ms 防抖兜底，防止服务器短时间内重复推送同一路径触发两次 open
-        auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lk(onlineVodSwitchMutex_);
-        const bool incomingIdleFreesong =
-            st.currentSongId == "IDLE" ||
-            st.currentSongTitle.find("空闲") != std::string::npos;
-        const std::string currentLayerPathForIdle =
-            FileUtils::normalizePath(vl->getCurrentPath());
-        const std::string incomingLayerPathForIdle =
-            FileUtils::normalizePath(songPath);
-        if (incomingIdleFreesong &&
-            !incomingLayerPathForIdle.empty() &&
-            currentLayerPathForIdle == incomingLayerPathForIdle &&
-            (vl->getState() == LayerVideo::PlayState::PLAYING ||
-             vl->getState() == LayerVideo::PlayState::PAUSED)) {
-          LOG_INFO("[OnlineVod] idle freesong already playing, skip roomState interrupt: current=%s incoming=%s",
-                   currentLayerPathForIdle.c_str(), songPath.c_str());
-          goto hint_section;
+        std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+        boundPlaybackPath = onlineVodPlaybackMediaPath_;
+        boundQueueItemId = onlineVodPlaybackQueueItemId_;
+        boundPlaybackWasIdle = onlineVodLastPlaybackWasIdle_;
+      }
+      const bool samePlaybackIdentity =
+          isIdleState
+              ? boundPlaybackWasIdle
+              : (!st.currentQueueItemId.empty() &&
+                 boundQueueItemId == st.currentQueueItemId);
+      const std::string serverMediaPath =
+          normalizeOnlineVodMediaPathForCompare(songPath);
+      const bool sameIdleSelection =
+          isIdleState && onlineVodIdleStatePath_.has_value() &&
+          *onlineVodIdleStatePath_ == serverMediaPath;
+      // Idle songs advance locally at EOF. An unchanged server selection is a
+      // state update, even if the layer has already advanced to another file.
+      const bool sameMedia =
+          (layerHasActiveMedia ||
+           (hasQueueSong && (videoLayer->isPlaybackFinished() ||
+                            videoLayer->isPlaybackFailed() ||
+                            onlineVodDurationFinished_))) &&
+          samePlaybackIdentity &&
+          isSameOnlineVodMediaPath(currentLayerPath, boundPlaybackPath) &&
+          (!isIdleState || sameIdleSelection ||
+           (validSongPath && isSameOnlineVodMediaPath(currentLayerPath, songPath)));
+      if (isIdleState) {
+        onlineVodIdleStatePath_ = serverMediaPath;
+      } else {
+        onlineVodIdleStatePath_.reset();
+      }
+      const uint64_t transportGeneration = onlineVodTransportGeneration_.load();
+      const bool reconnectSameMedia =
+          sameMedia && layerHasActiveMedia && st.playState == 1 &&
+          transportGeneration != onlineVodPlaybackTransportGeneration_;
+      const double resumePosition = reconnectSameMedia
+                                        ? videoLayer->getCurrentPosition()
+                                        : -1.0;
+
+      if (!isIdleState && hasQueueSong && st.playState != 0 &&
+          st.currentQueueItemId.empty()) {
+        LOG_ERROR("[OnlineVod] active room state rejected: missing playingNow.queueItemId songId=%s path=%s",
+                  st.currentSongId.c_str(), songPath.c_str());
+      } else if (!isIdleState && st.playState == 0) {
+        // 正式歌曲处于停止态时不得因 roomStateChanged 被重新拉起。
+        if (layerState != LayerVideo::PlayState::STOPPED) {
+          videoLayer->stop();
+          LOG_INFO("[OnlineVod] synchronized stopped state for songId=%s",
+                   st.currentSongId.c_str());
         }
-        if (!incomingIdleFreesong) {
+        std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+        lastOnlineVodSongPath_.clear();
+        onlineVodLastPlaybackWasIdle_ = false;
+        onlineVodPlaybackQueueItemId_.clear();
+        onlineVodPlaybackMediaPath_.clear();
+      } else if (sameMedia && !reconnectSameMedia) {
+        // 相同媒体仍必须同步播放/暂停、原伴唱，不能把房态误当成重复播放而整体跳过。
+        if (st.playState == 2 && layerState == LayerVideo::PlayState::PLAYING) {
+          videoLayer->pause();
+        } else if (st.playState == 1 && layerState == LayerVideo::PlayState::PAUSED) {
+          videoLayer->resume();
+        }
+        if (videoLayer->getState() != LayerVideo::PlayState::STOPPED) {
+          applyOnlineVodTrackType(videoLayer, desiredTrack);
+        }
+        {
+          std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+          lastOnlineVodSongPath_ = normalizeOnlineVodMediaPathForCompare(currentLayerPath);
+          onlineVodLastPlaybackWasIdle_ = isIdleState;
+          onlineVodPlaybackMediaPath_ = lastOnlineVodSongPath_;
+          onlineVodPlaybackQueueItemId_ =
+              isIdleState ? std::string() : st.currentQueueItemId;
+        }
+        LOG_INFO("[OnlineVod] synchronized same media: state=%d path=%s serverPath=%s",
+                 st.playState, currentLayerPath.c_str(), songPath.c_str());
+      } else if (!validSongPath && !reconnectSameMedia) {
+        // 空闲态没有配置媒体是合法状态，不能循环向服务器请求切歌。
+        if (isIdleState) {
+          bool previousPlaybackWasIdle = false;
+          {
+            std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+            previousPlaybackWasIdle = onlineVodLastPlaybackWasIdle_;
+            onlineVodLastPlaybackWasIdle_ = true;
+            if (!previousPlaybackWasIdle) lastOnlineVodSongPath_.clear();
+          }
+          if (layerHasActiveMedia && !previousPlaybackWasIdle) {
+            videoLayer->stop();
+            LOG_INFO("[OnlineVod] idle room state stopped the completed queue song");
+          }
+          const bool freesongStarted = tryPlayFreesongOnLayer(
+              vodLayerId, stateGeneration, st.playState == 2);
+          if (freesongStarted) {
+            LOG_INFO("[OnlineVod] idle room state has no media path; cached freesong is playing");
+          } else {
+            LOG_INFO("[OnlineVod] idle room state has no media path; freesong fetch scheduled or deferred, no skip requested");
+          }
+        } else if (hasQueueSong && st.playState == 1) {
+          LOG_WARN("[OnlineVod] active queue song has invalid path, requesting skip: songId=%s path=%s",
+                   st.currentSongId.c_str(), songPath.c_str());
+          requestOnlineVodSkipAsync("invalid_active_room_state_song_path",
+                                     st.currentQueueItemId);
+        } else {
+          LOG_INFO("[OnlineVod] room state has no playable media and is not active; no skip requested");
+        }
+      } else {
+        if (!isIdleState) {
           refreshOnlineVodQueueAndApplyAsync("room_state_changed");
         }
-        if (!invalidSongPath && songPath == lastOnlineVodSongPath_) {
-          // 先检查图层是否正在播放该路径（最优先）
-          std::string normalizedSongPath = FileUtils::normalizePath(songPath);
-          std::string currentLayerPath = FileUtils::normalizePath(vl->getCurrentPath());
-          bool isAlreadyPlaying = (!currentLayerPath.empty() &&
-                                   currentLayerPath == normalizedSongPath &&
-                                   vl->getState() == LayerVideo::PlayState::PLAYING);
-          if (isAlreadyPlaying) {
-            LOG_INFO("[OnlineVod] same songPath already playing, skip: %s", songPath.c_str());
-            goto hint_section;
-          }
-          // 图层已停止（播完）时：允许重播，不做防抖拦截
-          bool isStopped = (vl->getState() == LayerVideo::PlayState::STOPPED);
-          if (!isStopped) {
-            // 图层未停止且路径相同，500ms 防抖兜底（防止连续推送触发两次 open）
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - onlineVodLastSwitchTime_).count();
-            if (elapsed < 500) {
-              LOG_INFO("[OnlineVod] debounce: same songPath within 500ms (%lldms), skip",
-                       (long long)elapsed);
-              goto hint_section;
-            }
-          }
+        onlineVodDurationFinished_ = false;
+        {
+          std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+          onlineVodLastSwitchTime_ = std::chrono::steady_clock::now();
         }
-        onlineVodLastSwitchTime_ = now;
-        lastOnlineVodSongPath_ = songPath;
-      }
-      LOG_DEBUG("[OnlineVod] songPath=%s, executing server order", songPath.c_str());
-      // 收到推送直接播放，不做去重
-      lastOnlineVodSongId_ = st.currentSongId;
-      roomStatePlaySubmitted = true;
-      {
-        const VodDatabase::OnlineVodState roomState = st;
+        lastOnlineVodSongId_ = st.currentSongId;
+        roomStatePlaySubmitted = true;
+
+        VodDatabase::OnlineVodState roomState = st;
+        if (reconnectSameMedia) {
+          // Reopen the actual local idle song at its current position, rather
+          // than returning to the server's earlier idle selection.
+          roomStateJson["playingNow"]["songPath"] = currentLayerPath;
+          roomState.rawJson = JsonUtils::toString(roomStateJson);
+        }
         const std::string songTitle = st.currentSongTitle;
-        const bool showRoomStateSwitchHint = hadPreviousRoomState;
-        trackEngineAsyncTask(std::async(std::launch::async, [this, vodLayerId, roomState, songTitle, showRoomStateSwitchHint]() {
-          if (shuttingDown_.load()) return;
-          bool played = tryPlayOnlineVodStateSongOnLayer(vodLayerId, roomState);
-          if (!played) {
-            LOG_WARN("[OnlineVod] play failed for '%s', requesting skip from server", songTitle.c_str());
-            requestOnlineVodSkipAsync("room_state_play_failed");
-            return;
-          }
-          if (showRoomStateSwitchHint && systemConfig_ && mubu_ &&
-              systemConfig_->hasLayerConfig(41)) {
-            Layer* layer41 = mubu_->getLayer(41);
-            if (layer41 && layer41->getType() == LayerType::TEXT) {
-              LayerText* hintLayer = static_cast<LayerText*>(layer41);
-              hintLayer->setVisible(true);
-              hintLayer->showOperationHint(HintType::NEXT, "");
-            }
-          }
-        }));
+        const bool showSwitchHint = hadPreviousRoomState && !reconnectSameMedia &&
+                                   (isIdleState || !samePlaybackIdentity);
+        if (reconnectSameMedia) {
+          LOG_INFO("[OnlineVod] rebuilding media after control reconnect: transport=%llu position=%.3f path=%s",
+                   static_cast<unsigned long long>(transportGeneration),
+                   resumePosition, songPath.c_str());
+        }
+        trackEngineAsyncTask(std::async(
+            std::launch::async,
+            [this, vodLayerId, roomState, songTitle, showSwitchHint,
+             stateGeneration, desiredTrack, isIdleState, hasQueueSong,
+             transportGeneration, resumePosition, samePlaybackIdentity]() {
+              const auto applyLockWaitStart = std::chrono::steady_clock::now();
+              std::unique_lock<std::mutex> applyLock(onlineVodPlaybackApplyMutex_);
+              const auto applyLockWaitMs =
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - applyLockWaitStart)
+                      .count();
+              if (applyLockWaitMs >= 100) {
+                LOG_WARN("[OnlineVodTiming] media open waited %lldms for playback lock: generation=%llu songId=%s",
+                         static_cast<long long>(applyLockWaitMs),
+                         static_cast<unsigned long long>(stateGeneration),
+                         roomState.currentSongId.c_str());
+              }
+              if (shuttingDown_.load() ||
+                  stateGeneration != onlineVodRoomStateGeneration_.load()) {
+                LOG_INFO("[OnlineVod] discard stale room-state playback before open: generation=%llu",
+                         static_cast<unsigned long long>(stateGeneration));
+                return;
+              }
+
+              const PlaybackResult playResult = tryPlayOnlineVodStateSongOnLayer(
+                  vodLayerId, roomState, resumePosition);
+              if (shuttingDown_.load() ||
+                  stateGeneration != onlineVodRoomStateGeneration_.load()) {
+                LOG_INFO("[OnlineVod] room-state playback became stale after open: generation=%llu",
+                         static_cast<unsigned long long>(stateGeneration));
+                return;
+              }
+
+              bool played = playResult.isSuccess();
+              if (isIdleState && !played) {
+                // Startup can also fail before a decoder opens (resource busy,
+                // release timeout, etc.). Every unsuccessful idle request must
+                // reach the fallback's bounded retry path, even without another
+                // room-state event. Generation/admission/pause guards still apply.
+                {
+                  std::lock_guard<std::mutex> lock(onlineVodSwitchMutex_);
+                  onlineVodLastPlaybackWasIdle_ = true;
+                  lastOnlineVodSongPath_.clear();
+                  onlineVodPlaybackMediaPath_.clear();
+                  onlineVodPlaybackQueueItemId_.clear();
+                }
+                LOG_WARN("[OnlineVod] idle room-state playback failed: result=%s; trying freesong fallback",
+                         toString(playResult.code));
+                played = tryPlayFreesongOnLayer(
+                    vodLayerId, stateGeneration, roomState.playState == 2);
+                if (!played) {
+                  LOG_WARN("[OnlineVod] idle freesong fallback unavailable or fetch pending; no skip requested");
+                  return;
+                }
+              }
+              if (!played) {
+                const bool permanentMediaFailure =
+                    playResult.code == PlaybackResultCode::OpenFailed ||
+                    playResult.code == PlaybackResultCode::DecodeFailed ||
+                    playResult.code == PlaybackResultCode::UnsupportedFormat;
+                if (!isIdleState && hasQueueSong && roomState.playState == 1 &&
+                    !samePlaybackIdentity && resumePosition < 0.0 &&
+                    !playResult.softBlocked &&
+                    permanentMediaFailure) {
+                  LOG_WARN("[OnlineVod] play failed for '%s', requesting skip from server",
+                           songTitle.c_str());
+                  requestOnlineVodSkipAsync("room_state_play_failed",
+                                                roomState.currentQueueItemId);
+                } else {
+                  LOG_WARN("[OnlineVod] playback deferred/failed; keep queue: state=%d result=%s resume=%.3f title=%s",
+                           roomState.playState, toString(playResult.code),
+                           resumePosition, songTitle.c_str());
+                }
+                return;
+              }
+
+              if (stateGeneration != onlineVodRoomStateGeneration_.load()) {
+                LOG_INFO("[OnlineVod] room-state playback became stale after open: generation=%llu",
+                         static_cast<unsigned long long>(stateGeneration));
+                return;
+              }
+
+              onlineVodPlaybackTransportGeneration_ = transportGeneration;
+
+              Layer* currentLayer = mubu_ ? mubu_->getLayer(vodLayerId) : nullptr;
+              if (currentLayer && currentLayer->getType() == LayerType::VIDEO) {
+                LayerVideo* currentVideo = static_cast<LayerVideo*>(currentLayer);
+                applyOnlineVodTrackType(currentVideo, desiredTrack);
+                if ((roomState.playState == 2 || onlineVodPauseRequested_.load()) &&
+                    currentVideo->getState() == LayerVideo::PlayState::PLAYING) {
+                  currentVideo->pause();
+                }
+              }
+
+              if (showSwitchHint && systemConfig_ && mubu_ &&
+                  systemConfig_->hasLayerConfig(41)) {
+                Layer* hintBaseLayer = mubu_->getLayer(41);
+                if (hintBaseLayer && hintBaseLayer->getType() == LayerType::TEXT) {
+                  LayerText* hintLayer = static_cast<LayerText*>(hintBaseLayer);
+                  hintLayer->setVisible(true);
+                  hintLayer->showOperationHint(HintType::NEXT, "");
+                }
+              }
+            }));
       }
     }
   }
-  hint_section:
 
-  // 用函数入口保存的 prevSongId 判断歌曲是否切换，
-  // 避免 lastOnlineVodSongId_ 已在播放分支提前更新为 st.currentSongId 导致比较失效。
-  if (!roomStatePlaySubmitted && hadPreviousRoomState && st.currentSongId != prevSongId) {
-    if (!st.currentSongId.empty() && st.currentSongId != "IDLE") {
+  if (!roomStatePlaySubmitted && hadPreviousRoomState &&
+      st.currentSongId != prevSongId) {
+    if (!st.currentSongId.empty() && st.currentSongId != "IDLE" &&
+        st.currentSongId != "ERROR") {
       hint = HintType::NEXT;
     }
-    onlineVodLastFinishedReportedSongId_.clear();
     LOG_INFO("OnlineVodStateChanged: songId changed (%s -> %s)",
              prevSongId.c_str(), st.currentSongId.c_str());
   }
-  // 播放分支未触发时（songPath 不变/无路径），在这里补充更新 lastOnlineVodSongId_
-  if (lastOnlineVodSongId_ != st.currentSongId) {
-    lastOnlineVodSongId_ = (st.currentSongId == "IDLE") ? "" : st.currentSongId;
-  }
+  lastOnlineVodSongId_ = st.currentSongId;
 
   if (hint == HintType::NONE) return;
-
-  LOG_INFO("OnlineVodStateChanged: hint=%d playState=%d volume=%d mute=%d song=%s",
-           static_cast<int>(hint), st.playState, st.volume, st.muteStatus,
-           st.currentSongId.c_str());
-
   if (systemConfig_->hasLayerConfig(41)) {
     Layer* layer41 = mubu_->getLayer(41);
     if (layer41 && layer41->getType() == LayerType::TEXT) {
@@ -3509,14 +4932,24 @@ void Engine::update(float deltaTime) {
   // 更新图层
   runStage("mubu.updateLayers", [&]() {
     if (mubu_) {
+      applyPlaybackOperationHintConfig();
       mubu_->updateLayers(deltaTime);
     }
+  });
+
+  runStage("stageControl.update", [&]() {
+    if (licenseManager_ && licenseManager_->isModuleEnabled("stage"))
+      StageControlManager::getInstance().update();
   });
 
   // OnlineVod WS 线程写入的待执行项（Stop / Play 媒体 / 外设类 command）在主线程消费
   runStage("processOnlineVodServerPendingActions", [&]() {
     processOnlineVodServerPendingActions();
   });
+  runStage("retryOnlineVodFreesongPlayback", [&]() {
+    retryOnlineVodFreesongPlayback();
+  });
+  runStage("retryOnlineVodSkipAsync", [&]() { retryOnlineVodSkipAsync(); });
 
   runStage("updateRoamConfigTick", [&]() { updateRoamConfigTick(); });
 
@@ -3541,11 +4974,8 @@ void Engine::update(float deltaTime) {
 
   runStage("updateCaptureSignalTick", [&]() { updateCaptureSignalTick(); });
 
-  runStage("updateCaptureAutoSceneSwitchTick", [&]() {
-    updateCaptureAutoSceneSwitchTick();
-  });
-
   runStage("updateLyricTick", [&]() { updateLyricTick(); });
+  runStage("refreshConfiguredQrCode", [&]() { refreshConfiguredQrCode(); });
 
   // 更新播放列表提示图层（基于视频剩余时间自动显示/隐藏）
   runStage("updatePlaylistHintLayer", [&]() { updatePlaylistHintLayer(); });
@@ -3620,17 +5050,16 @@ void Engine::preCreateAuthorizedLayers() {
     int layerId = definition.id;
     LayerType type = definition.type;
 
-    if (!mubu_->getLayer(layerId)) {
-      if (mubu_->createLayer(layerId, type)) {
-        Layer *layer = mubu_->getLayer(layerId);
-        if (layer) {
-          // 预创建的图层默认设置为不可见
-          // 实际的可见性由 createLayersFromConfig() 从 config.json 中应用
-          layer->setVisible(false);
-          // 注意：渲染器_ 在 Step 4.2 才初始化，这里先不设置
-          // 会在 Step 4.2 后统一为所有图层设置 渲染器_
-          createdCount++;
-        }
+    if (mubu_->getLayer(layerId)) continue;
+    if (mubu_->createLayer(layerId, type)) {
+      Layer *layer = mubu_->getLayer(layerId);
+      if (layer) {
+        // 预创建的图层默认设置为不可见
+        // 实际的可见性由 createLayersFromConfig() 从 config.json 中应用
+        layer->setVisible(false);
+        // 注意：渲染器_ 在 Step 4.2 才初始化，这里先不设置
+        // 会在 Step 4.2 后统一为所有图层设置 渲染器_
+        createdCount++;
       }
     }
 
@@ -3642,6 +5071,7 @@ void Engine::preCreateAuthorizedLayers() {
 
   if (createdCount > 0) {
     mubu_->sortLayersByPriority(true);
+    applyPlaybackOperationHintConfig();
   }
 
   // USB/Mirror sources render through the app-owned MIRROR layer. Some older
@@ -3675,18 +5105,18 @@ void Engine::preCreateAuthorizedLayers() {
 // - 切片配置：从 config.json 读取的切片会应用到图层
 //
 // 注意：只有在 config.json 中配置的图层才会被应用参数并启用
-void Engine::createLayersFromConfig() {
+void Engine::createLayersFromConfig(const std::vector<int>& preservedLayerIds) {
 #ifdef USE_NEW_LAYER_INIT
   // 使用新的图层初始化器框架（重构版本）
-  createLayersFromConfigNew();
+  createLayersFromConfigNew(preservedLayerIds);
 #else
   // 使用旧的图层初始化方式（原版本）
-  createLayersFromConfigOld();
+  createLayersFromConfigOld(preservedLayerIds);
 #endif
 }
 
 // 新的图层初始化方法（使用工厂模式）
-void Engine::createLayersFromConfigNew() {
+void Engine::createLayersFromConfigNew(const std::vector<int>& preservedLayerIds) {
   LOG_INFO("[Engine] Step 3.2: Loading layer configurations (NEW initializer framework)");
 
   if (!mubu_ || !systemConfig_) {
@@ -3706,14 +5136,14 @@ void Engine::createLayersFromConfigNew() {
 
   // 使用工厂批量初始化所有图层
   LayerInitializerFactory& factory = LayerInitializerFactory::getInstance();
-  int initializedCount = factory.initializeAllLayers(context);
+  int initializedCount = factory.initializeAllLayers(context, preservedLayerIds);
 
   LOG_INFO("[Engine] Layer initialization complete: %d layers initialized using new framework",
            initializedCount);
 }
 
 // 旧的图层初始化方法（保留用于回退）
-void Engine::createLayersFromConfigOld() {
+void Engine::createLayersFromConfigOld(const std::vector<int>& preservedLayerIds) {
   const auto &configLayers = systemConfig_->getAllLayerConfigs();
 
   if (!configLayers.empty()) {
@@ -3729,6 +5159,8 @@ void Engine::createLayersFromConfigOld() {
     }
 
     for (int layerId : createOrder) {
+      if (std::find(preservedLayerIds.begin(), preservedLayerIds.end(), layerId) !=
+          preservedLayerIds.end()) continue;
       auto it = configLayers.find(layerId);
       if (it == configLayers.end())
         continue;
@@ -3903,7 +5335,6 @@ void Engine::createLayersFromConfigOld() {
           }
         } else if (layerType == LayerType::MIRROR) {
           LayerMirror *mirrorLayer = static_cast<LayerMirror *>(layer);
-          mirrorLayer->setFitMode(std::clamp(config.fitMode, 0, 1));
           mirrorLayer->setReadyHintVisible(config.mirrorReadyHintVisible);
           mirrorLayer->setTvVerticalCropPx(config.tvVerticalCropPx);
         } else if (layerType == LayerType::IMAGE || layerType == LayerType::QRCODE) {
@@ -3926,21 +5357,10 @@ void Engine::createLayersFromConfigOld() {
           // 尊重配置文件中的 animated 设置（用户可通过前端切换静态/动态模式）
           imageLayer->setAnimated(config.animated);
 
-          // 图层71（二维码）使用当前根目录路径（ROOT_PATH 为 /huoshan/ 或 /sdcard/huoshan/ 等）
+          // Engine restores QR cards only after resolving device-specific content.
           if (layerId == 71) {
-            std::string qrPath = ROOT_PATH + "QRCode/qrcode_71.png";
-            std::string normalizedQRPath = FileUtils::normalizePath(qrPath);
-            if (FileUtils::exists(normalizedQRPath) && imageLayer->loadImage(normalizedQRPath)) {
-              if (config.size.width > 0 && config.size.height > 0) {
-                layer->setSize(config.size);
-              }
-              layer->setPosition(config.position);
-            }
-            // 文件不存在时不打日志：初始化时可能尚未生成，后续 Scene管理器/重试 会再加载，且二维码已显示说明某次加载已成功
+            imageLayer->setContentReady(false);
           }
-          // 其他图片图层（非 Logo/QRCode）：imagePath 由 SystemConfig 从 image_file 拼出（ROOT_PATH+Image/+文件名）
-          // Layer70 (Logo): 不使用 imagePath，始终从 logo/ 目录硬编码加载（见下方）
-          // Layer71 (QRCode): 已在上方单独处理
           else if (layerId != 70 && !config.imagePath.empty()) {
             std::string imagePath = config.imagePath;
 
@@ -4029,15 +5449,18 @@ void Engine::createLayersFromConfigOld() {
             layer->setSize(config.size);
           }
           layer->setPosition(config.position);
-          // fontPath 从 config.json 读取的仅是文件名，需拼上 FONT_DIR 构成完整路径；
-          // 始终设置路径以便重启后 API/页面能返回配置的 font_file，文件存在时用规范路径，不存在时仍写入路径供后续加载
-          if (!config.fontPath.empty()) {
-            std::string fullFontPath = FONT_DIR + config.fontPath;
+          // 歌词字体只使用公共配置；普通文本图层保留各自字体。
+          const std::string configuredFont =
+              layerId == 21 ? systemConfig_->getLyricFont() : config.fontPath;
+          if (!configuredFont.empty()) {
+            std::string fullFontPath = FONT_DIR + configuredFont;
             std::string normalizedFontPath =
                 FileUtils::normalizePath(fullFontPath);
             textLayer->setFontPath(FileUtils::exists(normalizedFontPath)
                                       ? normalizedFontPath
                                       : fullFontPath);
+          } else if (layerId == 21) {
+            textLayer->setFontPath("");
           }
           textLayer->setFontSize(config.fontSize);
           textLayer->setTextColor(Color::fromString(config.textColor));

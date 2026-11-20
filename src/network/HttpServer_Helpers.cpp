@@ -1,3 +1,4 @@
+#include "foundation/VideoStorage.h"
 /**
  * @file HttpServer_Helpers.cpp（文件名）
  * @brief HttpServer 辅助函数实现
@@ -10,7 +11,7 @@
 #include "HttpRequest.h"
 #include "HttpResponse.h"
 #include "core/CommandRouter.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/PeripheralManager.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
@@ -113,6 +114,7 @@ static const char *apiErrorCodeForStatus(int statusCode) {
 }
 
 static int commandHttpStatus(int errorCode) {
+  if (errorCode == 0x0403) return 403;
   if (errorCode == 0x0001 || errorCode == 0x0007 ||
       errorCode == 0x000A || errorCode == 0x0C01 ||
       errorCode == 0x0C02 || errorCode == 0x0C03 ||
@@ -407,8 +409,12 @@ void HttpServer::setJsonSuccessResponse(HttpResponse &response,
                                         const std::string &message,
                                         const Json::Value &data) {
   (void)message;
+  // 前端以 null 作为请求失败的唯一哨兵；成功但无业务数据时统一返回空对象。
+  const Json::Value responseData = data.isNull()
+      ? Json::Value(Json::objectValue)
+      : data;
   response.setStatusCode(200);
-  response.setJson(jsonToString(makeApiSuccess(data)));
+  response.setJson(jsonToString(makeApiSuccess(responseData)));
 }
 
 void HttpServer::setJsonDataResponse(HttpResponse &response,
@@ -494,6 +500,7 @@ std::string HttpServer::normalizeMaterialPath(const std::string& path) {
 
 bool HttpServer::isPathAllowed(const std::string &path) {
   std::string effective = normalizeMaterialPath(path);
+  if (hsvj::videoStorage::isSataPath(effective)) return hsvj::videoStorage::safeSataPath(effective);
   const std::string& root = hsvj::ROOT_PATH;
   if (root.empty()) return false;
   const char* subdirs[] = {"video", "image", "Image", "Music", "ttf"};
@@ -590,7 +597,7 @@ void HttpServer::registerVideoControlRoutes() {
       {"/api/v1/video/pause", "pause"},
       {"/api/v1/video/resume", "resume"},  // 移动端恢复播
       {"/api/v1/video/stop", "stop"},
-      {"/api/v1/video/load", "load"},
+      {"/api/v1/video/load", "loadVideo"},
       {"/api/v1/video/volume", "setVolume"},
       {"/api/v1/video/playbackRate", "setPlaybackRate"},
       {"/api/v1/video/volume/up", "volumeUp"},      // 移动端音量增

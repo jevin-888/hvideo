@@ -3,8 +3,8 @@
  * @brief 移动端中控模块
  */
 
-import { addToCommandLog } from '../core/commandLog.js';
-import { apiPost, apiAction } from '../core/api.js';
+import { addToCommandLog } from '/shared/commandLog.js';
+import { apiAction, getLastApiError } from '../core/api.js';
 
 const DEFAULT_CONTROL_CONFIG = {
     hvac: {
@@ -39,6 +39,14 @@ const DEFAULT_CONTROL_CONFIG = {
             { id: 'floor', label: '地台灯', enabled: true, default_on: false, functions: [] },
             { id: 'flood', label: '聚光灯', enabled: true, default_on: false, functions: [] }
         ]
+    },
+    projector: {
+        enabled: true,
+        title: '投影',
+        items: [
+            { id: 'power_on', label: '开', kind: 'power_on', enabled: true, functions: [] },
+            { id: 'power_off', label: '关', kind: 'power_off', enabled: true, functions: [] }
+        ]
     }
 };
 
@@ -56,6 +64,9 @@ let hvacOn = true;
 let lightStates = {};
 let dimmerValue = 50;
 let currentLightType = 'spot';
+
+// 最近一次投影操作，仅用于按钮状态提示
+let lastProjectorAction = '';
 
 /**
  * 初始化中控页面
@@ -90,6 +101,7 @@ function normalizeControlConfig(config = {}) {
     const incoming = config && typeof config === 'object' ? config : {};
     const hvac = incoming.hvac && typeof incoming.hvac === 'object' ? incoming.hvac : {};
     const lighting = incoming.lighting && typeof incoming.lighting === 'object' ? incoming.lighting : {};
+    const projector = incoming.projector && typeof incoming.projector === 'object' ? incoming.projector : {};
 
     normalized.hvac.enabled = hvac.enabled !== false;
     normalized.hvac.title = String(hvac.title || normalized.hvac.title);
@@ -144,6 +156,23 @@ function normalizeControlConfig(config = {}) {
         };
     });
 
+    normalized.projector.enabled = projector.enabled !== false;
+    normalized.projector.title = String(projector.title || normalized.projector.title);
+    const projectorItems = new Map((Array.isArray(projector.items) ? projector.items : [])
+        .filter(item => item && typeof item === 'object')
+        .map(item => [String(item.id || ''), item]));
+    normalized.projector.items = normalized.projector.items.map(item => {
+        const incomingItem = projectorItems.get(item.id) || {};
+        return {
+            ...item,
+            label: String(incomingItem.label || item.label),
+            enabled: incomingItem.enabled !== false,
+            functions: Array.isArray(incomingItem.functions)
+                ? incomingItem.functions
+                : (Array.isArray(item.functions) ? item.functions : [])
+        };
+    });
+
     return normalized;
 }
 
@@ -164,7 +193,8 @@ function bindControlEventsOnce() {
     if (controlEventsBound) return;
     controlEventsBound = true;
 
-    document.querySelectorAll('.control-tab').forEach(tab => {
+    const controlPage = document.getElementById('page-control');
+    controlPage?.querySelectorAll('.control-tab').forEach(tab => {
         tab.addEventListener('click', function() {
             const tabName = this.dataset.tab;
             switchTab(tabName);
@@ -229,6 +259,17 @@ function bindControlEventsOnce() {
             updateDimmer();
         });
     }
+
+    document.getElementById('projector-button-container')?.addEventListener('click', event => {
+        const button = event.target.closest('.projector-action-btn[data-projector-id]');
+        if (!button) return;
+        const item = getConfiguredButton('projector', button.dataset.projectorId);
+        if (!item || item.enabled === false) return;
+        lastProjectorAction = item.id;
+        updateProjectorButtonState();
+        addToCommandLog('投影控制', 'info', `${item.label || item.id}指令已发送`);
+        executeConfiguredButton('projector', item.id);
+    });
 }
 
 function applyControlConfig(config) {
@@ -237,11 +278,15 @@ function applyControlConfig(config) {
     hvacMode = controlConfig.hvac.default_mode;
     fanSpeed = controlConfig.hvac.default_fan_speed;
     dimmerValue = controlConfig.lighting.dimmer.default_value;
+    if (!getConfiguredButton('projector', lastProjectorAction)) {
+        lastProjectorAction = '';
+    }
 
     syncControlTabTitles();
     updateTemperatureControlsAvailability();
     renderHvacButtons();
     renderLightSwitches();
+    renderProjectorButtons();
     updateTemperature();
     updateHvacMode();
     updateLightSelection();
@@ -262,10 +307,13 @@ function updateTemperatureControlsAvailability() {
 }
 
 function syncControlTabTitles() {
-    const acTab = document.querySelector('.control-tab[data-tab="ac"]');
-    const lightingTab = document.querySelector('.control-tab[data-tab="lighting"]');
+    const controlPage = document.getElementById('page-control');
+    const acTab = controlPage?.querySelector('.control-tab[data-tab="ac"]');
+    const lightingTab = controlPage?.querySelector('.control-tab[data-tab="lighting"]');
+    const projectorTab = controlPage?.querySelector('.control-tab[data-tab="projector"]');
     if (acTab) acTab.textContent = controlConfig.hvac.title || '空调';
     if (lightingTab) lightingTab.textContent = controlConfig.lighting.title || '灯光';
+    if (projectorTab) projectorTab.textContent = controlConfig.projector.title || '投影';
 }
 
 function renderHvacButtons() {
@@ -327,6 +375,57 @@ function renderLightSwitches() {
     `).join('');
 }
 
+function renderProjectorButtons() {
+    const container = document.getElementById('projector-button-container');
+    if (!container) return;
+
+    if (!controlConfig.projector.enabled) {
+        container.innerHTML = '<div class="control-empty">投影功能未启用</div>';
+        return;
+    }
+
+    const items = controlConfig.projector.items.filter(item => item.enabled !== false);
+    if (!items.length) {
+        container.innerHTML = '<div class="control-empty">暂无投影控制按钮</div>';
+        return;
+    }
+
+    container.innerHTML = `
+        <div class="projector-control-card">
+            <div class="projector-control-heading">
+                <div class="projector-control-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="5" width="18" height="12" rx="2" />
+                        <path d="M8 21h8M12 17v4" />
+                        <circle cx="17" cy="9" r="1" />
+                    </svg>
+                </div>
+                <div>
+                    <div class="projector-control-title">${escapeHtml(controlConfig.projector.title || '投影')}</div>
+                    <div class="projector-control-hint">请选择开机或关机</div>
+                </div>
+            </div>
+            <div class="projector-button-grid">
+                ${items.map(item => `
+                    <button class="projector-action-btn projector-action-${item.kind === 'power_off' ? 'off' : 'on'} ${item.id === lastProjectorAction ? 'active' : ''}"
+                        type="button" data-projector-id="${escapeHtml(item.id)}" aria-pressed="${item.id === lastProjectorAction ? 'true' : 'false'}">
+                        <span class="projector-action-symbol" aria-hidden="true">${item.kind === 'power_off' ? 'OFF' : 'ON'}</span>
+                        <span class="projector-action-label">${escapeHtml(item.label || item.id)}</span>
+                    </button>
+                `).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function updateProjectorButtonState() {
+    document.querySelectorAll('#projector-button-container .projector-action-btn').forEach(button => {
+        const active = button.dataset.projectorId === lastProjectorAction;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+}
+
 function getHvacItem(id) {
     return controlConfig.hvac.items.find(item => item.id === id);
 }
@@ -339,19 +438,29 @@ function getConfiguredButton(region, buttonId) {
 
 async function executeConfiguredButton(region, buttonId) {
     const button = getConfiguredButton(region, buttonId);
-    if (!button || !Array.isArray(button.functions) || button.functions.length === 0) {
+    const buttonLabel = button?.label || buttonId;
+    if (!button) {
+        addToCommandLog('功能执行', 'error', `${region}/${buttonId} 未找到配置按钮`);
+        return;
+    }
+    if (!Array.isArray(button.functions) || button.functions.length === 0) {
+        addToCommandLog('功能执行', 'warning', `${buttonLabel} 未绑定命令`);
         return;
     }
     try {
+        const delayBudgetMs = button.functions.reduce((total, fn) =>
+            total + (fn.action === 'delay' ? Math.max(0, Number(fn.delay_ms ?? 1000)) : 0), 0);
         const response = await apiAction('peripherals', 'execute_function_button', {
                 region,
                 button_id: buttonId
-            });
+            }, Math.max(120000, button.functions.length * 30000 + delayBudgetMs + 8000));
         if (response == null) {
-            addToCommandLog('功能执行', 'error', `${button.label || buttonId} 执行失败`);
+            addToCommandLog('功能执行', 'error', getLastApiError()?.message || `${buttonLabel} 执行失败`);
+        } else {
+            addToCommandLog('功能执行', 'success', `${buttonLabel} 命令执行成功`);
         }
     } catch (error) {
-        addToCommandLog('功能执行', 'error', error.message || `${button.label || buttonId} 执行失败`);
+        addToCommandLog('功能执行', 'error', error.message || `${buttonLabel} 执行失败`);
     }
 }
 
@@ -392,11 +501,13 @@ function escapeHtml(value) {
  * 切换标签页
  */
 function switchTab(tabName) {
-    document.querySelectorAll('.control-tab').forEach(tab => {
+    const controlPage = document.getElementById('page-control');
+    if (!controlPage) return;
+    controlPage.querySelectorAll('.control-tab').forEach(tab => {
         tab.classList.toggle('active', tab.dataset.tab === tabName);
     });
 
-    document.querySelectorAll('.control-panel').forEach(panel => {
+    controlPage.querySelectorAll('.control-panel').forEach(panel => {
         panel.classList.toggle('active', panel.id === `${tabName}-panel`);
     });
 }

@@ -14,10 +14,11 @@
 #define HSVJ_LAYER_IMAGE_H
 
 #include "layer/Layer.h"
-#include <string>
-#include <vector>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 namespace hsvj {
 
@@ -47,6 +48,9 @@ public:
   void shutdown() override;
   void update(float deltaTime) override;
   void render() override;
+  // Runtime readiness is separate from the user's persisted visibility setting.
+  void setContentReady(bool ready) { contentReady_.store(ready); }
+  bool isContentReady() const { return contentReady_.load(); }
 
   /** Vulkan 逻辑设备已重建：丢弃纹理 ID，下帧将重新上传 */
   void dropStaleGpuTextureHandles();
@@ -57,6 +61,12 @@ public:
    * @return 是否加载成功
    */
   bool loadImage(const std::string &path);
+
+  /** Pre-decode the next image off the render/update thread. */
+  void preloadImage(const std::string &path);
+
+  /** Activate an image only after its decode and GPU upload are complete. */
+  bool activatePreloadedImage(const std::string &path);
   
   /**
    * @brief 获取当前图像路径
@@ -230,6 +240,9 @@ public:
   }
 
 private:
+  std::atomic<bool> contentReady_{true};
+  struct DecodedImage;
+
   mutable std::recursive_mutex imageMutex_;
   std::string imagePath_;        // 图像文件路径
     int filterMode_;               // 过滤模式（0=线性, 1=最近邻）
@@ -251,6 +264,11 @@ private:
   double animationTimeMs_;                   // 当前播放头时间
   double totalDurationMs_;                   // 总计时间
   size_t currentFrame_;                      // 当前显示的帧索引
+
+  // Carousel preloading: worker decodes CPU data; render thread uploads textures.
+  std::future<std::unique_ptr<DecodedImage>> preloadFuture_;
+  std::unique_ptr<DecodedImage> preloadedImage_;
+  std::string preloadRequestedPath_;
   
   // --------------------------------------------------------------------------
   // 照片墙 (Photo Wall) 扩展
@@ -307,7 +325,17 @@ private:
    */
   void updateAnimationFrame();
   bool uploadPendingFramesLocked();
+  bool uploadPreloadedImageLocked();
   bool hasPendingFrameDataLocked() const;
+  void collectPreloadResultLocked();
+  void clearPreloadedImageLocked();
+  void releaseDecodedImageTexturesLocked(DecodedImage &image);
+  void installDecodedImageLocked(std::unique_ptr<DecodedImage> image);
+  std::unique_ptr<DecodedImage> takeCurrentImageLocked();
+
+  static std::unique_ptr<DecodedImage>
+  decodeImage(const std::string &normalizedPath, bool animated, int layerId,
+              uint32_t maxTextureDim);
 };
 
 } // 命名空间 hsvj

@@ -5,14 +5,19 @@
 
 #include "capture/UsbCapture.h"
 #include "utils/Logger.h"
+#include "IoctlUtils.h"
 
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/select.h>
+#include <poll.h>
+#include <exception>
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 #include <linux/videodev2.h>
 
@@ -30,11 +35,7 @@ UsbCapture::UsbCapture() = default;
 UsbCapture::~UsbCapture() { shutdown(); }
 
 int UsbCapture::v4l2Ioctl(int fd, unsigned long request, void *arg) {
-  int ret;
-  do {
-    ret = ioctl(fd, request, arg);
-  } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
-  return ret;
+  return captureIoctl(fd, request, arg);
 }
 
 bool UsbCapture::initialize(const UsbCaptureConfig &config) {
@@ -46,6 +47,8 @@ bool UsbCapture::initialize(const UsbCaptureConfig &config) {
 
   config_ = config;
   devicePath_ = config.devicePath;
+  isUnhealthy_.store(false, std::memory_order_release);
+  shouldStop_.store(false, std::memory_order_release);
 
   fd_ = open(devicePath_.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (fd_ < 0) {
@@ -124,6 +127,29 @@ bool UsbCapture::negotiateFrameRate() {
     return true; // 不致命：很多 UVC 设备不让设置 fps
   }
 
+#ifdef __ANDROID__
+  // Volatile service diagnostic override; absent by default, never persisted
+  // to layer configuration. Only known comparison rates are accepted.
+  char fpsOverride[PROP_VALUE_MAX] = {};
+  __system_property_get("debug.hsvj.usb_fps", fpsOverride);
+  const unsigned requestedFps = std::strcmp(fpsOverride, "30") == 0 ? 30u :
+                                std::strcmp(fpsOverride, "60") == 0 ? 60u : 0u;
+  if (requestedFps) {
+    struct v4l2_streamparm requested = parm;
+    requested.parm.capture.timeperframe.numerator = 1;
+    requested.parm.capture.timeperframe.denominator = requestedFps;
+    if (v4l2Ioctl(fd_, VIDIOC_S_PARM, &requested) == 0) {
+      parm = requested;
+      LOG_INFO("[Capture][USB] diagnostic frame rate requested=%u accepted=%u/%u",
+               requestedFps, parm.parm.capture.timeperframe.denominator,
+               parm.parm.capture.timeperframe.numerator);
+    } else {
+      LOG_WARN("[Capture][USB] diagnostic frame rate %u rejected: %s",
+               requestedFps, strerror(errno));
+    }
+  }
+#endif
+
   if (parm.parm.capture.timeperframe.numerator > 0 &&
       parm.parm.capture.timeperframe.denominator > 0) {
     actualFps_ = static_cast<float>(parm.parm.capture.timeperframe.denominator) /
@@ -189,6 +215,7 @@ void UsbCapture::cleanup() {
 }
 
 bool UsbCapture::startCapture(UsbFrameCallback callback) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (fd_ < 0) {
     LOG_ERROR("[采集][USB] startCapture before initialize");
     return false;
@@ -198,7 +225,12 @@ bool UsbCapture::startCapture(UsbFrameCallback callback) {
     return true;
   }
 
+  if (thread_.joinable()) thread_.join();
+  enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  v4l2Ioctl(fd_, VIDIOC_STREAMOFF, &type);
+
   frameCallback_ = std::move(callback);
+  isUnhealthy_.store(false, std::memory_order_release);
 
   for (size_t i = 0; i < buffers_.size(); ++i) {
     struct v4l2_buffer buf;
@@ -212,7 +244,6 @@ bool UsbCapture::startCapture(UsbFrameCallback callback) {
     }
   }
 
-  enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   if (v4l2Ioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
     LOG_ERROR("[采集][USB] STREAMON failed: %s", strerror(errno));
     return false;
@@ -220,23 +251,34 @@ bool UsbCapture::startCapture(UsbFrameCallback callback) {
 
   shouldStop_.store(false);
   isCapturing_.store(true);
-  thread_ = std::thread(&UsbCapture::captureThread, this);
+  try {
+    thread_ = std::thread(&UsbCapture::captureThread, this);
+  } catch (const std::exception &error) {
+    shouldStop_.store(true);
+    isCapturing_.store(false);
+    isUnhealthy_.store(true);
+    v4l2Ioctl(fd_, VIDIOC_STREAMOFF, &type);
+    frameCallback_ = nullptr;
+    LOG_ERROR("[Capture][USB] Cannot start worker: %s", error.what());
+    return false;
+  }
   LOG_INFO("[采集][USB] STREAMON ok, capture thread started (fd=%d)", fd_);
   return true;
 }
 
 void UsbCapture::shutdown() {
-  if (isCapturing_.load()) {
-    shouldStop_.store(true);
-    if (thread_.joinable()) thread_.join();
-    isCapturing_.store(false);
-  }
+  shouldStop_.store(true, std::memory_order_release);
+  // 即使采集线程因热拔出自行退出，thread_ 仍然是 joinable；必须回收，
+  // 否则下一次 startCapture/析构时给 std::thread 赋值会触发 terminate。
+  if (thread_.joinable()) thread_.join();
+  isCapturing_.store(false, std::memory_order_release);
   std::lock_guard<std::mutex> lock(mutex_);
   cleanup();
   frameCallback_ = nullptr;
 }
 
 void UsbCapture::releaseFrame(int bufferIndex) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (!isCapturing_.load() || fd_ < 0) return;
   if (bufferIndex < 0 || bufferIndex >= static_cast<int>(buffers_.size())) return;
 
@@ -247,6 +289,7 @@ void UsbCapture::releaseFrame(int bufferIndex) {
   buf.index = bufferIndex;
   if (v4l2Ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
     LOG_ERROR("[采集][USB] QBUF release[%d] failed: %s", bufferIndex, strerror(errno));
+    isUnhealthy_.store(true);
   }
 }
 
@@ -258,13 +301,12 @@ void UsbCapture::captureThread() {
   constexpr int kMaxErrors = 10;
   int frameLogCount = 0;
   int emptyLogCount = 0;
+  auto lastDequeuedAt = std::chrono::steady_clock::time_point{};
+  uint32_t lastSequence = 0;
 
-  while (!shouldStop_.load()) {
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(fd_, &fds);
-    struct timeval tv{0, 100000}; // 100ms
-    int ret = select(fd_ + 1, &fds, nullptr, nullptr, &tv);
+  while (!shouldStop_.load() && !isUnhealthy_.load()) {
+    struct pollfd descriptor{fd_, POLLIN, 0};
+    int ret = poll(&descriptor, 1, 100);
 
     if (ret < 0) {
       if (errno == EINTR) continue;
@@ -273,6 +315,7 @@ void UsbCapture::captureThread() {
         break;
       }
       if (++consecutiveErrors >= kMaxErrors) {
+        LOG_ERROR("[Capture][USB] poll failed %d times errno=%d", consecutiveErrors, errno);
         isUnhealthy_.store(true);
         break;
       }
@@ -280,31 +323,65 @@ void UsbCapture::captureThread() {
     }
     if (ret == 0) {
       if (++consecutiveTimeouts >= kMaxTimeouts) {
+        LOG_ERROR("[Capture][USB] no input for %d poll intervals (100ms each)", consecutiveTimeouts);
         isUnhealthy_.store(true);
         consecutiveTimeouts = 0;
       }
       continue;
     }
-    consecutiveTimeouts = 0;
-    consecutiveErrors = 0;
-    isUnhealthy_.store(false);
+    if (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+      LOG_ERROR("[Capture][USB] poll device event revents=0x%x", descriptor.revents);
+      break;
+    }
+    if (!(descriptor.revents & POLLIN)) continue;
 
     struct v4l2_buffer buf;
     memset(&buf, 0, sizeof(buf));
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
     if (v4l2Ioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
-      if (errno == EAGAIN) continue;
-      if (errno == ENODEV || errno == ENXIO || errno == EIO) break;
-      if (++consecutiveErrors >= kMaxErrors) break;
+      if (errno == EAGAIN) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      if (errno == ENODEV || errno == ENXIO || errno == EIO) {
+        LOG_ERROR("[Capture][USB] DQBUF stopped errno=%d", errno);
+        break;
+      }
+      if (++consecutiveErrors >= kMaxErrors) {
+        LOG_ERROR("[Capture][USB] DQBUF failed %d times errno=%d", consecutiveErrors, errno);
+        break;
+      }
       continue;
     }
+    const auto dequeuedAt = std::chrono::steady_clock::now();
+    const auto gapMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        dequeuedAt - lastDequeuedAt).count();
+    if (lastDequeuedAt.time_since_epoch().count() && gapMs >= 250) {
+      LOG_WARN("[Capture][USB] input gap=%lldms pollTimeouts=%d seq=%u previousSeq=%u bytes=%u flags=0x%x",
+               (long long)gapMs, consecutiveTimeouts, buf.sequence, lastSequence,
+               buf.bytesused, buf.flags);
+    }
+    lastDequeuedAt = dequeuedAt;
+    lastSequence = buf.sequence;
+    consecutiveTimeouts = 0;
+    consecutiveErrors = 0;
 
     int idx = buf.index;
     size_t bytes = buf.bytesused;
     if (idx < 0 || idx >= static_cast<int>(buffers_.size())) {
       LOG_WARN("[采集][USB] bad buffer idx %d", idx);
-      continue;
+      // 驱动返回非法索引时无法安全归还该 buffer；标记采集失效，
+      // 让上层停止继续向已损坏的队列提交帧，避免设备长期卡死。
+      isUnhealthy_.store(true, std::memory_order_release);
+      break;
+    }
+
+    if (bytes > buffers_[idx].length || (buf.flags & V4L2_BUF_FLAG_ERROR)) {
+      LOG_ERROR("[Capture][USB] Invalid frame size/flags: bytes=%zu mapped=%zu flags=%u",
+                bytes, buffers_[idx].length, buf.flags);
+      isUnhealthy_.store(true);
+      break;
     }
 
     // 过滤空 MJPEG 帧（4 字节 SOI+EOI）：MS2109 等设备会以 60Hz 输出
@@ -337,11 +414,29 @@ void UsbCapture::captureThread() {
     }
 
     if (frameCallback_) {
-      frameCallback_(frame);
+      try {
+        frameCallback_(frame);
+        const auto callbackMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - dequeuedAt).count();
+        if (callbackMs >= 50) {
+          LOG_WARN("[Capture][USB] slow callback=%lldms seq=%u", (long long)callbackMs, buf.sequence);
+        }
+      } catch (...) {
+        LOG_ERROR("[Capture][USB] Frame callback failed; stop and recover capture");
+        isUnhealthy_.store(true);
+        break;
+      }
     } else {
       releaseFrame(idx);
     }
   }
+  // 线程可能因设备热拔出或连续 I/O 错误提前退出；同步暴露状态，
+  // 使调用方无需等待下一次 shutdown 才能发现采集已停止。
+  const bool stoppedByRequest = shouldStop_.load(std::memory_order_acquire);
+  if (!stoppedByRequest) {
+    isUnhealthy_.store(true, std::memory_order_release);
+  }
+  isCapturing_.store(false, std::memory_order_release);
   LOG_DEBUG("[采集][USB] thread ended");
 }
 

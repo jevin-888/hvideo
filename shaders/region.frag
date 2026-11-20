@@ -55,21 +55,11 @@ layout(push_constant) uniform PushConstants {
 #define pc_dmxG (pc.dmxParams.y)
 #define pc_dmxB (pc.dmxParams.z)
 #define pc_dmxEnabled (uint(pc.dmxParams.w))
-layout(binding = 4) uniform sampler2D blendTexture;
 
 const int MASK_SHADER_MAX_VERTICES = 128;
 
 // --- 辅助函数：状态解析 ---
 bool getMaskEnabled() { return (pc.maskFlags & 1u) != 0u; }
-
-float sampleLegacyBlendMask(vec2 localUV) {
-    // 旧项目 CScreen::refreshBufers 为融合遮罩单独生成 0.01~0.99 的 UV。
-    // 旧项目融合纹理使用 OpenGL 纹理坐标：v=0 是屏幕底部，v=1 是屏幕顶部。
-    // 当前 Vulkan 局部坐标 y=0 是屏幕顶部，因此这里必须翻转 y 才等价。
-    vec2 uv = clamp(localUV, vec2(0.0), vec2(1.0));
-    vec2 fuseUV = vec2(0.01 + uv.x * 0.98, 0.01 + (1.0 - uv.y) * 0.98);
-    return clamp(texture(blendTexture, fuseUV).r, 0.0, 1.0);
-}
 
 float gammaBlend(float anchor, float slope, float gamma, float x) {
     if (x <= 0.0) return 0.0;
@@ -148,6 +138,35 @@ float sampleDynamicMask(vec2 canvasUV) {
     return clamp(texture(maskTexture, clamp(canvasUV, vec2(0.0), vec2(1.0))).r, 0.0, 1.0);
 }
 
+float geometryEdgeCoverage() {
+    const uint REGION_AA_LEFT = 0x1u;
+    const uint REGION_AA_RIGHT = 0x2u;
+    const uint REGION_AA_TOP = 0x4u;
+    const uint REGION_AA_BOTTOM = 0x8u;
+
+    vec2 outputPixels = max(cave.outputSize.zw, vec2(1.0));
+    vec2 regionSize = max(abs(pc.outputRect.zw), vec2(1e-6));
+    vec2 aaWidth = 1.0 / max(regionSize * outputPixels, vec2(1.0));
+    aaWidth = max(aaWidth, fwidth(fragUV));
+    vec2 halfAaWidth = 0.5 * aaWidth;
+
+    // Center coverage on the rasterized edge; outside-only ramps are never shaded.
+    float coverage = 1.0;
+    if ((pc._pad99 & REGION_AA_LEFT) != 0u) {
+        coverage *= smoothstep(-halfAaWidth.x, halfAaWidth.x, fragUV.x);
+    }
+    if ((pc._pad99 & REGION_AA_RIGHT) != 0u) {
+        coverage *= smoothstep(-halfAaWidth.x, halfAaWidth.x, 1.0 - fragUV.x);
+    }
+    if ((pc._pad99 & REGION_AA_TOP) != 0u) {
+        coverage *= smoothstep(-halfAaWidth.y, halfAaWidth.y, fragUV.y);
+    }
+    if ((pc._pad99 & REGION_AA_BOTTOM) != 0u) {
+        coverage *= smoothstep(-halfAaWidth.y, halfAaWidth.y, 1.0 - fragUV.y);
+    }
+    return clamp(coverage, 0.0, 1.0);
+}
+
 // 计算点 p 到线段 ab 的距离 (SDF)
 float sdSegment(vec2 p, vec2 a, vec2 b) {
     vec2 pa = p - a, ba = b - a;
@@ -207,7 +226,8 @@ void main() {
 
     // 6. 授权水印 (不随视频变形)
     if (pc.showLicenseWatermark != 0u) {
-        if (pc.showLicenseWatermark >= 3u) result = vec3(0.0);
+        // Stage 3 stays black; stage 4 keeps the IP/authorization screen visible.
+        if (pc.showLicenseWatermark == 3u) result = vec3(0.0);
         vec2 uv = fragDeformedPos;
         float textScale = 0.08;
         vec2 centered = (uv - vec2(0.31, 0.46)) / textScale;
@@ -232,6 +252,7 @@ void main() {
     }
 
     result *= blendMask * maskValue;
+    result *= geometryEdgeCoverage();
 
     // 区域之间应该无缝拼接，swapchain 始终写不透明颜色，避免系统合成层露出白缝。
     outColor = vec4(result, 1.0);

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file PeripheralManager.h（文件名）
  * @brief 外部设备管理类（RS232/RS485/DMX512）
  */
@@ -8,12 +8,15 @@
 
 #include <array>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <json/json.h>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace hsvj {
@@ -49,6 +52,9 @@ class PeripheralManager {
 public:
   static PeripheralManager &getInstance();
 
+  // 中控内置功能的唯一目录；列表展示和触发执行共用默认参数。
+  static const Json::Value &builtinControlFunctions();
+
   /**
    * @brief 初始化管理中心
    */
@@ -67,7 +73,8 @@ public:
   /**
    * @brief 设置命令路由器，用于处理网络协议接收到的指令
    */
-  void setCommandRouter(CommandRouter *router) { commandRouter_ = router; }
+  void setCommandRouter(CommandRouter *router);
+  void stopTriggerExecution();
 
   /**
    * @brief 组播播放器执行结果到所有连接的客户端
@@ -102,6 +109,12 @@ public:
    * @brief 发送测试数据
    */
   std::string sendTest(const std::string &target, const std::string &data);
+
+  /**
+   * @brief 发送舞台控制协议载荷。舞台控制模块统一复用现有外设适配器。
+   */
+  Json::Value sendStageProtocol(const Json::Value &param);
+  Json::Value dispatchVodEvent(const std::string& event, const Json::Value& data);
 
   /**
    * @brief 获取通道值 (根据当前模式返回 实时值 或 模拟值)
@@ -183,7 +196,7 @@ private:
     std::string port = "artnet"; // ttyUSBx 或 ArtNet/sACN
     DmxProtocol protocol = DmxProtocol::ARTNET;
     DmxInputMode inputMode = DmxInputMode::LOCAL;
-    std::string externalPort = "/dev/ttySWK4";   // 外接模式使用的旧项目 232 串口
+    std::string externalPort = "/dev/ttyS5"; // H6 onboard RS232 for DMX external mode
     int externalBaudrate = 115200;
     int externalDataBits = 8;
     int externalStopBits = 1;
@@ -216,6 +229,26 @@ private:
     Json::Value extraParam;     // 前端传入的其它字段，会覆盖 JSON 文件默认值
   };
 
+  struct TriggerExecutionResult {
+    size_t attempted = 0;
+    size_t succeeded = 0;
+    size_t failed = 0;
+    std::string firstError;
+
+    bool ok() const { return attempted > 0 && failed == 0; }
+  };
+
+  struct TriggerJob {
+    std::vector<TriggerFunction> functions;
+    std::string label, source, payload, hex;
+  };
+  std::mutex triggerQueueMutex_;
+  std::condition_variable triggerQueueCv_;
+  std::deque<TriggerJob> triggerQueue_;
+  std::thread triggerWorker_;
+  bool triggerStopping_ = false;
+  void enqueueTrigger(TriggerJob job);
+
   /**
    * @brief 触发条目：外部设备发来的字符串与一组功能链的映射
    */
@@ -245,12 +278,17 @@ private:
   std::unique_ptr<Rs232Server> serialLearnRs232_;
   std::unique_ptr<Rs485Server> serialLearnRs485_;
   std::unique_ptr<Rs232Server> dmxExternalRs232_;
+  // Output-only connections, protected by serialListenerMutex_.
+  std::map<std::string, std::unique_ptr<Rs232Server>> serialWriteRs232_;
+  std::map<std::string, std::unique_ptr<Rs485Server>> serialWriteRs485_;
   NetworkConfig udpConfig_;
   NetworkConfig tcpConfig_;
   NetworkConfig websocketConfig_;
   Json::Value functionConfig_;
+  Json::Value vodForwardConfig_;
 
   mutable std::mutex mutex_;
+  mutable std::mutex serialListenerMutex_;
   mutable std::mutex dmxExternalMutex_;
   SystemConfig *systemConfig_ = nullptr;
   Engine *engine_ = nullptr;
@@ -281,11 +319,12 @@ private:
    * @brief 真正派发：在锁外把已匹配的 functions 链交给 CommandRouter 执行
    *  会按 functionId 查 CommandList/playback 目录下的 JSON 文件补全默认参数（layerId/时间/...）
    */
-  void executeTriggerFunctions(const std::vector<TriggerFunction> &functions,
-                               const std::string &triggerLabel,
-                               const std::string &source,
-                               const std::string &payload = "",
-                               const std::string &hex = "");
+  TriggerExecutionResult executeTriggerFunctions(
+      const std::vector<TriggerFunction> &functions,
+      const std::string &triggerLabel,
+      const std::string &source,
+      const std::string &payload = "",
+      const std::string &hex = "");
   bool dispatchSerialTemplate(const std::string &type, const std::string &hex);
   bool dispatchSerialTemplate(const std::string &type, const std::string &hex,
                               const std::string &payload);
@@ -307,6 +346,7 @@ private:
   Json::Value setSerialLearnMode(const Json::Value &param);
   bool startSerialLearnThread(const std::string &type, const std::string &port,
                               int baudrate, std::string &error);
+  bool isSerialListenerRunning(const std::string &type) const;
   void stopSerialLearnThread();
   void stopSerialLearnThread(const std::string &type);
   void rememberSerialTemplate(const std::string &type, const std::string &port,
@@ -317,7 +357,8 @@ private:
   bool writeHexToSerial(const std::string &type, const std::string &port, int baudrate,
                         const std::string &hex, std::string &error);
   bool forwardPayload(const Json::Value &param, const std::string &payload,
-                      const std::string &hex, std::string &error);
+                      const std::string &hex, std::string &error,
+                      std::string *reply = nullptr);
   bool startDmxExternalInput(const std::string &port, int baudrate,
                              std::string &error);
   void stopDmxExternalInput();
@@ -334,7 +375,6 @@ private:
   void showDmxChannelInfoLocked() const;
   bool parseDmxExternalPacket(const uint8_t *packet, size_t len,
                               std::array<uint8_t, 12> &channels) const;
-  void writeDmxExternalStartupCommands(Rs232Server &server);
 
   // 模拟调试相关
   bool simulationMode_ = false;

@@ -78,7 +78,7 @@ void ASSRenderer::setSharedLibassHolder(SharedLibassHolder *holder) {
   sharedLibassHolder_ = holder;
 }
 
-bool ASSRenderer::loadSubtitleFile(const std::string &filename) {
+bool ASSRenderer::loadSubtitleFile(const std::string &filename, const std::string &assData) {
   if (!initialized_ || !library_ || !sharedLibassHolder_) {
     LOG_ERROR("[Lyric] ASS 加载文件失败 未初始化");
     return false;
@@ -87,7 +87,9 @@ bool ASSRenderer::loadSubtitleFile(const std::string &filename) {
   {
     std::lock_guard<std::mutex> lock(sharedLibassHolder_->getRenderMutex());
     freeTrackLocked();
-    track_ = ass_read_file(library_, const_cast<char *>(filename.c_str()), nullptr);
+    track_ = assData.empty()
+        ? ass_read_file(library_, const_cast<char *>(filename.c_str()), nullptr)
+        : ass_read_memory(library_, const_cast<char *>(assData.data()), assData.size(), nullptr);
 
     if (!track_) {
       LOG_ERROR("[Lyric] ASS 加载文件失败 ass_read_file path=%s", filename.c_str());
@@ -135,6 +137,7 @@ ASS_Image *ASSRenderer::renderFrame(int64_t timeMs, int *detectChange) {
     image = ass_render_frame(
         reinterpret_cast<ASS_Renderer *>(sharedLibassHolder_->getRenderer()),
         track_, timeMs, &change);
+    // libass retains this list for the next frame's change detection.
   }
 
   if (detectChange)
@@ -159,16 +162,15 @@ int ASSRenderer::getEventCount() const {
 }
 
 void ASSRenderer::updateDefaultFont(const std::string &fontPath) {
-  if (!renderer_ || !sharedLibassHolder_ || fontPath.empty()) {
+  if (!renderer_ || !sharedLibassHolder_) {
     return;
   }
 
   std::lock_guard<std::mutex> lock(sharedLibassHolder_->getRenderMutex());
-  // 重置 默认 font
-  // Second parameter is 默认 font 路径, third is 默认 font family
-  // We 设置 默认 family to "lyric" for compatibility
-  // 说明：关键参数是第一个 fontPath
-  ass_set_fonts(renderer_, fontPath.c_str(), "lyric",
+  // 公共配置留空时恢复启动时加载的默认字体。
+  const std::string &effectiveFont =
+      fontPath.empty() ? sharedLibassHolder_->getDefaultFontPath() : fontPath;
+  ass_set_fonts(renderer_, effectiveFont.empty() ? nullptr : effectiveFont.c_str(), "lyric",
                 ASS_FONTPROVIDER_NONE, nullptr, 1);
 }
 

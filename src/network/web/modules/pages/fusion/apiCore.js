@@ -4,14 +4,58 @@ function isFiniteNumber(value) {
 
 export function createFusionApi({ fusionCommand, apiPost }) {
     const post = (param, timeoutMs) => fusionCommand(param, timeoutMs);
+    let checkpointTimer = null;
+    let checkpointChain = Promise.resolve();
+
+    const clearCheckpointTimer = () => {
+        if (!checkpointTimer) return;
+        clearTimeout(checkpointTimer);
+        checkpointTimer = null;
+    };
+
+    const runCheckpoint = () => {
+        clearCheckpointTimer();
+        checkpointChain = checkpointChain
+            .catch(() => undefined)
+            .then(() => apiPost('/fusion/checkpoint', {}));
+        checkpointChain.catch((error) => {
+            console.warn('fusion realtime checkpoint failed:', error);
+        });
+        return checkpointChain;
+    };
+
+    // Throttle instead of debounce: continuous dragging is checkpointed every
+    // 400 ms rather than waiting indefinitely for the interaction to stop.
+    const scheduleCheckpoint = () => {
+        if (checkpointTimer) return;
+        checkpointTimer = setTimeout(() => {
+            void runCheckpoint();
+        }, 400);
+    };
+
+    const postDurableMutation = (param, timeoutMs) => post(param, timeoutMs)
+        .then((result) => {
+            scheduleCheckpoint();
+            return result;
+        });
 
     return {
         persist() {
-            return apiPost('/fusion/save', {});
+            clearCheckpointTimer();
+            return checkpointChain
+                .catch(() => undefined)
+                .then(() => apiPost('/fusion/save', {}));
+        },
+
+        checkpoint() {
+            return runCheckpoint();
         },
 
         reset() {
-            return apiPost('/fusion/reset', {});
+            clearCheckpointTimer();
+            return checkpointChain
+                .catch(() => undefined)
+                .then(() => apiPost('/fusion/reset', {}));
         },
 
         loadRegionConfig() {
@@ -101,14 +145,14 @@ export function createFusionApi({ fusionCommand, apiPost }) {
 
         resizeBlendGridBatch(regionIds, op) {
             return post({
-                action: 'geometry_resize_grid',
+                action: 'blend_resize_grid',
                 region_ids: regionIds,
                 op
             });
         },
 
         moveGeometry(regionId, op, du, dv) {
-            return post({
+            return postDurableMutation({
                 action: 'geometry_move',
                 region_id: regionId,
                 op,
@@ -126,7 +170,7 @@ export function createFusionApi({ fusionCommand, apiPost }) {
                 dv
             };
             if (typeof corner === 'string' && corner) param.corner = corner;
-            return post(param);
+            return postDurableMutation(param);
         },
 
         moveManagerLine(regionId, direction, du, dv, selected = null) {
@@ -141,11 +185,11 @@ export function createFusionApi({ fusionCommand, apiPost }) {
                 param.selected_row = selected.row;
                 param.selected_col = selected.col;
             }
-            return post(param);
+            return postDurableMutation(param);
         },
 
         setGeometryPoint(regionId, row, col, u, v) {
-            return post({
+            return postDurableMutation({
                 action: 'set_geometry_point',
                 region_id: regionId,
                 row,
@@ -164,11 +208,11 @@ export function createFusionApi({ fusionCommand, apiPost }) {
             if (typeof rows === 'number') param.rows = rows;
             if (typeof cols === 'number') param.cols = cols;
             if (typeof interpolationMode === 'number') param.interpolation_mode = interpolationMode;
-            return post(param);
+            return postDurableMutation(param);
         },
 
         resizeMask(op) {
-            return post({
+            return postDurableMutation({
                 action: 'mask_resize_grid',
                 op
             });
@@ -183,7 +227,7 @@ export function createFusionApi({ fusionCommand, apiPost }) {
             };
             if (isFiniteNumber(row)) param.row = row;
             if (isFiniteNumber(col)) param.col = col;
-            return post(param);
+            return postDurableMutation(param);
         },
 
         loadMask() {
@@ -191,18 +235,18 @@ export function createFusionApi({ fusionCommand, apiPost }) {
         },
 
         setMask(payload = {}) {
-            return post({
+            return postDurableMutation({
                 action: 'set_mask_state',
                 ...payload
             });
         },
 
         seedMaskFromGeometry() {
-            return post({ action: 'seed_mask_from_geometry' });
+            return postDurableMutation({ action: 'seed_mask_from_geometry' });
         },
 
         setMaskGuideVisibility(showGrid) {
-            return post({
+            return postDurableMutation({
                 action: 'set_mask_state',
                 show_guide: !!showGrid,
                 selected_row: showGrid ? 0 : -1,
@@ -350,6 +394,14 @@ export function createFusionApi({ fusionCommand, apiPost }) {
                 action: 'set_cave_wall_config',
                 region_id: regionId,
                 ...cave
+            });
+        },
+
+        initializeCave(regionId, wallType = 0) {
+            return post({
+                action: 'initialize_cave_wall',
+                region_id: regionId,
+                wall_type: wallType
             });
         }
     };

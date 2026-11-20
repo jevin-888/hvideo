@@ -1106,7 +1106,7 @@ input[type="range"] {
     color: #f0d39a;
 }
 
-.brightness-drag-field {
+.horizontal-drag-field {
     position: relative;
     display: flex;
     min-width: 0;
@@ -1114,28 +1114,29 @@ input[type="range"] {
     overflow: hidden;
     border-radius: 8px;
     background: rgba(0, 0, 0, .12);
-    --brightness-level: 50%;
-    --brightness-color: 59, 130, 246;
+    --horizontal-drag-level: 50%;
+    --horizontal-drag-color: 59, 130, 246;
+    cursor: ew-resize;
     touch-action: none;
 }
 
-.brightness-drag-field::before {
+.horizontal-drag-field::before {
     content: '';
     position: absolute;
     inset: 0 auto 0 0;
-    width: var(--brightness-level);
-    background: linear-gradient(90deg, rgba(var(--brightness-color), .18), rgba(var(--brightness-color), .5));
+    width: var(--horizontal-drag-level);
+    background: linear-gradient(90deg, rgba(var(--horizontal-drag-color), .18), rgba(var(--horizontal-drag-color), .5));
     opacity: .45;
     pointer-events: none;
     transition: opacity .12s ease, width .08s linear;
 }
 
-.brightness-drag-field::after {
+.horizontal-drag-field::after {
     content: '';
     position: absolute;
     top: 8px;
     bottom: 8px;
-    left: var(--brightness-level);
+    left: var(--horizontal-drag-level);
     width: 2px;
     border-radius: 999px;
     background: rgba(255, 255, 255, .86);
@@ -1144,28 +1145,34 @@ input[type="range"] {
     pointer-events: none;
 }
 
-.brightness-drag-field .field-control {
+.horizontal-drag-field .field-control {
     position: relative;
     z-index: 1;
-    display: grid;
-    place-items: center;
+    width: 100%;
+    min-width: 0;
     min-height: 38px;
     border-left-color: rgba(255, 255, 255, .1);
     border-right-color: rgba(255, 255, 255, .1);
     background: transparent;
+}
+
+.brightness-drag-field .field-control,
+.anchor-drag-field .field-control {
+    display: grid;
+    place-items: center;
     user-select: none;
     pointer-events: none;
 }
 
-.brightness-drag-field.is-brightness-dragging::before {
+.horizontal-drag-field.is-horizontal-dragging::before {
     opacity: .9;
 }
 
-.brightness-drag-field.is-brightness-dragging::after {
+.horizontal-drag-field.is-horizontal-dragging::after {
     opacity: 1;
 }
 
-.brightness-drag-field.is-brightness-dragging .field-control {
+.horizontal-drag-field.is-horizontal-dragging .field-control {
     color: #fff;
     text-shadow: 0 1px 3px rgba(0, 0, 0, .55);
 }

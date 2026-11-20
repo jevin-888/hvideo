@@ -401,7 +401,8 @@ static av_always_inline void pred_pskip_motion(const H264Context *const h,
     /* To avoid doing an entire fill_decode_caches, we inline the relevant
      * parts here.
      * FIXME: this is a partial duplicate of the logic in fill_decode_caches,
-     * but it's faster this way.  Is there a way to avoid this duplication*/
+     * but it's faster this way.  Is there a way to avoid this duplication?
+     */
     if (USES_LIST(sl->left_type[LTOP], 0)) {
         left_ref = ref[4 * sl->left_mb_xy[LTOP] + 1 + (sl->left_block[0] & ~1)];
         A = mv[h->mb2b_xy[sl->left_mb_xy[LTOP]] + 3 + b_stride * sl->left_block[0]];

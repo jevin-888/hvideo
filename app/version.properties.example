@@ -1,3 +1,5 @@
+# Last successful version; first APK build produces 1.0.1 (101).
 VERSION_MAJOR=1
 VERSION_MINOR=0
 VERSION_PATCH=0
+VERSION_CODE=100

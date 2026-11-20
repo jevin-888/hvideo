@@ -25,6 +25,7 @@
 #include "utils/FileUtils.h"
 #include "utils/JsonUtils.h"
 #include "utils/Logger.h"
+#include "utils/SystemUtils.h"
 #include "utils/V4L2DeviceDetector.h"
 #include <algorithm>
 #include <chrono>
@@ -267,6 +268,25 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     response.message = "Missing action parameter";
     return response;
   }
+  // 全局播放锁不依赖播放列表或当前图层，所有播放入口共用同一状态。
+  if (param.get("scope", "").asString() == "global" &&
+      (action == "lockPlayback" || action == "unlockPlayback" ||
+       action == "getPlaybackLock")) {
+    if (action != "getPlaybackLock") {
+      setGlobalPlaybackLocked(action == "lockPlayback");
+    }
+    const bool locked = isGlobalPlaybackLocked();
+    Json::Value data;
+    data["scope"] = "global";
+    data["locked"] = locked;
+    data["state"] = locked ? "locked" : "unlocked";
+    response.dataJson = jsonToString(data);
+    response.ok = true;
+    response.error = 0x0000;
+    response.message = locked ? "全局播放已锁定" : "全局播放已解锁";
+    return response;
+  }
+
   const std::string traceId =
       param.isMember("trace_id") && param["trace_id"].isString()
           ? param["trace_id"].asString()
@@ -277,6 +297,14 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       param.isMember("suppress_hint") && param["suppress_hint"].isBool()
           ? param["suppress_hint"].asBool()
           : false;
+  double syncStartTime = 0.0;
+  if (param.isMember("syncStartTime") && param["syncStartTime"].isNumeric()) {
+    syncStartTime = std::max(0.0, param["syncStartTime"].asDouble());
+  } else if (param.isMember("sync_start_time") &&
+             param["sync_start_time"].isNumeric()) {
+    syncStartTime = std::max(0.0, param["sync_start_time"].asDouble());
+  }
+  const bool forceSyncStart = param.get("sync_force", false).asBool();
   if (!traceId.empty()) {
     response.traceId = traceId;
     LOG_INFO("[FusionICloseTrace] trace=%s stage=video.handler.begin action=%s",
@@ -320,6 +348,11 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
         systemConfig_->setSystemVolume(volume);
         LOG_INFO("系统音量目标已更新到内存: %.2f（需点击保存才写入文件）", volume);
       }
+#ifdef __ANDROID__
+      // Apply a direct control immediately. The render-loop route synchronizer
+      // is intentionally throttled and is too slow for +/-/mute button feedback.
+      setManagedOutputVolume(volume, AudioOutputPath::System);
+#endif
 
       data["volume"] = volume;
       response.ok = true;
@@ -365,6 +398,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
         if (systemConfig_) {
           systemConfig_->setSystemVolume(0.0f);
         }
+#ifdef __ANDROID__
+        setManagedOutputVolume(0.0f, AudioOutputPath::System);
+#endif
         data["muted"] = true;
         data["volume"] = 0.0f;
         data["volume_before_mute"] = roundVolume01(s_volumeBeforeMute);
@@ -376,6 +412,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
         if (systemConfig_) {
           systemConfig_->setSystemVolume(restoreVolume);
         }
+#ifdef __ANDROID__
+        setManagedOutputVolume(restoreVolume, AudioOutputPath::System);
+#endif
         data["muted"] = false;
         data["volume"] = restoreVolume;
 
@@ -397,6 +436,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       if (systemConfig_) {
         systemConfig_->setSystemVolume(newSystemVolume);
       }
+#ifdef __ANDROID__
+      setManagedOutputVolume(newSystemVolume, AudioOutputPath::System);
+#endif
 
       int volumePercent = static_cast<int>(newSystemVolume * 100.0f + 0.5f);
       int currentPercent = static_cast<int>(currentSystemVolume * 100.0f + 0.5f);
@@ -429,7 +471,7 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
   }
 
   // ============================================================================
-  // 所有播放控制命令都必须使用 播放列表Id
+  // 显式列表用于切换；图层控制优先操作当前列表。
   // ============================================================================
 
   std::string playlistId;
@@ -459,9 +501,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
   const bool isPlaylistStepAction = (action == "next" || action == "previous");
   if (playlistId.empty() && isPlaylistStepAction && playlistManager_) {
     const int requestedLayerId = hasExplicitLayerId ? param["layerId"].asInt() : -1;
-    playlistId = playlistManager_->getDefaultPlaylistId(requestedLayerId);
+    playlistId = playlistManager_->getActivePlaylistId(requestedLayerId > 0 ? requestedLayerId : 1);
     if (playlistId.empty()) {
-      playlistId = playlistManager_->getActivePlaylistId(requestedLayerId > 0 ? requestedLayerId : 1);
+      playlistId = playlistManager_->getDefaultPlaylistId(requestedLayerId);
     }
   }
   // 移动端播放控制（暂停/恢复/音量/静音/重播/状态查询）可仅传 layerId，不要求 播放列表Id
@@ -470,7 +512,8 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
        action == "getStatus" || action == "switch_audioTrack" ||
        action == "next_audioTrack" || action == "prev_audioTrack" ||
        action == "set_audioChannel" || action == "stop" || action == "seek" ||
-       action == "setVolume" || action == "setPlaybackRate" ||
+       action == "prepare" || action == "setVolume" ||
+       action == "setPlaybackRate" ||
        action == "lockPlayback" ||
        action == "unlockPlayback" || action == "getPlaybackLock");
   if (playlistId.empty() && !isCaptureAction && !isPlayWithPath &&
@@ -496,7 +539,7 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       action == "switch_audioTrack" || action == "next_audioTrack" ||
       action == "prev_audioTrack" || action == "set_audioChannel" ||
       action == "pause" || action == "resume" || action == "stop" ||
-      action == "seek" || action == "replay" ||
+      action == "seek" || action == "replay" || action == "prepare" ||
       action == "getStatus" || action == "setPlaybackRate" ||
       action == "lockPlayback" ||
       action == "unlockPlayback" || action == "getPlaybackLock") {
@@ -518,7 +561,10 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
   } else if (isLayerScopedPlay) {
     layerId = param["layerId"].asInt();
     if (playlistManager_) {
-      playlistId = playlistManager_->getDefaultPlaylistId(layerId);
+      playlistId = playlistManager_->getActivePlaylistId(layerId);
+      if (playlistId.empty()) {
+        playlistId = playlistManager_->getDefaultPlaylistId(layerId);
+      }
     }
   } else if (!playlistId.empty() && playlistManager_) {
     layerId = playlistManager_->getPlaylistTargetLayer(playlistId);
@@ -526,7 +572,13 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       layerId = 1;
     }
   } else if (playlistId.empty() && playlistManager_) {
-    playlistId = playlistManager_->getDefaultPlaylistId(layerId);
+    playlistId = playlistManager_->getActivePlaylistId(layerId);
+    if (playlistId.empty()) {
+      playlistId = playlistManager_->getDefaultPlaylistId(layerId);
+    }
+  }
+  if (playlistId.empty() && isLayerOnlyAction && playlistManager_) {
+    playlistId = playlistManager_->getActivePlaylistId(layerId);
   }
   if (!traceId.empty()) {
     LOG_INFO("[FusionICloseTrace] trace=%s stage=video.route action=%s explicitLayerId=%d resolvedLayerId=%d playlistId=%s",
@@ -543,14 +595,11 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     if (action == "lockPlayback" || action == "unlockPlayback") {
       setPlaybackLocked(layerId, locked);
     }
-    Json::Value lockData;
-    lockData["layerId"] = layerId;
-    lockData["locked"] = isPlaybackLocked(layerId);
-    lockData["state"] = isPlaybackLocked(layerId) ? "locked" : "unlocked";
+    const Json::Value lockData = playbackLockState(layerId);
     response.dataJson = hsvj::JsonUtils::toString(lockData);
     response.ok = true;
     response.error = 0x0000;
-    response.message = isPlaybackLocked(layerId) ? "播放已锁定" : "播放已解锁";
+    response.message = lockData["locked"].asBool() ? "播放已锁定" : "播放已解锁";
     return response;
   }
   if (action == "play" || action == "loadVideo" || action == "next") {
@@ -623,7 +672,7 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       LOG_INFO("Preview mode check: currentState=%d (0=STOPPED,1=PLAYING,2=PAUSED), currentPath='%s', requestPath='%s'",
                 static_cast<int>(currentState), normalizedCurrentPath.c_str(), normalizedRequestPath.c_str());
 
-      if (currentState == LayerVideo::PlayState::PLAYING &&
+      if (!forceSyncStart && currentState == LayerVideo::PlayState::PLAYING &&
           normalizedCurrentPath == normalizedRequestPath) {
         data["state"] = "playing";
         data["preview"] = true;
@@ -636,7 +685,7 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       }
 
       // 如果是暂停状态且路径相同，直接恢复播放
-      if (currentState == LayerVideo::PlayState::PAUSED && 
+      if (!forceSyncStart && currentState == LayerVideo::PlayState::PAUSED &&
           normalizedCurrentPath == normalizedRequestPath) {
         LOG_INFO("Video is paused with same path, resuming instead of reloading");
         videoLayer->resume();
@@ -656,7 +705,7 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       PlaybackResult playResult =
           PlaybackRequestDispatcher::requestPlay(
               mubu_, layerId, videoPath, previewLoop, PlaybackSource::Preview,
-              true);
+              true, syncStartTime);
       if (playResult.softBlocked) {
         response = buildSoftBlockedPlaybackResponse(this, layerId, "",
                                                     videoPath, true,
@@ -664,6 +713,10 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
         return response;
       }
       if (playResult.isSuccess()) {
+        if (forceSyncStart && param.isMember("startPosition") &&
+            param["startPosition"].isNumeric()) {
+          videoLayer->seek(param["startPosition"].asDouble(), "sync-restart-position");
+        }
         data["state"] = "playing";
         data["preview"] = true;
         data["playbackResult"] = toString(playResult.code);
@@ -694,12 +747,22 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     const bool hasExplicitIndex =
         param.isMember("index") && param["index"].isInt() &&
         param["index"].asInt() >= 0;
+    if (param.isMember("index") && !hasExplicitIndex) {
+      response.ok = false;
+      response.error = 0x0001;
+      response.message = "Invalid index";
+      return response;
+    }
     // 检查视频图层当前状态
     LayerVideo::PlayState currentState = videoLayer->getState();
 
-    if (isLayerScopedPlay && playlistId.empty()) {
+    // 播放按钮恢复当前解码器，不能按列表模式重新选歌（loop=3 会推进索引）。
+    if (isLayerScopedPlay && !hasExplicitIndex &&
+        (playlistId.empty() || currentState == LayerVideo::PlayState::PAUSED ||
+         currentState == LayerVideo::PlayState::PLAYING)) {
       if (currentState == LayerVideo::PlayState::PAUSED) {
         LOG_INFO("Layer scoped play: video is paused, resuming layer=%d", layerId);
+        videoLayer->setVisible(true);
         videoLayer->resume();
         data["state"] = "playing";
         data["layerId"] = layerId;
@@ -714,6 +777,7 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
 
       if (currentState == LayerVideo::PlayState::PLAYING) {
         LOG_INFO("Layer scoped play: video is already playing layer=%d", layerId);
+        videoLayer->setVisible(true);
         data["state"] = "playing";
         data["layerId"] = layerId;
         response.dataJson = hsvj::JsonUtils::toString(data);
@@ -739,11 +803,6 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     int selectedIndex = -1;
     if (hasExplicitIndex) {
       selectedIndex = param["index"].asInt();
-    } else if (param.isMember("index")) {
-      response.ok = false;
-      response.error = 0x0001;
-      response.message = "Invalid index";
-      return response;
     } else {
       selectedIndex = choosePlaylistStartIndex(playConfig.loop,
                                                storedPlaylistIndex,
@@ -784,8 +843,11 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
         activePlaylistIndex == selectedIndex &&
         !normalizedItemPath.empty() &&
         normalizedCurrentPath == normalizedItemPath;
+    const int decoderLoop =
+        chooseDecoderLoopForPlaylist(playConfig.loop, layerItems.size());
+    const bool loopModeMatches = videoLayer->getLoop() == decoderLoop;
 
-    if (!hasExplicitIndex && sameActivePlaylistItem &&
+    if (!forceSyncStart && !hasExplicitIndex && sameActivePlaylistItem && loopModeMatches &&
         currentState == LayerVideo::PlayState::PAUSED) {
       LOG_INFO("Playlist item is paused, resuming: playlistId=%s layerId=%d index=%d uri=%s",
                playlistId.c_str(), layerId, selectedIndex, currentItem.uri.c_str());
@@ -805,7 +867,7 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       return response;
     }
 
-    if (!hasExplicitIndex && sameActivePlaylistItem &&
+    if (!forceSyncStart && !hasExplicitIndex && sameActivePlaylistItem && loopModeMatches &&
         currentState == LayerVideo::PlayState::PLAYING) {
       LOG_INFO("Playlist item already playing: playlistId=%s layerId=%d index=%d uri=%s",
                playlistId.c_str(), layerId, selectedIndex, currentItem.uri.c_str());
@@ -831,11 +893,10 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
                normalizedItemPath.c_str());
     }
 
-    const int loop =
-        chooseDecoderLoopForPlaylist(playConfig.loop, layerItems.size());
     PlaybackResult playResult =
         PlaybackRequestDispatcher::requestPlay(
-            mubu_, layerId, currentItem.uri, loop, PlaybackSource::Playlist, true);
+            mubu_, layerId, currentItem.uri, decoderLoop,
+            PlaybackSource::Playlist, true, syncStartTime);
     if (playResult.softBlocked) {
       response = buildSoftBlockedPlaybackResponse(this, layerId, playlistId,
                                                   currentItem.uri, false,
@@ -898,14 +959,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     int captureRotation = videoLayer->getCaptureRotation();
     int fitMode = videoLayer->getFitMode();
     int invert = videoLayer->getInvert();
-    int captureAutoTransform =
-        (param.isMember("captureAutoTransform") &&
-         param["captureAutoTransform"].isInt())
-            ? (param["captureAutoTransform"].asInt() == 1 ? 1 : 0)
-            : -1;
 
-    // 解析采集参数。采集分辨率只作为本次启动请求，实际分辨率由驱动回填；
-    // 不再从配置读取或持久化宽高，避免页面/配置文件残留手动分辨率项。
+    bool lockResolution = false;
+    // 解析采集参数。锁定模式下宽高作为强约束传入 V4L2；否则按驱动时序自动协商。
     if (param.isMember("device") && param["device"].isString()) {
       devicePath = param["device"].asString();
     }
@@ -925,6 +981,19 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     if (param.isMember("height") && param["height"].isInt()) {
       captureHeight = param["height"].asInt();
     }
+    if ((param.isMember("captureResolutionLocked") && param["captureResolutionLocked"].isBool()) ||
+        (param.isMember("capture_resolution_locked") && param["capture_resolution_locked"].isBool())) {
+      lockResolution = param.isMember("captureResolutionLocked")
+                           ? param["captureResolutionLocked"].asBool()
+                           : param["capture_resolution_locked"].asBool();
+    } else if (systemConfig_) {
+      if (const LayerConfigData *cfg = systemConfig_->getLayerConfig(layerId)) {
+        lockResolution = cfg->captureResolutionLocked;
+        if (captureWidth <= 0) captureWidth = cfg->captureWidth;
+        if (captureHeight <= 0) captureHeight = cfg->captureHeight;
+      }
+    }
+    lockResolution = lockResolution && captureWidth > 0 && captureHeight > 0;
     if ((param.isMember("captureIndex") && param["captureIndex"].isInt()) ||
         (param.isMember("capture_index") && param["capture_index"].isInt())) {
       captureIndex = param.isMember("captureIndex")
@@ -984,9 +1053,6 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     videoLayer->setCaptureRotation(captureRotation);
     videoLayer->setFitMode(fitMode);
     videoLayer->setInvert(invert);
-    if (captureAutoTransform >= 0 && captureRotation < 0) {
-      videoLayer->commitCaptureAutoTransform(captureAutoTransform);
-    }
 
     if (captureType == "AUTO") {
       if (systemConfig_) {
@@ -999,8 +1065,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
         cfgCopy.layerKey = "layer" + std::to_string(layerId);
         cfgCopy.visible = captureLayerWasVisible;
         cfgCopy.captureType = "AUTO";
-        cfgCopy.captureWidth = 0;
-        cfgCopy.captureHeight = 0;
+        cfgCopy.captureWidth = lockResolution ? captureWidth : 0;
+        cfgCopy.captureHeight = lockResolution ? captureHeight : 0;
+        cfgCopy.captureResolutionLocked = lockResolution;
         cfgCopy.captureIndex = captureIndex;
         cfgCopy.captureRotation = captureRotation;
         cfgCopy.fitMode = fitMode;
@@ -1010,7 +1077,8 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
         LOG_INFO("已持久化 layer%d 自动采集配置", layerId);
       }
 
-      videoLayer->checkAndAutoCapture("AUTO", captureWidth, captureHeight, captureIndex);
+      videoLayer->checkAndAutoCapture("AUTO", captureWidth, captureHeight, captureIndex,
+                                      lockResolution);
 
       data["layerId"] = layerId;
       data["state"] = "auto_negotiating";
@@ -1021,9 +1089,6 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       data["captureRotation"] = captureRotation;
       data["fitMode"] = fitMode;
       data["invert"] = invert;
-      if (captureAutoTransform >= 0) {
-        data["captureAutoTransform"] = captureAutoTransform;
-      }
       response.ok = true;
       response.error = 0x0000;
       response.message = "图层已配置，正在自动协商采集输入";
@@ -1100,8 +1165,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
         cfgCopy.layerKey = "layer" + std::to_string(layerId);
         cfgCopy.visible = captureLayerWasVisible;
         cfgCopy.captureType = captureType;
-        cfgCopy.captureWidth = 0;
-        cfgCopy.captureHeight = 0;
+        cfgCopy.captureWidth = lockResolution ? captureWidth : 0;
+        cfgCopy.captureHeight = lockResolution ? captureHeight : 0;
+        cfgCopy.captureResolutionLocked = lockResolution;
         cfgCopy.captureIndex = captureIndex;
         cfgCopy.captureRotation = captureRotation;
         cfgCopy.fitMode = fitMode;
@@ -1124,15 +1190,17 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     // 直接路由到三条独立通路之一，CommandRouter 不再经手 isUsbCamera/checkHdmiSignal 旧 API。
     std::future<bool> captureFuture =
         std::async(std::launch::async, [videoLayer, devicePath, captureWidth,
-                                        captureHeight, captureType]() {
+                                        captureHeight, captureType, lockResolution]() {
           prepareCaptureCommandWorkerThread("HSVJCapStart");
           if (captureType == "USB") {
             return videoLayer->startUsbCapture(devicePath, captureWidth, captureHeight);
           }
           if (captureType == "MIPI") {
-            return videoLayer->startMipiCapture(devicePath, captureWidth, captureHeight);
+            return videoLayer->startMipiCapture(devicePath, captureWidth, captureHeight,
+                                                lockResolution);
           }
-          return videoLayer->startHdmiCapture(devicePath, captureWidth, captureHeight);
+          return videoLayer->startHdmiCapture(devicePath, captureWidth, captureHeight,
+                                              lockResolution);
         });
 
     auto status = captureFuture.wait_for(std::chrono::seconds(timeoutSeconds));
@@ -1191,8 +1259,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
             cfgCopy.layerKey = "layer" + std::to_string(layerId);
             cfgCopy.visible = captureLayerWasVisible;
             cfgCopy.captureType = captureType;
-            cfgCopy.captureWidth = 0;
-            cfgCopy.captureHeight = 0;
+            cfgCopy.captureWidth = lockResolution ? captureWidth : 0;
+            cfgCopy.captureHeight = lockResolution ? captureHeight : 0;
+            cfgCopy.captureResolutionLocked = lockResolution;
             cfgCopy.captureIndex = captureIndex;
             cfgCopy.captureRotation = captureRotation;
             cfgCopy.fitMode = fitMode;
@@ -1232,8 +1301,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
             cfgCopy.layerKey = "layer" + std::to_string(layerId);
             cfgCopy.visible = captureLayerWasVisible;
             cfgCopy.captureType = captureType;
-            cfgCopy.captureWidth = 0;
-            cfgCopy.captureHeight = 0;
+            cfgCopy.captureWidth = lockResolution ? captureWidth : 0;
+            cfgCopy.captureHeight = lockResolution ? captureHeight : 0;
+            cfgCopy.captureResolutionLocked = lockResolution;
             cfgCopy.captureIndex = captureIndex;
             cfgCopy.captureRotation = captureRotation;
             cfgCopy.fitMode = fitMode;
@@ -1283,14 +1353,19 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
   } else if (action == "restartCapture" || action == "restartRk628Capture") {
     const bool captureLayerWasVisible = videoLayer->isVisible();
     int captureIndex = 0;
+    int captureWidth = 0;
+    int captureHeight = 0;
+    bool lockResolution = false;
     int captureRotation = videoLayer->getCaptureRotation();
     int fitMode = videoLayer->getFitMode();
     int invert = videoLayer->getInvert();
-    int captureAutoTransform =
-        (param.isMember("captureAutoTransform") &&
-         param["captureAutoTransform"].isInt())
-            ? (param["captureAutoTransform"].asInt() == 1 ? 1 : 0)
-            : -1;
+    if (systemConfig_) {
+      if (const LayerConfigData *cfg = systemConfig_->getLayerConfig(layerId)) {
+        captureWidth = cfg->captureWidth;
+        captureHeight = cfg->captureHeight;
+        lockResolution = cfg->captureResolutionLocked;
+      }
+    }
     if ((param.isMember("captureIndex") && param["captureIndex"].isInt()) ||
         (param.isMember("capture_index") && param["capture_index"].isInt())) {
       captureIndex = param.isMember("captureIndex")
@@ -1298,9 +1373,7 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
                          : param["capture_index"].asInt();
     } else if (systemConfig_) {
       const LayerConfigData *cfg = systemConfig_->getLayerConfig(layerId);
-      if (cfg) {
-        captureIndex = cfg->captureIndex;
-      }
+      if (cfg) captureIndex = cfg->captureIndex;
     }
     if ((param.isMember("captureRotation") && param["captureRotation"].isInt()) ||
         (param.isMember("capture_rotation") && param["capture_rotation"].isInt())) {
@@ -1354,9 +1427,6 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     videoLayer->setCaptureRotation(captureRotation);
     videoLayer->setFitMode(fitMode);
     videoLayer->setInvert(invert);
-    if (captureAutoTransform >= 0 && captureRotation < 0) {
-      videoLayer->commitCaptureAutoTransform(captureAutoTransform);
-    }
 
     if (systemConfig_) {
       LayerConfigData cfgCopy;
@@ -1368,8 +1438,7 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
       cfgCopy.layerKey = "layer" + std::to_string(layerId);
       cfgCopy.visible = captureLayerWasVisible;
       cfgCopy.captureType = captureType;
-      cfgCopy.captureWidth = 0;
-      cfgCopy.captureHeight = 0;
+      // 保留已配置的自定义分辨率锁定策略，重启采集不能把它清掉。
       cfgCopy.captureIndex = captureIndex;
       cfgCopy.captureRotation = captureRotation;
       cfgCopy.fitMode = fitMode;
@@ -1400,8 +1469,8 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     trackCommandAsyncTask(std::async(
         std::launch::async,
         [asyncVideoLayer, layerId, captureType, captureIndex,
-         captureRotation, fitMode, invert, captureLayerWasVisible,
-         captureAutoTransform, requestedAction]() {
+         captureWidth, captureHeight, lockResolution, captureRotation, fitMode, invert, captureLayerWasVisible,
+         requestedAction]() {
           prepareCaptureCommandWorkerThread("HSVJRk628Restart");
           struct CaptureStartGuard {
             LayerVideo *layer = nullptr;
@@ -1421,9 +1490,6 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
           asyncVideoLayer->setCaptureRotation(captureRotation);
           asyncVideoLayer->setFitMode(fitMode);
           asyncVideoLayer->setInvert(invert);
-          if (captureAutoTransform >= 0 && captureRotation < 0) {
-            asyncVideoLayer->commitCaptureAutoTransform(captureAutoTransform);
-          }
 
           const bool rebindOk =
               (requestedAction == "restartRk628Capture" && activeType == "MIPI")
@@ -1450,19 +1516,18 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
           bool success = false;
           if (!devicePath.empty()) {
             if (activeType == "USB") {
-              success = asyncVideoLayer->startUsbCapture(devicePath, 0, 0);
+              success = asyncVideoLayer->startUsbCapture(devicePath, captureWidth, captureHeight);
             } else if (activeType == "HDMI") {
-              success = asyncVideoLayer->startHdmiCapture(devicePath, 0, 0);
+              success = asyncVideoLayer->startHdmiCapture(devicePath, captureWidth, captureHeight,
+                                                          lockResolution);
             } else {
-              success = asyncVideoLayer->startMipiCapture(devicePath, 0, 0);
+              success = asyncVideoLayer->startMipiCapture(devicePath, captureWidth, captureHeight,
+                                                          lockResolution);
             }
             asyncVideoLayer->setVisible(captureLayerWasVisible);
             asyncVideoLayer->setCaptureRotation(captureRotation);
             asyncVideoLayer->setFitMode(fitMode);
             asyncVideoLayer->setInvert(invert);
-            if (captureAutoTransform >= 0 && captureRotation < 0) {
-              asyncVideoLayer->commitCaptureAutoTransform(captureAutoTransform);
-            }
           }
 
           LOG_WARN("[采集][RK628] async restart finished layer=%d type=%s index=%d "
@@ -1478,9 +1543,6 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     data["captureRotation"] = captureRotation;
     data["fitMode"] = fitMode;
     data["invert"] = invert;
-    if (captureAutoTransform >= 0) {
-      data["captureAutoTransform"] = captureAutoTransform;
-    }
     response.dataJson = hsvj::JsonUtils::toString(data);
     response.ok = true;
     response.error = 0x0000;
@@ -1625,7 +1687,8 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
     }
     PlaybackResult playResult =
         PlaybackRequestDispatcher::requestPlay(
-            mubu_, layerId, replayPath, replayLoop, PlaybackSource::Playlist, true);
+            mubu_, layerId, replayPath, replayLoop, PlaybackSource::Playlist, true,
+            0.0, true);
     if (playResult.softBlocked) {
       response = buildSoftBlockedPlaybackResponse(this, layerId, playlistId,
                                                   replayPath, false,
@@ -1778,6 +1841,9 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
 
     data["state"] = "switching";
     data["layerId"] = switchInfo.layerId;
+    data["playlistId"] = playlistId;
+    data["index"] = switchInfo.index;
+    data["uri"] = switchInfo.item.uri;
     response.dataJson = hsvj::JsonUtils::toString(data);
     response.ok = true;
     response.error = 0x0000;
@@ -1923,14 +1989,22 @@ CommandRouter::handleVideoPlayback(const std::string &paramJson) {
 
     // 在设置新音量前先获取旧音量
     float oldVolume = videoLayer->getVolume();
+    if (systemConfig_) {
+      if (const LayerConfigData *config = systemConfig_->getLayerConfig(layerId)) {
+        oldVolume = std::clamp(config->volume, 0.0f, 1.0f);
+      }
+    }
 
-    // 设置新音量
-    videoLayer->setVolume(volume);
-    data["volume"] = volume;
-
-    // 同步配置到文件
+    // This API updates configured volume; requested Online VOD stays at 100%.
     updateLayerConfigAndSave(
         layerId, [volume](LayerConfigData &config) { config.volume = volume; });
+    const bool onlineVodPolicyApplied =
+        engine_ && engine_->applyOnlineVodConfiguredLayerVolume(
+                       layerId, videoLayer, volume, "video_set_volume");
+    if (!onlineVodPolicyApplied) {
+      videoLayer->setVolume(volume);
+    }
+    data["volume"] = volume;
 
     // 显示音量提示 - 简化逻辑，统一处理
     int volumePercent = static_cast<int>(volume * 100.0f + 0.5f);

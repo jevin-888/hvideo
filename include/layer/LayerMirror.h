@@ -7,6 +7,7 @@
 #define HSVJ_LAYER_MIRROR_H
 
 #include "layer/LayerVideo.h"
+#include "renderer/SideBarDetector.h"
 #include <atomic>
 #include <mutex>
 #include <memory>
@@ -31,6 +32,8 @@ public:
   bool needsTextureUpdate() const override;
   void updateTexture() override;
   void render() override;
+  void setFitMode(int mode) override;
+  void setSize(const Size& size) override;
 
   /**
    * @brief 更新投屏帧
@@ -60,7 +63,9 @@ public:
    */
   void setConnected(bool connected);
 
-  bool isConnected() const { return isConnected_; }
+  bool isConnected() const {
+    return isConnected_.load(std::memory_order_acquire);
+  }
 
   /**
    * @brief 更新分辨率（处理横竖屏切换）
@@ -70,24 +75,39 @@ public:
   /**
    * @brief 设置投屏名称
    */
-  void setMirrorName(const std::string& name) { mirrorName_ = name; }
-  std::string getMirrorName() const { return mirrorName_; }
+  void setMirrorName(const std::string& name);
+  std::string getMirrorName() const;
 
   /**
    * @brief 设置 PIN 码
    */
-  void setPinCode(int pin) { pinCode_ = pin; }
-  int getPinCode() const { return pinCode_; }
+  void setPinCode(int pin);
+  int getPinCode() const;
+
+  /**
+   * @brief 同步投屏服务及连接状态，用于生成就绪提示。
+   */
+  void setServiceState(bool started, const std::string& serviceName,
+                       bool connected, const std::string& deviceName, int pin);
 
   void setReadyHintVisible(bool visible);
   bool isReadyHintVisible() const { return readyHintVisible_; }
   void setTvVerticalCropPx(int px);
+  void setTvModeActive(bool active);
   int getTvVerticalCropPx() const {
     return tvVerticalCropPx_.load(std::memory_order_acquire);
   }
 
 private:
-  void applyTvVerticalCrop(uint32_t textureId, int contentHeight);
+  std::vector<std::string> buildReadyHintLines() const;
+  std::string buildReadyHintText() const;
+  void applyMirrorContentCrop(uint32_t textureId, int contentHeight);
+  void updateSideBarCropFromHardwareBuffer(void* buffer, int contentWidth,
+                                           int contentHeight);
+  void updateSideBarCropFromDecodedFrame(DecodedFrame* frame, int contentWidth,
+                                          int contentHeight);
+  void updateSideBarCrop(const SideBarCropHint& hint, int contentWidth,
+                         const char* source);
 
   void* pendingBuffer_ = nullptr;
   DecodedFrame* pendingDecodedFrame_ = nullptr;
@@ -100,13 +120,26 @@ private:
   int pendingDecodedCropOffsetY_ = 0;
   std::mutex frameMutex_;
   
+  mutable std::mutex readyStateMutex_;
   std::string mirrorName_ = "HSVJ-Mirror";
+  std::string serviceName_;
   int pinCode_ = 8888;
-  bool isConnected_ = false;
+  bool serviceStarted_ = false;
+  std::atomic<bool> isConnected_{false};
   bool readyHintVisible_ = true;
   std::atomic<int> tvVerticalCropPx_{0};
+  std::atomic<bool> tvModeActive_{false};
+  std::atomic<bool> sideBarResetRequested_{false};
+  SideBarCropStabilizer sideBarCropDetector_;
+  uint64_t sideBarAnalysisFrameCounter_ = 0;
+  uint64_t sideBarAnalysisFailureCount_ = 0;
   int lastAppliedTvVerticalCropPx_ = -1;
   int lastAppliedTvVerticalCropHeight_ = 0;
+  bool lastAppliedTvModeActive_ = false;
+  bool lastAppliedSideCropEnabled_ = false;
+  int lastAppliedSideCropLeft_ = -1;
+  int lastAppliedSideCropRight_ = -1;
+  int lastAppliedSideCropFrameWidth_ = 0;
   int sourcePhysicalWidth_ = 0;
   int sourcePhysicalHeight_ = 0;
   int sourceStreamWidth_ = 0;
@@ -119,7 +152,7 @@ private:
   // 文本渲染支持
   SharedTextOverlayHolder* sharedTextOverlay_ = nullptr;
   std::unique_ptr<VulkanTextOverlayBridge> vtoBridge_;
-  bool textNeedsUpdate_ = true;
+  std::atomic<bool> textNeedsUpdate_{true};
   std::string lastText_;
 
   // 缓存正在 GPU 中使用的 Buffer，防止被提前释放导致驱动崩溃

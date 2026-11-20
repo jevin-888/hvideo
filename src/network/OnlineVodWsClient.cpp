@@ -9,6 +9,7 @@
 #include "utils/Logger.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cstring>
 #include <deque>
@@ -132,22 +133,12 @@ static bool isOnlineVodPlaybackCommand(const std::string& a) {
            a == "SkipSong" || a == "Replay" || a == "SwitchTrack";
 }
 
-static void queuePeripheralRouterRequest(VodDatabase* db, const std::string& actName,
-                                         const Json::Value& paramObj) {
-    Json::Value param = paramObj;
-    if (!actName.empty())
-        param["action"] = actName;
-    Json::Value wrap;
-    wrap["type"] = 0;
-    wrap["code"] = 0x50;
-    wrap["param"] = param;
-    db->setOnlineVodSyncMeta("online_vod_pending_router_json", JsonUtils::toString(wrap));
-}
-
-/** 从 pending 或 sock 读满 n 字节；EAGAIN 且尚未读到任何字节时返回 2（idle）；中途失败返回 -1；对端关闭返回 0 */
+/** 读满 n 字节；无数据返回 2；半帧最多等待 10 秒，超时重连；对端关闭返回 0。 */
 static int readExact(int sock, std::vector<unsigned char>& pending, unsigned char* dst, size_t n) {
   size_t got = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (got < n) {
+    if (std::chrono::steady_clock::now() >= deadline) return -1;
     if (!pending.empty()) {
       const size_t take = std::min(pending.size(), n - got);
       std::memcpy(dst + got, pending.data(), take);
@@ -160,13 +151,33 @@ static int readExact(int sock, std::vector<unsigned char>& pending, unsigned cha
     if (r == 0) return 0;
     if (r < 0) {
       const int err = errno;
-      if ((err == EAGAIN || err == EWOULDBLOCK) && got == 0) return 2;
-      if (err == EAGAIN || err == EWOULDBLOCK) return -1;
+      if (err == EINTR) continue;
+      if (err == EAGAIN || err == EWOULDBLOCK) {
+        if (got == 0) return 2;
+        continue;
+      }
       return -1;
     }
     pending.insert(pending.end(), tmp, tmp + static_cast<size_t>(r));
   }
   return 1;
+}
+
+static bool sendAll(int sock, const void* data, size_t length) {
+#if defined(_WIN32)
+  (void)sock; (void)data; (void)length;
+  return false;
+#else
+  const auto* bytes = static_cast<const unsigned char*>(data);
+  size_t sent = 0;
+  while (sent < length) {
+    const ssize_t n = send(sock, bytes + sent, length - sent, MSG_NOSIGNAL);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) return false;
+    sent += static_cast<size_t>(n);
+  }
+  return true;
+#endif
 }
 
 } // 命名空间
@@ -190,12 +201,31 @@ void OnlineVodWsClient::postAppLayerPing() {
     outboundUtf8Texts_.push_back(R"({"type":"ping"})");
 }
 
+void OnlineVodWsClient::postCommandResult(const std::string& action, bool ok,
+                                           int error, const std::string& message) {
+    if (action.empty()) return;
+    Json::Value result;
+    result["type"] = "command";
+    result["action"] = action;
+    result["ok"] = ok ? 1 : 0;
+    result["error"] = error;
+    result["message"] = message;
+    result["source"] = "player";
+    std::lock_guard<std::mutex> lk(outboundMutex_);
+    outboundUtf8Texts_.push_back(JsonUtils::toString(result));
+}
+
 bool OnlineVodWsClient::start(const std::string& host, int port, const std::string& roomId, VodDatabase* db) {
+    std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
     if (running_.load()) return true;
     if (!db) return false;
     if (host.empty() || port <= 0) return false;
 
     host_ = host;
+    {
+        std::lock_guard<std::mutex> lock(localAddressMutex_);
+        localAddress_.clear();
+    }
     port_ = port;
     roomId_ = roomId.empty() ? "current" : roomId;
     db_ = db;
@@ -212,6 +242,7 @@ bool OnlineVodWsClient::start(const std::string& host, int port, const std::stri
 }
 
 void OnlineVodWsClient::stop() {
+    std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
     stopRequested_.store(true);
     wakeSocket();
     if (worker_.joinable()) worker_.join();
@@ -223,7 +254,7 @@ void OnlineVodWsClient::stop() {
     }
 }
 
-void OnlineVodWsClient::flushOutboundTextFrames() {
+bool OnlineVodWsClient::flushOutboundTextFrames() {
     std::deque<std::string> batch;
     {
         std::lock_guard<std::mutex> lk(outboundMutex_);
@@ -232,9 +263,10 @@ void OnlineVodWsClient::flushOutboundTextFrames() {
     for (const auto& s : batch) {
         if (!sendMaskedTextFrame(s)) {
             LOG_WARN("OnlineVodWsClient: outbound JSON send failed (len=%zu)", s.size());
-            break;
+            return false;
         }
     }
+    return true;
 }
 
 bool OnlineVodWsClient::sendMaskedTextFrame(const std::string& utf8Payload) {
@@ -263,7 +295,7 @@ bool OnlineVodWsClient::sendMaskedTextFrame(const std::string& utf8Payload) {
     frame.insert(frame.end(), maskKey, maskKey + 4);
     for (size_t i = 0; i < len; ++i)
         frame.push_back(static_cast<unsigned char>(utf8Payload[i]) ^ maskKey[i % 4]);
-    return send(sock_, frame.data(), frame.size(), 0) == static_cast<ssize_t>(frame.size());
+    return sendAll(sock_, frame.data(), frame.size());
 #endif
 }
 
@@ -315,6 +347,9 @@ void OnlineVodWsClient::threadMain() {
 
         backoffMs = 500;
         LOG_INFO("OnlineVodWsClient: connected and handshake OK (total reconnects: %d)", reconnectCount);
+        initialRoomStateReceived_ = false;
+        nextJoinRetryAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        postJoinRoom(roomId_);
         
         // 触发连接成功回调
         if (onConnectionStateChanged_) {
@@ -327,30 +362,52 @@ void OnlineVodWsClient::threadMain() {
 
         // 协议级 WebSocket Ping（RFC 6455）
         // 用 shared_ptr 持有 stop 标志，避免栈帧提前销毁导致 heartbeat 线程悬空引用崩溃
-        auto lastMessageTime = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+        auto lastMessageTime = std::chrono::steady_clock::now();
         auto protocolHeartbeatStop = std::make_shared<std::atomic<bool>>(false);
-        std::thread protocolHeartbeatThread([this, protocolHeartbeatStop, lastMessageTime]() {
+        auto protocolHeartbeatMutex = std::make_shared<std::mutex>();
+        auto protocolHeartbeatCv = std::make_shared<std::condition_variable>();
+        std::thread protocolHeartbeatThread(
+            [this, protocolHeartbeatStop, protocolHeartbeatMutex,
+             protocolHeartbeatCv]() {
             LOG_INFO("OnlineVodWsClient: protocol Ping thread started (interval 25s)");
+            std::unique_lock<std::mutex> lock(*protocolHeartbeatMutex);
             while (!protocolHeartbeatStop->load() && !stopRequested_.load()) {
-                std::this_thread::sleep_for(std::chrono::seconds(25));
-                if (protocolHeartbeatStop->load() || stopRequested_.load()) break;
+                const bool stopped = protocolHeartbeatCv->wait_for(
+                    lock, std::chrono::seconds(25),
+                    [this, protocolHeartbeatStop]() {
+                        return protocolHeartbeatStop->load() || stopRequested_.load();
+                    });
+                if (stopped) break;
+                lock.unlock();
                 
                 if (sock_ >= 0) {
                     if (!sendPing()) {
                         LOG_WARN("OnlineVodWsClient: protocol Ping send failed");
+                        wakeSocket();
                         break;
                     }
-                    *lastMessageTime = std::chrono::steady_clock::now();
                     LOG_DEBUG("OnlineVodWsClient: protocol Ping sent");
                 }
+                lock.lock();
             }
             LOG_INFO("OnlineVodWsClient: protocol Ping thread stopped");
         });
         
         while (!stopRequested_.load()) {
-            flushOutboundTextFrames();
+            // TCP/Ping success does not prove room subscription succeeded.
+            if (!initialRoomStateReceived_ &&
+                std::chrono::steady_clock::now() >= nextJoinRetryAt_) {
+                LOG_WARN("OnlineVodWsClient: initial room state missing; retry join_room");
+                postJoinRoom(roomId_);
+                nextJoinRetryAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            }
+            if (!flushOutboundTextFrames()) {
+                if (onConnectionStateChanged_) onConnectionStateChanged_(false);
+                break;
+            }
             std::string text;
-            if (!readFrameText(text)) {
+            bool receivedFrame = false;
+            if (!readFrameText(text, receivedFrame)) {
                 LOG_WARN("OnlineVodWsClient: readFrameText failed, reconnecting");
                 // 触发连接失败回调（连接断开）
                 if (onConnectionStateChanged_) {
@@ -358,15 +415,22 @@ void OnlineVodWsClient::threadMain() {
                 }
                 break;
             }
-            flushOutboundTextFrames();
+            if (!flushOutboundTextFrames()) {
+                if (onConnectionStateChanged_) onConnectionStateChanged_(false);
+                break;
+            }
+            if (receivedFrame) {
+                // Any RFC6455 frame (including Ping/Pong) proves the connection is active; a socket timeout does not.
+                lastMessageTime = std::chrono::steady_clock::now();
+            }
             if (text.empty()) {
-                // recv 超时：检查长时间无有效下行
+                // Socket timeout: detect a connection that has received no WebSocket frame for too long.
                 auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - *lastMessageTime).count();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastMessageTime).count();
                 if (elapsed > 90) {
-                    // 90秒没收到任何消息且客户端Ping也失败了，可能是僵尸连接
-                    LOG_WARN("OnlineVodWsClient: no message received for %lld seconds, reconnecting", elapsed);
-                    // 触发连接失败回调（僵尸连接）
+                    // Reconnect only when no WebSocket frame at all has arrived for 90 seconds.
+                    LOG_WARN("OnlineVodWsClient: no WebSocket frame received for %lld seconds, reconnecting", elapsed);
+                    // Notify the connection-state observer about the stale connection.
                     if (onConnectionStateChanged_) {
                         onConnectionStateChanged_(false);
                     }
@@ -374,13 +438,16 @@ void OnlineVodWsClient::threadMain() {
                 }
                 continue;
             }
-            
-            // 收到消息，更新时间
-            *lastMessageTime = std::chrono::steady_clock::now();
-            handleMessage(text);
+
+            try {
+                handleMessage(text);
+            } catch (const std::exception& error) {
+                LOG_WARN("OnlineVodWsClient: invalid message ignored: %s", error.what());
+            }
         }
 
         protocolHeartbeatStop->store(true);
+        protocolHeartbeatCv->notify_all();
         if (protocolHeartbeatThread.joinable()) {
             protocolHeartbeatThread.join();
         }
@@ -468,7 +535,7 @@ bool OnlineVodWsClient::connectAndHandshake() {
         << "Sec-WebSocket-Version: 13\r\n\r\n";
 
     std::string reqStr = req.str();
-    if (send(sock_, reqStr.c_str(), reqStr.size(), 0) != (ssize_t)reqStr.size()) {
+    if (!sendAll(sock_, reqStr.data(), reqStr.size())) {
         LOG_ERROR("OnlineVodWsClient: handshake request send failed");
         closeSocket();
         return false;
@@ -477,7 +544,12 @@ bool OnlineVodWsClient::connectAndHandshake() {
     // 读满 HTTP 头（\r\n\r\n），避免与首帧 WebSocket 粘在同一 TCP 段时丢字节导致后续帧错位
     std::string httpBuf;
     httpBuf.reserve(4096);
+    const auto handshakeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (httpBuf.find("\r\n\r\n") == std::string::npos) {
+      if (stopRequested_.load() || std::chrono::steady_clock::now() >= handshakeDeadline) {
+        closeSocket();
+        return false;
+      }
       char chunk[4096];
       const ssize_t n = recv(sock_, chunk, sizeof(chunk), 0);
       if (n == 0) {
@@ -486,6 +558,7 @@ bool OnlineVodWsClient::connectAndHandshake() {
         return false;
       }
       if (n < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
         LOG_ERROR("OnlineVodWsClient: handshake recv errno=%d (%s)", errno, strerror(errno));
         closeSocket();
         return false;
@@ -509,6 +582,15 @@ bool OnlineVodWsClient::connectAndHandshake() {
       rxPending_.assign(httpBuf.begin() + static_cast<std::string::difference_type>(afterHeaders),
                        httpBuf.end());
       LOG_DEBUG("OnlineVodWsClient: %zu bytes after HTTP headers (queued for first WS frame)", rxPending_.size());
+    }
+    {
+        sockaddr_in local{};
+        socklen_t length = sizeof(local);
+        char ip[INET_ADDRSTRLEN]{};
+        if (getsockname(sock_, reinterpret_cast<sockaddr*>(&local), &length) == 0)
+            inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip));
+        std::lock_guard<std::mutex> lock(localAddressMutex_);
+        localAddress_ = ip;
     }
     LOG_INFO("OnlineVodWsClient: handshake success host=%s port=%d", host_.c_str(), port_);
     return true;
@@ -536,8 +618,9 @@ void OnlineVodWsClient::closeSocket() {
 #endif
 }
 
-bool OnlineVodWsClient::readFrameText(std::string& outText) {
+bool OnlineVodWsClient::readFrameText(std::string& outText, bool& receivedFrame) {
     outText.clear();
+    receivedFrame = false;
 #if defined(_WIN32)
     return false;
 #else
@@ -551,6 +634,7 @@ bool OnlineVodWsClient::readFrameText(std::string& outText) {
       return true;
     }
     if (rc != 1) return false;
+    receivedFrame = true;
 
     const unsigned char opcode = header[0] & 0x0F;
     const bool masked = (header[1] & 0x80) != 0;
@@ -606,15 +690,16 @@ bool OnlineVodWsClient::readFrameText(std::string& outText) {
       frame.insert(frame.end(), pongMask, pongMask + 4);
       for (size_t i = 0; i < payloadLen; i++) payload[i] ^= pongMask[i % 4];
       frame.insert(frame.end(), payload.begin(), payload.end());
-      ssize_t sent = -1;
+      bool sent = false;
       {
         std::lock_guard<std::mutex> lk(sendMutex_);
-        sent = send(sock_, frame.data(), frame.size(), 0);
+        sent = sendAll(sock_, frame.data(), frame.size());
       }
-      if (sent == static_cast<ssize_t>(frame.size())) {
+      if (sent) {
         LOG_DEBUG("OnlineVodWsClient: received Ping, replied Pong");
       } else {
         LOG_WARN("OnlineVodWsClient: failed to send Pong");
+        return false;
       }
       return true;
     }
@@ -656,7 +741,7 @@ bool OnlineVodWsClient::sendPing() {
     frame[3] = maskKey[1];
     frame[4] = maskKey[2];
     frame[5] = maskKey[3];
-    return send(sock_, frame, 6, 0) == 6;
+    return sendAll(sock_, frame, sizeof(frame));
 #endif
 }
 
@@ -681,12 +766,12 @@ void OnlineVodWsClient::handleMessage(const std::string& text) {
 
     if (type == "roomStateChanged") {
         // 带 path 字段的通知消息：服务器告知指定资源已变化，无 data 字段
-        // e.g. {"type":"roomStateChanged","path":"/api/v1/idle-media/scan","时间stamp":...}
+        // e.g. {"type":"roomStateChanged","path":"/api/v1/idle-media/scan","timestamp":...}
         if (root.isMember("path") && root["path"].isString()) {
             const std::string path = root["path"].asString();
             LOG_INFO("[OnlineVod] roomStateChanged path-notify: path=%s", path.c_str());
-            // 空闲歌曲列表变化：通知引擎刷新列表并立即播放
-            if (path.find("idle-media") != std::string::npos || path.find("freesongs") != std::string::npos) {
+            // Refresh the list; playback remains driven by the full room state.
+            if (path == "/api/v1/idle-media/scan") {
                 if (onFreesongNotify_) onFreesongNotify_();
             }
             return;
@@ -720,17 +805,16 @@ void OnlineVodWsClient::handleMessage(const std::string& text) {
         LOG_INFO("[OnlineVod] command received: action=%s",
                  actName.c_str());
 
-        if (!isOnlineVodPlaybackCommand(actName)) {
-            queuePeripheralRouterRequest(db_, actName, P);
-            return;
-        }
-
         bool handled = false;
-        if (onPlaybackCommand_) {
-            handled = onPlaybackCommand_(actName, P, raw);
-            db_->setOnlineVodSyncMeta("online_vod_ws_last_command_result", handled ? "ok" : "fail");
-            db_->setOnlineVodSyncMeta("online_vod_ws_last_command_action", actName);
+        if (isOnlineVodPlaybackCommand(actName)) {
+            if (onPlaybackCommand_) {
+                handled = onPlaybackCommand_(actName, P, raw);
+            }
+        } else if (onPeripheralCommand_) {
+            handled = onPeripheralCommand_(actName, P, raw);
         }
+        db_->setOnlineVodSyncMeta("online_vod_ws_last_command_result", handled ? "queued" : "rejected");
+        db_->setOnlineVodSyncMeta("online_vod_ws_last_command_action", actName);
 
         Json::Value patch;
         if (actName == "SetVolume") {
@@ -759,9 +843,14 @@ void OnlineVodWsClient::handleMessage(const std::string& text) {
 
 void OnlineVodWsClient::handleRoomUpdate(const Json::Value& data, int64_t nowMs) {
     // roomStateChanged：使用服务器/pad 同一份完整房间状态。
+    if (!data.isObject() || !data["roomId"].isString() || data["roomId"].asString().empty() ||
+        !data["playState"].isInt() || !data["volume"].isInt()) {
+        LOG_WARN("OnlineVodWsClient: invalid room state; subscription is still unconfirmed");
+        return;
+    }
     VodDatabase::OnlineVodState st;
     st.roomId = data.get("roomId", "").asString();
-    st.name = data.get("roomName", data.get("name", "")).asString();
+    st.name = data.get("roomName", "").asString();
     st.status = data.get("status", 0).asInt();
     st.playState = data.get("playState", 0).asInt();
     st.volume = data.get("volume", 0).asInt();
@@ -776,9 +865,19 @@ void OnlineVodWsClient::handleRoomUpdate(const Json::Value& data, int64_t nowMs)
     st.currentSongId = !playingNow.isNull()
                            ? playingNow.get("songId", data.get("currentSongId", "")).asString()
                            : data.get("currentSongId", "").asString();
+    st.currentQueueItemId = !playingNow.isNull()
+                                ? playingNow.get("queueItemId", "").asString()
+                                : "";
     st.currentSongTitle = !playingNow.isNull()
-                              ? playingNow.get("songTitle", data.get("currentSongTitle", "")).asString()
+                              ? playingNow
+                                    .get("songName",
+                                         playingNow.get(
+                                             "songTitle",
+                                             data.get("currentSongTitle", "")))
+                                    .asString()
                               : data.get("currentSongTitle", "").asString();
+    st.currentSongLightCode = !playingNow.isNull() ? playingNow.get("lightCode", "").asString() : "";
+    st.currentSongCategoryCode = !playingNow.isNull() ? playingNow.get("categoryCode", "").asString() : "";
 
     st.acStateJson = readJsonOrString(data, "ac");
     st.lightStateJson = readJsonOrString(data, "light");
@@ -790,6 +889,7 @@ void OnlineVodWsClient::handleRoomUpdate(const Json::Value& data, int64_t nowMs)
     st.updatedAt = data.get("updatedAt", "").asString();
     st.updatedAtEpochMs = nowMs;
     st.rawJson = JsonUtils::toString(data);
+    initialRoomStateReceived_ = true;
 
     // roomId 为空时用已解析的 roomId 或连接时指定的 roomId 兜底，不阻断回调
     if (st.roomId.empty()) {

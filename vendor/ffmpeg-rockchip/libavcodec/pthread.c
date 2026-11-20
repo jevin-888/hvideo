@@ -119,7 +119,7 @@ av_cold int ff_pthread_init(void *obj, const unsigned offsets[])
     PTHREAD_INIT_LOOP(mutex)
     PTHREAD_INIT_LOOP(cond)
 
-? fail:
+fail:
     *(unsigned*)((char*)obj + offsets[0]) = cnt;
     return err;
 }

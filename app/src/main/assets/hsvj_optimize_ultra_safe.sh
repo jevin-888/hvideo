@@ -15,29 +15,7 @@ echo "[HSVJ-SAFE] Ultra safe optimizer started."
 # SELinux 规则配置（不影响启动）
 # ==============================================
 configure_selinux_rules() {
-    echo "[HSVJ-SAFE] Configuring SELinux rules..."
-
-    if command -v supolicy >/dev/null 2>&1; then
-        supolicy --live \
-            "allow system_app video_device chr_file ioctl" \
-            "allow system_app video_device chr_file { read write open getattr }" \
-            "allow system_app mpp_device chr_file ioctl" \
-            "allow system_app mpp_device chr_file { read write open getattr }" \
-            "allow system_app gpu_device chr_file ioctl" \
-            "allow system_app gpu_device chr_file { read write open getattr }" \
-            2>/dev/null
-    fi
-
-    if [ "$(getenforce)" = "Enforcing" ]; then
-        setenforce 0
-    fi
-
-    for dev in /dev/mpp_service /dev/mpp-service /dev/rkvdec /dev/rkvenc /dev/vepu /dev/vpu_service /dev/dri/renderD128; do
-        if [ -e "$dev" ]; then
-            chmod 666 "$dev" 2>/dev/null
-            chown system:system "$dev" 2>/dev/null
-        fi
-    done
+    echo "[HSVJ-SAFE] SELinux and device access are managed by the H66_POR ROM policy."
 }
 
 # ==============================================
@@ -77,7 +55,7 @@ lock_cpu_performance() {
         [ -d "$policy" ] || continue
         set_node_value "$policy/scaling_governor" performance
         MAX_FREQ="$(cat "$policy/cpuinfo_max_freq" 2>/dev/null)"
-        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$policy/scaling_available_frequencies" 2>/dev/null | awk '{print $NF}')"
+        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(tr ' ' '\n' < "$policy/scaling_available_frequencies" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $1 > max { max=$1 } END { if (max) print max }')"
         if [ -n "$MAX_FREQ" ]; then
             set_node_value "$policy/scaling_max_freq" "$MAX_FREQ"
             set_node_value "$policy/scaling_min_freq" "$MAX_FREQ"
@@ -99,8 +77,10 @@ lock_devfreq_performance() {
         esac
 
         set_node_value "$dev/governor" performance
-        MAX_FREQ="$(cat "$dev/max_freq" 2>/dev/null)"
-        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$dev/available_frequencies" 2>/dev/null | awk '{print $NF}')"
+        # available_frequencies is the hardware table. max_freq may already be
+        # temporarily reduced by thermal cooling when this script starts.
+        MAX_FREQ="$(tr ' ' '\n' < "$dev/available_frequencies" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $1 > max { max=$1 } END { if (max) print max }')"
+        [ -z "$MAX_FREQ" ] && MAX_FREQ="$(cat "$dev/max_freq" 2>/dev/null)"
         if [ -n "$MAX_FREQ" ]; then
             set_node_value "$dev/max_freq" "$MAX_FREQ"
             set_node_value "$dev/min_freq" "$MAX_FREQ"
@@ -233,7 +213,8 @@ optimize_for_video() {
     setprop debug.hsvj.async_acquire on
     setprop debug.hsvj.async_acquire_wait_fence off
     setprop debug.hsvj.surface_frame_rate on
-    setprop debug.hsvj.drm_prime_cache 12
+    # One 4K DMA-BUF cache entry is the verified performance/stability limit.
+    setprop debug.hsvj.drm_prime_cache 1
 
     # 日志降噪
     setprop log.tag.CompositionEngine WARN
@@ -281,21 +262,6 @@ optimize_io() {
         fi
     done
 
-    # 端口转发 80 -> 8080（绑定当前有效 IPv4，手机/微信访问不需要带 8080）
-    echo "[HSVJ-SAFE] Setting up port forwarding 80 -> 8080..."
-    while true; do
-        line="$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | awk '/tcp dpt:80 redir ports 8080/ {print $1; exit}')"
-        [ -n "$line" ] || break
-        iptables -t nat -D PREROUTING "$line" 2>/dev/null || break
-    done
-    configured=0
-    for ip in $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1); do
-        [ -n "$ip" ] || continue
-        iptables -t nat -I PREROUTING 1 -d "$ip"/32 -p tcp --dport 80 -j REDIRECT --to-port 8080
-        echo "[HSVJ-SAFE] Port forwarding configured for $ip"
-        configured=$((configured + 1))
-    done
-    [ "$configured" -gt 0 ] || echo "[HSVJ-SAFE] Port forwarding skipped: no global IPv4"
 }
 
 # ==============================================
@@ -366,7 +332,6 @@ echo "[HSVJ-SAFE]   ✓ Telephony/Radio services disabled"
 echo "[HSVJ-SAFE]   ✓ Video playback optimized"
 echo "[HSVJ-SAFE]   ✓ RK HWC display pipeline timeline requested"
 echo "[HSVJ-SAFE]   ✓ Memory/IO optimized"
-echo "[HSVJ-SAFE]   ✓ Port forwarding 80->8080 configured"
 echo "[HSVJ-SAFE]   ✓ RKNN/traced/statsd disabled"
 echo "[HSVJ-SAFE] =========================================="
 echo "[HSVJ-SAFE] Preserved for system boot:"

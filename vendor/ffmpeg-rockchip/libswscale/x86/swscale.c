@@ -739,7 +739,7 @@ switch(c->dstBpc){ \
     if (EXTERNAL_AVX2_FAST(cpu_flags)) {
         switch (c->srcFormat) {
         INPUT_PLANER_RGB_YUVA_ALL_CASES(avx2)
-        ? default:
+        default:
             break;
         }
     }
@@ -782,7 +782,7 @@ switch(c->dstBpc){ \
         if (EXTERNAL_SSE2(cpu_flags)) {
             switch (c->dstFormat) {
             YUV2ANYX_GBRAP_CASES(sse2)
-            ? default:
+            default:
                 break;
             }
         }
@@ -790,7 +790,7 @@ switch(c->dstBpc){ \
         if (EXTERNAL_SSE4(cpu_flags)) {
             switch (c->dstFormat) {
             YUV2ANYX_GBRAP_CASES(sse4)
-            ? default:
+            default:
                 break;
             }
         }
@@ -798,7 +798,7 @@ switch(c->dstBpc){ \
         if (EXTERNAL_AVX2_FAST(cpu_flags)) {
             switch (c->dstFormat) {
             YUV2ANYX_GBRAP_CASES(avx2)
-            ? default:
+            default:
                 break;
             }
         }

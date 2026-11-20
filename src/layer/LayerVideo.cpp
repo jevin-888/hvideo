@@ -16,7 +16,7 @@
 #include "renderer/UsbCaptureRenderer.h"
 #include "capture/V4L2SubdevQuery.h"
 #include "core/LicenseManager.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "decoder/AudioOnlyPlayer.h"
 #include "decoder/VideoDecoder.h"
 #include "decoder/VideoDecoderPool.h"
@@ -69,17 +69,23 @@ static void releasePendingDecoderAfterFence(VulkanRenderer *renderer,
     frames[0] = nullptr;
     frames[1] = nullptr;
     renderer->deferUntilCurrentFrameFence([holder, frame0, frame1]() {
-      if (frame0) frame0->release();
-      if (frame1) frame1->release();
-      if (*holder) {
-        (*holder)->signalStop();
-        // 使用超时避免析构时永久阻塞
-        bool stopped = (*holder)->waitStoppedFor(5000);
-        if (!stopped) {
-          LOG_ERROR("[LayerVideo] Decoder failed to stop in destructor within 5000ms, forcing release");
+      // A fence callback can execute on the render thread. Do not release
+      // RKMPP frames or wait for decoder shutdown here: either operation may
+      // block in the kernel driver and stall every subsequent frame.
+      auto releaseTask = std::async(std::launch::async, [holder, frame0, frame1]() {
+        if (frame0) frame0->release();
+        if (frame1) frame1->release();
+        if (*holder) {
+          (*holder)->signalStop();
+          // 使用超时避免析构时永久阻塞
+          bool stopped = (*holder)->waitStoppedFor(5000);
+          if (!stopped) {
+            LOG_ERROR("[LayerVideo] Decoder failed to stop in destructor within 5000ms, forcing release");
+          }
+          VideoDecoderPool::getInstance().release(std::move(*holder));
         }
-        VideoDecoderPool::getInstance().release(std::move(*holder));
-      }
+      });
+      LayerVideo::trackAsyncTask(std::move(releaseTask));
     });
     return;
   }
@@ -225,10 +231,11 @@ LayerVideo::LayerVideo(int layerId)
 }
 
 void LayerVideo::setPlaybackRate(float rate) {
-  if (std::abs(playbackRate_ - rate) < 0.001f) {
+  const float previous = playbackRate_.load(std::memory_order_acquire);
+  if (std::abs(previous - rate) < 0.001f) {
     return;
   }
-  playbackRate_ = rate;
+  playbackRate_.store(rate, std::memory_order_release);
   if (decoder_) {
     decoder_->setPlaybackRate(rate);
   }
@@ -255,7 +262,15 @@ bool LayerVideo::isPlaybackFinished() const {
            audioOnlyPlayer_->isFinished();
   }
   std::lock_guard<std::timed_mutex> lock(mutex_);
-  return decoder_ && decoder_->isFinished();
+  return decoder_ && decoder_->isFinished() &&
+         decoder_->getLastErrorCode() == DecodeErrorCode::None;
+}
+
+bool LayerVideo::isPlaybackFailed() const {
+  std::lock_guard<std::timed_mutex> lock(mutex_);
+  return !isPlayingPureAudio_.load() && state_ == PlayState::STOPPED &&
+         !currentPath_.empty() && decoder_ && decoder_->isFinished() &&
+         decoder_->getLastErrorCode() != DecodeErrorCode::None;
 }
 
 void LayerVideo::onPureAudioPlaybackFinished() {
@@ -308,6 +323,9 @@ bool LayerVideo::ensureCapturePlaceholderRenderer() {
 
 void LayerVideo::shutdown() {
   std::lock_guard<std::mutex> lifecycleGuard(lifecycleOpMutex_);
+  syncPresentationDeadlineNs_.store(0, std::memory_order_release);
+  syncTraceDeadlineNs_.store(0, std::memory_order_release);
+  syncFirstFrameTraceEnabled_.store(false, std::memory_order_release);
   // 设置 shutdown flag to prevent other threads from continuing access
   isShuttingDown_.store(true);
 
@@ -341,7 +359,7 @@ void LayerVideo::shutdown() {
           DecodedFrame *frameToRelease = pendingFrames_[i];
           if (renderer_) {
             renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-              frameToRelease->release();
+              LayerVideo::releaseDecodedFrameAsync(frameToRelease);
             });
           } else {
             decoder_->releaseFrame(frameToRelease);
@@ -355,7 +373,7 @@ void LayerVideo::shutdown() {
       retainedLastFrame_ = nullptr;
       if (renderer_) {
         renderer_->deferUntilCurrentFrameFence([frameToRelease]() {
-          frameToRelease->release();
+          LayerVideo::releaseDecodedFrameAsync(frameToRelease);
         });
       } else {
         frameToRelease->release();
@@ -481,7 +499,7 @@ void LayerVideo::dropStaleVulkanTextureHandles() {
   if (retainedFrame) {
     if (renderer_) {
       renderer_->deferUntilCurrentFrameFence([retainedFrame]() {
-        retainedFrame->release();
+        LayerVideo::releaseDecodedFrameAsync(retainedFrame);
       });
     } else {
       retainedFrame->release();

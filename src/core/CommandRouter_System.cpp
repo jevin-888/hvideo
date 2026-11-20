@@ -11,7 +11,7 @@
 #include <unistd.h>
 #endif
 
-extern "C" void callJavaRestartMethod();
+extern "C" bool callJavaRestartMethod();
 
 // 应用版本号（由 jni_interface.cpp 在 initialize 时设置）
 extern std::string g_appVersion;
@@ -51,7 +51,12 @@ CommandResponse CommandRouter::handleSystemConfig(const std::string &paramJson) 
     data["networkStaticIp"] = systemConfig_->getNetworkStaticIp();
     data["networkGateway"] = systemConfig_->getNetworkGateway();
     data["networkDns"] = systemConfig_->getNetworkDns();
-    data["debugHotspotEnabled"] = systemConfig_->isDebugHotspotEnabled();
+    data["startupWirelessMode"] = systemConfig_->getStartupWirelessMode();
+    data["fusionDebugEnabled"] = systemConfig_->isFusionDebugEnabled();
+    data["vodMode"] = systemConfig_->getVodMode();
+    data["enableVod"] = systemConfig_->isVodEnabled();
+    data["onlineVodHost"] = systemConfig_->getOnlineVodHost();
+    data["onlineVodRoomId"] = systemConfig_->getOnlineVodRoomId();
     data["renderFrameRateMode"] = systemConfig_->getRenderFrameRateMode();
     data["renderQuality"] = systemConfig_->getRenderQuality();
     data["powerScheduleEnabled"] = systemConfig_->isPowerScheduleEnabled();
@@ -226,13 +231,16 @@ CommandResponse CommandRouter::handleSystemControl(const std::string &paramJson)
   if (action == "restart_app") {
     // 重启应用程序
     LOG_DEBUG("收到重启应用请求");
-    response.ok = true;
-    response.error = 0x0000;
-    response.message = "正在重启应用...";
-
-    // 调用 Java 层的重启方法
-    LOG_DEBUG("调用 Java 层的重启方法");
-    callJavaRestartMethod();
+    LOG_DEBUG("Submitting application restart through Java platform control");
+    if (callJavaRestartMethod()) {
+      response.ok = true;
+      response.error = 0x0000;
+      response.message = "Restart submitted";
+    } else {
+      response.ok = false;
+      response.error = 0x1001;
+      response.message = "Restart submission failed: platform control unavailable";
+    }
 
   } else if (action == "reboot") {
     // 重启系统

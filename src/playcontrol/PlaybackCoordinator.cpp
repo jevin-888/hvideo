@@ -1,4 +1,5 @@
 #include "playcontrol/PlaybackCoordinator.h"
+#include "audio/AudioPlayerManager.h"
 #include "playcontrol/MediaRuntimeDiagnostics.h"
 #include "playcontrol/DecoderResourceGate.h"
 #include "utils/Logger.h"
@@ -73,6 +74,29 @@ PlaybackResult PlaybackCoordinator::requestPlay(PlaybackRequest request) {
       request.requestId, request.layerId, request.path, toString(request.source),
       request.userInitiated);
 
+  if (AudioPlayerManager::getInstance().isExternalBluetoothAudioActive()) {
+    PlaybackResult result;
+    result.requestId = request.requestId;
+    result.switchId = MediaRuntimeDiagnostics::getInstance().nextSwitchId();
+    result.code = PlaybackResultCode::ResourceBusy;
+    result.softBlocked = true;
+    result.retryAfterMs = 1000;
+    result.message = "Bluetooth audio active, video playback deferred";
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      bluetoothDeferredRequests_[request.layerId] = request;
+    }
+    MediaRuntimeDiagnostics::getInstance().logPlaybackTrace(
+        result.requestId, result.switchId, request.layerId, "COORDINATOR_DEFER",
+        "reason=external-bluetooth-audio");
+    MediaRuntimeDiagnostics::getInstance().logPlaybackResult(
+        result.requestId, result.switchId, request.layerId, toString(result.code),
+        result.message);
+    LOG_INFO("[BluetoothAudio] Deferred video playback: layer=%d source=%s path=%s",
+             request.layerId, toString(request.source), request.path.c_str());
+    return result;
+  }
+
   if (isMirrorPlaybackBlocked() && request.layerId != 1) {
     PlaybackResult result;
     result.requestId = request.requestId;
@@ -112,11 +136,37 @@ PlaybackResult PlaybackCoordinator::requestPlay(PlaybackRequest request) {
   return result;
 }
 
+size_t PlaybackCoordinator::resumeBluetoothDeferredRequests() {
+  std::map<int, PlaybackRequest> pending;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending.swap(bluetoothDeferredRequests_);
+  }
+
+  size_t resumed = 0;
+  for (auto &entry : pending) {
+    PlaybackRequest request = std::move(entry.second);
+    request.requestId = 0;
+    PlaybackResult result = requestPlay(std::move(request));
+    if (result.isSuccess()) {
+      ++resumed;
+    } else if (result.softBlocked) {
+      LOG_WARN("[BluetoothAudio] Deferred playback remains blocked: layer=%d reason=%s",
+               entry.first, result.message.c_str());
+    } else {
+      LOG_ERROR("[BluetoothAudio] Deferred playback failed: layer=%d reason=%s",
+                entry.first, result.message.c_str());
+    }
+  }
+  return resumed;
+}
+
 PlaybackResult PlaybackCoordinator::stopLayer(int layerId) {
   LayerVideo *layer = nullptr;
   LayerPlaybackController *controller = nullptr;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    bluetoothDeferredRequests_.erase(layerId);
     if (layerResolver_) {
       layer = layerResolver_(layerId);
     }

@@ -1,0 +1,6 @@
+node_modules/
+src-tauri/target/
+HVIDEO-Debug-Tool*.exe
+!src-tauri/resources/adb/adb.exe
+!src-tauri/resources/adb/AdbWinApi.dll
+!src-tauri/resources/adb/AdbWinUsbApi.dll

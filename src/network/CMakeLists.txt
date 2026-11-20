@@ -4,6 +4,9 @@ get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE
 # 定义网络模块的源文件列表
 set(NETWORK_SOURCES
     DeviceDiscoveryService.cpp
+    DeviceFileSync.cpp
+    SyncClock.cpp
+    SyncUdpGroup.cpp
     NetworkManager.cpp
     HttpServer.cpp
     HttpServer_Connection.cpp
@@ -18,6 +21,8 @@ set(NETWORK_SOURCES
     HttpServer_Scenes.cpp
     HttpServer_Video.cpp
     HttpServer_System.cpp
+    HttpServer_ConfigBackup.cpp
+    DisplayOutputModeClient.cpp
     HttpServer_Runtime.cpp
     HttpServer_Config.cpp
     HttpServer_Command.cpp
@@ -38,6 +43,7 @@ set(NETWORK_SOURCES
     OnlineVodWsClient.cpp
     OnlineVodHttpSyncClient.cpp
     CloudLicenseClient.cpp
+    CloudAgentAuth.cpp
     CloudSyncService.cpp
     Rs232Server.cpp
     Rs485Server.cpp
@@ -69,6 +75,7 @@ endif()
 target_compile_features(hsvj_network PRIVATE cxx_std_17)
 
 target_link_libraries(hsvj_network PRIVATE
+    hsvj_jsoncpp
     hsvj_database
 )
 
@@ -95,3 +102,18 @@ endif()
 # - Android 平台：通过 app/build.gradle 中的 copyWebFiles 任务复制到 app/src/main/assets/web
 # - 非 Android 平台：运行时从源码目录或安装目录读取，无需在构建时复制
 
+# Architecture dependency contract (validated by scripts/check_architecture.py)
+target_link_libraries(hsvj_network PRIVATE
+    hsvj_capture
+    hsvj_core
+    hsvj_database
+    hsvj_decoder
+    hsvj_effect
+    hsvj_foundation
+    hsvj_layer
+    hsvj_playcontrol
+    hsvj_text
+    hsvj_utils
+    hsvj_local_vod
+    hsvj_jsoncpp
+)

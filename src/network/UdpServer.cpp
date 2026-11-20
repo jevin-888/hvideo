@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <errno.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <sstream>
@@ -231,17 +232,45 @@ void UdpServer::receiveLoop() {
 }
 
 bool UdpServer::sendTo(const std::string& address, int port, const std::string& data) {
-  if (socketFd_ < 0) return false;
+  if (socketFd_ < 0) {
+    LOG_WARN("UdpServer: Cannot send, socket not initialized");
+    return false;
+  }
+  if (address.empty() || port <= 0 || port > 65535) {
+    LOG_WARN("UdpServer: Invalid target %s:%d", address.c_str(), port);
+    return false;
+  }
 
-  sockaddr_in destAddr;
-  memset(&destAddr, 0, sizeof(destAddr));
-  destAddr.sin_family = AF_INET;
-  destAddr.sin_port = htons(port);
-  inet_pton(AF_INET, address.c_str(), &destAddr.sin_addr);
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_DGRAM;
+  hints.ai_protocol = IPPROTO_UDP;
+  addrinfo* addresses = nullptr;
+  const std::string service = std::to_string(port);
+  const int resolveResult =
+      getaddrinfo(address.c_str(), service.c_str(), &hints, &addresses);
+  if (resolveResult != 0 || !addresses) {
+    LOG_WARN("UdpServer: Failed to resolve target %s: %s", address.c_str(),
+             gai_strerror(resolveResult));
+    return false;
+  }
 
-  ssize_t sent = sendto(socketFd_, data.c_str(), data.length(), 0,
-                        (struct sockaddr*)&destAddr, sizeof(destAddr));
-  return sent == (ssize_t)data.length();
+  bool sentOk = false;
+  for (addrinfo* entry = addresses; entry; entry = entry->ai_next) {
+    const ssize_t sent =
+        sendto(socketFd_, data.data(), data.size(), 0, entry->ai_addr,
+               static_cast<socklen_t>(entry->ai_addrlen));
+    if (sent == static_cast<ssize_t>(data.size())) {
+      sentOk = true;
+      break;
+    }
+  }
+  freeaddrinfo(addresses);
+  if (!sentOk) {
+    LOG_WARN("UdpServer: Failed to send to %s:%d: %s", address.c_str(), port,
+             strerror(errno));
+  }
+  return sentOk;
 }
 
 size_t UdpServer::broadcastToClients(const std::string& data) {
@@ -389,6 +418,15 @@ bool UdpServer::sendToMulticastGroup(const std::string& multicastAddr, int port,
     return false;
   }
 
+  if (port <= 0 || port > 65535) {
+    LOG_WARN("UdpServer::sendToMulticastGroup: invalid target port %d", port);
+    return false;
+  }
+  if (ttl < 0 || ttl > 255) {
+    LOG_WARN("UdpServer::sendToMulticastGroup: invalid TTL %d", ttl);
+    return false;
+  }
+
   // 设置 TTL（每次发送前设置，允许不同调用使用不同 TTL）
   unsigned char ucTtl = static_cast<unsigned char>(ttl);
   if (setsockopt(socketFd_, IPPROTO_IP, IP_MULTICAST_TTL, &ucTtl, sizeof(ucTtl)) < 0) {
@@ -400,8 +438,10 @@ bool UdpServer::sendToMulticastGroup(const std::string& multicastAddr, int port,
   memset(&destAddr, 0, sizeof(destAddr));
   destAddr.sin_family = AF_INET;
   destAddr.sin_port = htons(port);
-  if (inet_pton(AF_INET, multicastAddr.c_str(), &destAddr.sin_addr) != 1) {
-    LOG_ERROR("UdpServer::sendToMulticastGroup: 无效的组播地址 %s", multicastAddr.c_str());
+  if (inet_pton(AF_INET, multicastAddr.c_str(), &destAddr.sin_addr) != 1 ||
+      !IN_MULTICAST(ntohl(destAddr.sin_addr.s_addr))) {
+    LOG_ERROR("UdpServer::sendToMulticastGroup: invalid multicast address %s",
+              multicastAddr.c_str());
     return false;
   }
 

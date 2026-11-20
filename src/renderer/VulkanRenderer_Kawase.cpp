@@ -18,18 +18,6 @@
 
 namespace hsvj {
 
-namespace {
-constexpr uint32_t kKawaseBlurOutputTextureId = 0x80000000u;
-VkDescriptorSet gKawaseBlurredDescriptorSet = VK_NULL_HANDLE;
-} // 命名空间
-
-void resetKawaseBlurApplyStatics() {
-  gKawaseBlurredDescriptorSet = VK_NULL_HANDLE;
-}
-
-// Kawase 模糊 最大层级数 (对应 kawaseBlurFBOs_ 数组大小)
-constexpr int MAX_BLUR_LEVELS = 8;
-
 bool VulkanRenderer::createKawasePipelines() {
   if (kawasePipelineInitialized_)
     return true;
@@ -226,109 +214,78 @@ bool VulkanRenderer::createKawasePipelines() {
   vkDestroyShaderModule(device_, upFragModule, nullptr);
   // 注意：不要销毁 kawaseRenderPass_，它会被缓存并用于 FBO
 
-  // --- 创建 YUV->RGBA conversion pipelines (compatible with Kawase RenderPass) ---
-  // These pipelines 使用 same shaders as YUV pipelines, but created with kawaseRenderPass_
-  // Used to convert YUV 视频 frames to RGBA before blur processing
-
-  // 创建 NV12 conversion 管线 (if NV12 管线 already initialized)
-  if (nv12PipelineInitialized_ && nv12PipelineLayout_ != VK_NULL_HANDLE) {
-    std::vector<uint32_t> nv12Vert = loadSpirvFromFile("texture.vert.spv");
-    std::vector<uint32_t> nv12Frag = loadSpirvFromFile("nv12_texture.frag.spv");
-    VkShaderModule nv12VertModule = createShaderModuleFromSpirv(nv12Vert);
-    VkShaderModule nv12FragModule = createShaderModuleFromSpirv(nv12Frag);
-
-    if (nv12VertModule != VK_NULL_HANDLE && nv12FragModule != VK_NULL_HANDLE) {
-      VkPipelineShaderStageCreateInfo stages[2] = {};
-      stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-      stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-      stages[0].module = nv12VertModule;
-      stages[0].pName = "main";
-      stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-      stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-      stages[1].module = nv12FragModule;
-      stages[1].pName = "main";
-
-      PipelineStateHelper ps;
-      ps.init();
-
-      VkGraphicsPipelineCreateInfo pipelineInfo{
-          VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-      pipelineInfo.stageCount = 2;
-      pipelineInfo.pStages = stages;
-      pipelineInfo.pVertexInputState = &ps.vertexInput;
-      pipelineInfo.pInputAssemblyState = &ps.inputAssembly;
-      pipelineInfo.pViewportState = &ps.viewportState;
-      pipelineInfo.pRasterizationState = &ps.rasterizer;
-      pipelineInfo.pMultisampleState = &ps.multisampling;
-      pipelineInfo.pColorBlendState = &ps.colorBlending;
-      pipelineInfo.pDynamicState = &ps.dynamicState;
-      pipelineInfo.layout = nv12PipelineLayout_;
-      pipelineInfo.renderPass = kawaseRenderPass_; // 使用 Kawase RenderPass
-    if (vkCreateGraphicsPipelines(device_, pipelineCache_, 1, &pipelineInfo,
-                                    nullptr, &kawaseNV12ConvertPipeline_) ==
-          VK_SUCCESS) {
-      }
-
-      vkDestroyShaderModule(device_, nv12VertModule, nullptr);
-      vkDestroyShaderModule(device_, nv12FragModule, nullptr);
-    }
-  }
-
-  // 创建 DRM PRIME conversion 管线
-  // 注意：DRM PRIME 使用 YCbCr 硬件采样器，会自动完成 YUV->RGB 转换
-  if (drmPrimePipelineInitialized_ &&
-      drmPrimePipelineLayout_ != VK_NULL_HANDLE) {
-    std::vector<uint32_t> drmVert = loadSpirvFromFile("texture.vert.spv");
-    std::vector<uint32_t> drmFrag = loadSpirvFromFile("texture.frag.spv");
-    VkShaderModule drmVertModule = createShaderModuleFromSpirv(drmVert);
-    VkShaderModule drmFragModule = createShaderModuleFromSpirv(drmFrag);
-
-    if (drmVertModule != VK_NULL_HANDLE && drmFragModule != VK_NULL_HANDLE) {
-      VkPipelineShaderStageCreateInfo stages[2] = {};
-      stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-      stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-      stages[0].module = drmVertModule;
-      stages[0].pName = "main";
-      stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-      stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-      stages[1].module = drmFragModule;
-      stages[1].pName = "main";
-
-      PipelineStateHelper ps;
-      ps.init();
-
-      VkGraphicsPipelineCreateInfo pipelineInfo{
-          VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-      pipelineInfo.stageCount = 2;
-      pipelineInfo.pStages = stages;
-      pipelineInfo.pVertexInputState = &ps.vertexInput;
-      pipelineInfo.pInputAssemblyState = &ps.inputAssembly;
-      pipelineInfo.pViewportState = &ps.viewportState;
-      pipelineInfo.pRasterizationState = &ps.rasterizer;
-      pipelineInfo.pMultisampleState = &ps.multisampling;
-      pipelineInfo.pColorBlendState = &ps.colorBlending;
-      pipelineInfo.pDynamicState = &ps.dynamicState;
-      pipelineInfo.layout = drmPrimePipelineLayout_;
-      pipelineInfo.renderPass = kawaseRenderPass_;
-
-      if (vkCreateGraphicsPipelines(device_, pipelineCache_, 1, &pipelineInfo,
-                                    nullptr, &kawaseDrmPrimeConvertPipeline_) ==
-          VK_SUCCESS) {
-      } else {
-        LOG_ERROR("[Kawase] DRM_PRIME->RGBA conversion pipeline creation failed");
-      }
-
-      vkDestroyShaderModule(device_, drmVertModule, nullptr);
-      vkDestroyShaderModule(device_, drmFragModule, nullptr);
-    }
-  }
-
   kawasePipelineInitialized_ = true;
   return true;
 }
 
+VkPipeline VulkanRenderer::getKawaseConversionPipeline(
+    VkPipelineLayout layout, const char *fragmentShader) {
+  if (layout == VK_NULL_HANDLE || !fragmentShader) return VK_NULL_HANDLE;
+  auto cached = kawaseConvertPipelines_.find(layout);
+  if (cached != kawaseConvertPipelines_.end()) return cached->second;
+
+  std::vector<uint32_t> vertSpirv, fragSpirv;
+  if (!loadShaderPair("texture.vert.spv", fragmentShader, vertSpirv, fragSpirv,
+                      "Kawase conversion")) return VK_NULL_HANDLE;
+  auto createModule = [this](const std::vector<uint32_t> &code) {
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = code.size() * sizeof(uint32_t);
+    info.pCode = code.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    vkCreateShaderModule(device_, &info, nullptr, &module);
+    return module;
+  };
+  const VkShaderModule vert = createModule(vertSpirv);
+  const VkShaderModule frag = createModule(fragSpirv);
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (vert != VK_NULL_HANDLE && frag != VK_NULL_HANDLE) {
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vert;
+    stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = frag;
+    stages[1].pName = "main";
+    PipelineStateHelper state;
+    state.init();
+    state.inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    state.blendAttachment.blendEnable = VK_FALSE;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &state.vertexInput;
+    info.pInputAssemblyState = &state.inputAssembly;
+    info.pViewportState = &state.viewportState;
+    info.pRasterizationState = &state.rasterizer;
+    info.pMultisampleState = &state.multisampling;
+    info.pColorBlendState = &state.colorBlending;
+    info.pDynamicState = &state.dynamicState;
+    info.layout = layout;
+    info.renderPass = kawaseRenderPass_;
+    if (vkCreateGraphicsPipelines(device_, pipelineCache_, 1, &info, nullptr,
+                                  &pipeline) == VK_SUCCESS) {
+      kawaseConvertPipelines_.emplace(layout, pipeline);
+    } else {
+      LOG_ERROR("[Kawase] Conversion pipeline creation failed: %s", fragmentShader);
+    }
+  }
+  if (vert != VK_NULL_HANDLE) vkDestroyShaderModule(device_, vert, nullptr);
+  if (frag != VK_NULL_HANDLE) vkDestroyShaderModule(device_, frag, nullptr);
+  return pipeline;
+}
+
 void VulkanRenderer::cleanupKawasePipelines() {
   std::lock_guard<std::mutex> lock(kawaseBlurMutex_);
+
+  for (auto &slot : kawaseBlurResources_) {
+    for (auto &resources : slot) {
+      textures_.erase(resources.outputTextureId);
+      for (auto &fbo : resources.fbos) destroyKawaseBlurFBO(fbo);
+    }
+    slot.clear();
+  }
+  kawaseBlurFrameId_ = 0;
 
   if (kawaseDownPipeline_)
     vkDestroyPipeline(device_, kawaseDownPipeline_, nullptr);
@@ -346,50 +303,17 @@ void VulkanRenderer::cleanupKawasePipelines() {
   kawasePipelineLayout_ = VK_NULL_HANDLE;
   kawaseDescriptorSetLayout_ = VK_NULL_HANDLE;
   kawaseRenderPass_ = VK_NULL_HANDLE;
-  kawaseBlurCacheFrameId_ = 0;
-  kawaseBlurCacheInputTextureId_ = 0;
-  kawaseBlurCacheAmountBucket_ = -1;
-  kawaseBlurCacheOutputTextureId_ = 0;
-  textures_.erase(kKawaseBlurOutputTextureId);
-
-  for (int i = 0; i < MAX_BLUR_LEVELS; ++i) {
-    destroyKawaseBlurFBO(kawaseBlurFBOs_[i]);
+  for (const auto &entry : kawaseConvertPipelines_) {
+    vkDestroyPipeline(device_, entry.second, nullptr);
   }
-
-  // 清理 YUV->RGBA 转换管线
-  if (kawaseNV12ConvertPipeline_) {
-    vkDestroyPipeline(device_, kawaseNV12ConvertPipeline_, nullptr);
-    kawaseNV12ConvertPipeline_ = VK_NULL_HANDLE;
-  }
-  if (kawaseDrmPrimeConvertPipeline_) {
-    vkDestroyPipeline(device_, kawaseDrmPrimeConvertPipeline_, nullptr);
-    kawaseDrmPrimeConvertPipeline_ = VK_NULL_HANDLE;
-  }
-  if (kawaseV4L2ConvertPipeline_) {
-    vkDestroyPipeline(device_, kawaseV4L2ConvertPipeline_, nullptr);
-    kawaseV4L2ConvertPipeline_ = VK_NULL_HANDLE;
-  }
-  if (kawaseNV24ConvertPipeline_) {
-    vkDestroyPipeline(device_, kawaseNV24ConvertPipeline_, nullptr);
-    kawaseNV24ConvertPipeline_ = VK_NULL_HANDLE;
-  }
-  if (kawaseNV16ConvertPipeline_) {
-    vkDestroyPipeline(device_, kawaseNV16ConvertPipeline_, nullptr);
-    kawaseNV16ConvertPipeline_ = VK_NULL_HANDLE;
-  }
-  if (kawaseYUYVConvertPipeline_) {
-    vkDestroyPipeline(device_, kawaseYUYVConvertPipeline_, nullptr);
-    kawaseYUYVConvertPipeline_ = VK_NULL_HANDLE;
-  }
+  kawaseConvertPipelines_.clear();
 
   kawasePipelineInitialized_ = false;
 }
 
 bool VulkanRenderer::createKawaseBlurFBO(uint32_t width, uint32_t height,
                                          KawaseBlurFBO &fbo) {
-  VkDescriptorSet reusableDescriptorSet = fbo.descriptorSet;
   destroyKawaseBlurFBO(fbo);
-  fbo.descriptorSet = reusableDescriptorSet;
 
   fbo.width = width;
   fbo.height = height;
@@ -507,7 +431,8 @@ bool VulkanRenderer::createKawaseBlurFBO(uint32_t width, uint32_t height,
 void VulkanRenderer::destroyKawaseBlurFBO(KawaseBlurFBO &fbo) {
   if (!fbo.initialized && fbo.framebuffer == VK_NULL_HANDLE &&
       fbo.imageView == VK_NULL_HANDLE && fbo.image == VK_NULL_HANDLE &&
-      fbo.memory == VK_NULL_HANDLE && fbo.sampler == VK_NULL_HANDLE) {
+      fbo.memory == VK_NULL_HANDLE && fbo.sampler == VK_NULL_HANDLE &&
+      fbo.descriptorSet == VK_NULL_HANDLE) {
     return;
   }
 
@@ -522,7 +447,10 @@ void VulkanRenderer::destroyKawaseBlurFBO(KawaseBlurFBO &fbo) {
     vkFreeMemory(device_, fbo.memory, nullptr);
   if (fbo.sampler)
     vkDestroySampler(device_, fbo.sampler, nullptr);
-  // Descriptor 设置 managed by descriptor pool, usually no need to manually 销毁 unless pool has FREE flag
+  if (fbo.descriptorSet != VK_NULL_HANDLE && descriptorPool_ != VK_NULL_HANDLE) {
+    vkFreeDescriptorSets(device_, descriptorPool_, 1, &fbo.descriptorSet);
+  }
+  fbo.descriptorSet = VK_NULL_HANDLE;
 
   fbo.initialized = false;
   fbo.framebuffer = VK_NULL_HANDLE;
@@ -533,17 +461,33 @@ void VulkanRenderer::destroyKawaseBlurFBO(KawaseBlurFBO &fbo) {
   fbo.sampler = VK_NULL_HANDLE;
 }
 
-bool VulkanRenderer::ensureKawaseBlurFBOs(uint32_t baseWidth,
+VulkanRenderer::KawaseBlurResources &VulkanRenderer::getKawaseBlurResources(
+    uint32_t textureId, int amountBucket) {
+  auto &slot = kawaseBlurResources_[currentFrame_];
+  for (auto &resources : slot) {
+    if (resources.frameId == kawaseBlurFrameId_ &&
+        resources.inputTextureId == textureId &&
+        resources.amountBucket == amountBucket) return resources;
+  }
+  for (auto &resources : slot) {
+    if (resources.frameId != kawaseBlurFrameId_) return resources;
+  }
+  slot.emplace_back();
+  return slot.back();
+}
+
+bool VulkanRenderer::ensureKawaseBlurFBOs(KawaseBlurResources &resources,
+                                          uint32_t baseWidth,
                                           uint32_t baseHeight,
                                           int requiredLevels) {
   std::lock_guard<std::mutex> lock(kawaseBlurMutex_);
 
   // FBO[0] keeps original 大小 (for YUV->RGBA conversion and final output)
   // FBO[1]、FBO[2] 等逐级减半
-  requiredLevels = std::clamp(requiredLevels, 1, MAX_BLUR_LEVELS);
-  for (int i = 0; i < MAX_BLUR_LEVELS; ++i) {
+  requiredLevels = std::clamp(requiredLevels, 1, MAX_KAWASE_BLUR_LEVELS);
+  for (int i = 0; i < MAX_KAWASE_BLUR_LEVELS; ++i) {
     if (i >= requiredLevels) {
-      destroyKawaseBlurFBO(kawaseBlurFBOs_[i]);
+      destroyKawaseBlurFBO(resources.fbos[i]);
       continue;
     }
     uint32_t currW, currH;
@@ -557,11 +501,11 @@ bool VulkanRenderer::ensureKawaseBlurFBOs(uint32_t baseWidth,
       currH = baseHeight >> i;
     }
 
-    if (currW < 4 || currH < 4)
-      break; // Minimum 大小 limit
-    if (!kawaseBlurFBOs_[i].initialized || kawaseBlurFBOs_[i].width != currW ||
-        kawaseBlurFBOs_[i].height != currH) {
-      if (!createKawaseBlurFBO(currW, currH, kawaseBlurFBOs_[i])) {
+    currW = std::max(4u, currW);
+    currH = std::max(4u, currH);
+    if (!resources.fbos[i].initialized || resources.fbos[i].width != currW ||
+        resources.fbos[i].height != currH) {
+      if (!createKawaseBlurFBO(currW, currH, resources.fbos[i])) {
         LOG_ERROR("[Kawase] Failed to create blur FBO level %d (%dx%d)", i, currW,
                   currH);
         return false;
@@ -597,13 +541,19 @@ uint32_t VulkanRenderer::applyKawaseBlur(uint32_t textureId, float blurAmount) {
 
   const int blurAmountBucket =
       static_cast<int>(std::clamp(blurAmount, 0.0f, 10.0f) * 10.0f + 0.5f);
-  if (kawaseBlurCacheFrameId_ == kawaseBlurFrameId_ &&
-      kawaseBlurCacheInputTextureId_ == textureId &&
-      kawaseBlurCacheAmountBucket_ == blurAmountBucket &&
-      kawaseBlurCacheOutputTextureId_ != 0 &&
-      textures_.find(kawaseBlurCacheOutputTextureId_) != textures_.end()) {
-    return kawaseBlurCacheOutputTextureId_;
+  auto &resources = getKawaseBlurResources(textureId, blurAmountBucket);
+  if (resources.frameId == kawaseBlurFrameId_ &&
+      resources.inputTextureId == textureId &&
+      resources.amountBucket == blurAmountBucket &&
+      resources.outputTextureId != 0 &&
+      textures_.find(resources.outputTextureId) != textures_.end()) {
+    return resources.outputTextureId;
   }
+  // This bundle has not been used by this frame; its slot fence has retired.
+  // No image or descriptor bound earlier in this frame may be resized here.
+  resources.frameId = kawaseBlurFrameId_;
+  resources.inputTextureId = textureId;
+  resources.amountBucket = -1;
 
   float blurStrength = std::clamp(blurAmount, 0.0f, 10.0f);
   uint32_t sourceVisibleW = inputTexture.visibleWidth();
@@ -628,7 +578,7 @@ uint32_t VulkanRenderer::applyKawaseBlur(uint32_t textureId, float blurAmount) {
     levels = 4;
   const float offsetScale = 1.0f + blurStrength * 0.13f;
 
-  if (!ensureKawaseBlurFBOs(blurBaseW, blurBaseH, levels)) {
+  if (!ensureKawaseBlurFBOs(resources, blurBaseW, blurBaseH, levels)) {
     return textureId;
   }
 
@@ -637,39 +587,51 @@ uint32_t VulkanRenderer::applyKawaseBlur(uint32_t textureId, float blurAmount) {
   // 质量平衡（当前使用固定 halfPixel 偏移）
 
   // 检查 if input 纹理 is YUV 格式
-  bool isYuvFormat = inputTexture.isAnyYuvTexture();
-  const bool isNv12ShaderTexture = inputTexture.usesNv12ShaderPath();
+  const bool isYuvFormat = inputTexture.isAnyYuvTexture() || inputTexture.isBGR3;
 
-  if (isYuvFormat && levels < 2) {
-    levels = 2;
-  }
-
-  // 检查 if there's available YUV->RGBA conversion 管线
   VkPipeline yuvConvertPipeline = VK_NULL_HANDLE;
   VkPipelineLayout yuvPipelineLayout = VK_NULL_HANDLE;
   VkDescriptorSet yuvDescriptorSet = inputTexture.descriptorSet;
 
   if (isYuvFormat) {
-    if (inputTexture.isDrmPrime &&
-        kawaseDrmPrimeConvertPipeline_ != VK_NULL_HANDLE) {
-      yuvConvertPipeline = kawaseDrmPrimeConvertPipeline_;
+    const char *fragmentShader = nullptr;
+    if (inputTexture.isDrmPrime) {
       yuvPipelineLayout = drmPrimePipelineLayout_;
-    } else if (inputTexture.isV4L2Capture &&
-               kawaseV4L2ConvertPipeline_ != VK_NULL_HANDLE) {
-      yuvConvertPipeline = kawaseV4L2ConvertPipeline_;
+      fragmentShader = "texture.frag.spv";
+    } else if (inputTexture.isV4L2Capture) {
       yuvPipelineLayout = v4l2PipelineLayout_;
-    } else if (isNv12ShaderTexture &&
-               kawaseNV12ConvertPipeline_ != VK_NULL_HANDLE) {
-      yuvConvertPipeline = kawaseNV12ConvertPipeline_;
+      fragmentShader = "texture.frag.spv";
+    } else if (inputTexture.isBGR3) {
+      yuvPipelineLayout = bgr3PipelineLayout_;
+      fragmentShader = "bgr3_texture.frag.spv";
+    } else if (inputTexture.isNV24) {
+      yuvPipelineLayout = nv24PipelineLayout_;
+      fragmentShader = "nv24_texture.frag.spv";
+    } else if (inputTexture.isYUYV) {
+      yuvPipelineLayout = yuyvPipelineLayout_;
+      fragmentShader = "yuyv_texture.frag.spv";
+    } else if (inputTexture.ycbcrConversion != VK_NULL_HANDLE) {
+      auto cached = ycbcrPipelineCache_.find(inputTexture.ycbcrPipelineKey);
+      yuvPipelineLayout = cached != ycbcrPipelineCache_.end()
+                              ? cached->second.pipelineLayout
+                              : ycbcrPipelineLayout_;
+      fragmentShader = "texture.frag.spv";
+    } else if (inputTexture.usesNv12ShaderPath()) {
       yuvPipelineLayout = nv12PipelineLayout_;
-    } else {
-      // 没有可用转换管线，返回原纹理
-      static int yuvBlurWarnCount = 0;
-      if (yuvBlurWarnCount++ < 3) {
-        LOG_WARN("[Kawase] No available YUV->RGBA conversion pipeline, returning original texture");
-      }
+      fragmentShader = "nv12_texture.frag.spv";
+    }
+    yuvConvertPipeline = getKawaseConversionPipeline(yuvPipelineLayout, fragmentShader);
+    if (yuvConvertPipeline == VK_NULL_HANDLE) {
+      LOG_WARN("[Kawase] No available source->RGBA conversion pipeline");
       return textureId;
     }
+  }
+
+  // The conversion/blur pass samples the original DMA-BUF even though the
+  // final layer draw only references its RGBA result. Keep the source owned
+  // until this submission completes, just like a direct layer draw.
+  if (inputTexture.isCaptureTexture() || inputTexture.isDrmPrime) {
+    recordTextureUsage(textureId);
   }
 
   // We must temporarily 停止 当前 RenderPass, because we need to 渲染 to offscreen FBOs
@@ -691,7 +653,7 @@ uint32_t VulkanRenderer::applyKawaseBlur(uint32_t textureId, float blurAmount) {
 
   // --- 0. YUV->RGBA conversion stage (if 需要) ---
   if (isYuvFormat && yuvConvertPipeline != VK_NULL_HANDLE) {
-    KawaseBlurFBO &rgbaFbo = kawaseBlurFBOs_[0];
+    KawaseBlurFBO &rgbaFbo = resources.fbos[0];
     if (!rgbaFbo.initialized) {
       LOG_ERROR("[Kawase] YUV conversion FBO not initialized");
       return textureId;
@@ -741,9 +703,14 @@ uint32_t VulkanRenderer::applyKawaseBlur(uint32_t textureId, float blurAmount) {
     pc.shapeInfo[2] = 0.0f; // 黑色转透明
     pc.shapeInfo[3] = 0.0f; // 反转
     pc.userCrop[0] = 0.0f;
-    pc.userCrop[1] = 0.0f;
-    pc.userCrop[2] = 1.0f;
-    pc.userCrop[3] = 1.0f;
+    pc.userCrop[1] = inputTexture.isShaderYuvTexture()
+                         ? 0.0f : static_cast<float>(inputTexture.cropOffsetY) / inputTexture.height;
+    // Packed shader paths normalize visible dimensions internally. Hardware
+    // YCbCr samplers need the visible rectangle within the storage image.
+    pc.userCrop[2] = inputTexture.isShaderYuvTexture()
+                         ? 1.0f : static_cast<float>(sourceVisibleW) / inputTexture.width;
+    pc.userCrop[3] = inputTexture.isShaderYuvTexture()
+                         ? 1.0f : static_cast<float>(sourceVisibleH) / inputTexture.height;
     vkCmdPushConstants(cmdBuffer, yuvPipelineLayout,
                        VK_SHADER_STAGE_VERTEX_BIT |
                            VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -760,7 +727,7 @@ uint32_t VulkanRenderer::applyKawaseBlur(uint32_t textureId, float blurAmount) {
 
   // --- 1. 下采样阶段 ---
   for (int i = startLevel; i < levels; ++i) {
-    KawaseBlurFBO &fbo = kawaseBlurFBOs_[i];
+    KawaseBlurFBO &fbo = resources.fbos[i];
     if (!fbo.initialized)
       break;
 
@@ -812,7 +779,7 @@ uint32_t VulkanRenderer::applyKawaseBlur(uint32_t textureId, float blurAmount) {
 
   // --- 2. 上采样阶段（Dual Filter）---
   for (int i = levels - 2; i >= 0; --i) {
-    KawaseBlurFBO &fbo = kawaseBlurFBOs_[i];
+    KawaseBlurFBO &fbo = resources.fbos[i];
 
     VkRenderPassBeginInfo rpInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpInfo.renderPass = fbo.renderPass;
@@ -856,55 +823,28 @@ uint32_t VulkanRenderer::applyKawaseBlur(uint32_t textureId, float blurAmount) {
 
     lastDescriptorSet = fbo.descriptorSet;
   }
-  // 创建 a temporary 纹理 struct for subsequent rendering
-  // Since Vulkan渲染器 uses uint32_t textureId, we need to register this offscreen image in textures_
-  // 但此图像是静态 FBO level 0（最终上/下采样结果）
-  const uint32_t blurredTextureId = kKawaseBlurOutputTextureId;
-  VkDescriptorSet &blurredDescriptorSet = gKawaseBlurredDescriptorSet;
-
-  if (blurredDescriptorSet == VK_NULL_HANDLE) {
-      VkDescriptorSetAllocateInfo allocInfo{};
-      allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-      allocInfo.descriptorPool = descriptorPool_;
-      allocInfo.descriptorSetCount = 1;
-      allocInfo.pSetLayouts = &descriptorSetLayout_; // 使用 standard layout!
-      if (vkAllocateDescriptorSets(device_, &allocInfo,
-                                   &blurredDescriptorSet) != VK_SUCCESS) {
-        LOG_ERROR("[Kawase] Cannot allocate blur texture descriptor set");
-        return textureId;
-      }
+  // Level zero already owns a compatible single-sampler descriptor. It is
+  // written only when this retired slot allocates/resizes the image.
+  if (resources.outputTextureId == 0) {
+    resources.outputTextureId = allocateTextureId();
   }
-
-  VkDescriptorImageInfo imageInfo{};
-  imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  imageInfo.imageView = kawaseBlurFBOs_[0].imageView;
-  imageInfo.sampler = kawaseBlurFBOs_[0].sampler;
-
-  VkWriteDescriptorSet descriptorWrite{};
-  descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  descriptorWrite.dstSet = blurredDescriptorSet;
-  descriptorWrite.dstBinding = 0;
-  descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  descriptorWrite.descriptorCount = 1;
-  descriptorWrite.pImageInfo = &imageInfo;
-
-  vkUpdateDescriptorSets(device_, 1, &descriptorWrite, 0, nullptr);
+  const uint32_t blurredTextureId = resources.outputTextureId;
+  const VkDescriptorSet blurredDescriptorSet = resources.fbos[0].descriptorSet;
 
   Texture blurTexture{};
-  blurTexture.width = kawaseBlurFBOs_[0].width;
-  blurTexture.height = kawaseBlurFBOs_[0].height;
-  blurTexture.originalWidth = kawaseBlurFBOs_[0].width;
-  blurTexture.originalHeight = kawaseBlurFBOs_[0].height;
-  blurTexture.image = kawaseBlurFBOs_[0].image;
-  blurTexture.imageView = kawaseBlurFBOs_[0].imageView;
-  blurTexture.sampler = kawaseBlurFBOs_[0].sampler;
+  blurTexture.width = resources.fbos[0].width;
+  blurTexture.height = resources.fbos[0].height;
+  blurTexture.originalWidth = resources.fbos[0].width;
+  blurTexture.originalHeight = resources.fbos[0].height;
+  blurTexture.image = resources.fbos[0].image;
+  blurTexture.imageView = resources.fbos[0].imageView;
+  blurTexture.sampler = resources.fbos[0].sampler;
   blurTexture.descriptorSet = blurredDescriptorSet;
   blurTexture.memory = VK_NULL_HANDLE;
   blurTexture.uvImage = VK_NULL_HANDLE;
   blurTexture.uvImageView = VK_NULL_HANDLE;
   blurTexture.uvMemory = VK_NULL_HANDLE;
   blurTexture.isNV12 = false;
-  blurTexture.isNV16 = false;
   blurTexture.isNV24 = false;
   blurTexture.isYUYV = false;
   blurTexture.isDrmPrime = false;
@@ -922,10 +862,7 @@ uint32_t VulkanRenderer::applyKawaseBlur(uint32_t textureId, float blurAmount) {
   blurTexture.ycbcrConversion = VK_NULL_HANDLE;
   textures_[blurredTextureId] = blurTexture;
 
-  kawaseBlurCacheFrameId_ = kawaseBlurFrameId_;
-  kawaseBlurCacheInputTextureId_ = textureId;
-  kawaseBlurCacheAmountBucket_ = blurAmountBucket;
-  kawaseBlurCacheOutputTextureId_ = blurredTextureId;
+  resources.amountBucket = blurAmountBucket;
 
   return blurredTextureId;
 }

@@ -14,7 +14,7 @@
  * 
  * 依赖：
  * - Lyric渲染器: 歌词渲染器，提供高层接口
- * - SharedLibassHolder: Engine 注入的共享 libass 实例
+ * - SharedLibassHolder: Mubu 创建图层时注入的共享 libass 实例
  * 
  * 架构模式：
  * - 委托模式：LayerText.cpp 委托层特定逻辑到本文件
@@ -26,7 +26,7 @@
  */
 
 #include "layer/LayerText.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "lyric/LyricRenderer.h"
 #include "lyric/SharedLibassHolder.h"
 #include "renderer/VulkanRenderer.h"
@@ -90,8 +90,19 @@ bool LayerText::updateLayer21Texture() {
   if (!needsLayer21TextureUpdate()) {
     return false;
   }
-  // 同步切片状态：无切片时主图走直绘批处理，有切片时由切片路径采样合成纹理。
-  lyricRenderer_->setHasSlices(hasSlices());
+  // Plain lyrics can draw the existing full-resolution glyph masks directly.
+  // Keep group composition for slices, transforms, clipping and group alpha;
+  // applying these independently to overlapping glyphs would change the image.
+  const auto margin = lyricRenderer_->getDisplayMargin();
+  const bool fullCanvas = renderer_ && position_.x == 0 && position_.y == 0 &&
+      size_.width == static_cast<int>(renderer_->getLogicalWidth()) &&
+      size_.height == static_cast<int>(renderer_->getLogicalHeight());
+  const bool compositeRequired =
+      !fullCanvas || hasSlices() || getRotation() != 0.0f || getScale() != 1.0f ||
+      getAlpha() != 1.0f || getShapeType() != 0 || getBlackToTransparent() ||
+      getInvert() != 0 || getGaussianBlur() > 0.0f ||
+      margin.left != 0 || margin.right != 0 || margin.top != 0 || margin.bottom != 0;
+  lyricRenderer_->setCompositeRequired(compositeRequired);
   // 每帧推进 ASS 时间轴，确保 \move 这类逐帧位移和滚动歌词保持平滑。
   // prepareFrame 仍包含 libass CPU 帧准备；这里不做固定 25fps 节流，避免引入可见抖动。
   layer21CachedTime_ = getLayer21CurrentTime();
@@ -104,16 +115,8 @@ void LayerText::renderLayer21(float alpha) {
     return;
   }
 
-  // 渲染倒计时（如果有）
-  // 必须在 renderLayer 之前调用，因为 countdown 是直绘到当前 render pass 的
   int w = size_.width > 0 ? size_.width : 1920;
   int h = size_.height > 0 ? size_.height : 1080;
-  int cdX = 0, cdY = 0;
-  int cdWidth = 0, cdHeight = 0;
-  if (lyricRenderer_->getCountdownPosition({position_.x, position_.y, w, h, alpha},
-                                           cdX, cdY, cdWidth, cdHeight)) {
-    lyricRenderer_->renderCountdownDots(renderer_, cdX, cdY, cdWidth, cdHeight, alpha);
-  }
 
   uint32_t lyricTextureId = lyricRenderer_->getCompositeTextureId();
   if (lyricTextureId != 0) {
@@ -139,9 +142,17 @@ void LayerText::setCurrentTimeCallback(std::function<double()> callback) {
   }
 }
 
-bool LayerText::autoLoadLyric(const std::string &lyricDir, const std::string &videoPath) {
+bool LayerText::autoLoadLyric(const std::string &lyricDir, const std::string &videoPath,
+                             const std::string &embeddedAss) {
   if (layerId_ != 21 || !lyricRenderer_) {
     return false;
+  }
+
+  if (!embeddedAss.empty() &&
+      (lyricRenderer_->isInitialized() || lyricRenderer_->initialize()) &&
+      lyricRenderer_->load(videoPath, embeddedAss)) {
+    LOG_INFO("[Lyric] Loaded embedded ASS: %s", videoPath.c_str());
+    return true;
   }
 
   if (lyricDir.empty()) {
@@ -151,6 +162,10 @@ bool LayerText::autoLoadLyric(const std::string &lyricDir, const std::string &vi
   std::string baseName;
   if (!videoPath.empty()) {
     std::string path = videoPath;
+    if (path.find("://") != std::string::npos) {
+      const size_t query = path.find_first_of("?#");
+      if (query != std::string::npos) path.resize(query);
+    }
     size_t lastSlash = path.find_last_of("/\\");
     if (lastSlash != std::string::npos) {
       path = path.substr(lastSlash + 1);

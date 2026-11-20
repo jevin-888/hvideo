@@ -1,0 +1,2562 @@
+{
+  "schema_version": 1,
+  "generated_from": "source discovery; planned items require executable cases",
+  "api_modules": [
+    {
+      "module": "layers",
+      "constant": "LAYERS",
+      "actions": [
+        {
+          "action": "create_layer",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp",
+            "src/network/web/modules/pages/layerMatrix/layerManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "create_runtime_layer",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "create_slice",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp",
+            "src/network/web/modules/pages/layerMatrix/sliceManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "getLayerInfo",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_property",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_roamConfig",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "list",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "removeLayer",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "remove_runtime_layer",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "restartCapture",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "restartRk628Capture",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_property",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "show_hint",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "startCapture",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "stopCapture",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "update",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "update_priority",
+          "sources": [
+            "src/core/CommandRouter_LayerManagement.cpp"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "lyrics",
+      "constant": "LYRICS",
+      "actions": [
+        {
+          "action": "bind_layer",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp",
+            "src/network/web/modules/pages/layerMatrix/layerManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "getStatus",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_bind_layer",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_margin",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_style",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "list_styles",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "load",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_margin",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_style",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_visible",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "unload",
+          "sources": [
+            "src/core/CommandRouter_Lyric.cpp"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "peripheral-events",
+      "constant": "PERIPHERAL_EVENTS",
+      "actions": [
+        {
+          "action": "clear_simulation",
+          "sources": [
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_channel",
+          "sources": [
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "peripherals",
+      "constant": "PERIPHERALS",
+      "actions": [
+        {
+          "action": "add_template",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "bluetooth_get_status",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "bluetooth_set_name",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "bluetooth_set_power",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "bluetooth_set_role",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "clear_simulation",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "clear_templates",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "ctrl512",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "delay",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "delete_template",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "dmx512_legacy",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "execute_function_button",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/mobile/modules/pages/mobileControl.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "forward_payload",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "forward_to_serial",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_config",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/mobile/modules/pages/mobileControl.js",
+            "src/network/web/modules/pages/peripheralManagement.js",
+            "src/network/web/modules/pages/vodForward.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_functions",
+          "sources": [
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_template_functions",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_templates",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "import_templates",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "list_serial_ports",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "rename_template",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "save_template_functions",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "send_test",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_channel",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_config",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js",
+            "src/network/web/modules/pages/vodForward.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_learn_mode",
+          "sources": [
+            "src/core/PeripheralManager.cpp",
+            "src/network/web/modules/pages/peripheralManagement.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_master",
+          "sources": [
+            "src/core/PeripheralManager.cpp"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "playback",
+      "constant": "PLAYBACK",
+      "actions": [
+        {
+          "action": "create_slice",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "detect_capture_devices",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "getPlaybackLock",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "getStatus",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "getSystemVolume",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "loadVideo",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "lockPlayback",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "muteToggle",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "next",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "next_audioTrack",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "pause",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "play",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp",
+            "src/network/web/mobile/modules/pages/mobileVideoControl.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "prepare",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "prev_audioTrack",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "previous",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "replay",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "restartCapture",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "restartRk628Capture",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "resume",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "seek",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "setPlaybackRate",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "setSystemVolume",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "setVolume",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_audioChannel",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "startCapture",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "stop",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "stopCapture",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "switch_audioTrack",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "unlockPlayback",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "volumeDown",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "volumeUp",
+          "sources": [
+            "src/core/CommandRouter_VideoPlayback.cpp"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "playlists",
+      "constant": "PLAYLISTS",
+      "actions": [
+        {
+          "action": "addVideoToPlayList",
+          "sources": [
+            "src/core/CommandRouter_Playlist.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "createPlayList",
+          "sources": [
+            "src/core/CommandRouter_Playlist.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "deletePlayList",
+          "sources": [
+            "src/core/CommandRouter_Playlist.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "getPlayMode",
+          "sources": [
+            "src/core/CommandRouter_Playlist.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "playVideo",
+          "sources": [
+            "src/core/CommandRouter_Playlist.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "removeVideoFromPlayList",
+          "sources": [
+            "src/core/CommandRouter_Playlist.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "setPlayMode",
+          "sources": [
+            "src/core/CommandRouter_Playlist.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "setTargetLayer",
+          "sources": [
+            "src/core/CommandRouter_Playlist.cpp"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "regions",
+      "constant": "REGIONS",
+      "actions": [
+        {
+          "action": "auto_recalculate_blend",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "blend_resize_grid",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "checkpoint_fusion_state",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "geometry_move",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "geometry_resize_grid",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_blend_auto_edges",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_cave_wall_config",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_flexible_mapping",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_fusion_master_enabled",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_geometry_state",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_manager_mode",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_mask_state",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_region_blend",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_region_color",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_region_config",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp",
+            "src/network/web/modules/pages/flexibleMapping.js",
+            "src/network/web/modules/pages/layerMatrix/config.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_region_geometry_correction",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "manager_move_line",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "manager_move_point",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "mask_move",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "mask_resize_grid",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "refresh_regions",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "reset_fusion_config",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "save_fusion_config",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "save_geometry",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "save_mask",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "save_matrix_command",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp",
+            "src/network/web/modules/pages/flexibleMapping.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "seed_mask_from_geometry",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_active_region_id",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_audio_output_layer",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_blend_auto_edges",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_cave_wall_config",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_flexible_mapping",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp",
+            "src/network/web/modules/pages/flexibleMapping.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_fusion_master_enabled",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_geometry_display",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_geometry_display_all",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_geometry_grid",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_geometry_point",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_geometry_points",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_geometry_selection",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_grid_visual_style",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_manager_mode",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_mask_state",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_merge_gap_brightness",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_region_blend",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_region_color",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_region_geometry_correction",
+          "sources": [
+            "src/core/CommandRouter_RegionConfig.cpp"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "rendering",
+      "constant": "RENDERING",
+      "actions": [
+        {
+          "action": "add_photo",
+          "sources": [
+            "src/core/CommandRouter_LayerRender.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "clear_photos",
+          "sources": [
+            "src/core/CommandRouter_LayerRender.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "create_slice",
+          "sources": [
+            "src/core/CommandRouter_LayerRender.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "generate_qrcode",
+          "sources": [
+            "src/core/CommandRouter_LayerRender.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "loadImage",
+          "sources": [
+            "src/core/CommandRouter_LayerRender.cpp",
+            "src/network/web/modules/features/materials.js",
+            "src/network/web/modules/features/playlist.js",
+            "src/network/web/modules/pages/videoControl.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_blend_mode",
+          "sources": [
+            "src/core/CommandRouter_LayerRender.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_effect",
+          "sources": [
+            "src/core/CommandRouter_LayerRender.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "update_text",
+          "sources": [
+            "src/core/CommandRouter_LayerRender.cpp"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "scenes",
+      "constant": "SCENES",
+      "actions": [
+        {
+          "action": "apply_scene",
+          "sources": [
+            "src/core/CommandRouter_Scene.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "delete_scene",
+          "sources": [
+            "src/core/CommandRouter_Scene.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "list_scenes",
+          "sources": [
+            "src/core/CommandRouter_Scene.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "load_default",
+          "sources": [
+            "src/core/CommandRouter_Scene.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "load_scene",
+          "sources": [
+            "src/core/CommandRouter_Scene.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "save_as",
+          "sources": [
+            "src/core/CommandRouter_Scene.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "save_current",
+          "sources": [
+            "src/core/CommandRouter_Scene.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "switch_scene",
+          "sources": [
+            "src/core/CommandRouter_Scene.cpp",
+            "src/network/web/mobile/modules/pages/mobileScene.js"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "stage-control",
+      "constant": "STAGE_CONTROL",
+      "actions": [
+        {
+          "action": "arm",
+          "sources": [
+            "src/core/StageControlManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "disarm",
+          "sources": [
+            "src/core/StageControlManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "get_config",
+          "sources": [
+            "src/core/StageControlManager.cpp",
+            "src/network/web/modules/pages/stageControl.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "preview_cue",
+          "sources": [
+            "src/core/StageControlManager.cpp",
+            "src/network/web/modules/pages/stageControl.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "replace_config",
+          "sources": [
+            "src/core/StageControlManager.cpp",
+            "src/network/web/modules/pages/stageControl.js"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "reset_timeline",
+          "sources": [
+            "src/core/StageControlManager.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "set_enabled",
+          "sources": [
+            "src/core/StageControlManager.cpp",
+            "src/network/web/modules/pages/stageControl.js"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "sync",
+      "constant": "SYNC",
+      "actions": [
+        {
+          "action": "online_vod_room_sync_start",
+          "sources": [
+            "src/core/CommandRouter_Sync.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "online_vod_room_sync_stop",
+          "sources": [
+            "src/core/CommandRouter_Sync.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "sync_device",
+          "sources": [
+            "src/core/CommandRouter_Sync.cpp",
+            "src/network/web/modules/pages/systemSettings.js"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "system",
+      "constant": "SYSTEM",
+      "actions": [
+        {
+          "action": "reboot",
+          "sources": [
+            "src/core/CommandRouter_System.cpp"
+          ],
+          "test_status": "planned"
+        },
+        {
+          "action": "restart_app",
+          "sources": [
+            "src/core/CommandRouter_System.cpp"
+          ],
+          "test_status": "planned"
+        }
+      ],
+      "status": "cataloged",
+      "test_status": "planned"
+    },
+    {
+      "module": "system-config",
+      "constant": "SYSTEM_CONFIG",
+      "actions": [],
+      "status": "cataloged",
+      "test_status": "planned"
+    }
+  ],
+  "ui_pages": [
+    {
+      "name": "configBackup",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/configBackup.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "displayOutput",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/displayOutput.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "displayResolution",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/displayResolution.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "effectControl",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/effectControl.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "factorySerial",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/factorySerial.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "flexibleMapping",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/flexibleMapping.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "fusion-background",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/fusion-background.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "fusionControl",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/fusionControl.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "layerMatrix",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/layerMatrix.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "login",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/login.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "peripheralManagement",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/peripheralManagement.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "projectionCorrection",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/projectionCorrection.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "sceneTemplates",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/sceneTemplates.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "stageControl",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/stageControl.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "systemSettings",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/systemSettings.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "systemStatus",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/systemStatus.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "videoControl",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/videoControl.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "vodForward",
+      "surface": "desktop",
+      "source": "src/network/web/modules/pages/vodForward.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "mobileControl",
+      "surface": "mobile",
+      "source": "src/network/web/mobile/modules/pages/mobileControl.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "mobileScene",
+      "surface": "mobile",
+      "source": "src/network/web/mobile/modules/pages/mobileScene.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "mobileVideoControl",
+      "surface": "mobile",
+      "source": "src/network/web/mobile/modules/pages/mobileVideoControl.js",
+      "test_status": "planned"
+    }
+  ],
+  "feature_files": [
+    {
+      "name": "materials",
+      "surface": "desktop",
+      "source": "src/network/web/modules/features/materials.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "playlist",
+      "surface": "desktop",
+      "source": "src/network/web/modules/features/playlist.js",
+      "test_status": "planned"
+    },
+    {
+      "name": "videoPreview",
+      "surface": "desktop",
+      "source": "src/network/web/modules/features/videoPreview.js",
+      "test_status": "planned"
+    }
+  ],
+  "native_domains": [
+    {
+      "name": "audio",
+      "source": "include/audio",
+      "test_status": "planned"
+    },
+    {
+      "name": "capture",
+      "source": "include/capture",
+      "test_status": "planned"
+    },
+    {
+      "name": "core",
+      "source": "include/core",
+      "test_status": "planned"
+    },
+    {
+      "name": "database",
+      "source": "include/database",
+      "test_status": "planned"
+    },
+    {
+      "name": "decoder",
+      "source": "include/decoder",
+      "test_status": "planned"
+    },
+    {
+      "name": "effect",
+      "source": "include/effect",
+      "test_status": "planned"
+    },
+    {
+      "name": "foundation",
+      "source": "include/foundation",
+      "test_status": "planned"
+    },
+    {
+      "name": "fusion",
+      "source": "include/fusion",
+      "test_status": "planned"
+    },
+    {
+      "name": "layer",
+      "source": "include/layer",
+      "test_status": "planned"
+    },
+    {
+      "name": "lyric",
+      "source": "include/lyric",
+      "test_status": "planned"
+    },
+    {
+      "name": "network",
+      "source": "include/network",
+      "test_status": "planned"
+    },
+    {
+      "name": "platform",
+      "source": "include/platform",
+      "test_status": "planned"
+    },
+    {
+      "name": "playcontrol",
+      "source": "include/playcontrol",
+      "test_status": "planned"
+    },
+    {
+      "name": "renderer",
+      "source": "include/renderer",
+      "test_status": "planned"
+    },
+    {
+      "name": "text",
+      "source": "include/text",
+      "test_status": "planned"
+    },
+    {
+      "name": "utils",
+      "source": "include/utils",
+      "test_status": "planned"
+    },
+    {
+      "name": "vod",
+      "source": "include/vod",
+      "test_status": "planned"
+    }
+  ],
+  "special_routes": [
+    {
+      "route": "/api/v1/audio-effect/disable",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/audio-effect/enable",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/audio-effect/preview",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/audio-effect/spectrum",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/audio-reactive/config",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/audio-reactive/engine",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/audio-reactive/learn",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/audio-reactive/spectrum",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/audio-reactive/state",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/auth/config",
+      "sources": [
+        "src/network/HttpServer_Auth.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/auth/login",
+      "sources": [
+        "src/network/HttpServer_Auth.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/auth/logout",
+      "sources": [
+        "src/network/HttpServer_Auth.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/auth/validate",
+      "sources": [
+        "src/network/HttpServer_Auth.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/config.json",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/config/layers",
+      "sources": [
+        "src/network/HttpServer_Config.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/config/layers/{id}",
+      "sources": [
+        "src/network/HttpServer_Config.cpp",
+        "src/network/HttpServer_Config.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/config/save",
+      "sources": [
+        "src/network/HttpServer_Config.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/dmx/channels",
+      "sources": [
+        "src/network/HttpServer_DMX_Routes.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/dmx/config",
+      "sources": [
+        "src/network/HttpServer_DMX_Routes.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/dmx/status",
+      "sources": [
+        "src/network/HttpServer_DMX_Routes.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/effect-config",
+      "sources": [
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp",
+        "src/network/HttpServer_AudioEffect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/effect/apply",
+      "sources": [
+        "src/network/HttpServer_Effect.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/filesystem/debug/list",
+      "sources": [
+        "src/network/HttpServer_Filesystem.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/filesystem/list",
+      "sources": [
+        "src/network/HttpServer_Filesystem.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/filesystem/mkdir",
+      "sources": [
+        "src/network/HttpServer_Filesystem.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/filesystem/usb/media",
+      "sources": [
+        "src/network/HttpServer_Filesystem.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/fusion/checkpoint",
+      "sources": [
+        "src/network/HttpServer_Fusion.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/fusion/reset",
+      "sources": [
+        "src/network/HttpServer_Fusion.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/fusion/save",
+      "sources": [
+        "src/network/HttpServer_Fusion.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/heartbeat",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/layers",
+      "sources": [
+        "src/network/HttpServer_Layer.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/layers/authorized",
+      "sources": [
+        "src/network/HttpServer_Layer.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/layers/templates",
+      "sources": [
+        "src/network/HttpServer_Layer.cpp",
+        "src/network/HttpServer_Layer.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/layers/templates/{name}",
+      "sources": [
+        "src/network/HttpServer_Layer.cpp",
+        "src/network/HttpServer_Layer.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/layers/templates/{name}/add",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/layers/{id}",
+      "sources": [
+        "src/network/HttpServer_Layer.cpp",
+        "src/network/HttpServer_Layer.cpp",
+        "src/network/HttpServer_Layer.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/layers/{id}/roam",
+      "sources": [
+        "src/network/HttpServer_Layer.cpp",
+        "src/network/HttpServer_Layer.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/layers/{id}/roam/reset",
+      "sources": [
+        "src/network/HttpServer_Layer.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/logs",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/logs/date",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/logs/download",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/logs/file",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/categories",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/delete",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/delete_folder",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/download",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/download_file",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/folders",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/index_status",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/refresh_index",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/rename",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/thumbnail",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/materials/thumbnail/status",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/mirror/actions/{action}",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/orders",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/orders/items",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/peripheral/presets",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/peripherals/command-lists",
+      "sources": [
+        "src/network/HttpServer_Command.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/peripherals/command-lists/check",
+      "sources": [
+        "src/network/HttpServer_Command.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/peripherals/command-lists/read",
+      "sources": [
+        "src/network/HttpServer_Command.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/playlists",
+      "sources": [
+        "src/network/HttpServer_Playlist.cpp",
+        "src/network/HttpServer_Playlist.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/playlists/default",
+      "sources": [
+        "src/network/HttpServer_Playlist.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/playlists/{id}",
+      "sources": [
+        "src/network/HttpServer_Playlist.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/playlists/{id}/config",
+      "sources": [
+        "src/network/HttpServer_Playlist.cpp",
+        "src/network/HttpServer_Playlist.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/playlists/{id}/items",
+      "sources": [
+        "src/network/HttpServer_Playlist.cpp",
+        "src/network/HttpServer_Playlist.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/playlists/{id}/items/{index}",
+      "sources": [
+        "src/network/HttpServer_Playlist.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/products",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/products/categories",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/actions/{action}",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/clear",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/materials/play",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/peripheral/ac",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/peripheral/ambiance",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/peripheral/button",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/peripheral/call",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/peripheral/effect",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/peripheral/light",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/peripheral/voice",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/queue",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp",
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/queue/played",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/queue/prioritize",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/queue/shuffle",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/queue/{songId}",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/state",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/rooms/{id}/youtube/queue",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/runtime/layers",
+      "sources": [
+        "src/network/HttpServer_Runtime.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/runtime/layers/{id}",
+      "sources": [
+        "src/network/HttpServer_Runtime.cpp",
+        "src/network/HttpServer_Runtime.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/scenes",
+      "sources": [
+        "src/network/HttpServer_Scenes.cpp",
+        "src/network/HttpServer_Scenes.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/scenes/current",
+      "sources": [
+        "src/network/HttpServer_Scenes.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/scenes/{name}",
+      "sources": [
+        "src/network/HttpServer_Scenes.cpp",
+        "src/network/HttpServer_Scenes.cpp",
+        "src/network/HttpServer_Scenes.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/scenes/{name}/load",
+      "sources": [
+        "src/network/HttpServer_Scenes.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/service-types",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/settings/screen_rotate",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/singerimg",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/songdb/singers",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/songdb/songs",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/songdb/warmup",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/streams",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/sync/push-to",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/sync/receive",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/boot-animation/install",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/boot-animation/list",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/capture-edid",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/config",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/config-backup",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/config-backup/status",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/data-root",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/device-alias",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/device-info",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/device-info/export",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/dicts",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/discovery",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/display-output",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/display-resolution",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/factory-serial",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/lan-devices",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/license",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/license/import",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/network/current-ip-config",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/network/info",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/ping",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/reboot",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/resources",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/settings",
+      "sources": [
+        "src/network/HttpServer_System.cpp",
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/status",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/system/storage-space",
+      "sources": [
+        "src/network/HttpServer_System.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/video/dsp/audio-route",
+      "sources": [
+        "src/network/HttpServer_Video.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/video/status",
+      "sources": [
+        "src/network/HttpServer_Video.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/video/transcode",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/video/transcode_batch",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/video/transcode_status",
+      "sources": [
+        "src/network/HttpServer_Material.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/youtube/hot",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/youtube/parse",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    },
+    {
+      "route": "/api/v1/youtube/search",
+      "sources": [
+        "src/network/HttpServer_VOD.cpp"
+      ],
+      "test_status": "planned"
+    }
+  ],
+  "coverage_gaps": [
+    "Actions built dynamically at runtime need explicit cases or a backend action manifest.",
+    "HTTP routes outside /api/v1 and WebSocket/event payloads need protocol-specific cases.",
+    "Hardware-only behavior needs a real hw81/hw82 device profile and evidence collector.",
+    "Server and Flutter Pad flows need external project adapters and environment fixtures."
+  ]
+}

@@ -187,7 +187,7 @@ void ff_add_pixels_clamped_mmi(const int16_t *block,
           [ftmp6]"=&f"(ftmp[6]),            [ftmp7]"=&f"(ftmp[7]),
           [ftmp8]"=&f"(ftmp[8]),            [tmp0]"=&r"(tmp[0]),
           [pixels]"+&r"(pixels),            [block]"+&r"(block)
-        : [line_size]"r"((mips_reg)? line_size)
+        : [line_size]"r"((mips_reg)line_size)
         : "memory"
     );
 }

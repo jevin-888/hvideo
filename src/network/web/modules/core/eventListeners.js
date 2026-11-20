@@ -1,5 +1,5 @@
 // 事件监听器模块
-import { getCurrentPage, showPage } from './navigation.js';
+import { getCurrentPage, showPage } from './navigation.js?v=3.17';
 
 // 初始化事件监听器
 export function initializeEventListeners() {

@@ -9,7 +9,7 @@
 #define HSVJ_LAYER_CONFIG_HELPERS_H
 
 #include "core/SystemConfig.h"
-#include "utils/SliceConfigJson.h"  // 使用项目中已有的sliceConfigToJson函数
+#include "core/SliceConfigJson.h"  // 使用项目中已有的sliceConfigToJson函数
 #include <json/json.h>
 
 namespace hsvj {

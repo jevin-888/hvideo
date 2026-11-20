@@ -1,0 +1,102 @@
+diff --git a/bootable/recovery/Android.bp b/bootable/recovery/Android.bp
+index 21de8bb3e9..15890b84ae 100644
+--- a/bootable/recovery/Android.bp
++++ b/bootable/recovery/Android.bp
+@@ -149,6 +149,7 @@ cc_binary {
+     required: [
+         "e2fsdroid.recovery",
+         "init_recovery.rc",
++        "hsvj-rom-update.recovery",
+         "librecovery_ui_ext",
+         "minadbd",
+         "mke2fs.conf.recovery",
+diff --git a/bootable/recovery/install/install.cpp b/bootable/recovery/install/install.cpp
+index 92c10164f8..6a25293adc 100644
+--- a/bootable/recovery/install/install.cpp
++++ b/bootable/recovery/install/install.cpp
+@@ -540,7 +540,9 @@ static InstallResult VerifyAndInstallPackage(Package* package, bool* wipe_cache,
+   }
+   ui->SetEnableReboot(false);
+   auto result = TryUpdateBinary(package, wipe_cache, log_buffer, retry_count, max_temperature, ui);
+-  result = (InstallResult)try_install_rkloader_from_package(package, ui);
++  if (result == INSTALL_SUCCESS) {
++    result = (InstallResult)try_install_rkloader_from_package(package, ui);
++  }
+   ui->SetEnableReboot(true);
+   ui->Print("\n");
+ 
+diff --git a/bootable/recovery/recovery_main.cpp b/bootable/recovery/recovery_main.cpp
+index e6852c7393..e6cad453f1 100644
+--- a/bootable/recovery/recovery_main.cpp
++++ b/bootable/recovery/recovery_main.cpp
+@@ -27,6 +27,7 @@
+ #include <string.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
++#include <sys/wait.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
+@@ -522,6 +523,48 @@ int main(int argc, char** argv) {
+ 
+   SetLoggingSehandle(sehandle);
+ 
++  // Internal updates initialize the normal UI but never enter legacy RK
++  // installation, media probing, or automatic format fallbacks.
++  for (const auto& argument : args) {
++    const std::string prefix = "--hsvj_update=";
++    if (argument.compare(0, prefix.size(), prefix) != 0) continue;
++    std::string id = argument.substr(prefix.size());
++    ui->SetBackground(RecoveryUI::INSTALLING_UPDATE);
++    ui->ShowText(true);
++    ui->Print("HSVJ ROM update. Do not power off.\n");
++    if (IsRoDebuggable() || IsDeviceUnlocked()) SetUsbConfig("adb");
++    int pipes[2];
++    pid_t child = -1;
++    if (pipe(pipes) == 0) {
++      child = fork();
++      if (child == 0) {
++        close(pipes[0]);
++        dup2(pipes[1], STDOUT_FILENO);
++        dup2(pipes[1], STDERR_FILENO);
++        close(pipes[1]);
++        execl("/system/bin/hsvj-rom-update", "hsvj-rom-update", "--recover", id.c_str(), nullptr);
++        _exit(127);
++      }
++      close(pipes[1]);
++      FILE* output = fdopen(pipes[0], "r");
++      if (output) {
++        char line[1024];
++        while (fgets(line, sizeof(line), output)) ui->Print("%s", line);
++        fclose(output);
++      } else { close(pipes[0]); }
++    }
++    int result = -1;
++    if (child > 0) while (waitpid(child, &result, 0) < 0 && errno == EINTR) {}
++    if (result == 0) {
++      ui->Print("ROM verified. Rebooting...\n");
++    } else {
++      ui->SetBackground(RecoveryUI::ERROR);
++      ui->Print("Installer returned %d. Waiting for service; no automatic retry.\n", result);
++    }
++    // A successful helper requests reboot. A failure must never run vendor fallback.
++    for (;;) pause();
++  }
++
+   std::atomic<Device::BuiltinAction> action;
+   std::thread listener_thread(ListenRecoverySocket, ui, std::ref(action));
+   listener_thread.detach();
+diff --git a/device/rockchip/rk356x_box/h66_por/recovery.fstab b/device/rockchip/rk356x_box/h66_por/recovery.fstab
+index 7c67217c01..d02ed6d58a 100755
+--- a/device/rockchip/rk356x_box/h66_por/recovery.fstab
++++ b/device/rockchip/rk356x_box/h66_por/recovery.fstab
+@@ -9,7 +9,8 @@
+ /dev/block/by-name/system_ext            /system_ext          ext4             defaults                  defaults
+ /dev/block/by-name/cache                 /cache               ext4             defaults                  defaults
+ /dev/block/by-name/metadata              /metadata            ext4             defaults                  defaults
+-/dev/block/by-name/userdata              /data                f2fs             defaults                  defaults
++/dev/block/by-name/userdata              /data                ext4             defaults                  defaults
++/dev/block/by-name/huoshan               /huoshan             ext4             defaults                  defaults
+ /dev/block/by-name/cust                  /cust                ext4             defaults                  defaults
+ /dev/block/by-name/custom                /custom              ext4             defaults                  defaults
+ /dev/block/by-name/radical_update        /radical_update      ext4             defaults                  defaults

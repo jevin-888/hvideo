@@ -41,6 +41,10 @@ set(LIBASS_SOURCES
 
 add_library(libass STATIC ${LIBASS_SOURCES})
 set_target_properties(libass PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(ANDROID)
+    # Rasterization must remain real-time in device debug builds too.
+    target_compile_options(libass PRIVATE "$<$<CONFIG:Debug>:-O2>")
+endif()
 
 target_include_directories(libass
     PUBLIC

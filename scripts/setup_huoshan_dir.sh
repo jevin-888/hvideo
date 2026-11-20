@@ -1,8 +1,13 @@
 #!/system/bin/sh
-# 在设备上创建 /huoshan 并设置为 system 可写，供 com.hsvj.engine（系统应用 UID 1000）写入
-# 需 root 执行一次，或放入 init.rc 在开机时执行
+# 验证 huoshan 专用分区已挂载，并设置为 system 可写，供 com.hsvj.engine（系统应用 UID 1000）写入
+# 需 root 执行一次，或放入 init.rc 在开机时执行；不会把根文件系统中的同名目录误当成分区。
 
 HUOSHAN="/huoshan"
+
+if ! mountpoint -q "${HUOSHAN}"; then
+    echo "setup_huoshan_dir: ${HUOSHAN} is not a mounted partition" >&2
+    exit 1
+fi
 
 mkdir -p "${HUOSHAN}/web" "${HUOSHAN}/config" "${HUOSHAN}/data" "${HUOSHAN}/shaders" \
          "${HUOSHAN}/ttf" "${HUOSHAN}/Lyrics" "${HUOSHAN}/Logo" "${HUOSHAN}/Image" \

@@ -1,6 +1,6 @@
 // 图层管理模块
-import { apiGet, apiPost, apiPut, apiDelete, sendLayerCommand, apiAction } from '../../core/api.js';
-import { addToCommandLog } from '../../core/commandLog.js';
+import { apiGet, apiPut, apiDelete, sendLayerCommand, apiAction } from '../../core/api.js';
+import { addToCommandLog } from '/shared/commandLog.js';
 import { parsePosition, parseSize } from './utils.js';
 import { handleApiOperation } from '../../utils/apiHelpers.js';
 import { readLayerCommonInputs } from './panels/InputReader.js';
@@ -13,15 +13,37 @@ export function cancelSaveTimer() {
 /**
  * 创建图层
  */
+function buildCreateLayerParams(layerId, initialBounds) {
+    const params = { layerId: Number(layerId) };
+    if (!initialBounds) return params;
+
+    const x = Math.round(Number(initialBounds.x));
+    const y = Math.round(Number(initialBounds.y));
+    const width = Math.round(Number(initialBounds.width));
+    const height = Math.round(Number(initialBounds.height));
+    if (
+        !Number.isFinite(x) || !Number.isFinite(y) ||
+        !Number.isFinite(width) || !Number.isFinite(height) ||
+        width <= 0 || height <= 0
+    ) {
+        throw new TypeError('Invalid initial layer bounds');
+    }
+
+    params.position = `${x} ${y}`;
+    params.size = `${width} ${height}`;
+    return params;
+}
+
 export async function createLayer(
     layerId, layerType, updateLayerMatrix, layers, refreshLayerInfo,
-    renderLayerMatrix = null, drawCanvas = null, updateLayerSelection = null
+    renderLayerMatrix = null, drawCanvas = null, updateLayerSelection = null,
+    initialBounds = null
 ) {
     try {
         addToCommandLog('新建图层', 'info', `正在创建图层 ${layerId}，类型: ${layerType}`);
 
         return await handleApiOperation(
-            apiAction('layers', 'create_layer', { layerId, layer_type: layerType }),
+            apiAction('layers', 'create_layer', buildCreateLayerParams(layerId, initialBounds)),
             '新建图层',
             `成功创建图层 ${layerId}`,
             '创建图层失败',
@@ -180,20 +202,6 @@ export async function fetchAndMergeLayerInfo(layerId, layers, options = {}) {
     }
     if (roamConfig && roamConfig.ok !== false) {
         merged.roam_config = roamConfig;
-    }
-
-    if (Number(layerId) === 21 && (!merged.font_file || merged.font_file === '')) {
-        const fromList = layers.find(l => Number(l.id) === Number(layerId));
-        if (fromList && fromList.font_file) {
-            merged.font_file = fromList.font_file;
-        } else {
-            try {
-                const cfg = await apiGet('/config.json');
-                if (cfg && typeof cfg === 'object' && cfg.layer21 && cfg.layer21.font_file) {
-                    merged.font_file = cfg.layer21.font_file;
-                }
-            } catch (_) { /* 忽略 */ }
-        }
     }
 
     return upsertLayer(layers, layerId, merged);
@@ -416,15 +424,11 @@ export async function applyLayerProperties(
         return el.value.trim() || defaultVal;
     };
 
-    const normalizeCaptureRotation = (value) => {
-        const rotation = Number(value) || 0;
-        return [-1, 0, 90, 180, 270].includes(rotation) ? rotation : 0;
-    };
 
     const layer = layers.find(l => Number(l.id) === Number(layerId));
     if (!layer) return;
 
-    const { isVideoLayer, isCaptureLayer, isQRCodeLayer, isImageLayer, isTextLayer, isLyricLayer, isLayer40, isLayer41, isEffectLayer } = getLayerTypeFlags(layer, layerId);
+    const { isCaptureLayer, isQRCodeLayer, isImageLayer, isTextLayer, isLyricLayer, isLayer40, isLayer41, isEffectLayer } = getLayerTypeFlags(layer, layerId);
 
     // 通用参数：position/size/priority/rotation/alpha/volume/gaussian_blur/
     // shape_*/black_to_transparent/invert/crop_*/fit_mode/roam_config 由通用读取器统一获取。
@@ -436,22 +440,18 @@ export async function applyLayerProperties(
         layer.roam_config = { ...properties.roam_config };
     }
 
-    // 采集图层参数（含分辨率：预设或自定义宽高）
+    // 采集图层保存输入源、设备索引和自定义分辨率策略。
+    // 方向、填充和场景不再由前端拼装，左右黑边由采集渲染器自动处理。
     if (isCaptureLayer) {
         const nextCaptureType = getStringValue('capture-type', 'AUTO');
         const nextCaptureIndex = Math.max(0, getIntValue('capture-index', 0));
-        const nextCaptureRotation = normalizeCaptureRotation(getIntValue('capture-rotation', 0));
         const currentCaptureType = layer.capture_type ?? layer.captureType ?? 'AUTO';
         const currentCaptureIndex = Math.max(0, Number(layer.capture_index ?? layer.captureIndex ?? 0) || 0);
-        const currentCaptureRotation = normalizeCaptureRotation(layer.capture_rotation ?? layer.captureRotation ?? 0);
         if (nextCaptureType !== currentCaptureType) {
             properties.capture_type = nextCaptureType;
         }
         if (nextCaptureIndex !== currentCaptureIndex) {
             properties.capture_index = nextCaptureIndex;
-        }
-        if (nextCaptureRotation !== currentCaptureRotation) {
-            properties.capture_rotation = nextCaptureRotation;
         }
     }
 
@@ -486,12 +486,11 @@ export async function applyLayerProperties(
     if (isQRCodeLayer) {
         properties.qr_content = getStringValue('qr-content');
         properties.qr_size = getIntValue('qr-size', 256);
-        properties.qr_logo_size = getIntValue('qr-logo-size', 0);
         const qrTextValue = getStringValue('qr-text') || getStringValue('qr-text-display');
         properties.qr_text = qrTextValue;
         properties.qr_text_color = getStringValue('qr-text-color', '1.0 1.0 1.0 1.0');
         const bgColorInput = document.getElementById('qr-bg-color-rgba') || document.getElementById('qr-bg-color');
-        properties.qr_bg_color = bgColorInput ? bgColorInput.value.trim() : getStringValue('qr-bg-color', '0 0.2 1 1'); // 默认 #0051FF
+        properties.qr_bg_color = bgColorInput?.value.trim() || '0 0.2 1 1'; // 默认 #0033FF
         properties.qr_fg_color = getStringValue('qr-fg-color', '0.0 0.0 0.0 1.0');
         properties.qr_error_correction = getIntValue('qr-error-correction', 1);
 
@@ -509,8 +508,6 @@ export async function applyLayerProperties(
     // 文本图层参数
     if (isTextLayer) {
         if (isLyricLayer) {
-            const fontVal = getStringValue('text-font-file');
-            properties.font_file = fontVal ? (fontVal.includes('/') ? fontVal.replace(/^.*\//, '') : fontVal) : '';
             const newBindLayerId = getIntValue('lyric-bind-layer', 1);
 
             // 处理歌词可见性设置

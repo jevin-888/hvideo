@@ -271,8 +271,7 @@ int ff_cbs_write_signed(CodedBitstreamContext *ctx, PutBitContext *pbc,
 
 // End of a syntax element which is made up of subelements which are
 // aleady traced, so we are only showing the value.  This forges a
-// PutBitContext to po
-  int to the position of the start of the syntax
+// PutBitContext to point to the position of the start of the syntax
 // element, but the other state doesn't matter because length is zero.
 #define CBS_TRACE_WRITE_END_VALUE_ONLY() \
     do { \

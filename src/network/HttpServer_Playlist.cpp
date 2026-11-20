@@ -9,6 +9,7 @@
 #include "HttpRequest.h"
 #include "HttpResponse.h"
 #include "core/CommandRouter.h"
+#include "core/Engine.h"
 #include "core/SystemConfig.h"
 #include "database/PlaylistManager.h"
 #include "database/PlaylistDatabase.h"
@@ -24,7 +25,7 @@
 
 void HttpServer::registerPlaylistRoutes() {
   auto forbidVodReservedLayer = [this](int layerId, HttpResponse& response) -> bool {
-    if (systemConfig_ && systemConfig_->isVodEnabled()) {
+    if (engine_ && engine_->isVodRuntimeEnabled()) {
       int vodLayerId = systemConfig_->getVodLayerId();
       if (vodLayerId > 0 && layerId == vodLayerId) {
         Json::Value data;
@@ -101,11 +102,12 @@ void HttpServer::registerPlaylistRoutes() {
     }
 
     if (playlistManager_->setDefaultPlaylist(playlistId, layerId)) {
-      if (playlistId.empty()) {
-        setJsonSuccessResponse(response, "Default playlist cleared");
-      } else {
-        setJsonSuccessResponse(response, "Default playlist set");
-      }
+      Json::Value data;
+      data["playlistId"] = playlistId;
+      data["targetLayerId"] = layerId;
+      setJsonDataResponse(response, data,
+                          playlistId.empty() ? "Default playlist cleared"
+                                             : "Default playlist set");
     } else {
       setJsonErrorResponse(response, 500, "Failed to set default playlist");
     }
@@ -419,7 +421,12 @@ void HttpServer::registerPlaylistRoutes() {
 
     if (playlistManager_->addVideoToPlayList(playlistId, item, layerId,
                                              index)) {
-      setJsonSuccessResponse(response, "Item added successfully");
+      Json::Value data;
+      data["playlistId"] = playlistId;
+      data["layerId"] = layerId;
+      data["path"] = normalizedPath;
+      data["requestedIndex"] = index;
+      setJsonDataResponse(response, data, "Item added successfully");
     } else {
       LOG_ERROR("addVideoToPlayList failed: playlist=%s, layer=%d, uri=%s",
                 playlistId.c_str(), layerId, normalizedPath.c_str());
@@ -457,7 +464,11 @@ void HttpServer::registerPlaylistRoutes() {
     }
 
     if (playlistManager_->removeVideoFromPlayList(playlistId, layerId, index)) {
-      setJsonSuccessResponse(response, "Item deleted successfully");
+      Json::Value data;
+      data["playlistId"] = playlistId;
+      data["layerId"] = layerId;
+      data["index"] = index;
+      setJsonDataResponse(response, data, "Item deleted successfully");
     } else {
       setJsonErrorResponse(response, 500, "Failed to delete item");
     }
@@ -473,7 +484,9 @@ void HttpServer::registerPlaylistRoutes() {
         std::string playlistId = request.getUrlParam("id");
 
         if (playlistManager_->deletePlayList(playlistId)) {
-          setJsonSuccessResponse(response, "Playlist deleted successfully");
+          Json::Value data;
+          data["playlistId"] = playlistId;
+          setJsonDataResponse(response, data, "Playlist deleted successfully");
         } else {
           setJsonErrorResponse(response, 500, "Failed to delete playlist");
         }

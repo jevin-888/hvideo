@@ -41,7 +41,7 @@ static int cbs_vp9_read_s(CodedBitstreamContext *ctx, GetBitContext *gbc,
 
     magnitude = get_bits(gbc, width);
     sign      = get_bits1(gbc);
-    value     = sign ? -(int32_t)? magnitude : magnitude;
+    value     = sign ? -(int32_t)magnitude : magnitude;
 
     CBS_TRACE_READ_END();
 

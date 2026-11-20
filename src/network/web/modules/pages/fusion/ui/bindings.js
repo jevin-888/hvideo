@@ -1,19 +1,21 @@
 import { ensureBlendRegion, getState, setActiveRegion, setFocusMode } from '../actions.js?v=2.95';
-import { drawBlendScene, drawGridScene, getBlendCurveAnchorFromDisplayValue, getBlendCurveHandleLayout } from '../canvas/renderer.js?v=2.101';
+import { drawBlendScene, drawGridScene, getBlendCurveHandleLayout, getBlendCurvePatchFromDisplayPoint } from '../canvas/renderer.js?v=2.101';
 import { onCanvasMouseDown, onCanvasMouseMove, onCanvasMouseUp } from '../interaction/mouse.js?v=2.100';
-import { handleKeyboard } from '../interaction/keyboard.js?v=2.100';
-import { renderFusionUi } from './panel.js?v=2.100';
+import { handleKeyboard } from '../interaction/keyboard.js?v=2.103';
+import { renderFusionUi } from './panel.js?v=2.103';
 import { patchBlendSide, pushBlendSideUndo, setActiveBlendSide, setBlendAutoEdges, setBlendMasterEnabled, setBlendSideEnabled } from '../blend/actions.js?v=2.95';
-import { hydrateBlendRegionsFromResponse, loadBlendRegion, syncBlendAutoEdges, syncBlendRegion } from '../sync/syncBlend.js?v=2.95';
+import { hydrateBlendRegionsFromResponse, loadBlendRegion, syncBlendAutoEdges, syncBlendRegion } from '../sync/syncBlend.js?v=2.96';
 import { patchColor, resetColor } from '../color/actions.js?v=2.95';
 import { flushPendingGeometryOps, persistGeometryRegion, syncGeometryRegion, syncActiveGeometrySelection } from '../sync/syncGeometry.js?v=2.95';
 import { persistMask, syncMask } from '../sync/syncMask.js?v=2.95';
 import { syncColorRegion } from '../sync/syncColor.js?v=2.95';
-import { setBlendCurveParams, setBlendMaster, setMergeGapBrightness } from '../api.js?v=2.95';
+import { setBlendCurveParams, setBlendMaster, setMergeGapBrightness } from '../api.js?v=2.97';
 import { showNotification } from '../../../components/toast.js';
 import { FOCUS_MODES, TABS } from '../types.js';
-import { switchFusionTab } from '../modeSwitch.js?v=2.100';
+import { switchFusionTab } from '../modeSwitch.js?v=2.104';
 import { clamp } from '../utils/grid.js';
+import { bindHorizontalDragControl, renderHorizontalDragFill } from './horizontalDrag.js?v=1.2';
+import { createAnchorMutationQueue } from './anchorMutationQueue.js?v=1.0';
 
 
 let gridDrawPending = false;
@@ -21,6 +23,24 @@ let blendCurveDrag = null;
 let blendCurveSyncTimer = null;
 let blendCurveSyncChain = Promise.resolve();
 let fullMaskSyncTimer = null;
+const anchorMutationQueue = createAnchorMutationQueue({
+    write: (regionId, side, value) => setBlendCurveParams(regionId, side, { anchor: value }),
+    onCommit: ({ side, responses }) => {
+        const suffix = { left: 'l', right: 'r', top: 't', bottom: 'b' }[side];
+        responses.forEach(({ regionId, response }) => {
+            const returned = Number(response?.[`anchor_${suffix}`]);
+            if (suffix && Number.isFinite(returned)) {
+                patchBlendSide(regionId, side, { anchor: clamp(returned, 0, 1) }, { undo: false });
+            }
+        });
+        renderFusionUi();
+    },
+    onError: ({ failures }) => {
+        const error = failures[0]?.error;
+        console.warn('fusion anchor sync failed:', error);
+        showNotification(error?.message || 'Anchor 同步失败', 'error');
+    }
+});
 
 function scheduleGridDraw(canvas) {
     if (gridDrawPending) return;
@@ -49,7 +69,7 @@ function ensureBlendCanvas() {
     const groups = Array.from(document.querySelectorAll('#fusion-tab-geometry-fusion .control-group'));
     const targetGroup = groups.find((group) => {
         const title = group.querySelector('.control-group__title');
-        return title && title.textContent.includes('融合参数');
+        return title && (globalThis.PlayerI18n?.sourceText(title) ?? title.textContent).includes('融合参数');
     });
     if (!targetGroup) return null;
 
@@ -237,21 +257,20 @@ function buildBlendCurvePatch(state, side, handleId, values) {
     const sideState = state.blend.byRegionId[regionId]?.[side]
         || state.blend.byRegionId[state.page.activeRegionId]?.[side]
         || {};
-    const stripStart = clamp(sideState.stripStart ?? 0, 0, 255);
-    const stripEnd = clamp(sideState.stripEnd ?? 255, 0, 255);
-    const patch = {};
-    if (handleId === 'stripStart') {
-        patch.stripStart = Math.round(clamp(values.x * 255, 0, Math.max(0, stripEnd - 1)));
-    } else if (handleId === 'stripEnd') {
-        patch.stripEnd = Math.round(clamp(values.x * 255, Math.min(255, stripStart + 1), 255));
-    } else {
-        patch.anchor = Number(getBlendCurveAnchorFromDisplayValue(sideState, values.y).toFixed(3));
-    }
-    return patch;
+    return getBlendCurvePatchFromDisplayPoint(sideState, handleId, values);
 }
 
 function syncBlendCurveDrag(ids, side, patch, reload) {
     if (!ids.length || !Object.keys(patch).length) return;
+    if (Object.keys(patch).length === 1 && Object.prototype.hasOwnProperty.call(patch, 'anchor')) {
+        anchorMutationQueue.schedule({
+            ids: [...ids],
+            side,
+            value: patch.anchor,
+            final: !!reload
+        });
+        return;
+    }
     blendCurveSyncChain = blendCurveSyncChain.catch(() => {}).then(() => Promise.all(ids.map(async (regionId) => {
         await setBlendCurveParams(regionId, side, patch);
         if (reload) await loadBlendRegion(regionId);
@@ -262,6 +281,15 @@ function syncBlendCurveDrag(ids, side, patch, reload) {
 }
 
 function scheduleBlendCurveSync(ids, side, patch, immediate) {
+    if (Object.keys(patch).length === 1 && Object.prototype.hasOwnProperty.call(patch, 'anchor')) {
+        anchorMutationQueue.schedule({
+            ids: [...ids],
+            side,
+            value: patch.anchor,
+            final: !!immediate
+        });
+        return;
+    }
     if (blendCurveSyncTimer) {
         clearTimeout(blendCurveSyncTimer);
         blendCurveSyncTimer = null;
@@ -292,93 +320,19 @@ function applyBlendCurveDrag(canvas, event, immediate) {
 
 function bindBrightnessDragControl(input, label, updateBrightness) {
     const host = input.closest('.brightness-drag-field') || input;
-    if (!host || host.dataset.brightnessDragBound) return;
-    host.dataset.brightnessDragBound = 'true';
-
-    let pressTimer = null;
-    let dragState = null;
-    let pressPoint = null;
     const colorByLabel = {
         R: '239, 68, 68',
         G: '34, 197, 94',
         B: '59, 130, 246'
     };
-
-    const clearPressTimer = () => {
-        if (pressTimer) {
-            clearTimeout(pressTimer);
-            pressTimer = null;
-        }
-        pressPoint = null;
-    };
-
-    const renderInlineDrag = (value) => {
-        const ratio = Math.max(0, Math.min(1, value / 255));
-        host.style.setProperty('--brightness-color', colorByLabel[label] || '59, 130, 246');
-        host.style.setProperty('--brightness-level', `${ratio * 100}%`);
-    };
-    host._renderBrightnessLevel = renderInlineDrag;
-
-    const valueFromPointer = (event) => {
-        const rect = host.getBoundingClientRect();
-        const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
-        return Math.round(ratio * 255);
-    };
-
-    const startDrag = (event) => {
-        const value = Math.max(0, Math.min(255, parseInt(input.value || 128, 10)));
-        input.blur();
-        dragState = { pointerId: event.pointerId };
-        renderInlineDrag(value);
-        host.classList.add('is-brightness-dragging');
-        if (host.setPointerCapture) host.setPointerCapture(event.pointerId);
-        event.preventDefault();
-        updateDrag(event, false);
-    };
-
-    const updateDrag = (event, final = false) => {
-        if (!dragState || dragState.pointerId !== event.pointerId) return;
-        const value = valueFromPointer(event);
-        renderInlineDrag(value);
-        updateBrightness(value, { reload: final });
-        event.preventDefault();
-    };
-
-    const finishDrag = (event) => {
-        clearPressTimer();
-        if (!dragState || dragState.pointerId !== event.pointerId) return;
-        updateDrag(event, true);
-        host.classList.remove('is-brightness-dragging');
-        if (host.releasePointerCapture && (!host.hasPointerCapture || host.hasPointerCapture(event.pointerId))) {
-            host.releasePointerCapture(event.pointerId);
-        }
-        dragState = null;
-    };
-
-    host.addEventListener('pointerdown', (event) => {
-        if (event.button !== undefined && event.button !== 0) return;
-        if (event.target && event.target.closest('button')) return;
-        clearPressTimer();
-        pressPoint = { x: event.clientX, y: event.clientY };
-        pressTimer = setTimeout(() => {
-            pressTimer = null;
-            startDrag(event);
-        }, 320);
+    bindHorizontalDragControl(input, {
+        host,
+        min: 0,
+        max: 255,
+        step: 1,
+        color: colorByLabel[label] || '59, 130, 246',
+        onChange: (value, { final }) => updateBrightness(value, { reload: final })
     });
-
-    host.addEventListener('pointermove', (event) => {
-        if (dragState) {
-            updateDrag(event, false);
-            return;
-        }
-        if (pressPoint && Math.hypot(event.clientX - pressPoint.x, event.clientY - pressPoint.y) > 8) {
-            clearPressTimer();
-        }
-    });
-    host.addEventListener('pointerup', finishDrag);
-    host.addEventListener('pointercancel', finishDrag);
-    host.addEventListener('pointerleave', clearPressTimer);
-    renderInlineDrag(Math.max(0, Math.min(255, parseInt(input.value || 128, 10))));
 }
 
 function bindTabButtons() {
@@ -561,7 +515,17 @@ function bindBlendControls() {
         });
     });
 
-    [['fusionGammaInput', 'gamma'], ['fusionSlopeInput', 'slope'], ['fusionGainInput', 'anchor']].forEach(([id, key]) => {
+    const applyAnchorLocalChange = (ids, side, value, { undo = true } = {}) => {
+        const next = clamp(Number(value), 0, 1);
+        ids.forEach((regionId) => {
+            if (undo) pushBlendSideUndo(regionId);
+            patchBlendSide(regionId, side, { anchor: next }, { undo: false });
+        });
+        renderFusionUi();
+        return next;
+    };
+
+    [['fusionGammaInput', 'gamma'], ['fusionSlopeInput', 'slope']].forEach(([id, key]) => {
         const input = document.getElementById(id);
         if (!input || input.dataset.bound) return;
         input.dataset.bound = 'true';
@@ -569,22 +533,56 @@ function bindBlendControls() {
         input.addEventListener('input', (event) => {
             event.stopPropagation();
             const state = getState();
-            const ids = state.blend.managerMode ? (state.layout.regionIds || [state.page.activeRegionId]) : [state.page.activeRegionId];
+            const ids = getBlendCurveTargetIds(state);
+            const side = state.blend.activeSide;
             const nextValue = parseFloat(input.value) || 0;
             ids.forEach((regionId) => {
                 const patch = { [key]: nextValue };
-                patchBlendSide(regionId, state.blend.activeSide, patch);
+                patchBlendSide(regionId, side, patch);
             });
             renderFusionUi();
             if (blendInputThrottle) clearTimeout(blendInputThrottle);
             blendInputThrottle = setTimeout(() => {
                 blendInputThrottle = null;
                 Promise.all(ids.map(async (regionId) => {
-                    await setBlendCurveParams(regionId, state.blend.activeSide, { [key]: nextValue });
+                    await setBlendCurveParams(regionId, side, { [key]: nextValue });
                     await loadBlendRegion(regionId);
                 })).then(() => renderFusionUi());
             }, 100);
         });
+    });
+
+    const anchorInput = document.getElementById('fusionGainInput');
+    let anchorDragTarget = null;
+    bindHorizontalDragControl(anchorInput, {
+        host: anchorInput?.closest('.anchor-drag-field'),
+        min: 0,
+        max: 1,
+        step: 0.01,
+        color: '245, 158, 11',
+        onStart: () => {
+            const state = getState();
+            anchorDragTarget = {
+                ids: getBlendCurveTargetIds(state),
+                side: state.blend.activeSide
+            };
+            anchorDragTarget.ids.forEach((regionId) => pushBlendSideUndo(regionId));
+        },
+        onChange: (value, { final }) => {
+            if (!anchorDragTarget) return;
+            const next = Number(value.toFixed(2));
+            anchorInput.value = String(next);
+            applyAnchorLocalChange(anchorDragTarget.ids, anchorDragTarget.side, next, { undo: false });
+            anchorMutationQueue.schedule({
+                ids: [...anchorDragTarget.ids],
+                side: anchorDragTarget.side,
+                value: next,
+                final
+            });
+        },
+        onEnd: () => {
+            anchorDragTarget = null;
+        }
     });
 
     [
@@ -603,9 +601,9 @@ function bindBlendControls() {
                 event.stopPropagation();
                 if (blendButtonThrottle) return;
                 blendButtonThrottle = setTimeout(() => { blendButtonThrottle = null; }, 150);
-                const min = Number(input?.min ?? 0);
-                const max = Number(input?.max ?? 1);
-                const step = Number(input?.step ?? 0.1);
+                const min = Number(input?.dataset.min ?? input?.min ?? 0);
+                const max = Number(input?.dataset.max ?? input?.max ?? 1);
+                const step = Number(input?.dataset.step ?? input?.step ?? 0.1);
                 const current = Number(input?.value ?? defaultValue);
                 let next = defaultValue;
                 if (mode === 'decrease') next = current - step;
@@ -615,14 +613,20 @@ function bindBlendControls() {
                 next = Number(next.toFixed(decimals));
                 if (input) input.value = String(next);
                 const state = getState();
-                const ids = state.blend.managerMode ? (state.layout.regionIds || [state.page.activeRegionId]) : [state.page.activeRegionId];
+                const ids = getBlendCurveTargetIds(state);
+                const side = state.blend.activeSide;
+                if (key === 'anchor') {
+                    const anchorValue = applyAnchorLocalChange(ids, side, next);
+                    anchorMutationQueue.schedule({ ids: [...ids], side, value: anchorValue, final: true });
+                    return;
+                }
                 ids.forEach((regionId) => {
                     const patch = { [key]: next };
-                    patchBlendSide(regionId, state.blend.activeSide, patch);
+                    patchBlendSide(regionId, side, patch);
                 });
                 renderFusionUi();
                 void Promise.all(ids.map(async (regionId) => {
-                    await setBlendCurveParams(regionId, state.blend.activeSide, { [key]: next });
+                    await setBlendCurveParams(regionId, side, { [key]: next });
                     await loadBlendRegion(regionId);
                 })).then(() => renderFusionUi());
             });
@@ -682,10 +686,11 @@ function bindBlendControls() {
             const next = clampBright(value);
             input.value = String(next);
             input.textContent = String(next);
-            const host = input.closest('.brightness-drag-field');
-            if (host && typeof host._renderBrightnessLevel === 'function') {
-                host._renderBrightnessLevel(next);
-            }
+            renderHorizontalDragFill(input, next, {
+                min: 0,
+                max: 255,
+                color: ['239, 68, 68', '34, 197, 94', '59, 130, 246'][colorId]
+            });
             const { ids, side } = getTarget();
             patchBrightnessLocal(ids, side, next);
             renderFusionUi();

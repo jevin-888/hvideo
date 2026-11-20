@@ -32,9 +32,14 @@
             -webkit-tap-highlight-color: transparent;
         }
     </style>
-    <link rel="stylesheet" href="style.css?v=2.68">
+    <link rel="stylesheet" href="style.css?v=20261116-layer-controls">
+    <link rel="stylesheet" href="shared/layer-properties.css?v=20261116">
+    <link rel="stylesheet" href="shared/capture-edid.css?v=20261118-layout">
     <!-- QRCode.js - 二维码生成库 -->
     <script src="qrcode.min.js"></script>
+    <link rel="stylesheet" href="shared/i18n.css?v=20261102">
+    <script defer src="shared/i18n-catalog.js?v=20261115-capture"></script>
+    <script defer src="shared/i18n.js?v=20261102"></script>
 </head>
 
 <body>
@@ -50,6 +55,7 @@
             <h1 id="app-title">HVIDEO控制软件</h1>
         </div>
         <div class="header-right">
+        <label class="player-language"><span aria-hidden="true">🌐</span><select data-player-language aria-label="语言"><option value="zh" translate="no">中文</option><option value="en">English</option><option value="id">Bahasa Indonesia</option><option value="vi">Tiếng Việt</option><option value="th">ไทย</option></select></label>
             <div class="system-status">
                 <span id="status-text">运行中</span>
                 <span class="status-divider">|</span>
@@ -155,6 +161,13 @@
                                 <circle cx="16" cy="12" r="2" />
                             </svg>
                             <span class="menu-text">CAVE校正</span>
+                        </li>
+                        <li class="menu-item" data-page="stage-control">
+                            <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M4 5h16M4 12h16M4 19h16" />
+                                <circle cx="8" cy="5" r="2" /><circle cx="15" cy="12" r="2" /><circle cx="10" cy="19" r="2" />
+                            </svg>
+                            <span class="menu-text">舞台控制</span>
                         </li>
                         <li class="menu-item" data-page="peripheral-management">
                             <svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -263,6 +276,24 @@
                         </div>
                     </div>
 
+                    <div class="matrix-subdivision-toolbar" aria-label="&#21306;&#22495;&#20998;&#21106;&#36741;&#21161;&#32447;">
+                        <span class="matrix-subdivision-title">&#21306;&#22495;&#20998;&#21106;</span>
+                        <select id="matrix-subdivision-preset" class="matrix-subdivision-select" aria-label="NxN &#20998;&#21106;&#35268;&#26684;">
+                            <option value="2">2&times;2</option>
+                            <option value="3">3&times;3</option>
+                            <option value="4">4&times;4</option>
+                        </select>
+                        <button type="button" id="matrix-subdivision-custom-toggle" class="matrix-subdivision-action secondary">&#33258;&#23450;&#20041;</button>
+                        <div id="matrix-subdivision-custom-fields" class="matrix-subdivision-custom-fields hidden">
+                            <label class="matrix-subdivision-dimension">&#34892;<input type="number" id="matrix-subdivision-rows" min="2" max="12" value="2" inputmode="numeric"></label>
+                            <span>&times;</span>
+                            <label class="matrix-subdivision-dimension">&#21015;<input type="number" id="matrix-subdivision-cols" min="2" max="12" value="2" inputmode="numeric"></label>
+                        </div>
+                        <button type="button" id="matrix-subdivision-apply" class="matrix-subdivision-action">&#36873;&#25321;&#21306;&#22495;</button>
+                        <button type="button" id="matrix-subdivision-clear" class="matrix-subdivision-action secondary">&#28165;&#38500;&#20840;&#37096;</button>
+                        <span id="matrix-subdivision-status" class="matrix-subdivision-status">&#26410;&#35774;&#32622;&#20998;&#21106;&#21306;&#22495;</span>
+                    </div>
+
                     <div class="layer-main-content">
                         <div class="layer-selection">
                         </div>
@@ -327,6 +358,10 @@
                                     <div class="material-actions-bar">
                                         <button id="upload-btn" class="btn primary">上传素材</button>
                                         <button id="upload-folder-btn" class="btn secondary">上传文件夹</button>
+                                        <div id="huoshan-storage-space" class="huoshan-storage-space"
+                                            role="status" aria-live="polite" title="huoshan 分区剩余空间">
+                                            剩余空间 -- GB
+                                        </div>
                                         <label class="preview-switch" title="预览开关">
                                             <input type="checkbox" id="video-preview-switch">
                                             <span class="switch-slider"></span>
@@ -373,6 +408,11 @@
                                             <button class="btn type-btn" data-type="image">图片</button>
                                             <button class="btn type-btn" data-type="audio">音乐</button>
                                         </div>
+                                    </div>
+                                    <div class="material-source-filters" role="group" aria-label="素材来源">
+                                        <button type="button" class="btn material-source-btn active" data-source="all" aria-pressed="true">全部来源</button>
+                                        <button type="button" class="btn material-source-btn" data-source="local" aria-pressed="false">本地</button>
+                                        <button type="button" class="btn material-source-btn" data-source="cloud" aria-pressed="false">云端</button>
                                     </div>
                                     <div id="material-folder-list" class="material-folder-list">
                                         <!-- 文件夹标签将通过JS动态生成 -->
@@ -639,6 +679,88 @@
 
 
 
+                <div id="stage-control-page" class="page">
+                    <div class="stage-control-page-shell">
+                        <div class="page-header stage-control-header">
+                            <div>
+                                <h2>舞台控制</h2>
+                                <p>根据视频播放时间触发特效和外部通信。</p>
+                            </div>
+                            <div class="stage-control-toolbar">
+                                <button id="stage-control-refresh" class="btn btn-secondary" type="button">刷新</button>
+                                <button id="stage-control-save" class="btn btn-primary" type="button">保存配置</button>
+                            </div>
+                        </div>
+
+                        <div class="stage-control-settings card">
+                            <div class="stage-setting-field">
+                                <label class="stage-control-switch" for="stage-control-enabled">
+                                    <input id="stage-control-enabled" type="checkbox">
+                                    <span>启用舞台控制</span>
+                                </label>
+                                <small>启用后点击“布防”开始按视频时间触发 Cue</small>
+                            </div>
+                            <div class="stage-setting-field">
+                                <label for="stage-control-tolerance">触发容差（ms）</label>
+                                <input id="stage-control-tolerance" type="number" min="0" max="2000" step="1" value="80">
+                                <small>视频跳过 Cue 时仍允许补触发的时间窗口</small>
+                            </div>
+                            <div class="stage-control-runtime-actions">
+                                <button id="stage-control-arm" class="btn btn-success" type="button">布防</button>
+                                <button id="stage-control-disarm" class="btn btn-warning" type="button">撤防</button>
+                                <button id="stage-control-reset" class="btn btn-secondary" type="button">重置时间轴</button>
+                            </div>
+                        </div>
+
+                        <div class="stage-control-section card stage-control-selection">
+                            <div class="stage-control-section-header"><div><h3>选择播放列表视频</h3><p>先选择播放列表，再选择其中的具体视频；每个视频拥有独立的 Cue 时间轴。</p></div></div>
+                            <div class="stage-video-selection-grid">
+                                <div><label for="stage-control-playlist">播放列表</label><select id="stage-control-playlist"></select></div>
+                                <div><label for="stage-control-video">视频</label><select id="stage-control-video"></select></div>
+                            </div>
+                            <div id="stage-control-selection-info" class="stage-control-selection-info">选择播放列表和视频后，可为该视频独立预设 Cue 时间轴</div>
+                        </div>
+
+                        <div id="stage-control-runtime-status" class="stage-control-runtime-status"></div>
+                        <div class="stage-control-media-line">当前媒体：<strong id="stage-control-media">未检测到已绑定播放视频</strong><span class="stage-control-binding-label">绑定：<strong id="stage-control-binding">未绑定播放列表</strong></span><span id="stage-control-error" class="stage-control-error" hidden></span></div>
+                        <div id="stage-control-message" class="stage-control-message" role="status"></div>
+
+                        <div class="stage-control-section card">
+                            <div class="stage-control-section-header"><div><h3>Cue 时间轴</h3><p>当前选中视频的 Cue 可同时触发内部特效与 UDP、TCP、WebSocket、RS-232、RS-485 通信。</p></div><button id="stage-control-add-cue" class="btn btn-primary" type="button">新增 Cue</button></div>
+                            <div class="stage-control-table-wrap">
+                                <table class="stage-control-cue-table"><thead><tr><th>启用</th><th>时间</th><th>名称 / ID</th><th>动作</th><th>操作</th></tr></thead><tbody id="stage-control-cue-list"></tbody></table>
+                                <div id="stage-control-empty" class="stage-control-empty">暂无 Cue，点击“新增 Cue”创建。</div>
+                            </div>
+                        </div>
+
+                        <div id="stage-cue-editor" class="stage-control-section card" hidden>
+                            <div class="stage-control-section-header"><div><h3 id="stage-cue-editor-title">新增 Cue</h3><p>以 JSON 配置 actions，后端会校验 Cue 和 effect / protocol 动作。</p></div></div>
+                            <div class="stage-cue-form-grid">
+                                <div><label for="stage-cue-id">Cue ID</label><input id="stage-cue-id" type="text" maxlength="128" placeholder="cue-opening"></div>
+                                <div><label for="stage-cue-name">名称</label><input id="stage-cue-name" type="text" maxlength="128" placeholder="开场"></div>
+                                <div><label for="stage-cue-time">触发时间</label><input id="stage-cue-time" type="text" placeholder="00:00:01.000"></div>
+                                <label class="stage-control-switch stage-cue-enabled"><input id="stage-cue-enabled" type="checkbox" checked><span>启用 Cue</span></label>
+                            </div>
+                            <label for="stage-cue-actions-json">动作 JSON</label>
+                            <textarea id="stage-cue-actions-json" class="stage-cue-actions-json" rows="12" spellcheck="false"></textarea>
+                            <details class="stage-cue-schema-help"><summary>查看动作 schema 示例</summary><pre>[{
+  "kind": "effect",
+  "layer_id": 1,
+  "effect_no": 3,
+  "effect_params": {}
+}, {
+  "kind": "protocol",
+  "protocol": "udp",
+  "mode": "direct",
+  "encoding": "text",
+  "address": "192.168.1.100",
+  "port": 9000,
+  "payload": "START"
+}]</pre></details>
+                            <div class="stage-control-editor-actions"><button id="stage-cue-cancel" class="btn btn-secondary" type="button">取消</button><button id="stage-cue-apply" class="btn btn-primary" type="button">应用 Cue</button></div>
+                        </div>
+                    </div>
+                </div>
                 <div id="peripheral-management-page" class="page">
                     <div class="peripheral-management-container">
                         <!-- 左侧：外设列表 -->
@@ -713,8 +835,12 @@
                                     </div>
                                     <div class="peripheral-item-info">
                                         <span class="peripheral-item-title">功能配置</span>
-                                        <span class="peripheral-item-desc">移动端灯光 / 空调功能</span>
+                                        <span class="peripheral-item-desc">移动端空调 / 灯光 / 投影功能</span>
                                     </div>
+                                </div>
+                                <div class="peripheral-item" data-peripheral="vod-forward" id="vod-forward-peripheral-item" style="display:none">
+                                    <div class="peripheral-item-icon"><span style="font-size:20px">V</span></div>
+                                    <div class="peripheral-item-info"><span class="peripheral-item-title">VOD转发</span><span class="peripheral-item-desc">VOD模式灯光 / 空调 / 音效转发</span></div>
                                 </div>
 
                             </div>
@@ -743,21 +869,21 @@
                                                             <option value="external">外接模式</option>
                                                         </select>
                                                     </div>
-                                                    <div class="setting-item width-port">
+                                                    <div class="setting-item width-port dmx-local-only">
                                                         <label>端口:</label>
                                                         <select id="dmx-port" class="form-control">
-                                                            <option value="/dev/ttySWK0" selected>RS485 DMX (/dev/ttySWK0)
-                                                            </option>
-                                                            <option value="/dev/ttyUSB0">USB DMX (/dev/ttyUSB0)</option>
-                                                            <option value="artnet">Art-Net (Network)</option>
-                                                            <option value="sacn">sACN (Network)</option>
+                                                            <option value="/dev/ttyS7" selected>7</option>
+                                                            <option value="/dev/ttyS9">9</option>
                                                         </select>
                                                     </div>
                                                     <div class="setting-item width-port dmx-external-only" style="display:none">
-                                                        <label>232接口:</label>
-                                                        <select id="dmx-external-port" class="form-control">
-                                                            <option value="/dev/ttySWK4" selected>RS232 (/dev/ttySWK4)</option>
-                                                        </select>
+                                                        <label for="dmx-external-port">232接口:</label>
+                                                        <input id="dmx-external-port" class="form-control" type="number"
+                                                            inputmode="numeric" min="0" step="1"
+                                                            list="dmx-external-port-options" value="5"
+                                                            placeholder="端口数字，例如 5"
+                                                            title="填写 RS232 串口数字，例如 5">
+                                                        <datalist id="dmx-external-port-options"></datalist>
                                                     </div>
                                                     <div class="setting-item width-baud">
                                                         <label>波特率:</label>
@@ -862,14 +988,19 @@
                                                 <div class="serial-header-card glass-panel">
                                                     <div class="serial-settings-row">
                                                         <div class="setting-item">
-                                                            <label>串口号:</label>
-                                                            <select id="serial-port-select"
-                                                                class="form-control dark-input peripheral-config-input">
-                                                                <option value="/dev/ttyS0">COM1 (/dev/ttyS0)</option>
-                                                                <option value="/dev/ttyS1">COM2 (/dev/ttyS1)</option>
-                                                                <option value="/dev/ttyUSB0">USB0 (/dev/ttyUSB0)
-                                                                </option>
+                                                            <label for="serial-type-select">串口类型:</label>
+                                                            <select id="serial-type-select" class="form-control dark-input peripheral-config-input">
+                                                                <option value="rs485">RS485</option>
+                                                                <option value="rs232">RS232</option>
                                                             </select>
+                                                        </div>
+                                                        <div class="setting-item">
+                                                            <label for="serial-port-select">自定义串口号:</label>
+                                                            <input id="serial-port-select" type="text" list="serial-port-options"
+                                                                value="7" placeholder="7 或 /dev/ttyUSB0"
+                                                                aria-label="自定义串口号" title="填写串口号，例如 7，或完整路径 /dev/ttyUSB0"
+                                                                class="form-control dark-input peripheral-config-input">
+                                                            <datalist id="serial-port-options"></datalist>
                                                         </div>
                                                         <div class="setting-item">
                                                             <label>波特率:</label>
@@ -1286,7 +1417,6 @@
                                                             class="btn primary peripheral-apply-btn">应用配置</button>
                                                     </div>
                                                 </div>
-
                                                 <div class="function-config-workbench">
                                                     <div class="serial-col template-col glass-panel">
                                                         <div class="col-header">
@@ -1330,6 +1460,27 @@
                                                             </div>
                                                         </div>
                                                     </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div id="config-vod-forward" class="config-section">
+                                            <div class="serial-layout-container">
+                                                <div class="serial-header-card glass-panel">
+                                                    <div class="serial-settings-row">
+                                                        <label class="setting-item">转发协议<select id="vod-forward-type" class="form-control"><option value="rs485">RS485</option><option value="rs232">RS232</option></select></label>
+                                                        <label class="setting-item">串口号<input id="vod-forward-port" class="form-control" placeholder="7 或 /dev/ttyUSB0"></label>
+                                                        <label class="setting-item">波特率<select id="vod-forward-baud" class="form-control"><option>1200</option><option>2400</option><option>4800</option><option>9600</option><option>19200</option><option>38400</option><option>57600</option><option>115200</option></select></label>
+                                                    </div>
+                                                    <div class="serial-actions-row">
+                                                        <label class="switch-wrapper"><input id="vod-forward-active" type="checkbox"> 启用VOD转发</label>
+                                                        <button id="save-vod-forward-config-btn" type="button" class="btn primary">保存配置</button>
+                                                    </div>
+                                                </div>
+                                                <div class="glass-panel vod-forward-rules-panel">
+                                                    <div class="serial-actions-row"><h3>功能映射</h3><button id="vod-forward-add-rule" type="button" class="btn">添加映射</button></div>
+                                                    <p>本地和在线VOD共用配置。填写歌曲码或控制值及对应Hex；每次事件按顺序发送所有匹配项。空调开关使用 true / false。</p>
+                                                    <div id="vod-forward-rule-list"></div>
+                                                    <p id="vod-forward-status" role="status" aria-live="polite"></p>
                                                 </div>
                                             </div>
                                         </div>
@@ -1378,7 +1529,6 @@
                             <button class="settings-tab" data-tab="common-config">公共配置</button>
                             <button class="settings-tab" data-tab="matrix-config">矩阵配置</button>
                             <button class="settings-tab" data-tab="lan-sync">配置同步</button>
-                            <button class="settings-tab" data-tab="import-folders">导入文件夹</button>
                             <button class="settings-tab" data-tab="log-viewer">日志管理</button>
                         </div>
 
@@ -1504,17 +1654,34 @@
 
                         <div id="common-config-tab" class="settings-tab-content">
                             <div class="setting-group">
-                                <div class="section-title-with-actions">
-                                    <h3 class="section-title">公共配置</h3>
+                                <div class="section-title-with-actions common-config-toolbar">
+                                    <div class="common-config-switcher" role="tablist" aria-label="公共配置分类">
+                                        <button type="button" id="common-config-tab-power" class="common-config-switch active"
+                                            role="tab" aria-selected="true" aria-controls="common-config-panel-power"
+                                            data-common-config-target="power">定时开关机</button>
+                                        <button type="button" id="common-config-tab-network" class="common-config-switch"
+                                            role="tab" aria-selected="false" aria-controls="common-config-panel-network"
+                                            data-common-config-target="network" tabindex="-1">IP 配置</button>
+                                        <button type="button" id="common-config-tab-sync" class="common-config-switch"
+                                            role="tab" aria-selected="false" aria-controls="common-config-panel-sync"
+                                            data-common-config-target="sync" tabindex="-1">多设备同步播放</button>
+                                        <button type="button" id="common-config-tab-vod" class="common-config-switch"
+                                            role="tab" aria-selected="false" aria-controls="common-config-panel-vod"
+                                            data-common-config-target="vod" tabindex="-1">VOD 配置</button>
+                                        <button type="button" id="common-config-tab-display" class="common-config-switch"
+                                            role="tab" aria-selected="false" aria-controls="common-config-panel-display"
+                                            data-common-config-target="display" tabindex="-1">显示配置</button>
+                                        <button type="button" id="common-config-tab-options" class="common-config-switch"
+                                            role="tab" aria-selected="false" aria-controls="common-config-panel-options"
+                                            data-common-config-target="options" tabindex="-1">勾选选项</button>
+                                    </div>
                                     <div class="actions">
                                         <button type="button" id="save-common-config-btn" class="btn primary">保存配置</button>
                                     </div>
                                 </div>
-                                <p class="hint" style="color: #888; font-size: 0.875rem; margin-bottom: 1rem;">
-                                    多图层同时播放时的全局选项，修改后需在「矩阵配置」或本页保存后生效。</p>
                                 <div class="common-config-panel">
-                                    <div class="common-config-card common-config-select-card">
-                                        <div class="common-config-card-title">定时开关机</div>
+                                    <div id="common-config-panel-power" class="common-config-card common-config-select-card active"
+                                        role="tabpanel" aria-labelledby="common-config-tab-power" data-common-config-panel="power">
                                         <div class="common-config-grid">
                                             <div class="setting-item setting-item-inline">
                                                 <label for="common-power-schedule-enabled">启用定时</label>
@@ -1546,8 +1713,8 @@
                                             </div>
                                         </div>
                                     </div>
-                                    <div class="common-config-card common-config-select-card">
-                                        <div class="common-config-card-title">IP 配置</div>
+                                    <div id="common-config-panel-network" class="common-config-card common-config-select-card"
+                                        role="tabpanel" aria-labelledby="common-config-tab-network" data-common-config-panel="network" hidden>
                                         <div class="common-config-grid">
                                             <div class="setting-item">
                                                 <label for="common-network-ip-mode">IP 模式</label>
@@ -1572,14 +1739,67 @@
                                                 <input id="common-network-dns" type="text" class="form-control"
                                                     placeholder="例如 223.5.5.5">
                                             </div>
-                                            <div class="setting-item setting-item-inline">
-                                                <label for="common-debug-hotspot-enabled">调试热点</label>
-                                                <input id="common-debug-hotspot-enabled" type="checkbox" title="开启后启动 HVIDEO 调试热点，关闭后保留普通 WiFi 联网">
+                                            <div class="setting-item">
+                                                <label for="common-startup-wireless-mode">启动无线模式</label>
+                                                <select id="common-startup-wireless-mode" class="form-control"
+                                                    title="保存后重启设备生效；WiFi 自动连接已保存的网络，热点默认开启 HVIDEO">
+                                                    <option value="hotspot">热点（默认）</option>
+                                                    <option value="wifi">WiFi</option>
+                                                </select>
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-usb-otg-mode">USB 口用途</label>
+                                                <select id="common-usb-otg-mode" class="form-control"
+                                                    title="刷机使用 Peripheral，鼠标或其他 USB 外设使用 Host">
+                                                    <option value="host">鼠标（Host）</option>
+                                                    <option value="otg">自动（OTG）</option>
+                                                    <option value="peripheral">刷机（Peripheral）</option>
+                                                </select>
                                             </div>
                                         </div>
                                     </div>
-                                    <div class="common-config-card common-config-select-card" id="online-vod-card">
-                                        <div class="common-config-card-title">VOD 配置</div>
+                                    <div id="common-config-panel-sync" class="common-config-card common-config-select-card"
+                                        role="tabpanel" aria-labelledby="common-config-tab-sync" data-common-config-panel="sync" hidden>
+                                        <div class="common-config-grid">
+                                            <div class="setting-item setting-item-inline">
+                                                <label for="common-sync-enabled">启用同步组</label>
+                                                <input id="common-sync-enabled" type="checkbox" title="启用 UDP 4322 多设备同步播放">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-sync-role">设备角色</label>
+                                                <select id="common-sync-role" class="form-control" title="主设备接收外部控制并向组内分发，从设备只执行主设备命令">
+                                                    <option value="leader">主设备（Leader）</option>
+                                                    <option value="follower">从设备（Follower）</option>
+                                                </select>
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-sync-group-id">同步组 ID</label>
+                                                <input id="common-sync-group-id" type="text" class="form-control" placeholder="例如 stage-a" maxlength="64">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-sync-leader-ip">主设备 IP 地址</label>
+                                                <input id="common-sync-leader-ip" type="text" class="form-control" placeholder="例如 192.168.2.103" inputmode="decimal" pattern="^\d{1,3}(\.\d{1,3}){3}$" maxlength="15">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-sync-multicast-addr">组播地址</label>
+                                                <input id="common-sync-multicast-addr" type="text" class="form-control" placeholder="239.255.42.10">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-sync-interface">网卡地址（可选）</label>
+                                                <input id="common-sync-interface" type="text" class="form-control" placeholder="留空自动选择，例如 192.168.1.20">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-sync-port">同步端口</label>
+                                                <input id="common-sync-port" type="number" class="form-control" value="4322" readonly aria-readonly="true">
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-sync-ttl">组播 TTL</label>
+                                                <input id="common-sync-ttl" type="number" class="form-control" min="0" max="255" step="1" value="1" title="同一局域网建议使用 1">
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div id="common-config-panel-vod" class="common-config-card common-config-select-card"
+                                        role="tabpanel" aria-labelledby="common-config-tab-vod" data-common-config-panel="vod" hidden>
                                         <div class="common-config-grid">
                                             <div class="setting-item">
                                                 <label for="common-audio-output-layer-id">音频输出图层</label>
@@ -1604,18 +1824,61 @@
                                             <div class="setting-item" id="online-vod-host-group" style="display: none;">
                                                 <label for="common-online-vod-host">服务器 Host</label>
                                                 <input id="common-online-vod-host" type="text" class="form-control"
-                                                    placeholder="例如 192.168.1.10">
+                                                    placeholder="例如 192.168.1.254">
                                             </div>
                                             <div class="setting-item" id="online-vod-room-group" style="display: none;">
                                                 <label for="common-online-vod-room-id">房间 ID</label>
                                                 <input id="common-online-vod-room-id" type="text" class="form-control"
                                                     value="current" placeholder="current(终端IP)">
                                             </div>
+                                            <div class="setting-item">
+                                                <label for="common-vod-volume-gain-db">VOD 音量增益（dB）</label>
+                                                <select id="common-vod-volume-gain-db" class="form-control"
+                                                    title="仅增强本地和在线 VOD 播放音量，含峰值限幅；保存后生效">
+                                                    <option value="0">0 dB（关闭）</option>
+                                                    <option value="1">+1 dB</option>
+                                                    <option value="2">+2 dB</option>
+                                                    <option value="3">+3 dB</option>
+                                                    <option value="4">+4 dB</option>
+                                                    <option value="5">+5 dB</option>
+                                                    <option value="6">+6 dB</option>
+                                                    <option value="7">+7 dB</option>
+                                                    <option value="8">+8 dB</option>
+                                                    <option value="9">+9 dB</option>
+                                                    <option value="10">+10 dB</option>
+                                                </select>
+                                            </div>
                                         </div>
                                     </div>
-                                    <div class="common-config-card common-config-select-card">
-                                        <div class="common-config-card-title">显示配置</div>
+                                    <div id="common-config-panel-display" class="common-config-card common-config-select-card"
+                                        role="tabpanel" aria-labelledby="common-config-tab-display" data-common-config-panel="display" hidden>
                                         <div class="common-config-grid">
+                                            <div class="setting-item display-output-setting">
+                                                <label for="common-display-output">显示输出</label>
+                                                <select id="common-display-output" class="form-control" disabled
+                                                    title="选择后自动保存，与系统设置同步；重启设备后生效"
+                                                    aria-describedby="display-output-status">
+                                                    <option value="" disabled>读取中…</option>
+                                                    <option value="hdmi">HDMI</option>
+                                                    <option value="mipi">MIPI</option>
+                                                </select>
+                                                <small id="display-output-status" role="status" aria-live="polite" hidden></small>
+                                                <button id="refresh-display-output-btn" type="button" class="btn btn-secondary"
+                                                    title="重新读取系统输出选择" hidden>重试</button>
+                                                <button id="reboot-display-output-btn" type="button" class="btn btn-primary"
+                                                    title="重启设备使输出选择生效" hidden>重启</button>
+                                            </div>
+                                            <div class="setting-item">
+                                                <label for="common-display-resolution">系统分辨率</label>
+                                                <select id="common-display-resolution" class="form-control" disabled
+                                                    title="与系统设置同步，选择并确认后立即切换和保存"
+                                                    aria-describedby="display-resolution-status">
+                                                    <option value="">读取中…</option>
+                                                </select>
+                                                <small id="display-resolution-status" role="status" aria-live="polite" hidden></small>
+                                                <button id="refresh-display-resolution-btn" type="button"
+                                                    class="btn btn-secondary" hidden>重试</button>
+                                            </div>
                                             <div class="setting-item">
                                                 <label for="common-render-frame-rate-mode">合成帧率</label>
                                                 <select id="common-render-frame-rate-mode" class="form-control"
@@ -1634,10 +1897,120 @@
                                                     <option value="ultra">超清</option>
                                                 </select>
                                             </div>
+                                            <div class="setting-item setting-item-inline">
+                                                <label for="common-startup-ip-hint-enabled">启动 IP 提示</label>
+                                                <label class="switch-wrapper">
+                                                    <input id="common-startup-ip-hint-enabled" type="checkbox" checked
+                                                        title="统一控制启动时的 IP、热点、连接信息和调试二维码；保存后立即生效">
+                                                    显示提示
+                                                </label>
+                                            </div>
+                                            <div class="setting-item setting-item-inline">
+                                                <label for="common-playback-operation-hint-enabled">播放操作提示</label>
+                                                <label class="switch-wrapper">
+                                                    <input id="common-playback-operation-hint-enabled" type="checkbox" checked
+                                                        title="显示播放、暂停、切歌、重播、音量、静音和原伴唱操作提示；保存后立即生效">
+                                                    显示提示
+                                                </label>
+                                            </div>
                                         </div>
                                     </div>
-                                    <div class="common-config-card common-config-check-card">
-                                        <div class="common-config-card-title">勾选选项</div>
+                                    <div id="common-config-panel-lyric" class="common-config-card lyric-settings"
+                                        role="region" aria-label="VOD 歌词配置" data-common-config-panel="vod">
+                                        <div class="lyric-settings-heading">
+                                            <div>
+                                                <h3>歌词与字幕</h3>
+                                                <p>调整歌词的显示方式，让每一句都清晰动人。</p>
+                                            </div>
+                                            <span class="lyric-settings-badge">播放显示</span>
+                                        </div>
+                                        <div class="lyric-settings-layout">
+                                            <div class="lyric-settings-controls">
+                                                <div class="lyric-option-row">
+                                                    <div>
+                                                        <label for="common-lyric-header-visible">歌曲信息</label>
+                                                        <p id="lyric-header-help">显示歌名、演唱和出品信息</p>
+                                                    </div>
+                                                    <input id="common-lyric-header-visible" class="lyric-toggle" type="checkbox"
+                                                        role="switch" aria-describedby="lyric-header-help">
+                                                </div>
+                                                <div class="lyric-option-row">
+                                                    <div>
+                                                        <label for="common-lyric-background-visible">歌词背景</label>
+                                                        <p id="lyric-background-help">添加黑色衬底，提升歌词辨识度</p>
+                                                    </div>
+                                                    <input id="common-lyric-background-visible" class="lyric-toggle" type="checkbox"
+                                                        role="switch" aria-describedby="lyric-background-help" checked>
+                                                </div>
+                                                <div class="lyric-field-grid">
+                                                    <div class="setting-item">
+                                                        <label for="common-lyric-display-mode">显示模式</label>
+                                                        <select id="common-lyric-display-mode" class="form-control" aria-describedby="lyric-mode-help">
+                                                            <option value="original">原文歌词</option>
+                                                            <option value="pinyin">纯拼音（带声调）</option>
+                                                        </select>
+                                                        <p id="lyric-mode-help">保留歌词同步与逐字变色。</p>
+                                                    </div>
+                                                    <div class="setting-item">
+                                                        <label for="common-lyric-font">歌词字体 <span class="lyric-restart-tag">重启生效</span></label>
+                                                        <select id="common-lyric-font" class="form-control" aria-describedby="lyric-font-help"
+                                                            title="选择 /huoshan/ttf 目录中的字体；保存后重启应用生效">
+                                                            <option value="">自动选择</option>
+                                                        </select>
+                                                        <p id="lyric-font-help">应用于当前歌词和下一句歌词。</p>
+                                                    </div>
+                                                    <div class="setting-item">
+                                                        <label for="common-lyric-title-font-size">标题字体大小</label>
+                                                        <input id="common-lyric-title-font-size" class="form-control" type="number" min="1" max="300" step="1" value="150">
+                                                    </div>
+                                                    <div class="setting-item">
+                                                        <label for="common-lyric-title-outline-width">标题描边宽度</label>
+                                                        <input id="common-lyric-title-outline-width" class="form-control" type="number" min="0" max="20" step="0.1" value="8">
+                                                    </div>
+                                                    <div class="setting-item">
+                                                        <label for="common-lyric-text-font-size">歌词文本字体大小</label>
+                                                        <input id="common-lyric-text-font-size" class="form-control" type="number" min="1" max="300" step="1" value="140">
+                                                    </div>
+                                                    <div class="setting-item">
+                                                        <label for="common-lyric-text-outline-width">歌词文本描边宽度</label>
+                                                        <input id="common-lyric-text-outline-width" class="form-control" type="number" min="0" max="20" step="0.1" value="10">
+                                                    </div>
+                                                    <div class="setting-item">
+                                                        <label for="common-lyric-text-spacing">歌词文本文字间距</label>
+                                                        <input id="common-lyric-text-spacing" class="form-control" type="number" min="-20" max="100" step="0.1" value="-10">
+                                                    </div>
+                                                    <div class="setting-item">
+                                                        <label for="common-lyric-producer-text">出品文字</label>
+                                                        <input id="common-lyric-producer-text" class="form-control" type="text" maxlength="256"
+                                                            placeholder="留空使用 ASS 自带出品文字">
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div class="lyric-preview">
+                                                <div class="lyric-preview-heading">
+                                                    <span>画面预览</span>
+                                                    <span id="lyric-preview-mode" class="lyric-preview-mode" aria-live="polite">原文歌词</span>
+                                                </div>
+                                                <div id="lyric-preview-stage" class="lyric-preview-stage has-background" role="img" aria-label="歌词排版示意">
+                                                    <div id="lyric-preview-header" class="lyric-preview-header" hidden>
+                                                        <strong>美好时光</strong>
+                                                        <span>演唱：示例歌手 · 出品：HVIDEO</span>
+                                                    </div>
+                                                    <div class="lyric-preview-lines">
+                                                        <div class="lyric-preview-current"><span id="lyric-preview-sung">让每一句歌</span><span id="lyric-preview-pending">都清晰动人</span></div>
+                                                        <div id="lyric-preview-next" class="lyric-preview-next">把美好留在这一刻</div>
+                                                    </div>
+                                                </div>
+                                                <p class="lyric-preview-note">排版示意，实际字体与播放效果以播放器为准。</p>
+                                            </div>
+                                        </div>
+                                        <div class="lyric-settings-footnote">
+                                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7v2"/></svg>
+                                            <span>调整完成后点击右上方「保存配置」。显示设置保存后生效，字体需重启应用。</span>
+                                        </div>
+                                    </div>
+                                    <div id="common-config-panel-options" class="common-config-card common-config-check-card"
+                                        role="tabpanel" aria-labelledby="common-config-tab-options" data-common-config-panel="options" hidden>
                                         <div class="common-config-check-list">
                                             <div class="setting-item setting-item-inline" id="local-song-file-scan-group">
                                                 <label for="common-local-song-file-scan-enabled">启动扫描</label>
@@ -1661,6 +2034,7 @@
                                     <h3 class="section-title">矩阵配置</h3>
                                     <div class="actions">
                                         <button id="apply-flexible-mapping" class="btn primary">保存</button>
+                                        <button id="save-matrix-command" class="btn">生成中控命令</button>
                                         <button id="reset-flexible-mapping" class="btn">重置</button>
                                     </div>
                                 </div>
@@ -1743,12 +2117,16 @@
                                 <div class="section-title-with-actions">
                                     <h3 class="section-title">局域网配置同步</h3>
                                     <div class="actions lan-sync-mode-actions">
+                                        <button type="button" id="config-backup-export" class="btn">备份配置</button>
+                                        <button type="button" id="config-backup-import" class="btn">还原配置</button>
+                                        <input type="file" id="config-backup-file" class="hidden" accept=".zip,application/zip">
                                         <button type="button" id="lan-sync-mode-pull-btn" class="btn"
                                             title="从选中设备拉取到本机，勾选右侧本机文件夹">同步到本机</button>
-                                        <button type="button" id="lan-sync-mode-push-btn" class="btn primary"
+                                        <button type="button" id="lan-sync-mode-push-btn" class="btn"
                                             title="推送到选中设备，勾选左侧设备文件夹">同步到选中设备</button>
                                     </div>
                                 </div>
+                                <p class="lan-sync-note">同步覆盖所选目录内的同名文件，保留其他文件及本机网络、房间和同步组配置。完整校验后，重启接收设备系统生效。</p>
                                 <div class="lan-sync-cards">
                                     <div class="lan-sync-card lan-sync-card-devices">
                                         <h4 class="lan-sync-card-title">扫描设备</h4>
@@ -1779,78 +2157,6 @@
                                                 <h5 class="lan-sync-folder-panel-title">本机文件夹</h5>
                                                 <div id="lan-sync-dirs-local-list" class="lan-sync-dirs-list"></div>
                                             </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div id="import-folders-tab" class="settings-tab-content">
-                            <div class="setting-group">
-                                <h3 class="section-title">导入文件夹到 huoshan 目录</h3>
-                                <p id="import-folder-root-desc" class="setting-desc">选择本地文件夹，将其内容导入到设备的当前数据根目录下。适用于批量导入视频、图片、字体等资源。</p>
-
-                                <div class="import-folders-section">
-                                    <div class="import-folder-card glass-panel">
-                                        <div class="import-folder-header">
-                                            <h4>选择文件夹</h4>
-                                            <button type="button" id="import-folder-btn" class="btn primary">
-                                                <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                                                    <polyline points="7 10 12 15 17 10" />
-                                                    <line x1="12" y1="15" x2="12" y2="3" />
-                                                </svg>
-                                                选择文件夹
-                                            </button>
-                                            <input type="file" id="import-folder-input" class="hidden" webkitdirectory directory multiple>
-                                        </div>
-
-                                        <div class="import-folder-body">
-                                            <div id="import-folder-info" class="import-info">
-                                                <p>未选择文件夹</p>
-                                            </div>
-
-                                            <div id="import-folder-preview" class="import-preview" style="display: none;">
-                                                <div class="import-target">
-                                                    <label>目标路径:</label>
-                                                    <input type="text" id="import-target-path" class="form-control dark-input"
-                                                           placeholder="例如: video, image, ttf" value="">
-                                                    <p id="import-target-root-help" class="help-text">输入目标子目录名称（相对于当前数据根目录），留空则导入到根目录</p>
-                                                </div>
-
-                                                <div class="import-file-list">
-                                                    <h5>文件列表 (<span id="import-file-count">0</span> 个文件)</h5>
-                                                    <div id="import-file-list-container" class="file-list-container"></div>
-                                                </div>
-
-                                                <div class="import-actions">
-                                                    <button type="button" id="import-execute-btn" class="btn primary" disabled>
-                                                        <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                                                            <polyline points="17 8 12 3 7 8" />
-                                                            <line x1="12" y1="3" x2="12" y2="15" />
-                                                        </svg>
-                                                        开始导入
-                                                    </button>
-                                                    <button type="button" id="import-cancel-btn" class="btn">
-                                                        取消
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <div id="import-progress-section" class="import-progress-section" style="display: none;">
-                                        <div class="progress-card glass-panel">
-                                            <h4>导入进度</h4>
-                                            <div class="progress-bar-container">
-                                                <div id="import-progress-bar" class="progress-bar" style="width: 0%;"></div>
-                                            </div>
-                                            <div class="progress-info">
-                                                <span id="import-progress-text">准备中...</span>
-                                                <span id="import-progress-percent">0%</span>
-                                            </div>
-                                            <div id="import-progress-log" class="progress-log"></div>
                                         </div>
                                     </div>
                                 </div>
@@ -2086,10 +2392,7 @@
             setTimeout(fixCursor, 1000);
         })();
     </script>
-    <script type="module" src="script.js?v=3.09"></script>
+    <script type="module" src="script.js?v=3.43"></script>
 </body>
 
 </html>
-
-
-

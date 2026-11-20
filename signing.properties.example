@@ -1,12 +1,10 @@
-# Copy to signing.properties and fill local signing secrets.
-# signing.properties is intentionally ignored by Git.
+# Copy to signing.properties and fill in the two platform signing passwords locally.
+hw81.platform.storeFile=vendor/security8.1/platform.keystore
+hw81.platform.storePassword=
+hw81.platform.keyAlias=android
+hw81.platform.keyPassword=
 
-hw81.storeFile=vendor/security8.1/platform.keystore
-hw81.storePassword=change-me
-hw81.keyAlias=android
-hw81.keyPassword=change-me
-
-hw82.storeFile=vendor/security8.2/platform.keystore
-hw82.storePassword=change-me
-hw82.keyAlias=platform
-hw82.keyPassword=change-me
+hw82.platform.storeFile=vendor/security8.2/platform.keystore
+hw82.platform.storePassword=
+hw82.platform.keyAlias=platform
+hw82.platform.keyPassword=

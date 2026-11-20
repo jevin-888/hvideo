@@ -117,6 +117,60 @@ float sampleYuyvLumaLinear(vec2 uv, int width, int height, int stride) {
     return mix(mix(y00, y10, f.x), mix(y01, y11, f.x), f.y);
 }
 
+
+float sharpenYuyvLuma(vec2 uv, float yVal, int width, int height, int stride) {
+    if (width <= 1 || height <= 1) {
+        return yVal;
+    }
+
+    vec2 texel = vec2(1.0 / float(width), 1.0 / float(height));
+    float left = sampleYuyvLumaLinear(uv + vec2(-texel.x, 0.0),
+                                      width, height, stride);
+    float right = sampleYuyvLumaLinear(uv + vec2(texel.x, 0.0),
+                                       width, height, stride);
+    float up = sampleYuyvLumaLinear(uv + vec2(0.0, -texel.y),
+                                    width, height, stride);
+    float down = sampleYuyvLumaLinear(uv + vec2(0.0, texel.y),
+                                      width, height, stride);
+    float neighborAvg = (left + right + up + down) * 0.25;
+    float localMin = min(min(left, right), min(up, down));
+    float localMax = max(max(left, right), max(up, down));
+    float localContrast = localMax - localMin;
+
+    vec2 srcPx = fwidth(uv) * vec2(float(width), float(height));
+    float maxSrcPx = max(srcPx.x, srcPx.y);
+    float upscaleGate = 1.0 - smoothstep(0.95, 1.35, maxSrcPx);
+    float minifyFade = 1.0 - smoothstep(1.15, 1.85, maxSrcPx);
+    float detailGate = smoothstep(0.008, 0.100, localContrast);
+    float hardEdgeGuard = 1.0 - 0.45 * smoothstep(0.18, 0.42, localContrast);
+
+    float strength = (0.075 + 0.115 * upscaleGate) * minifyFade *
+                     detailGate * hardEdgeGuard;
+    float sharpened = yVal + (yVal - neighborAvg) * strength;
+    float ringGuard = 0.010 + 0.012 * upscaleGate;
+    return clamp(sharpened,
+                 max(0.0, localMin - ringGuard),
+                 min(1.0, localMax + ringGuard));
+}
+
+vec3 yuvToRgbBt601Limited(float yVal, float uVal, float vVal) {
+    float y = (yVal - 16.0 / 255.0) * (255.0 / 219.0);
+    float u = (uVal - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (vVal - 128.0 / 255.0) * (255.0 / 224.0);
+    return vec3(y + 1.402 * v,
+                y - 0.344136 * u - 0.714136 * v,
+                y + 1.772 * u);
+}
+
+vec3 yuvToRgbBt709Limited(float yVal, float uVal, float vVal) {
+    float y = (yVal - 16.0 / 255.0) * (255.0 / 219.0);
+    float u = (uVal - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (vVal - 128.0 / 255.0) * (255.0 / 224.0);
+    return vec3(y + 1.5748 * v,
+                y - 0.187324 * u - 0.468124 * v,
+                y + 1.8556 * u);
+}
+
 void main() {
     float shapeType = pc.shapeInfo.x;
     float shapeParam = pc.shapeInfo.y;
@@ -181,7 +235,16 @@ void main() {
     if (pc.userCrop.z <= 0.0 || pc.userCrop.w <= 0.0) {
         texCoord = fragTexCoord;
     }
-    int mode = int(invertMode + 0.5);
+    int rawMode = int(invertMode + 0.5);
+    int rotateMode = rawMode & 0xF0;
+    int mode = rawMode & 0x0F;
+    if (rotateMode == 0x10) {
+        texCoord = vec2(1.0 - texCoord.x, 1.0 - texCoord.y);
+    } else if (rotateMode == 0x20) {
+        texCoord = vec2(texCoord.y, 1.0 - texCoord.x);
+    } else if (rotateMode == 0x30) {
+        texCoord = vec2(1.0 - texCoord.y, texCoord.x);
+    }
     if (mode == 1) {
         texCoord.x = 1.0 - texCoord.x;
     } else if (mode == 2) {
@@ -198,21 +261,19 @@ void main() {
     py = clamp(py, 0, origHeight - 1);
 
     float yVal = sampleYuyvLumaLinear(texCoord, origWidth, origHeight, stride);
+    yVal = sharpenYuyvLuma(texCoord, yVal, origWidth, origHeight, stride);
 
     int colStart = (px / 2) * 4;
     float uVal = fetchYuyvByte(colStart + 1, py, stride);
     float vVal = fetchYuyvByte(colStart + 3, py, stride);
 
-    // YUV 转 RGB
-    float yValue = yVal;
-    float uValue = uVal - 0.5;
-    float vValue = vVal - 0.5;
+    bool hdCapture = origWidth >= 1280 || origHeight >= 720;
+    vec3 rgbRaw = hdCapture
+                    ? yuvToRgbBt709Limited(yVal, uVal, vVal)
+                    : yuvToRgbBt601Limited(yVal, uVal, vVal);
+    vec3 rgb = clamp(rgbRaw, 0.0, 1.0);
 
-    float r = yValue + 1.402 * vValue;
-    float g = yValue - 0.344136 * uValue - 0.714136 * vValue;
-    float b = yValue + 1.772 * uValue;
-
-    vec4 finalColor = vec4(r, g, b, 1.0) * pc.color;
+    vec4 finalColor = vec4(rgb, 1.0) * pc.color;
 
     // 黑色变透明处理
     if (blackToTransparent > 0.5) {

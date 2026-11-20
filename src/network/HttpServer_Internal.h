@@ -16,7 +16,7 @@
 #include "HttpResponse.h"
 #include "SceneTemplateManager.h"
 #include "core/CommandRouter.h"
-#include "core/PathConfig.h"
+#include "foundation/PathConfig.h"
 #include "core/SystemConfig.h"
 #include "decoder/frame/FrameTypes.h"
 #include "network/PreviewStreamConverter.h"
@@ -116,10 +116,11 @@ public:
     auto it = sseClients_.begin();
     while (it != sseClients_.end()) {
       int clientSocket = *it;
-      ssize_t sent = send(clientSocket, message.c_str(), message.length(), 0);
+      ssize_t sent = send(clientSocket, message.c_str(), message.length(), MSG_NOSIGNAL | MSG_DONTWAIT);
       if (sent < 0 || sent != static_cast<ssize_t>(message.length())) {
-        // 发送失败，移除客户端
-        close(clientSocket);
+        // SSE worker owns the final close.  Shutdown wakes its poll loop
+        // without allowing this thread to race an fd reuse.
+        shutdown(clientSocket, SHUT_RDWR);
         it = sseClients_.erase(it);
       } else {
         ++it;
@@ -137,22 +138,11 @@ public:
       return true;
     }
 
-    std::promise<bool> initPromise;
-    std::future<bool> initFuture = initPromise.get_future();
-
-    std::thread([this, promise = std::move(initPromise)]() mutable {
-      bool result = startAsync();
-      promise.set_value(result);
-    }).detach();
-
-    // 等待初始化完成，但设置超时时间避傅无限等待
-    if (initFuture.wait_for(std::chrono::seconds(3)) ==
-        std::future_status::ready) {
-      return initFuture.get();
-    } else {
-      LOG_WARN("HttpServer initialization timed out");
-      return false;
-    }
+    // 初始化只涉及 socket、路由和工作线程创建，直接在调用线程完成。
+    // 旧实现使用 detached thread 捕获 this；启动超时后 HttpServer 可能被
+    // 析构，而后台线程仍继续访问 Impl，造成重启/失败初始化场景的 UAF。
+    // 接受连接的工作由 serverThread_ 负责，启动本身不需要额外线程。
+    return startAsync();
   }
 
   bool startAsync() ;
@@ -170,8 +160,11 @@ public:
   void setMubu(hsvj::Mubu *mubu) { mubu_ = mubu; }
 
   // 认证相关方法
-  void registerAuthRoutes();
+  void registerAuthRoutes(std::function<std::string()> cloudServerUrl);
   bool isAuthenticated(const HttpRequest& req);
+  // 9898 VOD/KTV compatibility authentication.  Keep this in one place so
+  // routed requests and long-lived stream handoffs cannot drift apart.
+  bool isVodClientAuthenticated(const HttpRequest& req) const;
   std::string extractAuthToken(const HttpRequest& req);
 
   void setMaterialIndex(hsvj::MaterialIndex *index) {
@@ -284,6 +277,7 @@ public:
   enum class StreamTaskType {
     Sse,
     Upload,
+    ConfigBackup,
     MaterialVideo,
     MaterialPreview,
     RoutedRequest
@@ -313,8 +307,6 @@ public:
   void closePendingClientsLocked();
   void closePendingStreamTasksLocked();
   void shutdownActiveClients();
-  void unregisterActiveClient(int clientSocket);
-  void closeActiveClientSocket(int clientSocket);
   static void tuneWorkerThread(int port, int workerIndex);
 
 
@@ -341,6 +333,8 @@ public:
   void handleMaterialUpload(int clientSocket, const HttpRequest &headerRequest,
                             const std::vector<char> &headerData,
                             size_t headerEndPos) ;
+  void handleConfigBackup(int clientSocket, const HttpRequest& request,
+                          const std::vector<char>& initialData, size_t headerEndPos);
 
 
   void handleRequest(HttpRequest &request, HttpResponse &response) ;

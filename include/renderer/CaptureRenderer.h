@@ -35,7 +35,10 @@ public:
               float rotation, float scale, float alpha,
               int shapeType = 0, float shapeParam = 0.0f,
               bool blackToTransparent = false, int invert = 0,
-              int fitMode = 0);
+              float gaussianBlur = 0.0f, int fitMode = 0);
+  void setContentCrop(bool enabled, float x, float y, float width, float height) {
+    cropEnabled_ = enabled; cropX_ = x; cropY_ = y; cropW_ = width; cropH_ = height;
+  }
 
   bool hasNewFrame() const;
   bool hasRecentFrame() const;
@@ -87,14 +90,11 @@ private:
   uint32_t prepareTextureForBuffer(int bufferIndex);
   bool updateTextureFromDmaBuf(const FrameCache &frameCache, uint32_t textureId);
   void markTextureUpdated(uint32_t textureId);
-  void updateContentCropFromFrame(const CaptureFrame &frame);
-  void applyContentCropToTexture(uint32_t textureId);
-  void resetContentCropStateLocked();
   void renderBlackTexture(float x, float y, float width, float height,
                           float rotation, float scale, float alpha,
                           int shapeType = 0, float shapeParam = 0.0f,
                           bool blackToTransparent = false, int invert = 0,
-                          int fitMode = 0);
+                          float gaussianBlur = 0.0f, int fitMode = 0);
 
   VulkanRenderer *renderer_ = nullptr;
   V4L2Capture *v4l2Capture_ = nullptr;
@@ -122,20 +122,6 @@ private:
   bool textureUpdated_ = false;
   uint32_t updatedTextureId_ = 0;
   std::atomic<uint64_t> textureUpdateSerial_{0};
-  bool hasContentCrop_ = false;
-  float contentCropX_ = 0.0f;
-  float contentCropY_ = 0.0f;
-  float contentCropW_ = 1.0f;
-  float contentCropH_ = 1.0f;
-  bool contentCropCandidateEnabled_ = false;
-  int contentCropCandidateLeft_ = 0;
-  int contentCropCandidateRight_ = 0;
-  int contentCropCandidateFrameWidth_ = 0;
-  int contentCropCandidateStableFrames_ = 0;
-  int contentCropCommittedLeft_ = 0;
-  int contentCropCommittedRight_ = 0;
-  int contentCropCommittedFrameWidth_ = 0;
-  uint32_t contentCropLogCounter_ = 0;
   std::chrono::steady_clock::time_point skipTextureUpdateUntil_{};
   int slowTextureUpdateCount_ = 0;
   uint32_t busyReuseCount_ = 0;
@@ -147,6 +133,8 @@ private:
   mutable std::chrono::steady_clock::time_point lastFrameTime_;
   int currentWidth_ = 0;
   int currentHeight_ = 0;
+  bool cropEnabled_ = false;
+  float cropX_ = 0.0f, cropY_ = 0.0f, cropW_ = 1.0f, cropH_ = 1.0f;
 };
 
 } // 命名空间 hsvj

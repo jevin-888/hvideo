@@ -25,6 +25,8 @@
 #include "mpp_meta.h"
 
 #include <unistd.h>
+#include <cstdio>
+#include <vector>
 
 #ifndef V4L2_PIX_FMT_NV12
 #define V4L2_PIX_FMT_NV12 0x3231564E
@@ -45,7 +47,26 @@ static constexpr int kMaxFrameAlignedW = 1920;
 static constexpr int kMaxFrameAlignedH = 1088;
 static constexpr int kMaxFrameBufSize  = kMaxFrameAlignedW * kMaxFrameAlignedH * 2;
 // Buffer pool 上限：input ≤ 4 待解 + output ≤ 8 在飞行（3 slot + 1 ready + 余量）
-static constexpr int kBufferGroupCountLimit = 16;
+
+static void reportInvalidJpeg(const uint8_t *jpeg, size_t size, const char *reason) {
+  static unsigned rejected = 0, dumped = 0;
+  const unsigned count = ++rejected;
+  if (count <= 3 || count % 60 == 0) {
+    LOG_WARN("[RkmppMjpegDecoder] invalid JPEG reason=%s bytes=%zu head=%02x%02x tail=%02x%02x count=%u",
+             reason, size, size ? jpeg[0] : 0, size > 1 ? jpeg[1] : 0,
+             size > 1 ? jpeg[size - 2] : 0, size ? jpeg[size - 1] : 0, count);
+  }
+  // Explicit diagnostic opt-in only; at most three files, removed after collection.
+  if (dumped < 3 && access("/huoshan/logs/usb-diagnostic.enable", F_OK) == 0) {
+    char path[96];
+    std::snprintf(path, sizeof(path), "/huoshan/logs/usb-rejected-%u.mjpg", ++dumped);
+    if (FILE *file = std::fopen(path, "wb")) {
+      const auto written = std::fwrite(jpeg, 1, size, file);
+      std::fclose(file);
+      LOG_WARN("[RkmppMjpegDecoder] diagnostic JPEG saved path=%s bytes=%zu", path, written);
+    }
+  }
+}
 
 RkmppMjpegDecoder::RkmppMjpegDecoder() = default;
 RkmppMjpegDecoder::~RkmppMjpegDecoder() { shutdown(); }
@@ -130,6 +151,41 @@ bool RkmppMjpegDecoder::decode(const uint8_t *jpeg, size_t size,
   out = {};
   if (!ctx_ || !bufGroup_ || !jpeg || size == 0) return false;
 
+  // A USB frame must contain one complete JPEG. Never let MPP search a
+  // truncated frame (or stale DMA pool bytes) for an end-of-image marker.
+  if (size < 4 || jpeg[0] != 0xff || jpeg[1] != 0xd8) {
+    reportInvalidJpeg(jpeg, size, "missing SOI");
+    return false;
+  }
+  size_t jpegSize = size;
+  const uint8_t *packetData = jpeg;
+  std::vector<uint8_t> repairedJpeg;
+  while (jpegSize >= 4 &&
+         !(jpeg[jpegSize - 2] == 0xff && jpeg[jpegSize - 1] == 0xd9)) {
+    --jpegSize;
+  }
+  if (jpegSize < 4) {
+    // Captured MacroSilicon frames contain the final EOI as D9 FF rather
+    // than FF D9. Repair only that observed two-byte reversal, in private
+    // storage. A genuinely truncated entropy stream must still be rejected.
+    if (jpeg[size - 2] != 0xd9 || jpeg[size - 1] != 0xff) {
+      reportInvalidJpeg(jpeg, size, "missing EOI");
+      return false;
+    }
+    repairedJpeg.assign(jpeg, jpeg + size);
+    repairedJpeg[size - 2] = 0xff;
+    repairedJpeg[size - 1] = 0xd9;
+    packetData = repairedJpeg.data();
+    jpegSize = repairedJpeg.size();
+    static unsigned repairedCount = 0;
+    const unsigned count = ++repairedCount;
+    if (count <= 3 || count % 60 == 0) {
+      LOG_WARN("[RkmppMjpegDecoder] repaired reversed EOI bytes=%zu repairedBytes=%zu count=%u",
+               size, jpegSize, count);
+    }
+  }
+  size = jpegSize; // Some UVC devices append padding after JPEG EOI.
+
   auto ctx = static_cast<MppCtx>(ctx_);
   auto *mpi = static_cast<MppApi *>(mpi_);
   auto grp = static_cast<MppBufferGroup>(bufGroup_);
@@ -140,7 +196,7 @@ bool RkmppMjpegDecoder::decode(const uint8_t *jpeg, size_t size,
     LOG_WARN("[RkmppMjpegDecoder] input mpp_buffer_get %zu bytes failed", size);
     return false;
   }
-  if (mpp_buffer_write(inBuf, 0, const_cast<uint8_t *>(jpeg), size) != MPP_OK) {
+  if (mpp_buffer_write(inBuf, 0, const_cast<uint8_t *>(packetData), jpegSize) != MPP_OK) {
     mpp_buffer_put(inBuf);
     return false;
   }
@@ -152,6 +208,11 @@ bool RkmppMjpegDecoder::decode(const uint8_t *jpeg, size_t size,
   }
   mpp_buffer_put(inBuf); // packet 持有 ref，可释放本地引用
 
+  // init_with_buffer defaults both fields to the allocation capacity. This
+  // shared pool may return a 4 MB output buffer for a much smaller JPEG.
+  // The JPEG parser reads both size and length; bound both to this frame.
+  mpp_packet_set_size(pkt, jpegSize);
+  mpp_packet_set_length(pkt, jpegSize);
   mpp_packet_set_pts(pkt, 0);
 
   // ===== 2. 输出：预分配 frame + buffer 并挂到 packet meta =====

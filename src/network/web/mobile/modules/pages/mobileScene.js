@@ -4,8 +4,8 @@
  */
 
 import { apiGet, apiPost, apiAction } from '../core/api.js';
-import { addToCommandLog } from '../core/commandLog.js';
-import { selectLayer, setCurrentPlaylistId, syncSimpleStatus } from './mobileVideoControl.js?v=115';
+import { addToCommandLog } from '/shared/commandLog.js';
+import { selectLayer, setCurrentPlaylistId, syncSimpleStatus } from './mobileVideoControl.js?v=118';
 
 // 当前选中的场景
 let currentScene = null;
@@ -54,6 +54,7 @@ export async function loadScenes() {
 
             const btn = document.createElement('button');
             btn.className = 'scene-btn';
+            btn.setAttribute('translate', 'no');
             btn.textContent = scene;
             btn.dataset.scene = scene;
 
@@ -174,15 +175,6 @@ export async function selectScene(sceneName) {
     }
 }
 
-/**
- * 获取当前场景
- */
-function getCurrentScene() {
-    return currentScene;
-}
-
-// 当前选中的播放列表
-let currentPlaylist = null;
 let playlistEventInitialized = false;
 let playlistsCache = [];
 let isPlaylistSwitching = false;
@@ -240,6 +232,7 @@ export async function loadPlaylists() {
         playlists.forEach(playlist => {
             const btn = document.createElement('button');
             btn.className = 'scene-btn playlist-btn';
+            btn.setAttribute('translate', 'no');
             btn.textContent = playlist.name || playlist.id;
             btn.dataset.playlistId = playlist.id;
 
@@ -296,8 +289,6 @@ async function selectPlaylist(playlistId) {
     const targetLayerId = Number(playlist?.targetLayerId) || 1;
 
     setPlaylistButtonsActive(playlistId);
-    currentPlaylist = playlistId;
-
     // 与桌面版视频控制页一致：选择列表后，后续控制使用该列表绑定的图层。
     setCurrentPlaylistId(playlistId);
     selectLayer(targetLayerId);

@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <thread>
 #include <chrono>
 #include <condition_variable>
@@ -141,6 +142,9 @@ public:
    */
   bool startDecoding(double syncStartTime = 0.0);
 
+  /** Idempotently start audio after this video layer acquires the route. */
+  bool ensureAudioOutputStarted();
+
   /**
    * @brief 停止解码线程（阻塞直到线程退出）
    */
@@ -227,6 +231,8 @@ public:
    * @return 跳转成功返回 true
    */
   bool seek(double position, const std::string &traceId = std::string());
+  // Validate and commit a duration fallback atomically with seek/audio restart.
+  bool finishPlaybackIfAtEnd(double endTolerance);
 
   /**
    * @brief 获取当前帧（线程安全）
@@ -244,6 +250,7 @@ public:
   AVCodecContext *getVideoCodecContext() const { return videoCodecCtx_; }
   double getFrameRate() const { return frameRate_; }
   double getDuration() const { return duration_; }
+  bool hasReachedVideoStreamEnd() const;
   DecodeErrorCode getLastErrorCode() const { return lastErrorCode_; }
   std::string getLastErrorMessage() const { return lastErrorMessage_; }
 
@@ -306,6 +313,7 @@ public:
    * @brief 获取当前播放时间（秒）
    */
   double getCurrentPlayTime() const;
+  bool setSyncStartTime(double syncStartTime);
 
   /**
    * @brief 设置音频数据回调（用于音频效果联动）
@@ -331,11 +339,6 @@ public:
   /** @brief 切换退场模式：冻结旧解码器，停止继续读包/追时钟，仅保留当前画面 */
   void setSwitchingOut(bool switchingOut) {
     switchingOut_.store(switchingOut, std::memory_order_release);
-  }
-
-  /** @brief 切歌预热小缓冲模式：更激进地收紧队列与过期帧清理 */
-  void setSwitchWarmupMode(bool enabled) {
-    switchWarmupMode_.store(enabled, std::memory_order_release);
   }
 
 private:
@@ -456,6 +459,10 @@ private:
    * @return 解码成功返回 true
    */
   bool decodeAudioFrame(AVPacket *packet);
+  bool audioDecodeInterrupted() const;
+  void handleAudioPacketError(AVPacket *packet, int error,
+                              double decodedEndPts = -1.0);
+  void waitForPresentationEnd();
 
   // ========== 音频解码线程（ijkplayer/ffplay 三线程架构）==========
   // 主 demux 线程仅负责 av_read_frame + 分发到 audio/video 包队列。
@@ -466,6 +473,9 @@ private:
 
   /** 启动音频解码线程，需在 audioCodecCtx_ 就绪后调用 */
   void startAudioDecodeThread();
+
+  /** Initialize the shared player for the current route owner. */
+  bool ensureAudioOutputStartedInternal(bool deferMpegPsDirectStart);
 
   /** 停止音频解码线程，drain=true 时等队列消化完再退出 */
   void stopAudioDecodeThread(bool drain = false);
@@ -484,6 +494,7 @@ private:
   /** 清空音频包队列（seek/flush/setAudioTrack 时调用） */
   void flushAudioPacketQueue();
   bool armAudioTrackSwitchGate(double position);
+  bool restoreAudioPacketQueueFromHistory(int streamIndex, double position);
   size_t dropAudioPacketsBefore(int streamIndex, double position);
 
   // ========== 视频解码线程（完整 VLC 架构）==========
@@ -574,6 +585,19 @@ private:
   void flushDecoders();
 
   /**
+   * @brief Release queued frame references and return RKMPP/DRM output buffers.
+   * @return Number of released queued frames.
+   */
+  size_t flushFrameQueue();
+
+  // RKMPP/DRM frame destruction may block in the kernel driver. Keep it off
+  // the render/update thread and drain it before this decoder is destroyed.
+  void enqueueFrameRelease(DecodedFrame *frame);
+  void waitPendingFrameReleaseTasks();
+  void stopFrameReleaseThread();
+  void frameReleaseLoop();
+
+  /**
    * @brief 将 PTS 转换为秒
    */
   double getPTSInSeconds(int64_t pts, const AVRational &timeBase) const;
@@ -601,7 +625,13 @@ private:
    * @brief 重新对齐时钟：当发生严重卡顿（如解码器过载）导致落后过多时，强制将时钟对齐到当前帧
    * @param pts 当前帧的 PTS（秒）
    */
-  void realignClock(double pts);
+  void realignClock(double pts, bool resetAudioPipeline);
+
+  // Drive non-MPEG-PS RKMPP video from the audible audio timeline.
+  bool shouldUseAudioMasterClock() const;
+  void resetAudioMasterClock(double position);
+  void updateAudioMasterClock(double framePts, int writtenFrames, int sampleRate,
+                              uint64_t audioClockGeneration);
 
   void recordMpegPsAudioPts(double audioPts);
   double getMpegPsBaseline(double fallback) const;
@@ -624,13 +654,28 @@ private:
   // ========== 音频解码线程（ijkplayer/ffplay 三线程架构）==========
   std::thread audioDecodeThread_;
   std::unordered_map<int, std::deque<AVPacket*>> audioPacketQueues_;
+  // Read-ahead history is independent from the active decode queue. The active
+  // queue is consumed immediately, but rapid original/accompaniment switches
+  // still need packets around the audible play position without seeking video.
+  std::unordered_map<int, std::deque<AVPacket*>> audioPacketHistoryQueues_;
   mutable std::mutex audioPacketQueueMutex_;
   std::condition_variable audioPacketQueueCv_;
   std::atomic<bool> audioDecodeShouldStop_{false};
   std::atomic<bool> audioDecodeDrainOnStop_{false};
   std::atomic<bool> audioDecodeThreadRunning_{false};
+  std::mutex audioDecodeThreadLifecycleMutex_;
+  // The shared AudioPlayer generation changes whenever focus moves between
+  // layers. A decoder that regains focus must rebuild PCM from packet history
+  // once for that generation instead of resuming with an empty output queue.
+  std::atomic<uint64_t> preparedAudioRouteGeneration_{0};
   static constexpr size_t kAudioPacketQueueCap = 60;
-  static constexpr double kInactiveAudioQueueWindowSeconds = 2.0;
+  static constexpr size_t kAudioPacketHistoryCap = 2048;
+  static constexpr double kAudioPacketHistoryWindowSeconds = 30.0;
+  static constexpr double kAudioTrackSwitchPrerollSeconds = 0.25;
+  static constexpr double kAudioTrackSwitchMaxLeadSeconds = 0.8;
+  static constexpr double kAudioTrackSwitchHistoryWaitMaxLagSeconds = 3.0;
+  static constexpr double kAudioTrackSwitchDecodeCatchupMaxLagSeconds = 12.0;
+  static constexpr int kAudioTrackSwitchHistoryWaitMs = 300;
 
   // ========== 视频解码线程（完整 VLC 架构）==========
   std::thread videoDecodeThread_;
@@ -649,6 +694,10 @@ private:
 
     int videoStreamIdx_;       // 视频流索引
   int audioStreamIdx_;       // 音频流索引
+  double audioStreamEndPts_ = -1.0; // Selected stream's declared end, not container end.
+  double videoStreamEndPts_ = -1.0;
+  std::atomic<bool> demuxInputEnded_{false};
+  std::mutex eofDrainMutex_; // Serialize natural worker drain with seek restarts.
   AVRational videoTimeBase_; // 视频时间基准
   AVRational audioTimeBase_; // 音频时间基准
 
@@ -673,6 +722,8 @@ private:
 
   // ========== 时间控制 ==========
 
+  // A reader must not publish a pre-seek clock candidate after the reset.
+  mutable std::recursive_mutex playbackClockMutex_;
   double startTime_;      // 播放开始时间
   double pausedTime_;     // 累计暂停时间
   double pauseStartTime_; // 当前暂停开始时间
@@ -680,6 +731,13 @@ private:
   // ========== 抖动缓冲队列 (Jitter Buffer) ==========
   std::deque<DecodedFrame*> frameQueue_;   // 帧待显示队列
   std::mutex queueMutex_;                  // 队列互斥锁
+  std::condition_variable frameQueueCv_;   // 解码生产者等待显示队列释放容量
+  std::deque<DecodedFrame *> pendingFrameReleases_;
+  std::mutex pendingFrameReleaseMutex_;
+  std::condition_variable pendingFrameReleaseCv_;
+  std::thread frameReleaseThread_;
+  bool frameReleaseActive_ = false;
+  bool frameReleaseStopping_ = false;
   int64_t flowReceiveCount_ = 0;
   int64_t flowProcessCount_ = 0;
   int64_t flowEnqueueCount_ = 0;
@@ -705,6 +763,7 @@ private:
   std::atomic<bool> shouldStop_; // 停止标志
   std::atomic<bool> decodeThreadExited_; // 解码线程已退出标志（比 isFinished_ 更可靠）
   std::atomic<bool> isPaused_;   // 暂停标志
+  std::atomic<double> pausedPosition_{0.0}; // frozen before audio focus changes
   std::atomic<bool> isSeeking_;  // 跳转中标志
   std::atomic<bool> isFinished_; // 解码完成标志
   std::atomic<bool> seekDropActive_{false};
@@ -746,6 +805,7 @@ private:
   
   // 第一帧对齐标志
   bool firstFrameAligned_;     // 第一帧是否已对齐到全局播放时钟
+  bool explicitSyncStart_ = false; // startTime_ 由跨设备同步计划明确指定
   bool isHttpStream_;          // 是否为 HTTP 流媒体（需要宽松帧同步）
   bool isMpegPsStream_ = false; // 是否为 MPEG-PS/MPG/VOB/DAT 老格式
   bool isMultiChannelAudio_ = false; // 当前音频是否为多声道输入
@@ -764,7 +824,7 @@ private:
   // 借鉴 VLC clock.c::coeff_avg：用滑动平均持续校准 startTime_，吸收音频时基与系统时钟的微漂移
   int64_t mpegPsLastSmoothedFramesRead_ = 0;  // 上次采样的 AAudio framesRead，避免无变化时重复计算
   // 本曲首次写入音频时 AAudio 已写入的累计帧数；用作"本曲已播帧数"基准。
-  // AAudioStream_getFramesRead/Written 是流生命周期累计值（跨歌不重置），
+  // AudioPlayer 的帧计数是流生命周期累计值（跨歌不重置），
   // 必须减去本曲开始时的锚点才能得到"本曲已播帧数"。
   int64_t mpegPsAudioFramesAnchor_ = 0;
   bool mpegPsAudioFramesAnchorInitialized_ = false;
@@ -787,13 +847,15 @@ private:
   // 自适应跳帧：当解码落后于播放时钟时，跳过非关键帧以快速追赶
   int consecutiveDrops_ = 0;   // 连续丢帧计数
   /** 追赶模式下已跳过音频包，需在恢复解码前 flush，否则音频时间轴快于视频 */
-  bool skippedAudioDuringCatchup_ = false;
   int severeDriftStreak_ = 0;
   int64_t lastClockRealignMs_ = 0;
   /** 本解码器是否已打印过首帧音频日志（勿用 static，多路解码各自独立） */
   bool audioFirstFrameLogged_ = false;
-  /** 连续音频包解码失败计数；HTTP 流中 MP2 Header Missing 等持续错误时自动禁用音频流 */
+  /** Consecutive corrupt audio packets; conceal their duration and keep decoding. */
   int consecutiveAudioErrors_ = 0;
+  /** HTTP 流中视频坏包计数；短暂传输损坏时丢包并刷新硬件解码器，不中止整首播放 */
+  int consecutiveVideoPacketErrors_ = 0;
+  int consecutiveVideoFrameErrors_ = 0;
   /** 音频首帧等待提示限频计数 */
   int audioWriteCountAfterSwitch_ = 0;
   int audioPrerollDropFrames_ = 0;
@@ -802,10 +864,23 @@ private:
   std::atomic<bool> audioTrackSwitching_{false};
   double audioTrackSwitchTargetPts_ = -1.0;
   int audioTrackSwitchDropCount_ = 0;
+  std::atomic<bool> audioTrackRestoreNeedsDecodeCatchup_{false};
+  std::atomic<double> audioTrackReplayThrottleEndPts_{-1.0};
   int consecutiveAudioWriteFailures_ = 0;
   int64_t lastAudioWriteFailureMs_ = 0;
-  double lastClockRealignPts_ = -1.0;
-  int repeatedClockRealignCount_ = 0;
+  // Audible audio timeline for non-MPEG-PS RKMPP playback.
+  std::atomic<bool> audioMasterClockValid_{false};
+  std::atomic<double> audioMasterClockPts_{0.0};
+  std::atomic<double> audioMasterClockSystemTime_{0.0};
+  std::atomic<double> audioMasterBufferedEndPts_{0.0};
+  std::atomic<uint64_t> audioMasterClockGeneration_{0};
+  // Continuous handoff between shared audio clock and wall clock.
+  mutable std::atomic<uint64_t> audioClockHandoffGeneration_{0};
+  mutable std::atomic<double> audioClockHandoffOffset_{0.0};
+  mutable std::atomic<double> continuousWallClockOffset_{0.0};
+  mutable std::atomic<double> lastReportedPlayTime_{0.0};
+  std::atomic<int64_t> lastAudioMasterClockLogMs_{0};
+  std::atomic<double> lastPresentedVideoPts_{-1.0};
   /** VPU 过载丢帧日志计数器（每实例独立，避免多路互相抑制） */
   int vpuDropLogCounter_ = 0;
   /** 4K 队列满丢帧日志计数器（每实例独立） */
@@ -828,8 +903,6 @@ private:
     std::atomic<bool> audioOutputSuppressed_{false};
   /** 旧解码器处于切换退场模式：冻结当前画面，停止继续推进读包/校时钟 */
   std::atomic<bool> switchingOut_{false};
-  /** 切歌预热期启用更小队列和更激进过期帧清理，降低峰值占用 */
-  std::atomic<bool> switchWarmupMode_{false};
   /** HTTP 打开/探测阶段的自适应截止时间；>0 且超时后由 interrupt_callback 中断阻塞 IO */
   std::atomic<int64_t> interruptDeadlineMs_{0};
   /** 起播保护窗口截止时间；在此之前禁止激进时钟重对齐，避免首播时卡几秒 */
